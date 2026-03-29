@@ -28,6 +28,12 @@ Or with [uv](https://docs.astral.sh/uv/):
 uv tool install mcp-stdio
 ```
 
+Or run directly without installing:
+
+```bash
+uvx mcp-stdio https://your-server.example.com:8080/mcp
+```
+
 ## Quick Start
 
 ```bash

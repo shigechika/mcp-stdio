@@ -28,6 +28,12 @@ pip install mcp-stdio
 uv tool install mcp-stdio
 ```
 
+インストールせずに直接実行：
+
+```bash
+uvx mcp-stdio https://your-server.example.com:8080/mcp
+```
+
 ## クイックスタート
 
 ```bash
