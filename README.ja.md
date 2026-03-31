@@ -12,6 +12,7 @@ MCP サーバー向け stdio-to-HTTP リレー — Claude Desktop/Code とリモ
 flowchart LR
     A[Claude<br>CLI/Desktop] -- stdio --> B(mcp-stdio)
     B == "HTTPS<br>(Bearer/Headers)" ==> C[Remote<br>MCP Server]
+    style B fill:#4a5,stroke:#333,color:#fff
 ```
 
 Bearer token やカスタムヘッダーをリモートサーバーへ転送します。
