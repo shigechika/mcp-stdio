@@ -1,6 +1,6 @@
 [project]
 name = "mcp-stdio"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Stdio-to-HTTP relay for MCP servers"
 readme = "README.md"
 license = "MIT"
@@ -28,6 +28,9 @@ Issues = "https://github.com/shigechika/mcp-stdio/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-httpx>=0.35.0"]
+
+[tool.hatch.version]
+path = "src/mcp_stdio/__init__.py"
 
 [build-system]
 requires = ["hatchling"]
