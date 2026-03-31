@@ -11,12 +11,12 @@ Stdio-to-HTTP relay for MCP servers — bridges Claude Desktop/Code to remote St
 [MCP](https://modelcontextprotocol.io/) clients like Claude Desktop and Claude Code see mcp-stdio as a locally running self-hosted MCP server, while it relays all requests to a remote MCP server over Streamable HTTP:
 
 ```mermaid
-graph LR
-    A[Claude Desktop / Code] -- stdio --> B[mcp-stdio]
-    B -- HTTPS --> C[Remote MCP Server]
+flowchart LR
+    A([Claude Client]) -- stdio --> B([mcp-stdio])
+    B -- "HTTPS | Bearer token | Custom headers" --> C([Remote MCP Server])
 ```
 
-It also works around known issues with HTTP transport in Claude Code ([#28293](https://github.com/anthropics/claude-code/issues/28293)) where custom headers are not forwarded on tool calls.
+Bearer tokens and custom headers are forwarded to the remote server.
 
 ## Install
 
@@ -113,7 +113,7 @@ Options:
 - **Retry with backoff** — retries up to 3 times on connection errors
 - **Session recovery** — resets MCP session ID on 404 and retries
 - **Bearer token auth** — via `--bearer-token` flag or `MCP_BEARER_TOKEN` env var
-- **Custom headers** — pass any header with `-H` (workaround for [#28293](https://github.com/anthropics/claude-code/issues/28293))
+- **Custom headers** — pass any header with `-H` (workaround for [#28293](https://github.com/anthropics/claude-code/issues/28293), [#39271](https://github.com/anthropics/claude-code/issues/39271))
 - **Graceful shutdown** — handles SIGTERM/SIGINT
 - **Minimal dependencies** — only [httpx](https://www.python-httpx.org/)
 

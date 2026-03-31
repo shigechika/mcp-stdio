@@ -9,12 +9,12 @@ MCP サーバー向け stdio-to-HTTP リレー — Claude Desktop/Code とリモ
 [MCP](https://modelcontextprotocol.io/) クライアント（Claude Desktop, Claude Code）に対してローカルで稼働するセルフホスト MCP サーバのように振る舞いつつ、リモート MCP サーバへの Streamable HTTP 接続を橋渡しします：
 
 ```mermaid
-graph LR
-    A[Claude Desktop / Code] -- stdio --> B[mcp-stdio]
-    B -- HTTPS --> C[Remote MCP Server]
+flowchart LR
+    A([Claude Client]) -- stdio --> B([mcp-stdio])
+    B -- "HTTPS | Bearer token | Custom headers" --> C([Remote MCP Server])
 ```
 
-Claude Code の HTTP transport でカスタムヘッダーが送れないバグ（[#28293](https://github.com/anthropics/claude-code/issues/28293)）のワークアラウンドとしても有用です。
+Bearer token やカスタムヘッダーをリモートサーバーへ転送します。
 
 ## インストール
 
@@ -111,7 +111,7 @@ mcp-stdio [OPTIONS] URL
 - **バックオフ付きリトライ** — 接続エラー時に最大3回リトライ
 - **セッション回復** — 404 でセッション ID をリセットして再試行
 - **Bearer token 認証** — `--bearer-token` フラグまたは `MCP_BEARER_TOKEN` 環境変数
-- **カスタムヘッダー** — `-H` で任意のヘッダーを送信（[#28293](https://github.com/anthropics/claude-code/issues/28293) のワークアラウンド）
+- **カスタムヘッダー** — `-H` で任意のヘッダーを送信（[#28293](https://github.com/anthropics/claude-code/issues/28293), [#39271](https://github.com/anthropics/claude-code/issues/39271) のワークアラウンド）
 - **グレースフルシャットダウン** — SIGTERM/SIGINT ハンドリング
 - **最小依存** — [httpx](https://www.python-httpx.org/) のみ
 
