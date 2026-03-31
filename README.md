@@ -1,3 +1,5 @@
+<!-- mcp-name: io.github.shigechika/mcp-stdio -->
+
 # mcp-stdio
 
 English | [日本語](README.ja.md)

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.shigechika/mcp-stdio",
+  "title": "MCP Stdio",
+  "description": "Stdio-to-HTTP relay for MCP servers — bridges Claude Desktop/Code to remote Streamable HTTP endpoints",
+  "repository": {
+    "url": "https://github.com/shigechika/mcp-stdio",
+    "source": "github"
+  },
+  "version": "0.2.1",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "mcp-stdio",
+      "version": "0.2.1",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
