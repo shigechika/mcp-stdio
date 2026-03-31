@@ -36,6 +36,12 @@ Or run directly without installing:
 uvx mcp-stdio https://your-server.example.com:8080/mcp
 ```
 
+Or with [Homebrew](https://brew.sh/):
+
+```bash
+brew install shigechika/tap/mcp-stdio
+```
+
 ## Quick Start
 
 ```bash

@@ -34,6 +34,12 @@ uv tool install mcp-stdio
 uvx mcp-stdio https://your-server.example.com:8080/mcp
 ```
 
+[Homebrew](https://brew.sh/) を使う場合：
+
+```bash
+brew install shigechika/tap/mcp-stdio
+```
+
 ## クイックスタート
 
 ```bash
