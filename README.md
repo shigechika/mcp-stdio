@@ -12,8 +12,8 @@ Stdio-to-HTTP relay for MCP servers — bridges Claude Desktop/Code to remote St
 
 ```mermaid
 flowchart LR
-    A([Claude Client]) -- stdio --> B([mcp-stdio])
-    B -- "HTTPS | Bearer token | Custom headers" --> C([Remote MCP Server])
+    A[Claude<br>CLI/Desktop] -- stdio --> B(mcp-stdio)
+    B == "HTTPS<br>(Bearer/Headers)" ==> C[Remote<br>MCP Server]
 ```
 
 Bearer tokens and custom headers are forwarded to the remote server.

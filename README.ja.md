@@ -10,8 +10,8 @@ MCP サーバー向け stdio-to-HTTP リレー — Claude Desktop/Code とリモ
 
 ```mermaid
 flowchart LR
-    A([Claude Client]) -- stdio --> B([mcp-stdio])
-    B -- "HTTPS | Bearer token | Custom headers" --> C([Remote MCP Server])
+    A[Claude<br>CLI/Desktop] -- stdio --> B(mcp-stdio)
+    B == "HTTPS<br>(Bearer/Headers)" ==> C[Remote<br>MCP Server]
 ```
 
 Bearer token やカスタムヘッダーをリモートサーバーへ転送します。
