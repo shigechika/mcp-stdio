@@ -50,6 +50,10 @@ mcp-stdio https://your-server.example.com:8080/mcp
 Bearer token 認証付き：
 
 ```bash
+# 推奨: 環境変数を使用（トークンが `ps` に表示されない）
+MCP_BEARER_TOKEN=YOUR_TOKEN mcp-stdio https://your-server.example.com:8080/mcp
+
+# または直接指定（トークンが `ps` の出力に表示される）
 mcp-stdio https://your-server.example.com:8080/mcp --bearer-token YOUR_TOKEN
 ```
 
@@ -68,10 +72,10 @@ mcp-stdio https://your-server.example.com:8080/mcp -H "X-API-Key: YOUR_KEY"
   "mcpServers": {
     "my-remote-server": {
       "command": "mcp-stdio",
-      "args": [
-        "https://your-server.example.com:8080/mcp",
-        "--bearer-token", "YOUR_TOKEN"
-      ]
+      "args": ["https://your-server.example.com:8080/mcp"],
+      "env": {
+        "MCP_BEARER_TOKEN": "YOUR_TOKEN"
+      }
     }
   }
 }
@@ -85,9 +89,9 @@ mcp-stdio https://your-server.example.com:8080/mcp -H "X-API-Key: YOUR_KEY"
 ## Claude Code の設定
 
 ```bash
-claude mcp add my-remote-server -- \
-  mcp-stdio https://your-server.example.com:8080/mcp \
-  --bearer-token YOUR_TOKEN
+claude mcp add my-remote-server \
+  -e MCP_BEARER_TOKEN=YOUR_TOKEN \
+  -- mcp-stdio https://your-server.example.com:8080/mcp
 ```
 
 ## 使い方

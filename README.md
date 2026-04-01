@@ -52,6 +52,10 @@ mcp-stdio https://your-server.example.com:8080/mcp
 With Bearer token authentication:
 
 ```bash
+# Recommended: use env var (token is hidden from `ps`)
+MCP_BEARER_TOKEN=YOUR_TOKEN mcp-stdio https://your-server.example.com:8080/mcp
+
+# Or pass directly (token is visible in `ps` output)
 mcp-stdio https://your-server.example.com:8080/mcp --bearer-token YOUR_TOKEN
 ```
 
@@ -70,10 +74,10 @@ Add to `claude_desktop_config.json`:
   "mcpServers": {
     "my-remote-server": {
       "command": "mcp-stdio",
-      "args": [
-        "https://your-server.example.com:8080/mcp",
-        "--bearer-token", "YOUR_TOKEN"
-      ]
+      "args": ["https://your-server.example.com:8080/mcp"],
+      "env": {
+        "MCP_BEARER_TOKEN": "YOUR_TOKEN"
+      }
     }
   }
 }
@@ -87,9 +91,9 @@ Config file locations:
 ## Claude Code Configuration
 
 ```bash
-claude mcp add my-remote-server -- \
-  mcp-stdio https://your-server.example.com:8080/mcp \
-  --bearer-token YOUR_TOKEN
+claude mcp add my-remote-server \
+  -e MCP_BEARER_TOKEN=YOUR_TOKEN \
+  -- mcp-stdio https://your-server.example.com:8080/mcp
 ```
 
 ## Usage
