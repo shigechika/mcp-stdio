@@ -120,6 +120,7 @@ Works around known issues in Claude Code's HTTP transport:
 - **Bearer token not sent** — Claude Code ignores `Authorization` header on tool calls ([#28293](https://github.com/anthropics/claude-code/issues/28293), [#33817](https://github.com/anthropics/claude-code/issues/33817))
 - **Missing Accept header** — servers return 406, misinterpreted as auth failure ([#42470](https://github.com/anthropics/claude-code/issues/42470))
 - **OAuth fallback loop** — Claude Code enters OAuth discovery even when not needed ([#34008](https://github.com/anthropics/claude-code/issues/34008), [#39271](https://github.com/anthropics/claude-code/issues/39271))
+- **Proxy settings ignored** — Claude Code does not respect `NO_PROXY` ([#34804](https://github.com/anthropics/claude-code/issues/34804)); mcp-stdio inherits proxy settings from httpx
 
 ## Features
 
@@ -128,6 +129,7 @@ Works around known issues in Claude Code's HTTP transport:
 - **Bearer token auth** — via `--bearer-token` flag or `MCP_BEARER_TOKEN` env var
 - **Custom headers** — pass any header with `-H`
 - **Graceful shutdown** — handles SIGTERM/SIGINT
+- **Proxy support** — respects `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` env vars via [httpx](https://www.python-httpx.org/)
 - **Minimal dependencies** — only [httpx](https://www.python-httpx.org/)
 
 ## How It Works

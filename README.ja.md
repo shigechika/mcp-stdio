@@ -120,6 +120,7 @@ Claude Code の HTTP transport の既知の問題を回避できます：
 - **Bearer token が送信されない** — ツール呼び出し時に `Authorization` ヘッダーが無視される（[#28293](https://github.com/anthropics/claude-code/issues/28293), [#33817](https://github.com/anthropics/claude-code/issues/33817)）
 - **Accept ヘッダーの欠落** — サーバーが 406 を返し、認証エラーと誤認される（[#42470](https://github.com/anthropics/claude-code/issues/42470)）
 - **OAuth フォールバックループ** — OAuth 不要なサーバーでも OAuth 検出が走る（[#34008](https://github.com/anthropics/claude-code/issues/34008), [#39271](https://github.com/anthropics/claude-code/issues/39271)）
+- **プロキシ設定が無視される** — Claude Code が `NO_PROXY` を尊重しない（[#34804](https://github.com/anthropics/claude-code/issues/34804)）; mcp-stdio は httpx 経由でプロキシ設定を継承
 
 ## 機能
 
@@ -128,6 +129,7 @@ Claude Code の HTTP transport の既知の問題を回避できます：
 - **Bearer token 認証** — `--bearer-token` フラグまたは `MCP_BEARER_TOKEN` 環境変数
 - **カスタムヘッダー** — `-H` で任意のヘッダーを送信
 - **グレースフルシャットダウン** — SIGTERM/SIGINT ハンドリング
+- **プロキシ対応** — `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` 環境変数を [httpx](https://www.python-httpx.org/) 経由でサポート
 - **最小依存** — [httpx](https://www.python-httpx.org/) のみ
 
 ## 仕組み
