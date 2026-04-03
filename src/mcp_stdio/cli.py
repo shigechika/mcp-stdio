@@ -7,13 +7,16 @@ import os
 import sys
 
 from . import __version__
-from .relay import run
+from .relay import run, test_connection
 
 
 def _parse_header(header: str) -> tuple[str, str]:
     """Parse a header string 'Key: Value' into a tuple."""
     if ":" not in header:
-        print(f"error: invalid header format (expected 'Key: Value'): {header}", file=sys.stderr)
+        print(
+            f"error: invalid header format (expected 'Key: Value'): {header}",
+            file=sys.stderr,
+        )
         sys.exit(1)
     key, _, value = header.partition(":")
     return key.strip(), value.strip()
@@ -57,6 +60,11 @@ def main() -> None:
         help="Read timeout in seconds (default: 120)",
     )
     parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Test connection to the MCP server and exit",
+    )
+    parser.add_argument(
         "-V",
         "--version",
         action="version",
@@ -74,6 +82,15 @@ def main() -> None:
     for h in args.headers:
         key, value = _parse_header(h)
         headers[key] = value
+
+    if args.test:
+        ok = test_connection(
+            url=args.url,
+            headers=headers,
+            timeout_connect=args.timeout_connect,
+            timeout_read=args.timeout_read,
+        )
+        sys.exit(0 if ok else 1)
 
     run(
         url=args.url,

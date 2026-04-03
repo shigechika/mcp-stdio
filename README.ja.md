@@ -107,6 +107,7 @@ mcp-stdio [OPTIONS] URL
   -H 'Key: Value'        カスタムヘッダー（複数指定可）
   --timeout-connect SEC  接続タイムアウト（デフォルト: 10秒）
   --timeout-read SEC     読み取りタイムアウト（デフォルト: 120秒）
+  --test                 接続テストして終了
   -V, --version          バージョン表示
   -h, --help             ヘルプ表示
 ```

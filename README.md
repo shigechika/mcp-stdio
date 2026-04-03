@@ -109,6 +109,7 @@ Options:
   -H 'Key: Value'        Custom header (can be repeated)
   --timeout-connect SEC  Connection timeout (default: 10)
   --timeout-read SEC     Read timeout (default: 120)
+  --test                 Test connection and exit
   -V, --version          Show version
   -h, --help             Show help
 ```
