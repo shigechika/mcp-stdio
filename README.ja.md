@@ -113,10 +113,20 @@ mcp-stdio [OPTIONS] URL
 
 ## 機能
 
+## ユースケース
+
+Claude Code の HTTP transport の既知の問題を回避できます：
+
+- **Bearer token が送信されない** — ツール呼び出し時に `Authorization` ヘッダーが無視される（[#28293](https://github.com/anthropics/claude-code/issues/28293), [#33817](https://github.com/anthropics/claude-code/issues/33817)）
+- **Accept ヘッダーの欠落** — サーバーが 406 を返し、認証エラーと誤認される（[#42470](https://github.com/anthropics/claude-code/issues/42470)）
+- **OAuth フォールバックループ** — OAuth 不要なサーバーでも OAuth 検出が走る（[#34008](https://github.com/anthropics/claude-code/issues/34008), [#39271](https://github.com/anthropics/claude-code/issues/39271)）
+
+## 機能
+
 - **バックオフ付きリトライ** — 接続エラー時に最大3回リトライ
 - **セッション回復** — 404 でセッション ID をリセットして再試行
 - **Bearer token 認証** — `--bearer-token` フラグまたは `MCP_BEARER_TOKEN` 環境変数
-- **カスタムヘッダー** — `-H` で任意のヘッダーを送信（[#28293](https://github.com/anthropics/claude-code/issues/28293), [#39271](https://github.com/anthropics/claude-code/issues/39271) のワークアラウンド）
+- **カスタムヘッダー** — `-H` で任意のヘッダーを送信
 - **グレースフルシャットダウン** — SIGTERM/SIGINT ハンドリング
 - **最小依存** — [httpx](https://www.python-httpx.org/) のみ
 

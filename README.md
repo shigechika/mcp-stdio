@@ -113,12 +113,20 @@ Options:
   -h, --help             Show help
 ```
 
+## Use Cases
+
+Works around known issues in Claude Code's HTTP transport:
+
+- **Bearer token not sent** — Claude Code ignores `Authorization` header on tool calls ([#28293](https://github.com/anthropics/claude-code/issues/28293), [#33817](https://github.com/anthropics/claude-code/issues/33817))
+- **Missing Accept header** — servers return 406, misinterpreted as auth failure ([#42470](https://github.com/anthropics/claude-code/issues/42470))
+- **OAuth fallback loop** — Claude Code enters OAuth discovery even when not needed ([#34008](https://github.com/anthropics/claude-code/issues/34008), [#39271](https://github.com/anthropics/claude-code/issues/39271))
+
 ## Features
 
 - **Retry with backoff** — retries up to 3 times on connection errors
 - **Session recovery** — resets MCP session ID on 404 and retries
 - **Bearer token auth** — via `--bearer-token` flag or `MCP_BEARER_TOKEN` env var
-- **Custom headers** — pass any header with `-H` (workaround for [#28293](https://github.com/anthropics/claude-code/issues/28293), [#39271](https://github.com/anthropics/claude-code/issues/39271))
+- **Custom headers** — pass any header with `-H`
 - **Graceful shutdown** — handles SIGTERM/SIGINT
 - **Minimal dependencies** — only [httpx](https://www.python-httpx.org/)
 
