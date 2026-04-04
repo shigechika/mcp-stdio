@@ -57,6 +57,67 @@ def send_request(
     raise last_error  # type: ignore[misc]
 
 
+class _StreamResult:
+    """Result of a streaming request."""
+
+    __slots__ = ("session_id", "status_code")
+
+    def __init__(self, session_id: str | None, status_code: int):
+        self.session_id = session_id
+        self.status_code = status_code
+
+
+def _post_and_stream(
+    client: httpx.Client,
+    url: str,
+    content: str,
+    headers: dict[str, str],
+    req_id: Any,
+) -> _StreamResult | None:
+    """Send a POST and stream the response to stdout with retry.
+
+    Handles both SSE and JSON responses.  Returns a ``_StreamResult``
+    on success (including non-200 status for caller to handle), or
+    ``None`` when all retries are exhausted (error already printed).
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            with client.stream("POST", url, content=content, headers=headers) as resp:
+                session = resp.headers.get("mcp-session-id")
+
+                if resp.status_code != 200:
+                    resp.read()
+                    return _StreamResult(session, resp.status_code)
+
+                content_type = resp.headers.get("content-type", "")
+                if "text/event-stream" in content_type:
+                    for line in resp.iter_lines():
+                        if line.startswith("data: "):
+                            print(line[6:], flush=True)
+                else:
+                    resp.read()
+                    text = resp.text.strip()
+                    if text:
+                        print(text, flush=True)
+
+                return _StreamResult(session, 200)
+        except (
+            httpx.ConnectError,
+            httpx.ReadTimeout,
+            httpx.WriteTimeout,
+            httpx.ReadError,
+        ) as e:
+            last_error = e
+            log(f"attempt {attempt}/{MAX_RETRIES} failed: {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY * attempt)
+
+    log(f"request failed after retries: {last_error}")
+    print(_error_response(str(last_error), req_id), flush=True)
+    return None
+
+
 def test_connection(
     url: str,
     headers: dict[str, str],
@@ -201,38 +262,22 @@ def run(
             if session_id:
                 req_headers["Mcp-Session-Id"] = session_id
 
-            try:
-                resp = send_request(client, url, line, req_headers)
-            except Exception as e:
-                log(f"request failed after retries: {e}")
+            result = _post_and_stream(client, url, line, req_headers, req_id)
+            if result is None:
+                # All retries exhausted — error already printed
                 session_id = None
-                print(_error_response(str(e), req_id), flush=True)
                 continue
 
-            # Session expired (404) — reset and retry
-            if resp.status_code == 404 and session_id:
+            # Session expired (404) — reset and retry once
+            if result.status_code == 404 and session_id:
                 log("session expired, resetting and retrying")
                 session_id = None
                 req_headers = dict(headers)
-                try:
-                    resp = send_request(client, url, line, req_headers)
-                except Exception as e:
-                    log(f"retry after session reset failed: {e}")
-                    print(_error_response(str(e), req_id), flush=True)
+                result = _post_and_stream(client, url, line, req_headers, req_id)
+                if result is None:
                     continue
 
-            # Track session ID
-            if "mcp-session-id" in resp.headers:
-                session_id = resp.headers["mcp-session-id"]
-
-            # Parse response
-            content_type = resp.headers.get("content-type", "")
-            if "text/event-stream" in content_type:
-                for event_line in resp.text.splitlines():
-                    if event_line.startswith("data: "):
-                        print(event_line[6:], flush=True)
-            else:
-                if resp.text.strip():
-                    print(resp.text.strip(), flush=True)
+            if result.session_id:
+                session_id = result.session_id
     finally:
         client.close()
