@@ -163,6 +163,8 @@ Claude Code の HTTP transport の既知の問題を回避できます：
 5. `Mcp-Session-Id` ヘッダーをリクエスト間で維持
 6. 401 で OAuth トークンをリフレッシュしてリトライ、404 でセッションをリセット
 
+OAuth トークンは `~/.config/mcp-stdio/tokens.json` に保存されます（パーミッション 0600）。
+
 ## ライセンス
 
 MIT

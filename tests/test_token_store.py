@@ -1,6 +1,5 @@
 """Tests for mcp_stdio.token_store module."""
 
-import json
 import os
 import stat
 
@@ -103,4 +102,63 @@ class TestLoadSaveDelete:
         monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
 
         store_file.write_text("not json")
+        assert load_token("https://example.com/mcp") is None
+
+
+class TestLegacyMigration:
+    def test_migrate_legacy_to_xdg(self, tmp_path, monkeypatch):
+        """Legacy ~/.mcp-stdio/tokens.json is moved to new XDG path."""
+        legacy_dir = tmp_path / "legacy"
+        legacy_file = legacy_dir / "tokens.json"
+        new_dir = tmp_path / "new"
+        new_file = new_dir / "tokens.json"
+
+        legacy_dir.mkdir()
+        legacy_file.write_text('{"https://example.com/mcp": {"access_token": "old"}}')
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", new_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", new_file)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_DIR", legacy_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
+
+        loaded = load_token("https://example.com/mcp")
+        assert loaded is not None
+        assert loaded.access_token == "old"
+        assert new_file.exists()
+        assert not legacy_file.exists()
+        assert not legacy_dir.exists()
+
+    def test_legacy_removed_if_new_exists(self, tmp_path, monkeypatch):
+        """If new file already exists, legacy is just removed."""
+        legacy_dir = tmp_path / "legacy"
+        legacy_file = legacy_dir / "tokens.json"
+        new_dir = tmp_path / "new"
+        new_file = new_dir / "tokens.json"
+
+        legacy_dir.mkdir()
+        legacy_file.write_text('{"https://example.com/mcp": {"access_token": "old"}}')
+        new_dir.mkdir()
+        new_file.write_text('{"https://example.com/mcp": {"access_token": "new"}}')
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", new_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", new_file)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_DIR", legacy_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
+
+        loaded = load_token("https://example.com/mcp")
+        assert loaded.access_token == "new"
+        assert not legacy_file.exists()
+
+    def test_no_migration_if_no_legacy(self, tmp_path, monkeypatch):
+        """No error when legacy path does not exist."""
+        new_dir = tmp_path / "new"
+        new_file = new_dir / "tokens.json"
+        legacy_dir = tmp_path / "legacy"
+        legacy_file = legacy_dir / "tokens.json"
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", new_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", new_file)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_DIR", legacy_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
+
         assert load_token("https://example.com/mcp") is None

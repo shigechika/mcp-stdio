@@ -165,6 +165,8 @@ Works around known issues in Claude Code's HTTP transport:
 5. Maintains the `Mcp-Session-Id` header across requests
 6. On 401, refreshes the OAuth token and retries; on 404, resets the session
 
+OAuth tokens are stored in `~/.config/mcp-stdio/tokens.json` (permissions 0600).
+
 ## License
 
 MIT

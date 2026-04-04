@@ -5,7 +5,6 @@ import hashlib
 import json
 import threading
 import time
-from unittest.mock import patch
 
 import httpx
 import pytest
@@ -23,7 +22,6 @@ from mcp_stdio.oauth import (
     generate_pkce,
     refresh_access_token,
     register_client,
-    ClientRegistration,
 )
 from mcp_stdio.token_store import TokenData
 
@@ -75,14 +73,13 @@ class TestPKCE:
         verifier, _ = generate_pkce()
         # URL-safe base64 chars only
         import re
+
         assert re.fullmatch(r"[A-Za-z0-9_-]+", verifier)
 
     def test_challenge_is_s256(self):
         verifier, challenge = generate_pkce()
         expected = (
-            base64.urlsafe_b64encode(
-                hashlib.sha256(verifier.encode("ascii")).digest()
-            )
+            base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
             .rstrip(b"=")
             .decode("ascii")
         )
@@ -404,7 +401,13 @@ class TestExchangeCode:
         )
         client = httpx.Client()
         result = exchange_code(
-            meta, "cid", None, "code123", "verifier", "http://127.0.0.1:9999/callback", client
+            meta,
+            "cid",
+            None,
+            "code123",
+            "verifier",
+            "http://127.0.0.1:9999/callback",
+            client,
         )
         assert result["access_token"] == "at123"
         assert result["refresh_token"] == "rt456"
@@ -425,7 +428,13 @@ class TestExchangeCode:
         )
         client = httpx.Client()
         exchange_code(
-            meta, "cid", "csec", "code", "verifier", "http://127.0.0.1:9999/callback", client
+            meta,
+            "cid",
+            "csec",
+            "code",
+            "verifier",
+            "http://127.0.0.1:9999/callback",
+            client,
         )
         req = httpx_mock.get_requests()[0]
         assert b"client_secret=csec" in req.content
@@ -446,7 +455,13 @@ class TestExchangeCode:
         )
         client = httpx.Client()
         result = exchange_code(
-            meta, "cid", None, "code", "verifier", "http://127.0.0.1:9999/callback", client
+            meta,
+            "cid",
+            None,
+            "code",
+            "verifier",
+            "http://127.0.0.1:9999/callback",
+            client,
         )
         assert result["access_token"] == "at123"
         assert "refresh_token" not in result
@@ -466,7 +481,13 @@ class TestExchangeCode:
         )
         client = httpx.Client()
         result = exchange_code(
-            meta, "cid", None, "code", "verifier", "http://127.0.0.1:9999/callback", client
+            meta,
+            "cid",
+            None,
+            "code",
+            "verifier",
+            "http://127.0.0.1:9999/callback",
+            client,
         )
         assert result["access_token"] == "at123"
         assert "expires_in" not in result
@@ -483,8 +504,13 @@ class TestExchangeCode:
         )
         client = httpx.Client()
         exchange_code(
-            meta, "cid", None, "code", "verifier",
-            "http://127.0.0.1:9999/callback", client,
+            meta,
+            "cid",
+            None,
+            "code",
+            "verifier",
+            "http://127.0.0.1:9999/callback",
+            client,
             resource="https://api.example.com/mcp",
         )
         req = httpx_mock.get_requests()[0]
@@ -503,8 +529,13 @@ class TestExchangeCode:
         client = httpx.Client()
         with pytest.raises(httpx.HTTPStatusError):
             exchange_code(
-                meta, "cid", None, "bad-code", "verifier",
-                "http://127.0.0.1:9999/callback", client,
+                meta,
+                "cid",
+                None,
+                "bad-code",
+                "verifier",
+                "http://127.0.0.1:9999/callback",
+                client,
             )
 
 
@@ -630,7 +661,10 @@ class TestTokenResponseToData:
             token_endpoint="https://ex.com/token",
         )
         data = _token_response_to_data(
-            raw, meta, "cid", None,
+            raw,
+            meta,
+            "cid",
+            None,
             previous_refresh_token="old_rt",
         )
         assert data.access_token == "new_at"
@@ -644,7 +678,10 @@ class TestTokenResponseToData:
             token_endpoint="https://ex.com/token",
         )
         data = _token_response_to_data(
-            raw, meta, "cid", None,
+            raw,
+            meta,
+            "cid",
+            None,
             previous_refresh_token="old_rt",
         )
         assert data.refresh_token == "new_rt"
@@ -682,7 +719,10 @@ class TestParseTokenResponse:
         """GitHub legacy: HTTP 200 with error in body."""
         httpx_mock.add_response(
             url="https://example.com/token",
-            json={"error": "bad_verification_code", "error_description": "Code expired"},
+            json={
+                "error": "bad_verification_code",
+                "error_description": "Code expired",
+            },
         )
         client = httpx.Client()
         resp = client.post("https://example.com/token")
@@ -711,6 +751,7 @@ class TestCallbackServer:
         handler_cls = _make_callback_handler(cb_result)
 
         from http.server import HTTPServer
+
         server = HTTPServer(("127.0.0.1", 0), handler_cls)
         port = server.server_address[1]
         done = threading.Event()
@@ -741,6 +782,7 @@ class TestCallbackServer:
         handler_cls = _make_callback_handler(cb_result)
 
         from http.server import HTTPServer
+
         server = HTTPServer(("127.0.0.1", 0), handler_cls)
         port = server.server_address[1]
         done = threading.Event()
@@ -753,9 +795,7 @@ class TestCallbackServer:
         t.start()
         time.sleep(0.3)
 
-        resp = httpx.get(
-            f"http://127.0.0.1:{port}/callback?error=access_denied"
-        )
+        resp = httpx.get(f"http://127.0.0.1:{port}/callback?error=access_denied")
         assert resp.status_code == 200
         assert "Authorization failed" in resp.text
 
@@ -773,6 +813,7 @@ class TestCallbackServer:
         handler_b = _make_callback_handler(result_b)
 
         from http.server import HTTPServer
+
         server_a = HTTPServer(("127.0.0.1", 0), handler_a)
         server_b = HTTPServer(("127.0.0.1", 0), handler_b)
         port_a = server_a.server_address[1]
@@ -816,12 +857,15 @@ class TestEnsureToken:
 
         from mcp_stdio.token_store import save_token
 
-        save_token("https://example.com/mcp", TokenData(
-            access_token="cached_at",
-            expires_at=time.time() + 3600,
-            token_endpoint="https://example.com/token",
-            authorization_endpoint="https://example.com/authorize",
-        ))
+        save_token(
+            "https://example.com/mcp",
+            TokenData(
+                access_token="cached_at",
+                expires_at=time.time() + 3600,
+                token_endpoint="https://example.com/token",
+                authorization_endpoint="https://example.com/authorize",
+            ),
+        )
 
         client = httpx.Client()
         data = ensure_token("https://example.com/mcp", client)
@@ -835,14 +879,17 @@ class TestEnsureToken:
 
         from mcp_stdio.token_store import save_token
 
-        save_token("https://example.com/mcp", TokenData(
-            access_token="expired_at",
-            expires_at=time.time() - 100,  # expired
-            refresh_token="valid_rt",
-            client_id="cid",
-            token_endpoint="https://example.com/token",
-            authorization_endpoint="https://example.com/authorize",
-        ))
+        save_token(
+            "https://example.com/mcp",
+            TokenData(
+                access_token="expired_at",
+                expires_at=time.time() - 100,  # expired
+                refresh_token="valid_rt",
+                client_id="cid",
+                token_endpoint="https://example.com/token",
+                authorization_endpoint="https://example.com/authorize",
+            ),
+        )
 
         httpx_mock.add_response(
             url="https://example.com/token",
@@ -866,14 +913,17 @@ class TestEnsureToken:
 
         from mcp_stdio.token_store import save_token, load_token
 
-        save_token("https://example.com/mcp", TokenData(
-            access_token="old_at",
-            expires_at=time.time() - 100,
-            refresh_token="old_rt",
-            client_id="cid",
-            token_endpoint="https://example.com/token",
-            authorization_endpoint="https://example.com/authorize",
-        ))
+        save_token(
+            "https://example.com/mcp",
+            TokenData(
+                access_token="old_at",
+                expires_at=time.time() - 100,
+                refresh_token="old_rt",
+                client_id="cid",
+                token_endpoint="https://example.com/token",
+                authorization_endpoint="https://example.com/authorize",
+            ),
+        )
 
         httpx_mock.add_response(
             url="https://example.com/token",
@@ -900,18 +950,23 @@ class TestEnsureToken:
 
         from mcp_stdio.token_store import save_token
 
-        save_token("https://example.com/mcp", TokenData(
-            access_token="no_expiry_at",
-            expires_at=None,  # unknown expiry
-            token_endpoint="https://example.com/token",
-            authorization_endpoint="https://example.com/authorize",
-        ))
+        save_token(
+            "https://example.com/mcp",
+            TokenData(
+                access_token="no_expiry_at",
+                expires_at=None,  # unknown expiry
+                token_endpoint="https://example.com/token",
+                authorization_endpoint="https://example.com/authorize",
+            ),
+        )
 
         client = httpx.Client()
         data = ensure_token("https://example.com/mcp", client)
         assert data.access_token == "no_expiry_at"
 
-    def test_token_near_expiry_triggers_refresh(self, tmp_path, monkeypatch, httpx_mock):
+    def test_token_near_expiry_triggers_refresh(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
         """Token expiring within 60s should be refreshed proactively."""
         store_file = tmp_path / "tokens.json"
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
@@ -919,14 +974,17 @@ class TestEnsureToken:
 
         from mcp_stdio.token_store import save_token
 
-        save_token("https://example.com/mcp", TokenData(
-            access_token="almost_expired",
-            expires_at=time.time() + 30,  # within 60s threshold
-            refresh_token="rt",
-            client_id="cid",
-            token_endpoint="https://example.com/token",
-            authorization_endpoint="https://example.com/authorize",
-        ))
+        save_token(
+            "https://example.com/mcp",
+            TokenData(
+                access_token="almost_expired",
+                expires_at=time.time() + 30,  # within 60s threshold
+                refresh_token="rt",
+                client_id="cid",
+                token_endpoint="https://example.com/token",
+                authorization_endpoint="https://example.com/authorize",
+            ),
+        )
 
         httpx_mock.add_response(
             url="https://example.com/token",
@@ -937,7 +995,9 @@ class TestEnsureToken:
         data = ensure_token("https://example.com/mcp", client)
         assert data.access_token == "fresh_at"
 
-    def test_refresh_preserves_old_refresh_token(self, tmp_path, monkeypatch, httpx_mock):
+    def test_refresh_preserves_old_refresh_token(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
         """Python SDK #2270: refresh response omits refresh_token; keep old."""
         store_file = tmp_path / "tokens.json"
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
@@ -945,14 +1005,17 @@ class TestEnsureToken:
 
         from mcp_stdio.token_store import save_token, load_token
 
-        save_token("https://example.com/mcp", TokenData(
-            access_token="expired_at",
-            expires_at=time.time() - 100,
-            refresh_token="precious_rt",
-            client_id="cid",
-            token_endpoint="https://example.com/token",
-            authorization_endpoint="https://example.com/authorize",
-        ))
+        save_token(
+            "https://example.com/mcp",
+            TokenData(
+                access_token="expired_at",
+                expires_at=time.time() - 100,
+                refresh_token="precious_rt",
+                client_id="cid",
+                token_endpoint="https://example.com/token",
+                authorization_endpoint="https://example.com/authorize",
+            ),
+        )
 
         # Server omits refresh_token in response
         httpx_mock.add_response(
@@ -968,7 +1031,9 @@ class TestEnsureToken:
         stored = load_token("https://example.com/mcp")
         assert stored.refresh_token == "precious_rt"
 
-    def test_refresh_failure_clears_stale_token(self, tmp_path, monkeypatch, httpx_mock):
+    def test_refresh_failure_clears_stale_token(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
         """#37747: failed refresh should clear cached token to prevent retry block."""
         store_file = tmp_path / "tokens.json"
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
@@ -976,14 +1041,17 @@ class TestEnsureToken:
 
         from mcp_stdio.token_store import save_token, load_token
 
-        save_token("https://example.com/mcp", TokenData(
-            access_token="expired_at",
-            expires_at=time.time() - 100,
-            refresh_token="invalid_rt",
-            client_id="cid",
-            token_endpoint="https://example.com/token",
-            authorization_endpoint="https://example.com/authorize",
-        ))
+        save_token(
+            "https://example.com/mcp",
+            TokenData(
+                access_token="expired_at",
+                expires_at=time.time() - 100,
+                refresh_token="invalid_rt",
+                client_id="cid",
+                token_endpoint="https://example.com/token",
+                authorization_endpoint="https://example.com/authorize",
+            ),
+        )
 
         # Refresh fails with 400
         httpx_mock.add_response(

@@ -1,17 +1,15 @@
 """Tests for mcp_stdio.relay module."""
 
 import json
-import sys
 from io import StringIO
 from unittest.mock import patch
 
 import httpx
-import pytest
 
 from mcp_stdio.relay import (
     _error_response,
     _extract_id,
-    send_request,
+    _post_and_stream,
     run,
 )
 
@@ -66,47 +64,38 @@ class TestErrorResponse:
         assert result["id"] == "req-42"
 
 
-# --- send_request ---
+# --- _post_and_stream ---
 
 
-class TestSendRequest:
-    def test_success_first_attempt(self, httpx_mock):
-        httpx_mock.add_response(json={"jsonrpc": "2.0", "result": {}, "id": 1})
-        client = httpx.Client()
-        resp = send_request(
-            client, "https://example.com/mcp", '{"id":1}', {"Content-Type": "application/json"}
+class TestPostAndStream:
+    def test_success_json(self, httpx_mock, capsys):
+        httpx_mock.add_response(
+            json={"jsonrpc": "2.0", "result": {}, "id": 1},
+            headers={"content-type": "application/json"},
         )
-        assert resp.status_code == 200
-
-    def test_retry_on_connect_error(self, httpx_mock):
-        httpx_mock.add_exception(httpx.ConnectError("connection refused"))
-        httpx_mock.add_exception(httpx.ConnectError("connection refused"))
-        httpx_mock.add_response(json={"jsonrpc": "2.0", "result": {}, "id": 1})
-
         client = httpx.Client()
-        with patch("mcp_stdio.relay.time.sleep"):
-            resp = send_request(
-                client, "https://example.com/mcp", '{"id":1}', {}
-            )
-        assert resp.status_code == 200
+        result = _post_and_stream(client, "https://example.com/mcp", '{"id":1}', {}, 1)
+        assert result is not None
+        assert result.status_code == 200
 
-    def test_raises_after_max_retries(self, httpx_mock):
+    def test_returns_none_after_max_retries(self, httpx_mock):
         for _ in range(3):
-            httpx_mock.add_exception(httpx.ConnectError("connection refused"))
-
+            httpx_mock.add_exception(httpx.ConnectError("refused"))
         client = httpx.Client()
         with patch("mcp_stdio.relay.time.sleep"):
-            with pytest.raises(httpx.ConnectError):
-                send_request(client, "https://example.com/mcp", '{"id":1}', {})
+            result = _post_and_stream(
+                client, "https://example.com/mcp", '{"id":1}', {}, 1
+            )
+        assert result is None
 
-    def test_retry_on_read_timeout(self, httpx_mock):
-        httpx_mock.add_exception(httpx.ReadTimeout("timeout"))
-        httpx_mock.add_response(json={"ok": True})
-
+    def test_non_200_returns_status(self, httpx_mock):
+        httpx_mock.add_response(
+            status_code=404, text="", headers={"content-type": "application/json"}
+        )
         client = httpx.Client()
-        with patch("mcp_stdio.relay.time.sleep"):
-            resp = send_request(client, "https://example.com/mcp", "{}", {})
-        assert resp.status_code == 200
+        result = _post_and_stream(client, "https://example.com/mcp", '{"id":1}', {}, 1)
+        assert result is not None
+        assert result.status_code == 404
 
 
 # --- run (integration) ---
@@ -118,7 +107,11 @@ class TestRun:
         stdin_data = "\n".join(stdin_lines) + "\n"
         stdout = StringIO()
         with patch("sys.stdin", StringIO(stdin_data)), patch("sys.stdout", stdout):
-            run("https://example.com/mcp", {"Content-Type": "application/json"}, **kwargs)
+            run(
+                "https://example.com/mcp",
+                {"Content-Type": "application/json"},
+                **kwargs,
+            )
         return stdout.getvalue()
 
     def test_json_response(self, httpx_mock):
@@ -127,16 +120,20 @@ class TestRun:
             text=body,
             headers={"content-type": "application/json"},
         )
-        output = self._run_with_stdin(httpx_mock, ['{"jsonrpc":"2.0","method":"init","id":1}'])
+        output = self._run_with_stdin(
+            httpx_mock, ['{"jsonrpc":"2.0","method":"init","id":1}']
+        )
         assert json.loads(output.strip()) == json.loads(body)
 
     def test_sse_response(self, httpx_mock):
-        sse_body = "data: {\"jsonrpc\":\"2.0\",\"result\":{},\"id\":1}\n\n"
+        sse_body = 'data: {"jsonrpc":"2.0","result":{},"id":1}\n\n'
         httpx_mock.add_response(
             text=sse_body,
             headers={"content-type": "text/event-stream"},
         )
-        output = self._run_with_stdin(httpx_mock, ['{"jsonrpc":"2.0","method":"init","id":1}'])
+        output = self._run_with_stdin(
+            httpx_mock, ['{"jsonrpc":"2.0","method":"init","id":1}']
+        )
         assert json.loads(output.strip())["id"] == 1
 
     def test_empty_lines_skipped(self, httpx_mock):
@@ -145,7 +142,9 @@ class TestRun:
             text=body,
             headers={"content-type": "application/json"},
         )
-        output = self._run_with_stdin(httpx_mock, ["", '{"jsonrpc":"2.0","method":"init","id":1}', ""])
+        output = self._run_with_stdin(
+            httpx_mock, ["", '{"jsonrpc":"2.0","method":"init","id":1}', ""]
+        )
         assert json.loads(output.strip())["id"] == 1
 
     def test_session_id_tracking(self, httpx_mock):
@@ -160,11 +159,14 @@ class TestRun:
             text='{"jsonrpc":"2.0","result":{},"id":2}',
             headers={"content-type": "application/json"},
         )
-        output = self._run_with_stdin(httpx_mock, [
-            '{"jsonrpc":"2.0","method":"init","id":1}',
-            '{"jsonrpc":"2.0","method":"call","id":2}',
-        ])
-        lines = [l for l in output.strip().splitlines() if l]
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","method":"init","id":1}',
+                '{"jsonrpc":"2.0","method":"call","id":2}',
+            ],
+        )
+        lines = [x for x in output.strip().splitlines() if x]
         assert len(lines) == 2
 
         # Verify second request included session header
@@ -191,11 +193,14 @@ class TestRun:
             text='{"jsonrpc":"2.0","result":{"ok":true},"id":2}',
             headers={"content-type": "application/json"},
         )
-        output = self._run_with_stdin(httpx_mock, [
-            '{"jsonrpc":"2.0","method":"init","id":1}',
-            '{"jsonrpc":"2.0","method":"call","id":2}',
-        ])
-        lines = [l for l in output.strip().splitlines() if l]
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","method":"init","id":1}',
+                '{"jsonrpc":"2.0","method":"call","id":2}',
+            ],
+        )
+        lines = [x for x in output.strip().splitlines() if x]
         assert len(lines) == 2
         # Verify session was reset: the retry request should NOT have Mcp-Session-Id
         requests = httpx_mock.get_requests()
@@ -206,7 +211,9 @@ class TestRun:
         for _ in range(3):
             httpx_mock.add_exception(httpx.ConnectError("refused"))
         with patch("mcp_stdio.relay.time.sleep"):
-            output = self._run_with_stdin(httpx_mock, ['{"jsonrpc":"2.0","method":"init","id":5}'])
+            output = self._run_with_stdin(
+                httpx_mock, ['{"jsonrpc":"2.0","method":"init","id":5}']
+            )
         result = json.loads(output.strip())
         assert result["error"]["code"] == -32000
         assert result["id"] == 5
@@ -225,7 +232,10 @@ class TestRun:
         )
 
         def mock_refresher():
-            return {"Content-Type": "application/json", "Authorization": "Bearer new-token"}
+            return {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer new-token",
+            }
 
         output = self._run_with_stdin(
             httpx_mock,

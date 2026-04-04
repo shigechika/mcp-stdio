@@ -1,6 +1,5 @@
 """Tests for mcp_stdio.cli module."""
 
-import sys
 from unittest.mock import patch
 
 import pytest
@@ -45,15 +44,27 @@ class TestMain:
             assert exc_info.value.code == 2
 
     def test_headers_and_bearer_token(self):
-        with patch("sys.argv", [
-            "mcp-stdio",
-            "https://example.com/mcp",
-            "--bearer-token", "tok123",
-            "-H", "X-Custom: val",
-        ]), patch("mcp_stdio.cli.run") as mock_run:
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "https://example.com/mcp",
+                    "--bearer-token",
+                    "tok123",
+                    "-H",
+                    "X-Custom: val",
+                ],
+            ),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
             main()
             call_kwargs = mock_run.call_args
-            headers = call_kwargs.kwargs["headers"] if call_kwargs.kwargs else call_kwargs[1]["headers"]
+            headers = (
+                call_kwargs.kwargs["headers"]
+                if call_kwargs.kwargs
+                else call_kwargs[1]["headers"]
+            )
             # If called positionally
             if not headers:
                 headers = call_kwargs[0][1]
@@ -62,31 +73,49 @@ class TestMain:
 
     def test_bearer_token_from_env(self, monkeypatch):
         monkeypatch.setenv("MCP_BEARER_TOKEN", "env-token")
-        with patch("sys.argv", ["mcp-stdio", "https://example.com/mcp"]), \
-             patch("mcp_stdio.cli.run") as mock_run:
+        with (
+            patch("sys.argv", ["mcp-stdio", "https://example.com/mcp"]),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
             main()
-            headers = mock_run.call_args[1]["headers"] if mock_run.call_args[1] else mock_run.call_args[0][1]
+            headers = (
+                mock_run.call_args[1]["headers"]
+                if mock_run.call_args[1]
+                else mock_run.call_args[0][1]
+            )
             assert headers["Authorization"] == "Bearer env-token"
 
     def test_custom_timeouts(self):
-        with patch("sys.argv", [
-            "mcp-stdio",
-            "https://example.com/mcp",
-            "--timeout-connect", "5",
-            "--timeout-read", "60",
-        ]), patch("mcp_stdio.cli.run") as mock_run:
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "https://example.com/mcp",
+                    "--timeout-connect",
+                    "5",
+                    "--timeout-read",
+                    "60",
+                ],
+            ),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
             main()
             kwargs = mock_run.call_args
             assert kwargs.kwargs["timeout_connect"] == 5.0
             assert kwargs.kwargs["timeout_read"] == 60.0
 
     def test_oauth_and_bearer_token_mutually_exclusive(self):
-        with patch("sys.argv", [
-            "mcp-stdio",
-            "https://example.com/mcp",
-            "--oauth",
-            "--bearer-token", "tok",
-        ]):
+        with patch(
+            "sys.argv",
+            [
+                "mcp-stdio",
+                "https://example.com/mcp",
+                "--oauth",
+                "--bearer-token",
+                "tok",
+            ],
+        ):
             with pytest.raises(SystemExit) as exc_info:
                 main()
             assert exc_info.value.code == 1

@@ -38,25 +38,6 @@ def _error_response(message: str, req_id: Any = None) -> str:
     )
 
 
-def send_request(
-    client: httpx.Client,
-    url: str,
-    content: str,
-    headers: dict[str, str],
-) -> httpx.Response:
-    """Send a request with retry on transient errors."""
-    last_error: Exception | None = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            return client.post(url, content=content, headers=headers)
-        except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout) as e:
-            last_error = e
-            log(f"attempt {attempt}/{MAX_RETRIES} failed: {e}")
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY * attempt)
-    raise last_error  # type: ignore[misc]
-
-
 class _StreamResult:
     """Result of a streaming request."""
 
@@ -281,9 +262,7 @@ def run(
                     req_headers = dict(headers)
                     if session_id:
                         req_headers["Mcp-Session-Id"] = session_id
-                    result = _post_and_stream(
-                        client, url, line, req_headers, req_id
-                    )
+                    result = _post_and_stream(client, url, line, req_headers, req_id)
                     if result is None:
                         continue
                 else:

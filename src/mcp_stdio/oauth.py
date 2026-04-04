@@ -62,8 +62,7 @@ def _fetch_authorization_server_metadata(
             return OAuthMetadata(
                 authorization_endpoint=data.get("authorization_endpoint")
                 or f"{auth_server_url}/authorize",
-                token_endpoint=data.get("token_endpoint")
-                or f"{auth_server_url}/token",
+                token_endpoint=data.get("token_endpoint") or f"{auth_server_url}/token",
                 registration_endpoint=data.get("registration_endpoint") or None,
             )
     except Exception:
@@ -71,9 +70,7 @@ def _fetch_authorization_server_metadata(
     return None
 
 
-def discover_oauth_metadata(
-    server_url: str, client: httpx.Client
-) -> OAuthMetadata:
+def discover_oauth_metadata(server_url: str, client: httpx.Client) -> OAuthMetadata:
     """Discover OAuth authorization server metadata.
 
     Follows the MCP spec discovery flow:
@@ -224,10 +221,7 @@ def _make_callback_handler(
                 msg = html.escape(result.error)
                 body = f"<h1>Authorization failed</h1><p>{msg}</p>"
             else:
-                body = (
-                    "<h1>Authorization successful</h1>"
-                    "<p>You can close this tab.</p>"
-                )
+                body = "<h1>Authorization successful</h1><p>You can close this tab.</p>"
             self.wfile.write(body.encode())
 
         def log_message(self, format: str, *args: Any) -> None:
@@ -407,7 +401,10 @@ def ensure_token(
                     registration_endpoint=cached.registration_endpoint,
                 )
                 data = _token_response_to_data(
-                    raw, metadata, cached.client_id, cached.client_secret,
+                    raw,
+                    metadata,
+                    cached.client_id,
+                    cached.client_secret,
                     previous_refresh_token=cached.refresh_token,
                 )
                 save_token(server_url, data)
@@ -504,7 +501,13 @@ def ensure_token(
     # Token exchange (RFC 8707: include resource indicator)
     log("exchanging authorization code for token")
     raw = exchange_code(
-        metadata, cid, csecret, code, code_verifier, redirect_uri, client,
+        metadata,
+        cid,
+        csecret,
+        code,
+        code_verifier,
+        redirect_uri,
+        client,
         resource=server_url,
     )
     data = _token_response_to_data(raw, metadata, cid, csecret)

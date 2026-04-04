@@ -5,13 +5,17 @@ from __future__ import annotations
 import json
 import os
 import stat
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 
-_STORE_DIR = Path.home() / ".mcp-stdio"
+_STORE_DIR = Path.home() / ".config" / "mcp-stdio"
 _STORE_FILE = _STORE_DIR / "tokens.json"
+
+# Legacy path (v0.3.0 and earlier)
+_LEGACY_STORE_DIR = Path.home() / ".mcp-stdio"
+_LEGACY_STORE_FILE = _LEGACY_STORE_DIR / "tokens.json"
 
 
 @dataclass
@@ -37,8 +41,27 @@ def _ensure_store_dir() -> None:
     _STORE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
 
 
+def _migrate_legacy_store() -> None:
+    """Migrate tokens from ~/.mcp-stdio/ to ~/.config/mcp-stdio/ if needed."""
+    if not _LEGACY_STORE_FILE.exists():
+        return
+    if _STORE_FILE.exists():
+        # New file already exists — just remove legacy
+        _LEGACY_STORE_FILE.unlink()
+    else:
+        _ensure_store_dir()
+        _LEGACY_STORE_FILE.rename(_STORE_FILE)
+        os.chmod(_STORE_FILE, stat.S_IRUSR | stat.S_IWUSR)
+    # Remove legacy directory if empty
+    try:
+        _LEGACY_STORE_DIR.rmdir()
+    except OSError:
+        pass  # Not empty or already gone
+
+
 def _read_store() -> dict[str, Any]:
     """Read the token store file."""
+    _migrate_legacy_store()
     if not _STORE_FILE.exists():
         return {}
     try:
