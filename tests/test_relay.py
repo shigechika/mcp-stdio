@@ -210,3 +210,64 @@ class TestRun:
         result = json.loads(output.strip())
         assert result["error"]["code"] == -32000
         assert result["id"] == 5
+
+    def test_401_triggers_token_refresh(self, httpx_mock):
+        # First request returns 401
+        httpx_mock.add_response(
+            status_code=401,
+            text="",
+            headers={"content-type": "application/json"},
+        )
+        # Retry after refresh succeeds
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"ok":true},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+
+        def mock_refresher():
+            return {"Content-Type": "application/json", "Authorization": "Bearer new-token"}
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","method":"init","id":1}'],
+            token_refresher=mock_refresher,
+        )
+        result = json.loads(output.strip())
+        assert result["result"]["ok"] is True
+        # Verify retry used new token
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 2
+        assert requests[1].headers["authorization"] == "Bearer new-token"
+
+    def test_401_refresh_failure_returns_error(self, httpx_mock):
+        httpx_mock.add_response(
+            status_code=401,
+            text="",
+            headers={"content-type": "application/json"},
+        )
+
+        def mock_refresher():
+            return None  # refresh failed
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","method":"init","id":1}'],
+            token_refresher=mock_refresher,
+        )
+        result = json.loads(output.strip())
+        assert result["error"]["message"] == "authentication failed"
+        assert result["id"] == 1
+
+    def test_401_without_refresher_passes_through(self, httpx_mock):
+        # 401 without token_refresher should not crash
+        httpx_mock.add_response(
+            status_code=401,
+            text="",
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","method":"init","id":1}'],
+        )
+        # No output because 401 is non-200 and no refresher
+        assert output.strip() == ""

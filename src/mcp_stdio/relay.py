@@ -216,6 +216,7 @@ def run(
     timeout_connect: float = 10,
     timeout_read: float = 120,
     timeout_write: float = 30,
+    token_refresher: Any = None,
 ) -> None:
     """Run the stdio-to-HTTP relay loop.
 
@@ -228,6 +229,9 @@ def run(
         timeout_connect: Connection timeout in seconds
         timeout_read: Read timeout in seconds
         timeout_write: Write timeout in seconds
+        token_refresher: Optional callable that returns updated headers
+            on successful token refresh, or None on failure. Called when
+            the server returns HTTP 401.
     """
 
     # Graceful shutdown on SIGTERM/SIGINT
@@ -267,6 +271,28 @@ def run(
                 # All retries exhausted — error already printed
                 session_id = None
                 continue
+
+            # Token expired (401) — refresh and retry once
+            if result.status_code == 401 and token_refresher:
+                log("received 401, attempting token refresh")
+                new_headers = token_refresher()
+                if new_headers:
+                    headers.update(new_headers)
+                    req_headers = dict(headers)
+                    if session_id:
+                        req_headers["Mcp-Session-Id"] = session_id
+                    result = _post_and_stream(
+                        client, url, line, req_headers, req_id
+                    )
+                    if result is None:
+                        continue
+                else:
+                    log("token refresh failed, returning error")
+                    print(
+                        _error_response("authentication failed", req_id),
+                        flush=True,
+                    )
+                    continue
 
             # Session expired (404) — reset and retry once
             if result.status_code == 404 and session_id:

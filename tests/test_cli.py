@@ -79,3 +79,14 @@ class TestMain:
             kwargs = mock_run.call_args
             assert kwargs.kwargs["timeout_connect"] == 5.0
             assert kwargs.kwargs["timeout_read"] == 60.0
+
+    def test_oauth_and_bearer_token_mutually_exclusive(self):
+        with patch("sys.argv", [
+            "mcp-stdio",
+            "https://example.com/mcp",
+            "--oauth",
+            "--bearer-token", "tok",
+        ]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 1

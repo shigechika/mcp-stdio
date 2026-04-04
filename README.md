@@ -65,6 +65,15 @@ With custom headers:
 mcp-stdio https://your-server.example.com:8080/mcp -H "X-API-Key: YOUR_KEY"
 ```
 
+With OAuth 2.1 authentication (for servers that require it):
+
+```bash
+mcp-stdio --oauth https://your-server.example.com:8080/mcp
+
+# With a pre-registered client ID (skips dynamic registration)
+mcp-stdio --oauth --client-id YOUR_CLIENT_ID https://your-server.example.com:8080/mcp
+```
+
 ## Claude Desktop Configuration
 
 Add to `claude_desktop_config.json`:
@@ -106,6 +115,9 @@ Arguments:
 
 Options:
   --bearer-token TOKEN   Bearer token (or set MCP_BEARER_TOKEN env var)
+  --oauth                Enable OAuth 2.1 authentication
+  --client-id ID         Pre-registered OAuth client ID (or set MCP_OAUTH_CLIENT_ID)
+  --oauth-scope SCOPE    OAuth scope to request
   -H 'Key: Value'        Custom header (can be repeated)
   --timeout-connect SEC  Connection timeout (default: 10)
   --timeout-read SEC     Read timeout (default: 120)
@@ -125,20 +137,31 @@ Works around known issues in Claude Code's HTTP transport:
 
 ## Features
 
+- **OAuth 2.1 client** — built-in authorization code flow with PKCE, dynamic client registration, token refresh, and secure token persistence. Implements the full MCP authorization spec:
+  - [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) Protected Resource Metadata discovery
+  - [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) Authorization Server Metadata discovery
+  - [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) Resource Indicators for audience binding
+  - [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) PKCE with S256 challenge method
+  - [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591) Dynamic Client Registration
+  - [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) Bearer Token usage
 - **Retry with backoff** — retries up to 3 times on connection errors
+- **Streaming resilience** — streams SSE responses in real time; retries on mid-stream disconnect
 - **Session recovery** — resets MCP session ID on 404 and retries
+- **Token refresh on 401** — automatically refreshes expired OAuth tokens mid-session
 - **Bearer token auth** — via `--bearer-token` flag or `MCP_BEARER_TOKEN` env var
 - **Custom headers** — pass any header with `-H`
 - **Graceful shutdown** — handles SIGTERM/SIGINT
 - **Proxy support** — respects `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` env vars via [httpx](https://www.python-httpx.org/)
-- **Minimal dependencies** — only [httpx](https://www.python-httpx.org/)
+- **Minimal dependencies** — only [httpx](https://www.python-httpx.org/); OAuth uses stdlib only
 
 ## How It Works
 
-1. Reads JSON-RPC messages from stdin (sent by Claude Desktop/Code)
-2. Forwards each message as HTTP POST to the remote MCP server
-3. Parses the response (JSON or SSE) and writes it to stdout
-4. Maintains the `Mcp-Session-Id` header across requests
+1. If `--oauth` is set, obtains an access token (cached → refresh → browser flow)
+2. Reads JSON-RPC messages from stdin (sent by Claude Desktop/Code)
+3. Streams each message as HTTP POST to the remote MCP server
+4. Parses the response (JSON or SSE) and writes it to stdout
+5. Maintains the `Mcp-Session-Id` header across requests
+6. On 401, refreshes the OAuth token and retries; on 404, resets the session
 
 ## License
 
