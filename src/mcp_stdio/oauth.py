@@ -188,145 +188,52 @@ def generate_pkce() -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 
-class _CallbackHandler(BaseHTTPRequestHandler):
-    """HTTP handler that captures the OAuth callback."""
+@dataclass
+class CallbackResult:
+    """Result captured by the OAuth callback handler."""
 
     auth_code: str | None = None
     state: str | None = None
     error: str | None = None
 
-    def do_GET(self) -> None:  # noqa: N802
-        params = parse_qs(urlparse(self.path).query)
 
-        if "error" in params:
-            _CallbackHandler.error = params["error"][0]
-        elif "code" in params:
-            _CallbackHandler.auth_code = params["code"][0]
-            _CallbackHandler.state = params.get("state", [None])[0]
+def _make_callback_handler(
+    result: CallbackResult,
+) -> type[BaseHTTPRequestHandler]:
+    """Create a callback handler class bound to a specific result instance.
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html")
-        self.end_headers()
-
-        if _CallbackHandler.error:
-            msg = html.escape(_CallbackHandler.error)
-            body = f"<h1>Authorization failed</h1><p>{msg}</p>"
-        else:
-            body = "<h1>Authorization successful</h1><p>You can close this tab.</p>"
-        self.wfile.write(body.encode())
-
-    def log_message(self, format: str, *args: Any) -> None:
-        """Suppress default HTTP server logs."""
-        pass
-
-
-def _run_callback_server(
-    port: int = 0, timeout: float = 120
-) -> tuple[str, str | None]:
-    """Start a localhost callback server and wait for the OAuth redirect.
-
-    Args:
-        port: Port to listen on (0 = ephemeral).
-        timeout: Seconds to wait for the callback.
-
-    Returns:
-        (auth_code, state) tuple.
-
-    Raises:
-        TimeoutError: If the callback is not received in time.
-        RuntimeError: If the server received an error.
+    Each OAuth flow gets its own result object, avoiding class-variable
+    race conditions when multiple flows run concurrently.
     """
-    # Reset class state
-    _CallbackHandler.auth_code = None
-    _CallbackHandler.state = None
-    _CallbackHandler.error = None
 
-    server = HTTPServer(("127.0.0.1", port), _CallbackHandler)
-    actual_port = server.server_address[1]
-    ready = threading.Event()
-    done = threading.Event()
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            params = parse_qs(urlparse(self.path).query)
 
-    def serve() -> None:
-        ready.set()
-        while not done.is_set():
-            server.handle_request()
+            if "error" in params:
+                result.error = params["error"][0]
+            elif "code" in params:
+                result.auth_code = params["code"][0]
+                result.state = params.get("state", [None])[0]
 
-    thread = threading.Thread(target=serve, daemon=True)
-    thread.start()
-    ready.wait()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
 
-    redirect_uri = f"http://127.0.0.1:{actual_port}/callback"
+            if result.error:
+                msg = html.escape(result.error)
+                body = f"<h1>Authorization failed</h1><p>{msg}</p>"
+            else:
+                body = (
+                    "<h1>Authorization successful</h1>"
+                    "<p>You can close this tab.</p>"
+                )
+            self.wfile.write(body.encode())
 
-    # Wait for callback
-    deadline = time.monotonic() + timeout
-    while not (_CallbackHandler.auth_code or _CallbackHandler.error):
-        if time.monotonic() > deadline:
-            done.set()
-            server.server_close()
-            raise TimeoutError(
-                "OAuth callback not received within timeout. "
-                "Please restart and try again."
-            )
-        time.sleep(0.2)
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
 
-    done.set()
-    server.server_close()
-
-    if _CallbackHandler.error:
-        raise RuntimeError(f"OAuth error: {_CallbackHandler.error}")
-
-    return _CallbackHandler.auth_code, _CallbackHandler.state  # type: ignore[return-value]
-
-
-# ---------------------------------------------------------------------------
-# Authorization + Token Exchange
-# ---------------------------------------------------------------------------
-
-
-def authorize(
-    metadata: OAuthMetadata,
-    client_id: str,
-    redirect_uri: str,
-    code_verifier: str,
-    code_challenge: str,
-    scope: str | None = None,
-    timeout: float = 120,
-) -> str:
-    """Open browser for authorization and return the auth code.
-
-    Starts a localhost callback server, opens the browser to the
-    authorization endpoint, and waits for the redirect.
-
-    Returns the authorization code.
-    """
-    state = secrets.token_urlsafe(32)
-
-    params: dict[str, str] = {
-        "client_id": client_id,
-        "response_type": "code",
-        "redirect_uri": redirect_uri,
-        "state": state,
-        "code_challenge": code_challenge,
-        "code_challenge_method": "S256",
-    }
-    if scope:
-        params["scope"] = scope
-
-    auth_url = f"{metadata.authorization_endpoint}?{urlencode(params)}"
-    log(f"opening browser for authorization: {metadata.authorization_endpoint}")
-
-    if not webbrowser.open(auth_url):
-        log(f"could not open browser. Please open this URL manually:\n{auth_url}")
-
-    # Parse port from redirect_uri to pass to callback server
-    port = int(urlparse(redirect_uri).port or 0)
-
-    code, returned_state = _run_callback_server(port=port, timeout=timeout)
-
-    if returned_state != state:
-        raise RuntimeError("OAuth state mismatch — possible CSRF attack")
-
-    return code
+    return Handler
 
 
 def _parse_token_response(resp: httpx.Response) -> dict[str, Any]:
@@ -517,12 +424,10 @@ def ensure_token(
     metadata = discover_oauth_metadata(server_url, client)
 
     # Start callback server early to get the port for redirect_uri
-    # Reset handler state
-    _CallbackHandler.auth_code = None
-    _CallbackHandler.state = None
-    _CallbackHandler.error = None
+    cb_result = CallbackResult()
+    handler_cls = _make_callback_handler(cb_result)
 
-    callback_server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
+    callback_server = HTTPServer(("127.0.0.1", 0), handler_cls)
     port = callback_server.server_address[1]
     redirect_uri = f"http://127.0.0.1:{port}/callback"
 
@@ -574,7 +479,7 @@ def ensure_token(
     thread.start()
 
     deadline = time.monotonic() + timeout
-    while not (_CallbackHandler.auth_code or _CallbackHandler.error):
+    while not (cb_result.auth_code or cb_result.error):
         if time.monotonic() > deadline:
             done.set()
             callback_server.server_close()
@@ -587,13 +492,13 @@ def ensure_token(
     done.set()
     callback_server.server_close()
 
-    if _CallbackHandler.error:
-        raise RuntimeError(f"OAuth error: {_CallbackHandler.error}")
+    if cb_result.error:
+        raise RuntimeError(f"OAuth error: {cb_result.error}")
 
-    if _CallbackHandler.state != state:
+    if cb_result.state != state:
         raise RuntimeError("OAuth state mismatch — possible CSRF attack")
 
-    code = _CallbackHandler.auth_code
+    code = cb_result.auth_code
     assert code is not None
 
     # Token exchange (RFC 8707: include resource indicator)

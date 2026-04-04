@@ -11,11 +11,11 @@ import httpx
 import pytest
 
 from mcp_stdio.oauth import (
+    CallbackResult,
     OAuthMetadata,
     _authorization_base_url,
-    _CallbackHandler,
+    _make_callback_handler,
     _parse_token_response,
-    _run_callback_server,
     _token_response_to_data,
     discover_oauth_metadata,
     ensure_token,
@@ -707,25 +707,11 @@ class TestParseTokenResponse:
 class TestCallbackServer:
     def test_receives_code(self):
         """Send a simulated redirect to the callback server."""
-        result = {}
-
-        def run_server():
-            try:
-                code, state = _run_callback_server(port=0, timeout=5)
-                result["code"] = code
-                result["state"] = state
-            except Exception as e:
-                result["error"] = str(e)
-
-        # We need to find the port, so start server in a thread,
-        # then poke it with an HTTP request
-        _CallbackHandler.auth_code = None
-        _CallbackHandler.state = None
-        _CallbackHandler.error = None
+        cb_result = CallbackResult()
+        handler_cls = _make_callback_handler(cb_result)
 
         from http.server import HTTPServer
-        # Create server ourselves to know the port
-        server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
+        server = HTTPServer(("127.0.0.1", 0), handler_cls)
         port = server.server_address[1]
         done = threading.Event()
 
@@ -737,7 +723,6 @@ class TestCallbackServer:
         t.start()
         time.sleep(0.3)
 
-        # Simulate browser redirect
         resp = httpx.get(
             f"http://127.0.0.1:{port}/callback?code=test_code_123&state=test_state"
         )
@@ -747,17 +732,16 @@ class TestCallbackServer:
         done.set()
         server.server_close()
 
-        assert _CallbackHandler.auth_code == "test_code_123"
-        assert _CallbackHandler.state == "test_state"
+        assert cb_result.auth_code == "test_code_123"
+        assert cb_result.state == "test_state"
 
     def test_receives_error(self):
         """Server sends an OAuth error via callback."""
-        _CallbackHandler.auth_code = None
-        _CallbackHandler.state = None
-        _CallbackHandler.error = None
+        cb_result = CallbackResult()
+        handler_cls = _make_callback_handler(cb_result)
 
         from http.server import HTTPServer
-        server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
+        server = HTTPServer(("127.0.0.1", 0), handler_cls)
         port = server.server_address[1]
         done = threading.Event()
 
@@ -778,12 +762,46 @@ class TestCallbackServer:
         done.set()
         server.server_close()
 
-        assert _CallbackHandler.error == "access_denied"
-        assert _CallbackHandler.auth_code is None
+        assert cb_result.error == "access_denied"
+        assert cb_result.auth_code is None
 
-    def test_timeout(self):
-        with pytest.raises(TimeoutError):
-            _run_callback_server(port=0, timeout=0.5)
+    def test_concurrent_flows_isolated(self):
+        """Two callback handlers with separate result objects don't interfere."""
+        result_a = CallbackResult()
+        result_b = CallbackResult()
+        handler_a = _make_callback_handler(result_a)
+        handler_b = _make_callback_handler(result_b)
+
+        from http.server import HTTPServer
+        server_a = HTTPServer(("127.0.0.1", 0), handler_a)
+        server_b = HTTPServer(("127.0.0.1", 0), handler_b)
+        port_a = server_a.server_address[1]
+        port_b = server_b.server_address[1]
+        done = threading.Event()
+
+        def serve_a():
+            while not done.is_set():
+                server_a.handle_request()
+
+        def serve_b():
+            while not done.is_set():
+                server_b.handle_request()
+
+        threading.Thread(target=serve_a, daemon=True).start()
+        threading.Thread(target=serve_b, daemon=True).start()
+        time.sleep(0.3)
+
+        httpx.get(f"http://127.0.0.1:{port_a}/callback?code=code_a&state=state_a")
+        httpx.get(f"http://127.0.0.1:{port_b}/callback?code=code_b&state=state_b")
+
+        done.set()
+        server_a.server_close()
+        server_b.server_close()
+
+        assert result_a.auth_code == "code_a"
+        assert result_b.auth_code == "code_b"
+        assert result_a.state == "state_a"
+        assert result_b.state == "state_b"
 
 
 # --- ensure_token ---
