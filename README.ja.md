@@ -9,13 +9,15 @@ MCP サーバー向け stdio-to-HTTP リレー — Claude Desktop/Code とリモ
 [MCP](https://modelcontextprotocol.io/) クライアント（Claude Desktop, Claude Code）に対してローカルで稼働するセルフホスト MCP サーバのように振る舞いつつ、リモート MCP サーバへの Streamable HTTP 接続を橋渡しします：
 
 ```mermaid
-flowchart LR
+flowchart BT
     A[Claude<br>CLI/Desktop] <-- stdio --> B(mcp-stdio)
-    B <== "HTTPS<br>(Bearer/Headers)" ==> C[Remote<br>MCP Server]
+    B <== "<b>HTTPS</b><br>Bearer Token<br>Header<br>OAuth" ==> C[Remote<br>MCP Server]
+    B -. "OAuth 2.1<br>(PKCE)" .-> D[Authorization<br>Server]
+    D -. callback .-> B
     style B fill:#4a5,stroke:#333,color:#fff
 ```
 
-Bearer token やカスタムヘッダーをリモートサーバーへ転送します。
+Bearer token、カスタムヘッダー、OAuth 2.1 認証情報をリモートサーバーへ転送します。
 
 ## インストール
 

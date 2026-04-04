@@ -11,13 +11,15 @@ Stdio-to-HTTP relay for MCP servers — bridges Claude Desktop/Code to remote St
 [MCP](https://modelcontextprotocol.io/) clients like Claude Desktop and Claude Code see mcp-stdio as a locally running self-hosted MCP server, while it relays all requests to a remote MCP server over Streamable HTTP:
 
 ```mermaid
-flowchart LR
+flowchart BT
     A[Claude<br>CLI/Desktop] <-- stdio --> B(mcp-stdio)
-    B <== "HTTPS<br>(Bearer/Headers)" ==> C[Remote<br>MCP Server]
+    B <== "<b>HTTPS</b><br>Bearer Token<br>Header<br>OAuth" ==> C[Remote<br>MCP Server]
+    B -. "OAuth 2.1<br>(PKCE)" .-> D[Authorization<br>Server]
+    D -. callback .-> B
     style B fill:#4a5,stroke:#333,color:#fff
 ```
 
-Bearer tokens and custom headers are forwarded to the remote server.
+Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the remote server.
 
 ## Install
 
