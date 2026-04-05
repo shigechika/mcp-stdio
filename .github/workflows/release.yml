@@ -91,6 +91,12 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp && mv server.tmp server.json
+          # Sanity check: ensure placeholder was replaced
+          if jq -e '.version == "0.0.0" or .packages[0].version == "0.0.0"' server.json > /dev/null; then
+            echo "::error::server.json still contains placeholder 0.0.0 after patching"
+            exit 1
+          fi
+          echo "Patched server.json to version $VERSION"
 
       - name: Install mcp-publisher
         run: |

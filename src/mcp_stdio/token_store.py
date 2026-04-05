@@ -71,10 +71,29 @@ def _read_store() -> dict[str, Any]:
 
 
 def _write_store(data: dict[str, Any]) -> None:
-    """Write the token store file with secure permissions."""
+    """Write the token store file atomically with secure permissions.
+
+    Uses a temp file created with 0o600 from the start (no umask window),
+    then atomically renames it over the target file so a crash mid-write
+    cannot corrupt existing tokens.
+    """
     _ensure_store_dir()
-    _STORE_FILE.write_text(json.dumps(data, indent=2))
-    os.chmod(_STORE_FILE, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
+    payload = json.dumps(data, indent=2).encode("utf-8")
+    tmp_path = _STORE_FILE.with_suffix(_STORE_FILE.suffix + f".tmp.{os.getpid()}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(tmp_path, flags, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, _STORE_FILE)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def load_token(server_url: str) -> TokenData | None:

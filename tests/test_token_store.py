@@ -104,6 +104,45 @@ class TestLoadSaveDelete:
         store_file.write_text("not json")
         assert load_token("https://example.com/mcp") is None
 
+    def test_atomic_write_leaves_no_tempfile(self, tmp_path, monkeypatch):
+        """Successful save should not leave .tmp files behind."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        save_token("https://example.com/mcp", TokenData(access_token="tok"))
+        leftovers = list(tmp_path.glob("tokens.json.tmp*"))
+        assert leftovers == []
+
+    def test_write_failure_preserves_existing_tokens(self, tmp_path, monkeypatch):
+        """Crash mid-write must not corrupt the existing store."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        # First write succeeds
+        save_token("https://example.com/mcp", TokenData(access_token="original"))
+
+        # Second write fails mid-way
+        original_replace = os.replace
+
+        def failing_replace(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr("mcp_stdio.token_store.os.replace", failing_replace)
+        try:
+            save_token("https://example.com/mcp", TokenData(access_token="new"))
+        except OSError:
+            pass
+        monkeypatch.setattr("mcp_stdio.token_store.os.replace", original_replace)
+
+        # Original token must still be intact
+        loaded = load_token("https://example.com/mcp")
+        assert loaded is not None
+        assert loaded.access_token == "original"
+        # Temp file must have been cleaned up
+        assert list(tmp_path.glob("tokens.json.tmp*")) == []
+
 
 class TestLegacyMigration:
     def test_migrate_legacy_to_xdg(self, tmp_path, monkeypatch):
