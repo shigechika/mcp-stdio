@@ -99,6 +99,41 @@ def _post_and_stream(
     return None
 
 
+def _reinitialize(
+    client: httpx.Client,
+    url: str,
+    headers: dict[str, str],
+) -> str | None:
+    """Send an initialize request to establish a new MCP session.
+
+    Used to recover from a 404 "session expired" response mid-stream.
+    Returns the new session ID on success, or None on failure. The
+    initialize response payload is discarded — the caller only needs
+    the session ID for subsequent requests.
+    """
+    initialize_msg = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "method": "initialize",
+            "id": 0,
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "mcp-stdio", "version": "session-recovery"},
+            },
+        }
+    )
+    try:
+        resp = client.post(url, content=initialize_msg, headers=headers)
+    except httpx.HTTPError as e:
+        log(f"re-initialize request failed: {e}")
+        return None
+    if resp.status_code != 200:
+        log(f"re-initialize returned HTTP {resp.status_code}")
+        return None
+    return resp.headers.get("mcp-session-id")
+
+
 def test_connection(
     url: str,
     headers: dict[str, str],
@@ -124,9 +159,7 @@ def test_connection(
     )
 
     client = httpx.Client(
-        timeout=httpx.Timeout(
-            connect=timeout_connect, read=timeout_read, write=30, pool=10
-        )
+        timeout=httpx.Timeout(connect=timeout_connect, read=timeout_read, write=30, pool=10)
     )
 
     try:
@@ -169,9 +202,7 @@ def test_connection(
             tools = "yes" if caps.get("tools") else "no"
             resources = "yes" if caps.get("resources") else "no"
             prompts = "yes" if caps.get("prompts") else "no"
-            log(
-                f"✓ Capabilities: tools={tools}, resources={resources}, prompts={prompts}"
-            )
+            log(f"✓ Capabilities: tools={tools}, resources={resources}, prompts={prompts}")
         elif result_data and "error" in result_data:
             err = result_data["error"]
             log(f"✗ MCP error: {err.get('message', err)}")
@@ -273,11 +304,18 @@ def run(
                     )
                     continue
 
-            # Session expired (404) — reset and retry once
+            # Session expired (404) — reset, re-initialize, then retry
             if result.status_code == 404 and session_id:
-                log("session expired, resetting and retrying")
+                log("session expired, re-initializing and retrying")
                 session_id = None
+                new_session_id = _reinitialize(client, url, dict(headers))
+                if new_session_id is None:
+                    log("re-initialize failed, dropping request")
+                    print(_error_response("session lost", req_id), flush=True)
+                    continue
+                session_id = new_session_id
                 req_headers = dict(headers)
+                req_headers["Mcp-Session-Id"] = session_id
                 result = _post_and_stream(client, url, line, req_headers, req_id)
                 if result is None:
                     continue
