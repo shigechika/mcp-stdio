@@ -177,10 +177,14 @@ Works around known issues in Claude Code's HTTP transport:
 
 1. If `--oauth` is set, obtains an access token (cached → refresh → browser flow)
 2. Reads JSON-RPC messages from stdin (sent by Claude Desktop/Code)
-3. Streams each message as HTTP POST to the remote MCP server
-4. Parses the response (JSON or SSE) and writes it to stdout
-5. Maintains the `Mcp-Session-Id` header across requests
-6. On 401, refreshes the OAuth token and retries; on 404, resets the session
+3. Relays them over HTTPS to the remote MCP server
+4. Parses responses and writes them to stdout
+5. On 401, refreshes the OAuth token and retries
+
+Transport details:
+
+- **Streamable HTTP** (default) — each stdin message is a single POST; session state is tracked via the `Mcp-Session-Id` header and re-initialized automatically on 404.
+- **SSE** (MCP 2024-11-05 legacy) — a persistent `GET` stream delivers responses and the initial `endpoint` event containing the POST URL; the stream auto-reconnects on disconnect.
 
 OAuth tokens are stored in `~/.config/mcp-stdio/tokens.json` (permissions 0600).
 

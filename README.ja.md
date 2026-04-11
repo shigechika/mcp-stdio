@@ -175,10 +175,14 @@ Claude Code の HTTP transport の既知の問題を回避できます：
 
 1. `--oauth` 指定時、アクセストークンを取得（キャッシュ → リフレッシュ → ブラウザ認証）
 2. stdin から JSON-RPC メッセージを読み取り（Claude Desktop/Code が送信）
-3. HTTP POST でリモート MCP サーバーにストリーミング転送
-4. レスポンス（JSON または SSE）をパースして stdout に書き出し
-5. `Mcp-Session-Id` ヘッダーをリクエスト間で維持
-6. 401 で OAuth トークンをリフレッシュしてリトライ、404 でセッションをリセット
+3. HTTPS でリモート MCP サーバーへ転送
+4. レスポンスをパースして stdout に書き出し
+5. 401 で OAuth トークンをリフレッシュしてリトライ
+
+トランスポート別の挙動：
+
+- **Streamable HTTP**（デフォルト）— 各メッセージを単一 POST で送信。`Mcp-Session-Id` ヘッダーでセッション状態を追跡し、404 時は自動で再初期化。
+- **SSE**（MCP 2024-11-05 レガシー）— 持続的な `GET` ストリームで応答と初回の `endpoint` イベント（POST 先 URL）を受信。ストリーム切断時は自動再接続。
 
 OAuth トークンは `~/.config/mcp-stdio/tokens.json` に保存されます（パーミッション 0600）。
 
