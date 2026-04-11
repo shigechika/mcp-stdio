@@ -420,18 +420,21 @@ def _sse_reader_loop(
                 log("SSE stream ended, reconnecting")
                 state.endpoint_url = None
                 state.ready.clear()
-        except (
-            httpx.ConnectError,
-            httpx.ReadError,
-            httpx.RemoteProtocolError,
-            httpx.ReadTimeout,
-        ) as e:
+                # Responsive reconnect delay: exits immediately on stop.
+                if state.stop.wait(RETRY_DELAY):
+                    return
+        except httpx.HTTPError as e:
             if state.stop.is_set():
                 return
             log(f"SSE disconnected, reconnecting: {e}")
             state.endpoint_url = None
             state.ready.clear()
-            time.sleep(RETRY_DELAY)
+            if state.stop.wait(RETRY_DELAY):
+                return
+        except Exception as e:  # noqa: BLE001 — thread safety net
+            log(f"SSE reader unexpected error: {e}")
+            state.ready.set()
+            return
 
 
 def run_sse(
