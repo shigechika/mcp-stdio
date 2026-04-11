@@ -11,7 +11,7 @@ from typing import Callable
 import httpx
 
 from . import __version__
-from .relay import check_connection, log, run
+from .relay import check_connection, log, run, run_sse
 
 
 def _parse_header(header: str) -> tuple[str, str]:
@@ -121,6 +121,12 @@ def main() -> None:
         help="Custom header to send (can be specified multiple times)",
     )
     parser.add_argument(
+        "--transport",
+        choices=["streamable-http", "sse"],
+        default="streamable-http",
+        help="Transport type: streamable-http (default) or sse (MCP 2024-11-05 legacy)",
+    )
+    parser.add_argument(
         "--timeout-connect",
         type=float,
         default=10,
@@ -202,7 +208,8 @@ def main() -> None:
         )
         sys.exit(0 if ok else 1)
 
-    run(
+    relay_fn = run_sse if args.transport == "sse" else run
+    relay_fn(
         url=args.url,
         headers=headers,
         timeout_connect=args.timeout_connect,

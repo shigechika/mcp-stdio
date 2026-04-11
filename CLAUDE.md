@@ -33,10 +33,13 @@ A minimal stdio-to-HTTP relay for MCP (Model Context Protocol) servers. Only run
 
 Four modules under `src/mcp_stdio/`:
 
-- **`relay.py`** — Core loop: reads JSON-RPC from stdin line-by-line, streams POST to the remote URL via httpx, parses JSON or SSE responses, writes to stdout. Handles retry with backoff (3 attempts), session ID tracking (`Mcp-Session-Id` header), 404-based session recovery, and 401-based token refresh.
-- **`cli.py`** — argparse-based CLI. Builds headers, resolves `MCP_BEARER_TOKEN` / `MCP_OAUTH_CLIENT_ID` env vars, runs OAuth flow before relay if `--oauth` is set, and calls `relay.run()`.
+- **`relay.py`** — Two relay implementations sharing stdin/stdout plumbing:
+  - `run()` — Streamable HTTP transport (MCP current spec, default). Reads JSON-RPC from stdin line-by-line, streams POST to the remote URL via httpx, parses JSON or SSE responses, writes to stdout. Handles retry with backoff (3 attempts), session ID tracking (`Mcp-Session-Id` header), 404-based session recovery, and 401-based token refresh.
+  - `run_sse()` — SSE transport (MCP 2024-11-05 legacy). Spawns a daemon reader thread that maintains a long-lived `GET /sse` connection, parses `endpoint`/`message` events per the WHATWG SSE spec, and resolves the POST endpoint URL (possibly relative). The main thread reads stdin and POSTs to that endpoint. Auto-reconnects on stream disconnect.
+  - Signal handlers (`signal.signal`) are set from the main thread only — the SSE reader runs in a daemon thread so pytest tests must drive `run_sse` from the main thread.
+- **`cli.py`** — argparse-based CLI. Builds headers, resolves `MCP_BEARER_TOKEN` / `MCP_OAUTH_CLIENT_ID` env vars, runs OAuth flow before relay if `--oauth` is set, and dispatches to `run()` or `run_sse()` based on `--transport`.
 - **`oauth.py`** — OAuth 2.1 client: RFC 9728/8414 discovery, RFC 7591 dynamic client registration, RFC 7636 PKCE, RFC 8707 resource indicators, authorization code flow with localhost callback server, token exchange and refresh.
-- **`token_store.py`** — Token persistence in `~/.mcp-stdio/tokens.json` (0o600). Stores per-server-URL tokens with client credentials and endpoint URLs for refresh.
+- **`token_store.py`** — Token persistence in `~/.config/mcp-stdio/tokens.json` (0o600). Stores per-server-URL tokens with client credentials and endpoint URLs for refresh. Migrates legacy `~/.mcp-stdio/` tokens on first read.
 
 Entry point: `mcp-stdio` command → `mcp_stdio.cli:main`.
 

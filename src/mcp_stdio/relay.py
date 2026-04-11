@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import signal
 import sys
+import threading
 import time
 from typing import Any
+from urllib.parse import urljoin
 
 import httpx
 
@@ -350,4 +352,235 @@ def run(
             if result.session_id:
                 session_id = result.session_id
     finally:
+        client.close()
+
+
+class _SseState:
+    """Shared state between SSE reader thread and main stdin loop."""
+
+    __slots__ = ("endpoint_url", "ready", "stop")
+
+    def __init__(self) -> None:
+        self.endpoint_url: str | None = None
+        self.ready = threading.Event()
+        self.stop = threading.Event()
+
+
+def _sse_reader_loop(
+    client: httpx.Client,
+    url: str,
+    headers: dict[str, str],
+    state: _SseState,
+) -> None:
+    """Reader thread: maintain SSE GET stream and dispatch events.
+
+    Parses the SSE event stream per the WHATWG Server-Sent Events
+    specification. The first ``endpoint`` event provides the POST URL
+    (which may be relative — resolved with urljoin). Subsequent
+    ``message`` events are JSON-RPC responses written to stdout.
+
+    Reconnects automatically on disconnect.
+    """
+    while not state.stop.is_set():
+        try:
+            with client.stream("GET", url, headers=headers) as resp:
+                if resp.status_code != 200:
+                    log(f"SSE connection failed: HTTP {resp.status_code}")
+                    state.ready.set()
+                    return
+
+                event_type = "message"
+                data_lines: list[str] = []
+
+                for line in resp.iter_lines():
+                    if state.stop.is_set():
+                        return
+
+                    if line == "":
+                        if data_lines:
+                            data = "\n".join(data_lines)
+                            if event_type == "endpoint":
+                                resolved = urljoin(url, data)
+                                state.endpoint_url = resolved
+                                state.ready.set()
+                                log(f"SSE endpoint: {resolved}")
+                            elif event_type == "message":
+                                print(data, flush=True)
+                        event_type = "message"
+                        data_lines = []
+                    elif line.startswith(":"):
+                        continue
+                    elif line.startswith("event:"):
+                        event_type = line[len("event:") :].strip()
+                    elif line.startswith("data:"):
+                        data_lines.append(line[len("data:") :].lstrip(" "))
+
+                if state.stop.is_set():
+                    return
+                log("SSE stream ended, reconnecting")
+                state.endpoint_url = None
+                state.ready.clear()
+        except (
+            httpx.ConnectError,
+            httpx.ReadError,
+            httpx.RemoteProtocolError,
+            httpx.ReadTimeout,
+        ) as e:
+            if state.stop.is_set():
+                return
+            log(f"SSE disconnected, reconnecting: {e}")
+            state.endpoint_url = None
+            state.ready.clear()
+            time.sleep(RETRY_DELAY)
+
+
+def run_sse(
+    url: str,
+    headers: dict[str, str],
+    *,
+    timeout_connect: float = 10,
+    timeout_read: float = 120,
+    timeout_write: float = 30,
+    token_refresher: Any = None,
+) -> None:
+    """Run the stdio-to-SSE relay loop (MCP 2024-11-05 legacy transport).
+
+    This implements the legacy SSE transport from the MCP 2024-11-05 spec:
+
+    1. Open a persistent ``GET`` connection to the SSE endpoint
+    2. Receive the first ``endpoint`` event containing the POST URL
+    3. For each stdin line, POST the JSON-RPC message to that URL
+    4. Receive responses via ``message`` events on the SSE stream
+
+    Spec references:
+    - WHATWG HTML — Server-Sent Events
+      https://html.spec.whatwg.org/multipage/server-sent-events.html
+    - MCP 2024-11-05 — HTTP with SSE Transport
+      https://modelcontextprotocol.io/specification/2024-11-05/basic/transports
+
+    Args:
+        url: Remote MCP server SSE endpoint URL
+        headers: HTTP headers to send with each request
+        timeout_connect: Connection timeout in seconds
+        timeout_read: Read timeout for the POST request
+        timeout_write: Write timeout in seconds
+        token_refresher: Optional callable that returns updated headers
+            on successful token refresh, or None on failure. Called when
+            the server returns HTTP 401 on POST.
+    """
+
+    def _shutdown(signum: int, _: Any) -> None:
+        log(f"received signal {signum}, shutting down")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    log(f"connecting to {url} (SSE transport)")
+
+    # SSE GET is long-lived; use no read timeout for streaming.
+    # POST uses a bounded timeout via a separate per-request call.
+    client = httpx.Client(
+        timeout=httpx.Timeout(
+            connect=timeout_connect,
+            read=None,
+            write=timeout_write,
+            pool=10,
+        )
+    )
+
+    state = _SseState()
+    reader = threading.Thread(
+        target=_sse_reader_loop,
+        args=(client, url, headers, state),
+        daemon=True,
+    )
+    reader.start()
+
+    if not state.ready.wait(timeout=timeout_connect):
+        log("timed out waiting for SSE endpoint event")
+        state.stop.set()
+        client.close()
+        sys.exit(1)
+
+    if state.endpoint_url is None:
+        log("SSE reader terminated before endpoint event")
+        state.stop.set()
+        client.close()
+        sys.exit(1)
+
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+
+            if state.endpoint_url is None:
+                if not state.ready.wait(timeout=timeout_read):
+                    req_id = _extract_id(line)
+                    print(
+                        _error_response("SSE endpoint unavailable", req_id),
+                        flush=True,
+                    )
+                    continue
+
+            req_id = _extract_id(line)
+            endpoint = state.endpoint_url
+            if endpoint is None:
+                print(
+                    _error_response("SSE endpoint unavailable", req_id),
+                    flush=True,
+                )
+                continue
+
+            try:
+                resp = client.post(
+                    endpoint,
+                    content=line,
+                    headers=headers,
+                    timeout=httpx.Timeout(
+                        connect=timeout_connect,
+                        read=timeout_read,
+                        write=timeout_write,
+                        pool=10,
+                    ),
+                )
+
+                if resp.status_code == 401 and token_refresher:
+                    log("received 401, attempting token refresh")
+                    new_headers = token_refresher()
+                    if new_headers:
+                        headers.update(new_headers)
+                        resp = client.post(
+                            endpoint,
+                            content=line,
+                            headers=headers,
+                            timeout=httpx.Timeout(
+                                connect=timeout_connect,
+                                read=timeout_read,
+                                write=timeout_write,
+                                pool=10,
+                            ),
+                        )
+                    else:
+                        log("token refresh failed, returning error")
+                        print(
+                            _error_response("authentication failed", req_id),
+                            flush=True,
+                        )
+                        continue
+
+                if resp.status_code not in (200, 202):
+                    log(f"POST returned HTTP {resp.status_code}")
+                    print(
+                        _error_response(
+                            f"HTTP {resp.status_code}", req_id
+                        ),
+                        flush=True,
+                    )
+            except httpx.HTTPError as e:
+                log(f"POST failed: {e}")
+                print(_error_response(str(e), req_id), flush=True)
+    finally:
+        state.stop.set()
         client.close()

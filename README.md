@@ -23,6 +23,7 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
 
 ## Features
 
+- **Both MCP transports supported** — Streamable HTTP (current spec, default) and SSE (MCP 2024-11-05 legacy), selectable with `--transport`. SSE parser follows the [WHATWG Server-Sent Events spec](https://html.spec.whatwg.org/multipage/server-sent-events.html).
 - **OAuth 2.1 client** — built-in authorization code flow with PKCE, dynamic client registration, token refresh, and secure token persistence. Implements the full MCP authorization spec:
   - [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) Protected Resource Metadata discovery
   - [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) Authorization Server Metadata discovery
@@ -31,7 +32,7 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
   - [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591) Dynamic Client Registration
   - [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) Bearer Token usage
 - **Retry with backoff** — retries up to 3 times on connection errors
-- **Streaming resilience** — streams SSE responses in real time; retries on mid-stream disconnect
+- **Streaming resilience** — streams SSE responses in real time; auto-reconnects on mid-stream disconnect
 - **Session recovery** — resets MCP session ID on 404 and retries
 - **Token refresh on 401** — automatically refreshes expired OAuth tokens mid-session
 - **Bearer token auth** — via `--bearer-token` flag or `MCP_BEARER_TOKEN` env var
@@ -95,6 +96,12 @@ mcp-stdio --oauth https://your-server.example.com:8080/mcp
 mcp-stdio --oauth --client-id YOUR_CLIENT_ID https://your-server.example.com:8080/mcp
 ```
 
+For legacy MCP servers using the 2024-11-05 SSE transport:
+
+```bash
+mcp-stdio --transport sse https://your-server.example.com:8080/sse
+```
+
 Test connectivity before use:
 
 ```bash
@@ -146,6 +153,8 @@ Options:
   --client-id ID         Pre-registered OAuth client ID (or set MCP_OAUTH_CLIENT_ID)
   --oauth-scope SCOPE    OAuth scope to request
   -H, --header 'Key: Value'  Custom header (can be repeated)
+  --transport {streamable-http,sse}
+                         Transport type (default: streamable-http)
   --timeout-connect SEC  Connection timeout (default: 10)
   --timeout-read SEC     Read timeout (default: 120)
   --test                 Test connection and exit

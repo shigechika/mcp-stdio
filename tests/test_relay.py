@@ -1,17 +1,24 @@
 """Tests for mcp_stdio.relay module."""
 
 import json
+import queue
+import threading
+import time
 from io import StringIO
 from unittest.mock import patch
 
 import httpx
+from pytest_httpx import IteratorStream
 
 from mcp_stdio.relay import (
+    _SseState,
     _error_response,
     _extract_id,
     _post_and_stream,
-    run,
+    _sse_reader_loop,
     check_connection,
+    run,
+    run_sse,
 )
 
 
@@ -496,3 +503,374 @@ class TestCheckConnection:
         assert check_connection(self.URL, dict(self.HEADERS)) is True
         captured = capsys.readouterr()
         assert "sess-xyz" in captured.err
+
+
+# --- SSE transport ---
+
+
+class TestSseReaderLoop:
+    """Unit tests for _sse_reader_loop (the reader thread body)."""
+
+    URL = "https://example.com/sse"
+
+    def _run_reader(self, httpx_mock, sse_bytes, state=None):
+        """Run the reader loop against a finite SSE stream.
+
+        Arranges for the loop to exit after consuming the provided
+        bytes by setting state.stop at end-of-stream via a tail chunk.
+        """
+        if state is None:
+            state = _SseState()
+
+        def gen():
+            for chunk in sse_bytes:
+                yield chunk
+            state.stop.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream(gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        client = httpx.Client()
+        stdout = StringIO()
+        try:
+            with patch("sys.stdout", stdout):
+                _sse_reader_loop(client, self.URL, {}, state)
+        finally:
+            client.close()
+
+        return state, stdout.getvalue()
+
+    def test_endpoint_event_is_parsed(self, httpx_mock):
+        state, _ = self._run_reader(
+            httpx_mock,
+            [b"event: endpoint\ndata: /messages?sessionId=abc\n\n"],
+        )
+        assert state.endpoint_url == "https://example.com/messages?sessionId=abc"
+        assert state.ready.is_set()
+
+    def test_absolute_endpoint_url(self, httpx_mock):
+        state, _ = self._run_reader(
+            httpx_mock,
+            [b"event: endpoint\ndata: https://other.example.com/post\n\n"],
+        )
+        assert state.endpoint_url == "https://other.example.com/post"
+
+    def test_message_event_relayed_to_stdout(self, httpx_mock):
+        payload = '{"jsonrpc":"2.0","result":{},"id":1}'
+        _, stdout = self._run_reader(
+            httpx_mock,
+            [
+                b"event: endpoint\ndata: /messages?sessionId=abc\n\n",
+                f"event: message\ndata: {payload}\n\n".encode(),
+            ],
+        )
+        lines = [x for x in stdout.strip().splitlines() if x]
+        assert lines == [payload]
+
+    def test_comment_lines_ignored(self, httpx_mock):
+        payload = '{"jsonrpc":"2.0","result":{},"id":2}'
+        _, stdout = self._run_reader(
+            httpx_mock,
+            [
+                b": keepalive comment\n\n"
+                b"event: endpoint\ndata: /post\n\n"
+                b": another comment\n"
+                + f"event: message\ndata: {payload}\n\n".encode(),
+            ],
+        )
+        assert payload in stdout
+
+    def test_default_event_type_is_message(self, httpx_mock):
+        """SSE spec: lines with only `data:` default to the `message` event."""
+        payload = '{"jsonrpc":"2.0","result":{},"id":3}'
+        _, stdout = self._run_reader(
+            httpx_mock,
+            [
+                b"event: endpoint\ndata: /post\n\n",
+                f"data: {payload}\n\n".encode(),
+            ],
+        )
+        assert payload in stdout
+
+    def test_non_200_status_sets_ready_and_returns(self, httpx_mock):
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            status_code=401,
+        )
+        state = _SseState()
+        client = httpx.Client()
+        try:
+            _sse_reader_loop(client, self.URL, {}, state)
+        finally:
+            client.close()
+        # ready is set so run_sse's wait() unblocks on the error path
+        assert state.ready.is_set()
+        # endpoint_url stays None to signal failure
+        assert state.endpoint_url is None
+
+    # --- WHATWG SSE spec compliance ---
+
+    def test_multiline_data_joined_with_newline(self, httpx_mock):
+        """WHATWG SSE spec: multiple ``data:`` fields in one event are
+        concatenated with a single ``\\n`` between them."""
+        _, stdout = self._run_reader(
+            httpx_mock,
+            [
+                b"event: endpoint\ndata: /post\n\n",
+                b"event: message\ndata: line1\ndata: line2\ndata: line3\n\n",
+            ],
+        )
+        assert "line1\nline2\nline3" in stdout
+
+    def test_crlf_line_endings(self, httpx_mock):
+        """WHATWG SSE spec: ``\\r\\n`` is a valid line terminator alongside
+        ``\\n`` and ``\\r``."""
+        payload = '{"jsonrpc":"2.0","result":{},"id":1}'
+        _, stdout = self._run_reader(
+            httpx_mock,
+            [
+                b"event: endpoint\r\ndata: /post\r\n\r\n",
+                f"event: message\r\ndata: {payload}\r\n\r\n".encode(),
+            ],
+        )
+        assert payload in stdout
+
+    def test_multiple_consecutive_messages(self, httpx_mock):
+        """Several message events in a row should all reach stdout in order."""
+        _, stdout = self._run_reader(
+            httpx_mock,
+            [
+                b"event: endpoint\ndata: /post\n\n",
+                b'event: message\ndata: {"id":1}\n\n',
+                b'event: message\ndata: {"id":2}\n\n',
+                b'event: message\ndata: {"id":3}\n\n',
+            ],
+        )
+        lines = [x for x in stdout.strip().splitlines() if x]
+        assert lines == ['{"id":1}', '{"id":2}', '{"id":3}']
+
+    def test_unknown_event_type_ignored(self, httpx_mock):
+        """Events with unknown types (e.g. keepalive/ping) must be silently
+        dropped — they should not reach stdout."""
+        _, stdout = self._run_reader(
+            httpx_mock,
+            [
+                b"event: endpoint\ndata: /post\n\n",
+                b"event: ping\ndata: heartbeat\n\n",
+                b"event: keepalive\ndata: noise\n\n",
+                b'event: message\ndata: {"id":1}\n\n',
+            ],
+        )
+        lines = [x for x in stdout.strip().splitlines() if x]
+        assert lines == ['{"id":1}']
+
+    def test_event_without_data_not_dispatched(self, httpx_mock):
+        """An event with no ``data:`` field should not produce any output."""
+        _, stdout = self._run_reader(
+            httpx_mock,
+            [
+                b"event: endpoint\ndata: /post\n\n",
+                b"event: message\n\n",
+                b'event: message\ndata: {"id":1}\n\n',
+            ],
+        )
+        lines = [x for x in stdout.strip().splitlines() if x]
+        assert lines == ['{"id":1}']
+
+    # --- Real-world edge cases from mcp-remote issues ---
+
+    def test_relative_endpoint_with_complex_query_string(self, httpx_mock):
+        """mcp-remote#196: relative endpoint URLs with query strings must be
+        preserved when resolved against the base URL. Missing sessionId in
+        the POST URL caused Atlassian MCP connections to fail."""
+        state, _ = self._run_reader(
+            httpx_mock,
+            [b"event: endpoint\ndata: /v1/messages/?sessionId=abc&token=xyz\n\n"],
+        )
+        assert (
+            state.endpoint_url
+            == "https://example.com/v1/messages/?sessionId=abc&token=xyz"
+        )
+
+    def test_jsonrpc_id_type_variations_passthrough(self, httpx_mock):
+        """mcp-remote#194: JSON-RPC ``id`` can be number, string, or null —
+        all must pass through the SSE reader unchanged. The relay does not
+        parse or interpret ids; it forwards bytes verbatim to stdout."""
+        _, stdout = self._run_reader(
+            httpx_mock,
+            [
+                b"event: endpoint\ndata: /post\n\n",
+                b'event: message\ndata: {"jsonrpc":"2.0","result":{},"id":1}\n\n',
+                b'event: message\ndata: {"jsonrpc":"2.0","result":{},"id":"abc"}\n\n',
+                b'event: message\ndata: {"jsonrpc":"2.0","result":{},"id":null}\n\n',
+            ],
+        )
+        assert '"id":1' in stdout
+        assert '"id":"abc"' in stdout
+        assert '"id":null' in stdout
+
+
+class _BlockingStdin:
+    """Stdin iterator that yields one line then blocks until released.
+
+    Keeps run_sse's main loop alive after the POST so the SSE reader
+    thread has time to receive and print the response event. Once the
+    release event is set, the iterator raises StopIteration and the
+    main loop exits cleanly.
+    """
+
+    def __init__(self, line: str, release: threading.Event):
+        self._line = line
+        self._emitted = False
+        self._release = release
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self._emitted:
+            self._emitted = True
+            return self._line
+        self._release.wait(timeout=5)
+        raise StopIteration
+
+
+class TestRunSse:
+    """End-to-end tests for run_sse driven from the main thread."""
+
+    URL = "https://example.com/sse"
+
+    def test_endpoint_then_post_then_message(self, httpx_mock):
+        payload = '{"jsonrpc":"2.0","result":{},"id":42}'
+        post_received = threading.Event()
+        release_stdin = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=xyz\n\n"
+            post_received.wait(timeout=3)
+            yield f"event: message\ndata: {payload}\n\n".encode()
+            time.sleep(0.1)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        def post_callback(request):
+            post_received.set()
+            return httpx.Response(status_code=202)
+
+        httpx_mock.add_callback(
+            post_callback,
+            url="https://example.com/messages?sessionId=xyz",
+            method="POST",
+        )
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"test","id":42}\n', release_stdin
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {})
+
+        out = stdout.getvalue()
+        assert payload in out
+
+    def test_post_401_triggers_token_refresh(self, httpx_mock):
+        """On POST 401, run_sse calls token_refresher and retries."""
+        post_received = threading.Event()
+        release_stdin = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=xyz\n\n"
+            post_received.wait(timeout=3)
+            yield b'event: message\ndata: {"jsonrpc":"2.0","result":{},"id":1}\n\n'
+            time.sleep(0.1)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        call_count = {"n": 0}
+
+        def post_callback(request):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return httpx.Response(status_code=401)
+            post_received.set()
+            return httpx.Response(status_code=202)
+
+        httpx_mock.add_callback(
+            post_callback,
+            url="https://example.com/messages?sessionId=xyz",
+            method="POST",
+            is_reusable=True,
+        )
+
+        refresher_called = {"n": 0}
+
+        def token_refresher():
+            refresher_called["n"] += 1
+            return {"Authorization": "Bearer new"}
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"test","id":1}\n', release_stdin
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {}, token_refresher=token_refresher)
+
+        assert refresher_called["n"] == 1
+        assert call_count["n"] == 2
+
+    def test_post_non_success_returns_error_response(self, httpx_mock):
+        """Non-200/202 POST status maps to a JSON-RPC error response."""
+        post_received = threading.Event()
+        release_stdin = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=xyz\n\n"
+            post_received.wait(timeout=3)
+            time.sleep(0.1)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        def post_callback(request):
+            post_received.set()
+            return httpx.Response(status_code=500)
+
+        httpx_mock.add_callback(
+            post_callback,
+            url="https://example.com/messages?sessionId=xyz",
+            method="POST",
+        )
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"test","id":99}\n', release_stdin
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {})
+
+        out = stdout.getvalue().strip()
+        parsed = json.loads(out)
+        assert parsed["error"]["message"] == "HTTP 500"
+        assert parsed["id"] == 99
