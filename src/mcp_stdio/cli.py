@@ -11,7 +11,7 @@ from typing import Callable
 import httpx
 
 from . import __version__
-from .relay import log, run, test_connection
+from .relay import check_connection, log, run
 
 
 def _parse_header(header: str) -> tuple[str, str]:
@@ -194,7 +194,7 @@ def main() -> None:
             client.close()
 
     if args.test:
-        ok = test_connection(
+        ok = check_connection(
             url=args.url,
             headers=headers,
             timeout_connect=args.timeout_connect,

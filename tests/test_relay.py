@@ -11,6 +11,7 @@ from mcp_stdio.relay import (
     _extract_id,
     _post_and_stream,
     run,
+    check_connection,
 )
 
 
@@ -383,3 +384,115 @@ class TestRun:
         )
         # No output because 401 is non-200 and no refresher
         assert output.strip() == ""
+
+
+# --- check_connection ---
+
+
+class TestCheckConnection:
+    URL = "https://example.com/mcp"
+    HEADERS = {"Content-Type": "application/json"}
+
+    def test_json_success(self, httpx_mock):
+        """JSON initialize response with full capabilities."""
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "serverInfo": {"name": "demo", "version": "1.2.3"},
+                    "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+                },
+            }
+        )
+        httpx_mock.add_response(
+            text=body,
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "abc123",
+            },
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+
+    def test_sse_single_event(self, httpx_mock):
+        """SSE response with one data: line."""
+        body = (
+            'data: {"jsonrpc":"2.0","id":1,"result":'
+            '{"protocolVersion":"2024-11-05","serverInfo":{"name":"sse","version":"0.1"},'
+            '"capabilities":{}}}\n\n'
+        )
+        httpx_mock.add_response(
+            text=body,
+            headers={"content-type": "text/event-stream"},
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+
+    def test_sse_multiple_events_uses_first_valid(self, httpx_mock):
+        """Multiple SSE events — parser takes the first valid data: line and stops."""
+        body = (
+            ": ping\n"
+            "data: not-json\n\n"
+            'data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}\n\n'
+            'data: {"jsonrpc":"2.0","id":2,"result":{"unrelated":true}}\n\n'
+        )
+        httpx_mock.add_response(
+            text=body,
+            headers={"content-type": "text/event-stream"},
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+
+    def test_non_200_returns_false(self, httpx_mock):
+        httpx_mock.add_response(status_code=500, text="oops")
+        assert check_connection(self.URL, dict(self.HEADERS)) is False
+
+    def test_unauthorized_returns_false(self, httpx_mock):
+        httpx_mock.add_response(status_code=401, text="nope")
+        assert check_connection(self.URL, dict(self.HEADERS)) is False
+
+    def test_mcp_error_returns_false(self, httpx_mock):
+        """JSON-RPC error object in body → False."""
+        body = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "error": {"code": -32603, "message": "boom"}}
+        )
+        httpx_mock.add_response(
+            text=body,
+            headers={"content-type": "application/json"},
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is False
+
+    def test_malformed_json_body_still_true(self, httpx_mock):
+        """Body isn't valid JSON — HTTP 200 is enough to report the server as reachable."""
+        httpx_mock.add_response(
+            text="{not valid json",
+            headers={"content-type": "application/json"},
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+
+    def test_missing_result_and_error_still_true(self, httpx_mock):
+        """Parsed body has neither result nor error — treated as reachable."""
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","id":1}',
+            headers={"content-type": "application/json"},
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+
+    def test_connect_error_returns_false(self, httpx_mock):
+        httpx_mock.add_exception(httpx.ConnectError("refused"))
+        assert check_connection(self.URL, dict(self.HEADERS)) is False
+
+    def test_session_id_header_logged(self, httpx_mock, capsys):
+        """When the server returns mcp-session-id header, it should appear in stderr logs."""
+        body = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2024-11-05"}}
+        )
+        httpx_mock.add_response(
+            text=body,
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "sess-xyz",
+            },
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+        captured = capsys.readouterr()
+        assert "sess-xyz" in captured.err

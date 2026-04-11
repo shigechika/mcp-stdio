@@ -161,14 +161,14 @@ def _reinitialize(
     return new_session_id
 
 
-def test_connection(
+def check_connection(
     url: str,
     headers: dict[str, str],
     *,
     timeout_connect: float = 10,
     timeout_read: float = 120,
 ) -> bool:
-    """Test MCP server connectivity by sending an initialize request.
+    """Check MCP server connectivity by sending an initialize request.
 
     Returns True if the server responds successfully.
     """
