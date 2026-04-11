@@ -4,11 +4,11 @@
 
 English | [日本語](README.ja.md)
 
-Stdio-to-HTTP relay for MCP servers — bridges Claude Desktop/Code to remote Streamable HTTP endpoints.
+Stdio-to-HTTP relay — bridges MCP clients to remote HTTP MCP servers.
 
-## Why?
+## Overview
 
-[MCP](https://modelcontextprotocol.io/) clients like Claude Desktop and Claude Code see mcp-stdio as a locally running self-hosted MCP server, while it relays all requests to a remote MCP server over Streamable HTTP:
+[MCP](https://modelcontextprotocol.io/) clients like Claude Desktop and Claude Code see mcp-stdio as a locally running self-hosted MCP server, while it relays all requests to a remote MCP server with support for various authentication methods:
 
 ```mermaid
 flowchart BT
@@ -20,6 +20,25 @@ flowchart BT
 ```
 
 Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the remote server.
+
+## Features
+
+- **OAuth 2.1 client** — built-in authorization code flow with PKCE, dynamic client registration, token refresh, and secure token persistence. Implements the full MCP authorization spec:
+  - [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) Protected Resource Metadata discovery
+  - [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) Authorization Server Metadata discovery
+  - [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) Resource Indicators for audience binding
+  - [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) PKCE with S256 challenge method
+  - [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591) Dynamic Client Registration
+  - [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) Bearer Token usage
+- **Retry with backoff** — retries up to 3 times on connection errors
+- **Streaming resilience** — streams SSE responses in real time; retries on mid-stream disconnect
+- **Session recovery** — resets MCP session ID on 404 and retries
+- **Token refresh on 401** — automatically refreshes expired OAuth tokens mid-session
+- **Bearer token auth** — via `--bearer-token` flag or `MCP_BEARER_TOKEN` env var
+- **Custom headers** — pass any header with `-H`
+- **Graceful shutdown** — handles SIGTERM/SIGINT
+- **Proxy support** — respects `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` env vars via [httpx](https://www.python-httpx.org/)
+- **Minimal dependencies** — only [httpx](https://www.python-httpx.org/); OAuth uses stdlib only
 
 ## Install
 
@@ -64,7 +83,7 @@ mcp-stdio https://your-server.example.com:8080/mcp --bearer-token YOUR_TOKEN
 With custom headers:
 
 ```bash
-mcp-stdio https://your-server.example.com:8080/mcp -H "X-API-Key: YOUR_KEY"
+mcp-stdio https://your-server.example.com:8080/mcp --header "X-API-Key: YOUR_KEY"
 ```
 
 With OAuth 2.1 authentication (for servers that require it):
@@ -74,6 +93,12 @@ mcp-stdio --oauth https://your-server.example.com:8080/mcp
 
 # With a pre-registered client ID (skips dynamic registration)
 mcp-stdio --oauth --client-id YOUR_CLIENT_ID https://your-server.example.com:8080/mcp
+```
+
+Test connectivity before use:
+
+```bash
+mcp-stdio --test https://your-server.example.com:8080/mcp
 ```
 
 ## Claude Desktop Configuration
@@ -120,7 +145,7 @@ Options:
   --oauth                Enable OAuth 2.1 authentication
   --client-id ID         Pre-registered OAuth client ID (or set MCP_OAUTH_CLIENT_ID)
   --oauth-scope SCOPE    OAuth scope to request
-  -H 'Key: Value'        Custom header (can be repeated)
+  -H, --header 'Key: Value'  Custom header (can be repeated)
   --timeout-connect SEC  Connection timeout (default: 10)
   --timeout-read SEC     Read timeout (default: 120)
   --test                 Test connection and exit
@@ -128,7 +153,7 @@ Options:
   -h, --help             Show help
 ```
 
-## Use Cases
+## Workarounds
 
 Works around known issues in Claude Code's HTTP transport:
 
@@ -138,25 +163,6 @@ Works around known issues in Claude Code's HTTP transport:
 - **Session lost after disconnect** — mcp-stdio recovers MCP sessions automatically on 404 ([#34498](https://github.com/anthropics/claude-code/issues/34498), [#38631](https://github.com/anthropics/claude-code/issues/38631))
 - **OAuth scope omitted** — Claude Code sends no `scope` parameter in authorization requests, causing strict OAuth servers to reject the flow ([#4540](https://github.com/anthropics/claude-code/issues/4540)); mcp-stdio sends scopes via `--oauth-scope`
 - **Proxy settings ignored** — Claude Code does not respect `NO_PROXY` ([#34804](https://github.com/anthropics/claude-code/issues/34804)); mcp-stdio inherits proxy settings from httpx
-
-## Features
-
-- **OAuth 2.1 client** — built-in authorization code flow with PKCE, dynamic client registration, token refresh, and secure token persistence. Implements the full MCP authorization spec:
-  - [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) Protected Resource Metadata discovery
-  - [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) Authorization Server Metadata discovery
-  - [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) Resource Indicators for audience binding
-  - [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) PKCE with S256 challenge method
-  - [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591) Dynamic Client Registration
-  - [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) Bearer Token usage
-- **Retry with backoff** — retries up to 3 times on connection errors
-- **Streaming resilience** — streams SSE responses in real time; retries on mid-stream disconnect
-- **Session recovery** — resets MCP session ID on 404 and retries
-- **Token refresh on 401** — automatically refreshes expired OAuth tokens mid-session
-- **Bearer token auth** — via `--bearer-token` flag or `MCP_BEARER_TOKEN` env var
-- **Custom headers** — pass any header with `-H`
-- **Graceful shutdown** — handles SIGTERM/SIGINT
-- **Proxy support** — respects `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` env vars via [httpx](https://www.python-httpx.org/)
-- **Minimal dependencies** — only [httpx](https://www.python-httpx.org/); OAuth uses stdlib only
 
 ## How It Works
 

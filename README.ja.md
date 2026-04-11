@@ -2,11 +2,11 @@
 
 [English](README.md) | 日本語
 
-MCP サーバー向け stdio-to-HTTP リレー — Claude Desktop/Code とリモート Streamable HTTP エンドポイントを橋渡しします。
+Stdio-to-HTTP リレー — MCP クライアントとリモート HTTP MCP サーバーを橋渡しします。
 
-## なぜ必要？
+## 概要
 
-[MCP](https://modelcontextprotocol.io/) クライアント（Claude Desktop, Claude Code）に対してローカルで稼働するセルフホスト MCP サーバのように振る舞いつつ、リモート MCP サーバへの Streamable HTTP 接続を橋渡しします：
+[MCP](https://modelcontextprotocol.io/) クライアント（Claude Desktop, Claude Code）に対してローカルで稼働するセルフホスト MCP サーバのように振る舞いつつ、各種認証でリモート MCP サーバーへの接続を橋渡しします：
 
 ```mermaid
 flowchart BT
@@ -18,6 +18,25 @@ flowchart BT
 ```
 
 Bearer token、カスタムヘッダー、OAuth 2.1 認証情報をリモートサーバーへ転送します。
+
+## 特徴
+
+- **OAuth 2.1 クライアント** — 認可コードフロー（PKCE）、動的クライアント登録、トークンリフレッシュ、安全なトークン永続化を内蔵。MCP 認可仕様の関連 RFC に完全対応：
+  - [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) Protected Resource Metadata の検出
+  - [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) Authorization Server Metadata の検出
+  - [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) Resource Indicators によるオーディエンス指定
+  - [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) PKCE（S256 チャレンジメソッド）
+  - [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591) Dynamic Client Registration
+  - [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) Bearer Token の利用
+- **バックオフ付きリトライ** — 接続エラー時に最大3回リトライ
+- **ストリーミング耐性** — SSE レスポンスをリアルタイムで転送、切断時にリトライ
+- **セッション回復** — 404 でセッション ID をリセットして再試行
+- **401 時の自動トークンリフレッシュ** — セッション中に OAuth トークンが失効しても自動更新
+- **Bearer token 認証** — `--bearer-token` フラグまたは `MCP_BEARER_TOKEN` 環境変数
+- **カスタムヘッダー** — `-H` で任意のヘッダーを送信
+- **グレースフルシャットダウン** — SIGTERM/SIGINT ハンドリング
+- **プロキシ対応** — `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` 環境変数を [httpx](https://www.python-httpx.org/) 経由でサポート
+- **最小依存** — [httpx](https://www.python-httpx.org/) のみ; OAuth は stdlib のみ使用
 
 ## インストール
 
@@ -62,7 +81,7 @@ mcp-stdio https://your-server.example.com:8080/mcp --bearer-token YOUR_TOKEN
 カスタムヘッダー付き：
 
 ```bash
-mcp-stdio https://your-server.example.com:8080/mcp -H "X-API-Key: YOUR_KEY"
+mcp-stdio https://your-server.example.com:8080/mcp --header "X-API-Key: YOUR_KEY"
 ```
 
 OAuth 2.1 認証付き（OAuth 必須のサーバー向け）：
@@ -72,6 +91,12 @@ mcp-stdio --oauth https://your-server.example.com:8080/mcp
 
 # 事前登録済みクライアント ID を使用（動的クライアント登録をスキップ）
 mcp-stdio --oauth --client-id YOUR_CLIENT_ID https://your-server.example.com:8080/mcp
+```
+
+接続テスト：
+
+```bash
+mcp-stdio --test https://your-server.example.com:8080/mcp
 ```
 
 ## Claude Desktop の設定
@@ -118,7 +143,7 @@ mcp-stdio [OPTIONS] URL
   --oauth                OAuth 2.1 認証を有効化
   --client-id ID         事前登録済み OAuth クライアント ID（MCP_OAUTH_CLIENT_ID 環境変数でも指定可）
   --oauth-scope SCOPE    要求する OAuth スコープ
-  -H 'Key: Value'        カスタムヘッダー（複数指定可）
+  -H, --header 'Key: Value'  カスタムヘッダー（複数指定可）
   --timeout-connect SEC  接続タイムアウト（デフォルト: 10秒）
   --timeout-read SEC     読み取りタイムアウト（デフォルト: 120秒）
   --test                 接続テストして終了
@@ -126,7 +151,7 @@ mcp-stdio [OPTIONS] URL
   -h, --help             ヘルプ表示
 ```
 
-## ユースケース
+## ワークアラウンド
 
 Claude Code の HTTP transport の既知の問題を回避できます：
 
@@ -136,25 +161,6 @@ Claude Code の HTTP transport の既知の問題を回避できます：
 - **切断後にセッションが失われる** — mcp-stdio は 404 で MCP セッションを自動回復（[#34498](https://github.com/anthropics/claude-code/issues/34498), [#38631](https://github.com/anthropics/claude-code/issues/38631)）
 - **OAuth scope が送信されない** — 認可リクエストに `scope` パラメータが含まれず、厳格な OAuth サーバーがフローを拒否する（[#4540](https://github.com/anthropics/claude-code/issues/4540)）; mcp-stdio は `--oauth-scope` でスコープを送信
 - **プロキシ設定が無視される** — Claude Code が `NO_PROXY` を尊重しない（[#34804](https://github.com/anthropics/claude-code/issues/34804)）; mcp-stdio は httpx 経由でプロキシ設定を継承
-
-## 機能
-
-- **OAuth 2.1 クライアント** — 認可コードフロー（PKCE）、動的クライアント登録、トークンリフレッシュ、安全なトークン永続化を内蔵。MCP 認可仕様の関連 RFC に完全対応：
-  - [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) Protected Resource Metadata の検出
-  - [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) Authorization Server Metadata の検出
-  - [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) Resource Indicators によるオーディエンス指定
-  - [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) PKCE（S256 チャレンジメソッド）
-  - [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591) Dynamic Client Registration
-  - [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) Bearer Token の利用
-- **バックオフ付きリトライ** — 接続エラー時に最大3回リトライ
-- **ストリーミング耐性** — SSE レスポンスをリアルタイムで転送、切断時にリトライ
-- **セッション回復** — 404 でセッション ID をリセットして再試行
-- **401 時の自動トークンリフレッシュ** — セッション中に OAuth トークンが失効しても自動更新
-- **Bearer token 認証** — `--bearer-token` フラグまたは `MCP_BEARER_TOKEN` 環境変数
-- **カスタムヘッダー** — `-H` で任意のヘッダーを送信
-- **グレースフルシャットダウン** — SIGTERM/SIGINT ハンドリング
-- **プロキシ対応** — `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` 環境変数を [httpx](https://www.python-httpx.org/) 経由でサポート
-- **最小依存** — [httpx](https://www.python-httpx.org/) のみ; OAuth は stdlib のみ使用
 
 ## 仕組み
 
