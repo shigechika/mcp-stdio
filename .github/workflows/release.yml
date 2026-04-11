@@ -11,6 +11,16 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Verify __version__ matches tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG_VERSION=$(python3 -c "import re; print(re.search(r'__version__ = \"([^\"]+)\"', open('src/mcp_stdio/__init__.py').read()).group(1))")
+          if [ "$TAG" != "$PKG_VERSION" ]; then
+            echo "::error::Tag v$TAG does not match __version__ $PKG_VERSION in src/mcp_stdio/__init__.py"
+            exit 1
+          fi
+          echo "Verified: tag v$TAG matches __version__ $PKG_VERSION"
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
