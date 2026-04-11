@@ -13,7 +13,7 @@ Stdio-to-HTTP relay — bridges MCP clients to remote HTTP MCP servers.
 ```mermaid
 flowchart BT
     A[Claude<br>CLI/Desktop] <-- stdio --> B(mcp-stdio)
-    B <== "<b>HTTPS</b><br>Bearer Token<br>Header<br>OAuth" ==> C[Remote<br>MCP Server]
+    B <== "<b>HTTPS</b><br>Streamable HTTP / SSE<br>Bearer Token<br>Header<br>OAuth" ==> C[Remote<br>MCP Server]
     B -. "OAuth 2.1<br>(PKCE)" .-> D[Authorization<br>Server]
     D -. callback .-> B
     style B fill:#4a5,stroke:#333,color:#fff
