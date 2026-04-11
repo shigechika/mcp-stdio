@@ -10,7 +10,7 @@ Stdio-to-HTTP ゲートウェイ — MCP クライアントとリモート HTTP 
 
 ```mermaid
 flowchart BT
-    A[Claude<br>CLI/Desktop] <-- stdio --> B(mcp-stdio)
+    A[Claude<br>Desktop/Code] <-- stdio --> B(mcp-stdio)
     B <== "<b>HTTPS</b><br>Streamable HTTP / SSE<br>Bearer Token<br>Header<br>OAuth" ==> C[Remote<br>MCP Server]
     B -. "OAuth 2.1<br>(PKCE)" .-> D[Authorization<br>Server]
     D -. callback .-> B
