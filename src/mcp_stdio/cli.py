@@ -84,8 +84,8 @@ def main() -> None:
     """Entry point for mcp-stdio CLI."""
     parser = argparse.ArgumentParser(
         prog="mcp-stdio",
-        description="Stdio-to-HTTP relay for MCP servers. "
-        "Bridges Claude Desktop/Code (stdio) to remote Streamable HTTP MCP endpoints.",
+        description="Stdio-to-HTTP gateway for MCP servers. "
+        "Bridges MCP clients (stdio) to remote Streamable HTTP or SSE MCP endpoints.",
     )
     parser.add_argument(
         "url",

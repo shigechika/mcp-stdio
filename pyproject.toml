@@ -1,12 +1,12 @@
 [project]
 name = "mcp-stdio"
 dynamic = ["version"]
-description = "Stdio-to-HTTP relay — bridges MCP clients to remote HTTP MCP servers"
+description = "Stdio-to-HTTP gateway — bridges MCP clients to remote HTTP MCP servers"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [{ name = "Shigechika AIKAWA" }]
-keywords = ["mcp", "stdio", "proxy", "relay", "claude", "bridge", "oauth", "sse", "streamable-http"]
+keywords = ["mcp", "stdio", "gateway", "proxy", "relay", "claude", "bridge", "oauth", "sse", "streamable-http"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",

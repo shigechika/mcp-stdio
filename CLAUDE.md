@@ -29,11 +29,11 @@ Uses **hatch** as the build backend. Version is defined in `src/mcp_stdio/__init
 
 ## Architecture
 
-A minimal stdio-to-HTTP relay for MCP (Model Context Protocol) servers. Only runtime dependency is **httpx**.
+A minimal stdio-to-HTTP gateway for MCP (Model Context Protocol) servers — translates between stdio JSON-RPC framing and the two MCP HTTP transports (Streamable HTTP and legacy SSE). Only runtime dependency is **httpx**.
 
 Four modules under `src/mcp_stdio/`:
 
-- **`relay.py`** — Two relay implementations sharing stdin/stdout plumbing:
+- **`relay.py`** — Two transport implementations sharing stdin/stdout plumbing (file name kept for import compatibility):
   - `run()` — Streamable HTTP transport (MCP current spec, default). Reads JSON-RPC from stdin line-by-line, streams POST to the remote URL via httpx, parses JSON or SSE responses, writes to stdout. Handles retry with backoff (3 attempts), session ID tracking (`Mcp-Session-Id` header), 404-based session recovery, and 401-based token refresh.
   - `run_sse()` — SSE transport (MCP 2024-11-05 legacy). Spawns a daemon reader thread that maintains a long-lived `GET /sse` connection, parses `endpoint`/`message` events per the WHATWG SSE spec, and resolves the POST endpoint URL (possibly relative). The main thread reads stdin and POSTs to that endpoint. Auto-reconnects on stream disconnect.
   - Signal handlers (`signal.signal`) are set from the main thread only — the SSE reader runs in a daemon thread so pytest tests must drive `run_sse` from the main thread.
