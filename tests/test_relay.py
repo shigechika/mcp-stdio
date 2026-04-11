@@ -83,9 +83,7 @@ class TestPostAndStream:
             httpx_mock.add_exception(httpx.ConnectError("refused"))
         client = httpx.Client()
         with patch("mcp_stdio.relay.time.sleep"):
-            result = _post_and_stream(
-                client, "https://example.com/mcp", '{"id":1}', {}, 1
-            )
+            result = _post_and_stream(client, "https://example.com/mcp", '{"id":1}', {}, 1)
         assert result is None
 
     def test_non_200_returns_status(self, httpx_mock):
@@ -120,9 +118,7 @@ class TestRun:
             text=body,
             headers={"content-type": "application/json"},
         )
-        output = self._run_with_stdin(
-            httpx_mock, ['{"jsonrpc":"2.0","method":"init","id":1}']
-        )
+        output = self._run_with_stdin(httpx_mock, ['{"jsonrpc":"2.0","method":"init","id":1}'])
         assert json.loads(output.strip()) == json.loads(body)
 
     def test_sse_response(self, httpx_mock):
@@ -131,9 +127,7 @@ class TestRun:
             text=sse_body,
             headers={"content-type": "text/event-stream"},
         )
-        output = self._run_with_stdin(
-            httpx_mock, ['{"jsonrpc":"2.0","method":"init","id":1}']
-        )
+        output = self._run_with_stdin(httpx_mock, ['{"jsonrpc":"2.0","method":"init","id":1}'])
         assert json.loads(output.strip())["id"] == 1
 
     def test_empty_lines_skipped(self, httpx_mock):
@@ -173,8 +167,16 @@ class TestRun:
         req2 = httpx_mock.get_requests()[1]
         assert req2.headers["mcp-session-id"] == "sess-123"
 
-    def test_session_expired_retry(self, httpx_mock):
-        # First request sets a session ID
+    def test_session_expired_triggers_reinitialize_then_retry(self, httpx_mock):
+        """Reproduces the 404 -> 400 hang from FastMCP StreamableHTTP.
+
+        Before the fix, mcp-stdio cleared the session_id on 404 and just
+        re-sent the original request — but FastMCP requires an initialize
+        handshake on each new session, so the retry came back 400 and the
+        caller hung. The fix sends an initialize to establish a new
+        session first, then replays the original request with it.
+        """
+        # Request 1: init — server assigns sess-old
         httpx_mock.add_response(
             text='{"jsonrpc":"2.0","result":{},"id":1}',
             headers={
@@ -182,17 +184,26 @@ class TestRun:
                 "mcp-session-id": "sess-old",
             },
         )
-        # Second request gets 404 (session expired)
+        # Request 2: tool call with sess-old — server returns 404 (expired)
         httpx_mock.add_response(
             status_code=404,
             text="",
             headers={"content-type": "application/json"},
         )
-        # Retry after session reset succeeds
+        # Request 3: _reinitialize sends a fresh initialize — server assigns sess-new
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"protocolVersion":"2024-11-05"},"id":0}',
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "sess-new",
+            },
+        )
+        # Request 4: original tool call replayed with sess-new — server returns result
         httpx_mock.add_response(
             text='{"jsonrpc":"2.0","result":{"ok":true},"id":2}',
             headers={"content-type": "application/json"},
         )
+
         output = self._run_with_stdin(
             httpx_mock,
             [
@@ -201,19 +212,64 @@ class TestRun:
             ],
         )
         lines = [x for x in output.strip().splitlines() if x]
+        # stdout gets the two original responses (init + call); the re-initialize
+        # response is internal and should not leak to stdout.
         assert len(lines) == 2
-        # Verify session was reset: the retry request should NOT have Mcp-Session-Id
+        assert json.loads(lines[1])["result"] == {"ok": True}
+
         requests = httpx_mock.get_requests()
-        assert len(requests) == 3
+        assert len(requests) == 4
+
+        # Request 2 (the call) still carried sess-old before the 404
+        assert requests[1].headers.get("mcp-session-id") == "sess-old"
+
+        # Request 3 is the re-initialize: no session header, body is initialize
         assert "mcp-session-id" not in requests[2].headers
+        init_body = json.loads(requests[2].content)
+        assert init_body["method"] == "initialize"
+
+        # Request 4 is the replayed tool call, now with sess-new
+        assert requests[3].headers.get("mcp-session-id") == "sess-new"
+        replay_body = json.loads(requests[3].content)
+        assert replay_body["method"] == "call"
+        assert replay_body["id"] == 2
+
+    def test_reinitialize_failure_returns_error(self, httpx_mock):
+        """If the post-404 re-initialize fails, we surface a JSON-RPC error
+        instead of silently dropping the original request."""
+        # Request 1: init
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "sess-old",
+            },
+        )
+        # Request 2: tool call -> 404
+        httpx_mock.add_response(status_code=404, text="")
+        # Request 3: re-initialize also fails (server still broken)
+        httpx_mock.add_response(status_code=500, text="")
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","method":"init","id":1}',
+                '{"jsonrpc":"2.0","method":"call","id":2}',
+            ],
+        )
+        lines = [x for x in output.strip().splitlines() if x]
+        # First response goes through, second is an error reply (not a hang)
+        assert len(lines) == 2
+        err = json.loads(lines[1])
+        assert err["id"] == 2
+        assert err["error"]["code"] == -32000
+        assert "session lost" in err["error"]["message"]
 
     def test_request_failure_returns_error(self, httpx_mock):
         for _ in range(3):
             httpx_mock.add_exception(httpx.ConnectError("refused"))
         with patch("mcp_stdio.relay.time.sleep"):
-            output = self._run_with_stdin(
-                httpx_mock, ['{"jsonrpc":"2.0","method":"init","id":5}']
-            )
+            output = self._run_with_stdin(httpx_mock, ['{"jsonrpc":"2.0","method":"init","id":5}'])
         result = json.loads(output.strip())
         assert result["error"]["code"] == -32000
         assert result["id"] == 5
