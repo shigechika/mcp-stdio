@@ -10,6 +10,8 @@ from typing import Any
 
 import httpx
 
+from mcp_stdio import __version__
+
 MAX_RETRIES = 3
 RETRY_DELAY = 1  # seconds
 
@@ -104,9 +106,15 @@ def _reinitialize(
     url: str,
     headers: dict[str, str],
 ) -> str | None:
-    """Send an initialize request to establish a new MCP session.
+    """Send an initialize handshake to establish a new MCP session.
 
-    Used to recover from a 404 "session expired" response mid-stream.
+    Used to recover after a session expires (server returns 404 on the
+    next request). Performs the full MCP initialize handshake:
+
+    1. POST an ``initialize`` request to get a new session ID
+    2. POST a ``notifications/initialized`` notification to signal
+       readiness (required by the MCP spec before any other requests)
+
     Returns the new session ID on success, or None on failure. The
     initialize response payload is discarded — the caller only needs
     the session ID for subsequent requests.
@@ -119,7 +127,7 @@ def _reinitialize(
             "params": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "mcp-stdio", "version": "session-recovery"},
+                "clientInfo": {"name": "mcp-stdio", "version": __version__},
             },
         }
     )
@@ -131,7 +139,26 @@ def _reinitialize(
     if resp.status_code != 200:
         log(f"re-initialize returned HTTP {resp.status_code}")
         return None
-    return resp.headers.get("mcp-session-id")
+    new_session_id = resp.headers.get("mcp-session-id")
+    if not new_session_id:
+        log("re-initialize response missing mcp-session-id header")
+        return None
+
+    # MCP spec: send notifications/initialized before any other requests
+    initialized_msg = json.dumps(
+        {"jsonrpc": "2.0", "method": "notifications/initialized"}
+    )
+    initialized_headers = dict(headers)
+    initialized_headers["Mcp-Session-Id"] = new_session_id
+    try:
+        resp = client.post(url, content=initialized_msg, headers=initialized_headers)
+    except httpx.HTTPError as e:
+        log(f"notifications/initialized failed: {e}")
+        return None
+    if resp.status_code not in (200, 202):
+        log(f"notifications/initialized returned HTTP {resp.status_code}")
+        return None
+    return new_session_id
 
 
 def test_connection(
@@ -153,7 +180,7 @@ def test_connection(
             "params": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "mcp-stdio", "version": "test"},
+                "clientInfo": {"name": "mcp-stdio", "version": __version__},
             },
         }
     )

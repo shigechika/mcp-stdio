@@ -198,7 +198,9 @@ class TestRun:
                 "mcp-session-id": "sess-new",
             },
         )
-        # Request 4: original tool call replayed with sess-new — server returns result
+        # Request 4: _reinitialize sends notifications/initialized with sess-new
+        httpx_mock.add_response(status_code=202, text="")
+        # Request 5: original tool call replayed with sess-new — server returns result
         httpx_mock.add_response(
             text='{"jsonrpc":"2.0","result":{"ok":true},"id":2}',
             headers={"content-type": "application/json"},
@@ -213,12 +215,12 @@ class TestRun:
         )
         lines = [x for x in output.strip().splitlines() if x]
         # stdout gets the two original responses (init + call); the re-initialize
-        # response is internal and should not leak to stdout.
+        # handshake is internal and should not leak to stdout.
         assert len(lines) == 2
         assert json.loads(lines[1])["result"] == {"ok": True}
 
         requests = httpx_mock.get_requests()
-        assert len(requests) == 4
+        assert len(requests) == 5
 
         # Request 2 (the call) still carried sess-old before the 404
         assert requests[1].headers.get("mcp-session-id") == "sess-old"
@@ -228,9 +230,15 @@ class TestRun:
         init_body = json.loads(requests[2].content)
         assert init_body["method"] == "initialize"
 
-        # Request 4 is the replayed tool call, now with sess-new
+        # Request 4 is notifications/initialized with sess-new
         assert requests[3].headers.get("mcp-session-id") == "sess-new"
-        replay_body = json.loads(requests[3].content)
+        notif_body = json.loads(requests[3].content)
+        assert notif_body["method"] == "notifications/initialized"
+        assert "id" not in notif_body  # notifications must not carry an id
+
+        # Request 5 is the replayed tool call, now with sess-new
+        assert requests[4].headers.get("mcp-session-id") == "sess-new"
+        replay_body = json.loads(requests[4].content)
         assert replay_body["method"] == "call"
         assert replay_body["id"] == 2
 
@@ -259,6 +267,44 @@ class TestRun:
         )
         lines = [x for x in output.strip().splitlines() if x]
         # First response goes through, second is an error reply (not a hang)
+        assert len(lines) == 2
+        err = json.loads(lines[1])
+        assert err["id"] == 2
+        assert err["error"]["code"] == -32000
+        assert "session lost" in err["error"]["message"]
+
+    def test_reinitialize_notifications_initialized_failure_returns_error(
+        self, httpx_mock
+    ):
+        """If the initialize succeeds but the notifications/initialized step
+        fails, we treat the whole re-init as failed and surface an error."""
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "sess-old",
+            },
+        )
+        httpx_mock.add_response(status_code=404, text="")
+        # Initialize succeeds — server assigns sess-new
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":0}',
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "sess-new",
+            },
+        )
+        # notifications/initialized fails
+        httpx_mock.add_response(status_code=500, text="")
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","method":"init","id":1}',
+                '{"jsonrpc":"2.0","method":"call","id":2}',
+            ],
+        )
+        lines = [x for x in output.strip().splitlines() if x]
         assert len(lines) == 2
         err = json.loads(lines[1])
         assert err["id"] == 2
