@@ -47,6 +47,22 @@ def _authorization_base_url(server_url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
+def _build_metadata_url(issuer: str) -> str:
+    """Build the RFC 8414 Section 3 well-known metadata URL for an issuer.
+
+    If the issuer has a path component, the well-known string is inserted
+    *before* the path (not appended):
+      https://auth.example.com/v2 -> https://auth.example.com/.well-known/oauth-authorization-server/v2
+    If no path:
+      https://auth.example.com -> https://auth.example.com/.well-known/oauth-authorization-server
+    """
+    parsed = urlparse(issuer)
+    path = parsed.path.rstrip("/")
+    if path:
+        return f"{parsed.scheme}://{parsed.netloc}/.well-known/oauth-authorization-server{path}"
+    return f"{parsed.scheme}://{parsed.netloc}/.well-known/oauth-authorization-server"
+
+
 def _fetch_authorization_server_metadata(
     auth_server_url: str, client: httpx.Client
 ) -> OAuthMetadata | None:
@@ -54,7 +70,7 @@ def _fetch_authorization_server_metadata(
 
     Returns None on any failure (404, invalid JSON, connection error).
     """
-    well_known = f"{auth_server_url}/.well-known/oauth-authorization-server"
+    well_known = _build_metadata_url(auth_server_url)
     try:
         resp = client.get(well_known)
         if resp.status_code == 200:

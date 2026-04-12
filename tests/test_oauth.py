@@ -13,6 +13,7 @@ from mcp_stdio.oauth import (
     CallbackResult,
     OAuthMetadata,
     _authorization_base_url,
+    _build_metadata_url,
     _make_callback_handler,
     _parse_token_response,
     _token_response_to_data,
@@ -310,6 +311,66 @@ class TestDiscoverMetadata:
         client = httpx.Client()
         meta = discover_oauth_metadata("https://api.example.com/mcp", client)
         assert meta.token_endpoint == "https://api.example.com/token"
+
+    def test_issuer_with_path_rfc8414_path_insertion(self, httpx_mock):
+        """mcp-remote #207: auth server from RFC 9728 with path uses RFC 8414 Section 3 path insertion.
+
+        When the authorization server URL has a path component (e.g. https://auth.example.com/v2),
+        the well-known metadata URL must be constructed by *inserting* the well-known prefix
+        before the path, not appending it:
+          correct:  https://auth.example.com/.well-known/oauth-authorization-server/v2
+          wrong:    https://auth.example.com/v2/.well-known/oauth-authorization-server
+        """
+        # Phase 1: RFC 9728 returns auth server URL with path
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource",
+            json={
+                "resource": "https://api.example.com/mcp",
+                "authorization_servers": ["https://auth.example.com/v2"],
+            },
+        )
+        # Phase 2: metadata URL with path inserted (RFC 8414 Section 3)
+        httpx_mock.add_response(
+            url="https://auth.example.com/.well-known/oauth-authorization-server/v2",
+            json={
+                "authorization_endpoint": "https://auth.example.com/v2/authorize",
+                "token_endpoint": "https://auth.example.com/v2/token",
+                "registration_endpoint": "https://auth.example.com/v2/register",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata("https://api.example.com/mcp", client)
+        assert meta.authorization_endpoint == "https://auth.example.com/v2/authorize"
+        assert meta.token_endpoint == "https://auth.example.com/v2/token"
+        assert meta.registration_endpoint == "https://auth.example.com/v2/register"
+
+    def test_build_metadata_url_no_path(self):
+        """_build_metadata_url: issuer without path."""
+        assert (
+            _build_metadata_url("https://auth.example.com")
+            == "https://auth.example.com/.well-known/oauth-authorization-server"
+        )
+
+    def test_build_metadata_url_with_path(self):
+        """_build_metadata_url: issuer with path uses RFC 8414 Section 3 path insertion."""
+        assert (
+            _build_metadata_url("https://auth.example.com/v2")
+            == "https://auth.example.com/.well-known/oauth-authorization-server/v2"
+        )
+
+    def test_build_metadata_url_with_trailing_slash(self):
+        """_build_metadata_url: trailing slash on issuer path is stripped."""
+        assert (
+            _build_metadata_url("https://auth.example.com/v2/")
+            == "https://auth.example.com/.well-known/oauth-authorization-server/v2"
+        )
+
+    def test_build_metadata_url_deep_path(self):
+        """_build_metadata_url: multi-segment path is preserved."""
+        assert (
+            _build_metadata_url("https://auth.example.com/a/b/c")
+            == "https://auth.example.com/.well-known/oauth-authorization-server/a/b/c"
+        )
 
 
 # --- register_client ---
