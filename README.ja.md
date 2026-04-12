@@ -2,7 +2,7 @@
 
 [English](README.md) | 日本語
 
-Stdio-to-HTTP ゲートウェイ — MCP クライアントとリモート HTTP MCP サーバーを橋渡しします。
+Stdio-to-HTTP ゲートウェイ — MCP クライアントとリモート HTTP MCP サーバーを接続します。
 
 ## 概要
 

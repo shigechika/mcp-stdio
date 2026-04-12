@@ -1,7 +1,7 @@
 [project]
 name = "mcp-stdio"
 dynamic = ["version"]
-description = "Stdio-to-HTTP gateway — bridges MCP clients to remote HTTP MCP servers"
+description = "Stdio-to-HTTP gateway — connects MCP clients to remote HTTP MCP servers"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

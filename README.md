@@ -4,7 +4,7 @@
 
 English | [日本語](README.ja.md)
 
-Stdio-to-HTTP gateway — bridges MCP clients to remote HTTP MCP servers.
+Stdio-to-HTTP gateway — connects MCP clients to remote HTTP MCP servers.
 
 ## Overview
 

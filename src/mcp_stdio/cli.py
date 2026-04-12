@@ -85,7 +85,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="mcp-stdio",
         description="Stdio-to-HTTP gateway for MCP servers. "
-        "Bridges MCP clients (stdio) to remote Streamable HTTP or SSE MCP endpoints.",
+        "Connects MCP clients (stdio) to remote Streamable HTTP or SSE MCP endpoints.",
     )
     parser.add_argument(
         "url",
