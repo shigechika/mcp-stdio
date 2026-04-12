@@ -162,6 +162,8 @@ mcp-stdio [OPTIONS] URL
 
 ## ワークアラウンド
 
+### Claude Code
+
 Claude Code の HTTP transport の既知の問題を回避できます：
 
 - **Bearer token が送信されない** — ツール呼び出し時に `Authorization` ヘッダーが無視される（[#28293](https://github.com/anthropics/claude-code/issues/28293), [#33817](https://github.com/anthropics/claude-code/issues/33817)）
@@ -170,6 +172,10 @@ Claude Code の HTTP transport の既知の問題を回避できます：
 - **切断後にセッションが失われる** — mcp-stdio は 404 で MCP セッションを自動回復（[#34498](https://github.com/anthropics/claude-code/issues/34498), [#38631](https://github.com/anthropics/claude-code/issues/38631)）
 - **OAuth scope が送信されない** — 認可リクエストに `scope` パラメータが含まれず、厳格な OAuth サーバーがフローを拒否する（[#4540](https://github.com/anthropics/claude-code/issues/4540)）; mcp-stdio は `--oauth-scope` でスコープを送信
 - **プロキシ設定が無視される** — Claude Code が `NO_PROXY` を尊重しない（[#34804](https://github.com/anthropics/claude-code/issues/34804)）; mcp-stdio は httpx 経由でプロキシ設定を継承
+
+### mcp-remote
+
+- **パス付き auth server で OAuth 検出が失敗する** — RFC 8414 §3 のパス挿入ルール未実装のため、auth server URL にパスが含まれるサーバー（マルチテナント・Keycloak 等）で検出が失敗する（[mcp-remote#207](https://github.com/geelen/mcp-remote/issues/207)）; mcp-stdio は正しい well-known URL を構築する
 
 ## 仕組み
 
