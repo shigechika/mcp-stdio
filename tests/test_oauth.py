@@ -14,6 +14,7 @@ from mcp_stdio.oauth import (
     OAuthMetadata,
     _authorization_base_url,
     _build_metadata_url,
+    _is_client_secret_expired,
     _make_callback_handler,
     _parse_token_response,
     _token_response_to_data,
@@ -519,6 +520,60 @@ class TestRegisterClient:
         client = httpx.Client()
         with pytest.raises(httpx.HTTPStatusError):
             register_client(meta, "http://127.0.0.1:9999/callback", client)
+
+    def test_client_secret_expires_at_captured(self, httpx_mock):
+        """RFC 7591 §3.2.1: client_secret_expires_at should be preserved."""
+        future = time.time() + 86400
+        httpx_mock.add_response(
+            url="https://api.example.com/register",
+            json={
+                "client_id": "cid",
+                "client_secret": "csec",
+                "client_secret_expires_at": future,
+            },
+        )
+        meta = OAuthMetadata(
+            authorization_endpoint="https://api.example.com/authorize",
+            token_endpoint="https://api.example.com/token",
+            registration_endpoint="https://api.example.com/register",
+        )
+        client = httpx.Client()
+        reg = register_client(meta, "http://127.0.0.1:9999/callback", client)
+        assert reg.client_secret_expires_at == future
+
+    def test_client_secret_expires_at_zero_means_never(self, httpx_mock):
+        """RFC 7591 §3.2.1: 0 means 'never expires' — normalize to None."""
+        httpx_mock.add_response(
+            url="https://api.example.com/register",
+            json={
+                "client_id": "cid",
+                "client_secret": "csec",
+                "client_secret_expires_at": 0,
+            },
+        )
+        meta = OAuthMetadata(
+            authorization_endpoint="https://api.example.com/authorize",
+            token_endpoint="https://api.example.com/token",
+            registration_endpoint="https://api.example.com/register",
+        )
+        client = httpx.Client()
+        reg = register_client(meta, "http://127.0.0.1:9999/callback", client)
+        assert reg.client_secret_expires_at is None
+
+    def test_client_secret_expires_at_missing(self, httpx_mock):
+        """Field absent → None (treated as no expiry)."""
+        httpx_mock.add_response(
+            url="https://api.example.com/register",
+            json={"client_id": "cid", "client_secret": "csec"},
+        )
+        meta = OAuthMetadata(
+            authorization_endpoint="https://api.example.com/authorize",
+            token_endpoint="https://api.example.com/token",
+            registration_endpoint="https://api.example.com/register",
+        )
+        client = httpx.Client()
+        reg = register_client(meta, "http://127.0.0.1:9999/callback", client)
+        assert reg.client_secret_expires_at is None
 
 
 # --- exchange_code ---
@@ -1286,3 +1341,173 @@ class TestEnsureToken:
         requests = httpx_mock.get_requests()
         urls = [str(r.url) for r in requests]
         assert "https://example.com/register" not in urls
+
+
+# --- RFC 7591 client_secret_expires_at ---
+
+
+class TestClientSecretExpiry:
+    def test_is_expired_none_means_no_expiry(self):
+        """None client_secret_expires_at means 'no expiry known' → never expired."""
+        data = TokenData(access_token="at", client_secret_expires_at=None)
+        assert _is_client_secret_expired(data) is False
+
+    def test_is_expired_future(self):
+        """Future timestamp → not expired."""
+        data = TokenData(
+            access_token="at", client_secret_expires_at=time.time() + 3600
+        )
+        assert _is_client_secret_expired(data) is False
+
+    def test_is_expired_past(self):
+        """Past timestamp → expired."""
+        data = TokenData(
+            access_token="at", client_secret_expires_at=time.time() - 3600
+        )
+        assert _is_client_secret_expired(data) is True
+
+    def test_expired_secret_skips_refresh_and_clears_token(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """RFC 7591 §3.2.1: expired client_secret must skip refresh and delete token."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        from mcp_stdio.token_store import load_token, save_token
+
+        save_token(
+            "https://example.com/mcp",
+            TokenData(
+                access_token="expired_at",
+                expires_at=time.time() - 100,
+                refresh_token="valid_rt",
+                client_id="cid",
+                client_secret="csec",
+                client_secret_expires_at=time.time() - 3600,  # expired
+                token_endpoint="https://example.com/token",
+                authorization_endpoint="https://example.com/authorize",
+            ),
+        )
+
+        # Discovery for full flow (which will run after refresh is skipped)
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-authorization-server",
+            status_code=404,
+        )
+        # Full flow re-registers (since client_secret expired, not reused)
+        httpx_mock.add_response(
+            url="https://example.com/register",
+            json={"client_id": "new_cid", "client_secret": "new_csec"},
+        )
+
+        client = httpx.Client()
+        with pytest.raises(Exception):
+            # Full flow will fail at browser step, that's OK
+            ensure_token("https://example.com/mcp", client, timeout=0.5)
+
+        # /token should NOT have been called for refresh (secret expired)
+        token_calls = [
+            r for r in httpx_mock.get_requests()
+            if str(r.url) == "https://example.com/token"
+        ]
+        assert len(token_calls) == 0
+        # The old token should have been deleted when refresh was skipped.
+        # (load_token returns None because the full flow fails before saving.)
+        assert load_token("https://example.com/mcp") is None
+
+    def test_valid_secret_allows_refresh(self, tmp_path, monkeypatch, httpx_mock):
+        """Non-expired client_secret should proceed with refresh normally."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        from mcp_stdio.token_store import load_token, save_token
+
+        future_expiry = time.time() + 86400
+        save_token(
+            "https://example.com/mcp",
+            TokenData(
+                access_token="expired_at",
+                expires_at=time.time() - 100,
+                refresh_token="valid_rt",
+                client_id="cid",
+                client_secret="csec",
+                client_secret_expires_at=future_expiry,
+                token_endpoint="https://example.com/token",
+                authorization_endpoint="https://example.com/authorize",
+            ),
+        )
+
+        httpx_mock.add_response(
+            url="https://example.com/token",
+            json={"access_token": "refreshed_at", "expires_in": 3600},
+        )
+
+        client = httpx.Client()
+        data = ensure_token("https://example.com/mcp", client)
+        assert data.access_token == "refreshed_at"
+        # client_secret_expires_at must be preserved after refresh (not erased)
+        stored = load_token("https://example.com/mcp")
+        assert stored.client_secret_expires_at == future_expiry
+
+    def test_full_flow_does_not_reuse_expired_client_id(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """When client_secret is expired, full flow must re-register, not reuse cid."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        from mcp_stdio.token_store import save_token
+
+        # Cached credentials exist but client_secret is expired.
+        # No access_token and no refresh_token → goes directly to full flow.
+        save_token(
+            "https://example.com/mcp",
+            TokenData(
+                access_token="",
+                refresh_token=None,
+                client_id="old_cid",
+                client_secret="old_csec",
+                client_secret_expires_at=time.time() - 3600,  # expired
+                token_endpoint="https://example.com/token",
+                authorization_endpoint="https://example.com/authorize",
+                registration_endpoint="https://example.com/register",
+            ),
+        )
+
+        # Discovery
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://example.com/authorize",
+                "token_endpoint": "https://example.com/token",
+                "registration_endpoint": "https://example.com/register",
+            },
+        )
+        # Re-registration should occur because the cached client_secret expired
+        httpx_mock.add_response(
+            url="https://example.com/register",
+            json={"client_id": "new_cid", "client_secret": "new_csec"},
+        )
+
+        client = httpx.Client()
+        with pytest.raises(Exception):
+            # Full flow will fail at browser step, that's OK
+            ensure_token("https://example.com/mcp", client, timeout=0.5)
+
+        # Verify /register WAS called (new registration, not cached reuse)
+        register_calls = [
+            r for r in httpx_mock.get_requests()
+            if str(r.url) == "https://example.com/register"
+        ]
+        assert len(register_calls) == 1

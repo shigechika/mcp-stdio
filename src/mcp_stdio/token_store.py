@@ -30,6 +30,7 @@ class TokenData:
     # Dynamic client registration credentials
     client_id: str | None = None
     client_secret: str | None = None
+    client_secret_expires_at: float | None = None  # RFC 7591 §3.2.1; None = no expiry
     # Server endpoints (for refresh)
     token_endpoint: str = ""
     authorization_endpoint: str = ""

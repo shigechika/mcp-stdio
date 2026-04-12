@@ -29,7 +29,7 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
   - [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) Authorization Server Metadata discovery (§3 path insertion for issuers with path components)
   - [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) Resource Indicators for audience binding
   - [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) PKCE with S256 challenge method
-  - [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591) Dynamic Client Registration
+  - [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591) Dynamic Client Registration (§3.2.1 `client_secret_expires_at` — auto re-register on expiry)
   - [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) Bearer Token usage
 - **Retry with backoff** — retries up to 3 times on connection errors
 - **Streaming resilience** — streams SSE responses in real time; auto-reconnects on mid-stream disconnect

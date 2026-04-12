@@ -163,6 +163,14 @@ class ClientRegistration:
 
     client_id: str
     client_secret: str | None = None
+    client_secret_expires_at: float | None = None  # RFC 7591 §3.2.1; None = no expiry
+
+
+def _is_client_secret_expired(cached: TokenData) -> bool:
+    """Return True if the cached client secret has expired per RFC 7591 §3.2.1."""
+    if cached.client_secret_expires_at is None:
+        return False
+    return time.time() > cached.client_secret_expires_at
 
 
 def register_client(
@@ -192,9 +200,17 @@ def register_client(
     )
     resp.raise_for_status()
     data = resp.json()
+    # RFC 7591 §3.2.1: client_secret_expires_at = 0 means "never expires".
+    # Normalize 0 to None at the source so later expiry checks don't need to
+    # special-case it.
+    raw_expiry = data.get("client_secret_expires_at")
+    expiry: float | None = None
+    if raw_expiry:
+        expiry = float(raw_expiry)
     return ClientRegistration(
         client_id=data["client_id"],
         client_secret=data.get("client_secret"),
+        client_secret_expires_at=expiry,
     )
 
 
@@ -378,6 +394,7 @@ def _token_response_to_data(
     client_secret: str | None,
     *,
     previous_refresh_token: str | None = None,
+    client_secret_expires_at: float | None = None,
 ) -> TokenData:
     """Convert a raw token response to TokenData.
 
@@ -396,6 +413,7 @@ def _token_response_to_data(
         scope=raw.get("scope"),
         client_id=client_id,
         client_secret=client_secret,
+        client_secret_expires_at=client_secret_expires_at,
         token_endpoint=metadata.token_endpoint,
         authorization_endpoint=metadata.authorization_endpoint,
         registration_endpoint=metadata.registration_endpoint,
@@ -425,38 +443,46 @@ def ensure_token(
             log("using cached OAuth token")
             return cached
 
-        # 2. Try refresh
+        # 2. Try refresh (skip if client_secret has expired per RFC 7591 §3.2.1)
         if cached.refresh_token and cached.token_endpoint and cached.client_id:
-            log("access token expired, attempting refresh")
-            try:
-                raw = refresh_access_token(
-                    cached.token_endpoint,
-                    cached.client_id,
-                    cached.client_secret,
-                    cached.refresh_token,
-                    client,
-                    resource=server_url,
+            if _is_client_secret_expired(cached):
+                log(
+                    "OAuth client_secret expired (RFC 7591) — "
+                    "skipping refresh, will re-register"
                 )
-                metadata = OAuthMetadata(
-                    authorization_endpoint=cached.authorization_endpoint,
-                    token_endpoint=cached.token_endpoint,
-                    registration_endpoint=cached.registration_endpoint,
-                )
-                data = _token_response_to_data(
-                    raw,
-                    metadata,
-                    cached.client_id,
-                    cached.client_secret,
-                    previous_refresh_token=cached.refresh_token,
-                )
-                save_token(server_url, data)
-                log("token refreshed successfully")
-                return data
-            except Exception as e:
-                log(f"token refresh failed: {e}")
-                # Clear stale token to prevent cached failure blocking retry
-                # (#37747: failed auth state cached, preventing retry)
                 delete_token(server_url)
+            else:
+                log("access token expired, attempting refresh")
+                try:
+                    raw = refresh_access_token(
+                        cached.token_endpoint,
+                        cached.client_id,
+                        cached.client_secret,
+                        cached.refresh_token,
+                        client,
+                        resource=server_url,
+                    )
+                    metadata = OAuthMetadata(
+                        authorization_endpoint=cached.authorization_endpoint,
+                        token_endpoint=cached.token_endpoint,
+                        registration_endpoint=cached.registration_endpoint,
+                    )
+                    data = _token_response_to_data(
+                        raw,
+                        metadata,
+                        cached.client_id,
+                        cached.client_secret,
+                        previous_refresh_token=cached.refresh_token,
+                        client_secret_expires_at=cached.client_secret_expires_at,
+                    )
+                    save_token(server_url, data)
+                    log("token refreshed successfully")
+                    return data
+                except Exception as e:
+                    log(f"token refresh failed: {e}")
+                    # Clear stale token to prevent cached failure blocking retry
+                    # (#37747: failed auth state cached, preventing retry)
+                    delete_token(server_url)
 
     # 3. Full OAuth flow
     log("starting OAuth 2.1 authorization flow")
@@ -473,15 +499,18 @@ def ensure_token(
     # Dynamic Client Registration
     cid = client_id
     csecret: str | None = None
+    cse_at: float | None = None
     if not cid:
-        if cached and cached.client_id:
+        if cached and cached.client_id and not _is_client_secret_expired(cached):
             cid = cached.client_id
             csecret = cached.client_secret
+            cse_at = cached.client_secret_expires_at
         else:
             log("registering OAuth client")
             reg = register_client(metadata, redirect_uri, client)
             cid = reg.client_id
             csecret = reg.client_secret
+            cse_at = reg.client_secret_expires_at
             log(f"registered client: {cid}")
     assert cid is not None
 
@@ -552,7 +581,9 @@ def ensure_token(
         client,
         resource=server_url,
     )
-    data = _token_response_to_data(raw, metadata, cid, csecret)
+    data = _token_response_to_data(
+        raw, metadata, cid, csecret, client_secret_expires_at=cse_at
+    )
     save_token(server_url, data)
     log("OAuth token obtained and saved")
     return data
