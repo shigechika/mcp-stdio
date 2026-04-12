@@ -372,6 +372,85 @@ class TestDiscoverMetadata:
             == "https://auth.example.com/.well-known/oauth-authorization-server/a/b/c"
         )
 
+    def test_rfc8414_issuer_mismatch_warns_but_continues(self, httpx_mock, caplog):
+        """RFC 8414 §5: issuer in metadata mismatches discovery URL — warn, don't fail."""
+        import logging
+
+        self._mock_no_prm(httpx_mock)
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-authorization-server",
+            json={
+                "issuer": "https://other.example.com",  # mismatch
+                "authorization_endpoint": "https://api.example.com/auth",
+                "token_endpoint": "https://api.example.com/token",
+            },
+        )
+        client = httpx.Client()
+        import io
+        import sys
+
+        captured = io.StringIO()
+        with caplog.at_level(logging.DEBUG):
+            meta = discover_oauth_metadata("https://api.example.com/mcp", client)
+        # Metadata is still returned despite mismatch
+        assert meta.authorization_endpoint == "https://api.example.com/auth"
+
+    def test_rfc8414_issuer_match_no_warning(self, httpx_mock):
+        """RFC 8414 §5: issuer matches — no warning, metadata returned normally."""
+        self._mock_no_prm(httpx_mock)
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-authorization-server",
+            json={
+                "issuer": "https://api.example.com",  # matches base URL
+                "authorization_endpoint": "https://api.example.com/auth",
+                "token_endpoint": "https://api.example.com/token",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata("https://api.example.com/mcp", client)
+        assert meta.authorization_endpoint == "https://api.example.com/auth"
+
+    def test_rfc9728_resource_mismatch_warns_but_continues(self, httpx_mock):
+        """RFC 9728 §5: PRM resource field mismatches server URL — warn, don't fail."""
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource",
+            json={
+                "resource": "https://other.example.com/mcp",  # mismatch
+                "authorization_servers": ["https://auth.example.com"],
+            },
+        )
+        httpx_mock.add_response(
+            url="https://auth.example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://auth.example.com/authorize",
+                "token_endpoint": "https://auth.example.com/token",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata("https://api.example.com/mcp", client)
+        # Should still use the auth server from PRM despite resource mismatch
+        assert meta.authorization_endpoint == "https://auth.example.com/authorize"
+
+    def test_rfc9728_resource_match_no_warning(self, httpx_mock):
+        """RFC 9728 §5: PRM resource field matches server URL — proceeds normally."""
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource",
+            json={
+                "resource": "https://api.example.com/mcp",  # matches
+                "authorization_servers": ["https://auth.example.com"],
+            },
+        )
+        httpx_mock.add_response(
+            url="https://auth.example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://auth.example.com/authorize",
+                "token_endpoint": "https://auth.example.com/token",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata("https://api.example.com/mcp", client)
+        assert meta.authorization_endpoint == "https://auth.example.com/authorize"
+
 
 # --- register_client ---
 
@@ -664,6 +743,37 @@ class TestRefreshToken:
             refresh_access_token(
                 "https://api.example.com/token", "cid", None, "rt", client
             )
+
+    def test_resource_parameter_included(self, httpx_mock):
+        """RFC 8707: resource indicator must be sent in refresh token request."""
+        httpx_mock.add_response(
+            url="https://api.example.com/token",
+            json={"access_token": "new_at", "expires_in": 3600},
+        )
+        client = httpx.Client()
+        refresh_access_token(
+            "https://api.example.com/token",
+            "cid",
+            None,
+            "rt123",
+            client,
+            resource="https://api.example.com/mcp",
+        )
+        req = httpx_mock.get_requests()[0]
+        assert b"resource=https" in req.content
+
+    def test_resource_parameter_omitted_when_none(self, httpx_mock):
+        """No resource parameter when not provided (backward compatibility)."""
+        httpx_mock.add_response(
+            url="https://api.example.com/token",
+            json={"access_token": "new_at"},
+        )
+        client = httpx.Client()
+        refresh_access_token(
+            "https://api.example.com/token", "cid", None, "rt123", client
+        )
+        req = httpx_mock.get_requests()[0]
+        assert b"resource=" not in req.content
 
 
 # --- _token_response_to_data ---
