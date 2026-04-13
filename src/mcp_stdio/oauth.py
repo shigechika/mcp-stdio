@@ -75,13 +75,13 @@ def _fetch_authorization_server_metadata(
         resp = client.get(well_known)
         if resp.status_code == 200:
             data = resp.json()
-            # RFC 8414 §5: issuer in response must match the URL used for discovery.
+            # RFC 8414 §3: issuer in response must match the URL used for discovery.
             # Log a warning on mismatch but continue — real servers may be slightly
             # misconfigured (trailing slash, etc.) and rejecting would be too strict.
             issuer = data.get("issuer")
             if issuer and issuer.rstrip("/") != auth_server_url.rstrip("/"):
                 log(
-                    f"warning: RFC 8414 §5 issuer mismatch — "
+                    f"warning: RFC 8414 §3 issuer mismatch — "
                     f"expected {auth_server_url!r}, got {issuer!r}"
                 )
             return OAuthMetadata(
@@ -116,13 +116,13 @@ def discover_oauth_metadata(server_url: str, client: httpx.Client) -> OAuthMetad
         resp = client.get(prm_url)
         if resp.status_code == 200:
             prm_data = resp.json()
-            # RFC 9728 §5: the `resource` field in the PRM response should match
+            # RFC 9728 §3: the `resource` field in the PRM response should match
             # the server URL. Log a warning on mismatch but continue — strict
             # rejection would break servers that normalise URLs differently.
             prm_resource = prm_data.get("resource")
             if prm_resource and prm_resource.rstrip("/") != server_url.rstrip("/"):
                 log(
-                    f"warning: RFC 9728 resource mismatch — "
+                    f"warning: RFC 9728 §3 resource mismatch — "
                     f"expected {server_url!r}, got {prm_resource!r}"
                 )
             auth_servers = prm_data.get("authorization_servers")

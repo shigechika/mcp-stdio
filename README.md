@@ -24,13 +24,22 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
 ## Features
 
 - **Both MCP transports supported** — Streamable HTTP (current spec, default) and SSE (MCP 2024-11-05 legacy), selectable with `--transport`. SSE parser follows the [WHATWG Server-Sent Events spec](https://html.spec.whatwg.org/multipage/server-sent-events.html).
-- **OAuth 2.1 client** — built-in authorization code flow with PKCE, dynamic client registration, token refresh, and secure token persistence. Implements the full MCP authorization spec:
-  - [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) Protected Resource Metadata discovery
-  - [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) Authorization Server Metadata discovery (§3 path insertion for issuers with path components)
-  - [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) Resource Indicators for audience binding
-  - [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) PKCE with S256 challenge method
-  - [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591) Dynamic Client Registration (§3.2.1 `client_secret_expires_at` — auto re-register on expiry)
+- **OAuth 2.1 client** — built-in authorization code flow with PKCE, dynamic client registration, token refresh, and secure token persistence. Implements the full MCP authorization spec at the section level:
+  - [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) Protected Resource Metadata
+    - §3 discovery of authorization servers via `/.well-known/oauth-protected-resource`
+    - §3 `resource` field validation — warn on mismatch, continue
+  - [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) Authorization Server Metadata
+    - §3 well-known URL construction, including path insertion for issuers with path components
+    - §3 `issuer` validation — warn on mismatch, continue
+  - [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) Resource Indicators
+    - §2 `resource` parameter in authorization, token exchange, **and refresh** requests
+  - [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) PKCE
+    - §4.1–4.2 S256 `code_challenge_method` with a 96-char `code_verifier`
+  - [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591) Dynamic Client Registration
+    - §3 client registration request (public client with `token_endpoint_auth_method: none`)
+    - §3.2.1 `client_secret_expires_at` handling — auto re-register on expiry
   - [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) Bearer Token usage
+    - §2.1 `Authorization: Bearer <token>` request header
 - **Retry with backoff** — retries up to 3 times on connection errors
 - **Streaming resilience** — streams SSE responses in real time; auto-reconnects on mid-stream disconnect
 - **Session recovery** — resets MCP session ID on 404 and retries

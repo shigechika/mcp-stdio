@@ -374,7 +374,7 @@ class TestDiscoverMetadata:
         )
 
     def test_rfc8414_issuer_mismatch_warns_but_continues(self, httpx_mock, caplog):
-        """RFC 8414 §5: issuer in metadata mismatches discovery URL — warn, don't fail."""
+        """RFC 8414 §3: issuer in metadata mismatches discovery URL — warn, don't fail."""
         import logging
 
         self._mock_no_prm(httpx_mock)
@@ -397,7 +397,7 @@ class TestDiscoverMetadata:
         assert meta.authorization_endpoint == "https://api.example.com/auth"
 
     def test_rfc8414_issuer_match_no_warning(self, httpx_mock):
-        """RFC 8414 §5: issuer matches — no warning, metadata returned normally."""
+        """RFC 8414 §3: issuer matches — no warning, metadata returned normally."""
         self._mock_no_prm(httpx_mock)
         httpx_mock.add_response(
             url="https://api.example.com/.well-known/oauth-authorization-server",
@@ -412,7 +412,7 @@ class TestDiscoverMetadata:
         assert meta.authorization_endpoint == "https://api.example.com/auth"
 
     def test_rfc9728_resource_mismatch_warns_but_continues(self, httpx_mock):
-        """RFC 9728 §5: PRM resource field mismatches server URL — warn, don't fail."""
+        """RFC 9728 §3: PRM resource field mismatches server URL — warn, don't fail."""
         httpx_mock.add_response(
             url="https://api.example.com/.well-known/oauth-protected-resource",
             json={
@@ -433,7 +433,7 @@ class TestDiscoverMetadata:
         assert meta.authorization_endpoint == "https://auth.example.com/authorize"
 
     def test_rfc9728_resource_match_no_warning(self, httpx_mock):
-        """RFC 9728 §5: PRM resource field matches server URL — proceeds normally."""
+        """RFC 9728 §3: PRM resource field matches server URL — proceeds normally."""
         httpx_mock.add_response(
             url="https://api.example.com/.well-known/oauth-protected-resource",
             json={
