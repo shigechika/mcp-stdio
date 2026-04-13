@@ -45,7 +45,7 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
 - **Session recovery** — resets MCP session ID on 404 and retries
 - **Token refresh on 401** — automatically refreshes expired OAuth tokens mid-session
 - **Bearer token auth** — via `--bearer-token` flag or `MCP_BEARER_TOKEN` env var
-- **Custom headers** — pass any header with `-H`
+- **Custom headers** — pass any header with `-H` / `--header`
 - **Graceful shutdown** — handles SIGTERM/SIGINT
 - **Proxy support** — respects `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` env vars via [httpx](https://www.python-httpx.org/)
 - **Minimal dependencies** — only [httpx](https://www.python-httpx.org/); OAuth uses stdlib only
