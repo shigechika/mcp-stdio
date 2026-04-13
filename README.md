@@ -111,10 +111,10 @@ For legacy MCP servers using the 2024-11-05 SSE transport:
 mcp-stdio --transport sse https://your-server.example.com:8080/sse
 ```
 
-Test connectivity before use:
+Check connectivity before use:
 
 ```bash
-mcp-stdio --test https://your-server.example.com:8080/mcp
+mcp-stdio --check https://your-server.example.com:8080/mcp
 ```
 
 ## Claude Desktop Configuration
@@ -166,7 +166,7 @@ Options:
                          Transport type (default: streamable-http)
   --timeout-connect SEC  Connection timeout (default: 10)
   --timeout-read SEC     Read timeout (default: 120)
-  --test                 Test connection and exit
+  --check                Check connection and exit
   -V, --version          Show version
   -h, --help             Show help
 ```

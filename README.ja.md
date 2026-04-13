@@ -109,10 +109,10 @@ MCP 2024-11-05 レガシーの SSE トランスポートを使うサーバー向
 mcp-stdio --transport sse https://your-server.example.com:8080/sse
 ```
 
-接続テスト：
+接続確認：
 
 ```bash
-mcp-stdio --test https://your-server.example.com:8080/mcp
+mcp-stdio --check https://your-server.example.com:8080/mcp
 ```
 
 ## Claude Desktop の設定
@@ -164,7 +164,7 @@ mcp-stdio [OPTIONS] URL
                          トランスポート種別（デフォルト: streamable-http）
   --timeout-connect SEC  接続タイムアウト（デフォルト: 10秒）
   --timeout-read SEC     読み取りタイムアウト（デフォルト: 120秒）
-  --test                 接続テストして終了
+  --check                接続確認して終了
   -V, --version          バージョン表示
   -h, --help             ヘルプ表示
 ```

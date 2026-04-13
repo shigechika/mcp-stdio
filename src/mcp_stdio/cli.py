@@ -139,9 +139,16 @@ def main() -> None:
         help="Read timeout in seconds (default: 120)",
     )
     parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Check connection to the MCP server and exit",
+    )
+    parser.add_argument(
+        # Deprecated alias for --check; hidden from --help.
+        # Kept for backward compatibility with v0.4.x and earlier.
         "--test",
         action="store_true",
-        help="Test connection to the MCP server and exit",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "-V",
@@ -200,6 +207,14 @@ def main() -> None:
             client.close()
 
     if args.test:
+        print(
+            "warning: --test is deprecated and will be removed in a future "
+            "release; use --check instead",
+            file=sys.stderr,
+        )
+        args.check = True
+
+    if args.check:
         ok = check_connection(
             url=args.url,
             headers=headers,

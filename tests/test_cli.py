@@ -119,3 +119,57 @@ class TestMain:
             with pytest.raises(SystemExit) as exc_info:
                 main()
             assert exc_info.value.code == 1
+
+    def test_check_flag_invokes_check_connection(self):
+        """--check should call check_connection and exit with its result."""
+        with (
+            patch(
+                "sys.argv", ["mcp-stdio", "https://example.com/mcp", "--check"]
+            ),
+            patch("mcp_stdio.cli.check_connection", return_value=True) as mock_check,
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 0
+            assert mock_check.called
+
+    def test_test_flag_deprecated_alias_works(self, capsys):
+        """--test still works for backward compatibility but emits a deprecation warning."""
+        with (
+            patch(
+                "sys.argv", ["mcp-stdio", "https://example.com/mcp", "--test"]
+            ),
+            patch("mcp_stdio.cli.check_connection", return_value=True) as mock_check,
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 0
+            assert mock_check.called
+            captured = capsys.readouterr()
+            assert "--test is deprecated" in captured.err
+            assert "--check" in captured.err
+
+    def test_check_flag_no_deprecation_warning(self, capsys):
+        """--check (the new spelling) must NOT emit any deprecation warning."""
+        with (
+            patch(
+                "sys.argv", ["mcp-stdio", "https://example.com/mcp", "--check"]
+            ),
+            patch("mcp_stdio.cli.check_connection", return_value=True),
+        ):
+            with pytest.raises(SystemExit):
+                main()
+            captured = capsys.readouterr()
+            assert "deprecated" not in captured.err
+
+    def test_check_flag_failure_exits_nonzero(self):
+        """--check exits with code 1 when check_connection returns False."""
+        with (
+            patch(
+                "sys.argv", ["mcp-stdio", "https://example.com/mcp", "--check"]
+            ),
+            patch("mcp_stdio.cli.check_connection", return_value=False),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 1
