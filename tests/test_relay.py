@@ -12,6 +12,7 @@ from pytest_httpx import IteratorStream
 
 from mcp_stdio.relay import (
     _SseState,
+    _enforce_lf_stdio,
     _error_response,
     _extract_id,
     _post_and_stream,
@@ -20,6 +21,58 @@ from mcp_stdio.relay import (
     run,
     run_sse,
 )
+
+
+# --- _enforce_lf_stdio ---
+
+
+class TestEnforceLfStdio:
+    """Guard against python-sdk#2433: CRLF translation on Windows stdio."""
+
+    def test_noop_on_posix(self):
+        """On non-Windows, reconfigure() must NOT be called."""
+        mock_stdin = type("S", (), {"reconfigure": lambda self, **kw: None})()
+        mock_stdout = type("S", (), {"reconfigure": lambda self, **kw: None})()
+        calls = []
+        mock_stdin.reconfigure = lambda **kw: calls.append(("stdin", kw))
+        mock_stdout.reconfigure = lambda **kw: calls.append(("stdout", kw))
+        with (
+            patch("mcp_stdio.relay.sys.platform", "darwin"),
+            patch("mcp_stdio.relay.sys.stdin", mock_stdin),
+            patch("mcp_stdio.relay.sys.stdout", mock_stdout),
+        ):
+            _enforce_lf_stdio()
+        assert calls == []
+
+    def test_reconfigures_on_windows(self):
+        """On Windows, both stdin and stdout must be reconfigured to newline=''."""
+        calls = []
+
+        class FakeStream:
+            def reconfigure(self, **kw):
+                calls.append(kw)
+
+        with (
+            patch("mcp_stdio.relay.sys.platform", "win32"),
+            patch("mcp_stdio.relay.sys.stdin", FakeStream()),
+            patch("mcp_stdio.relay.sys.stdout", FakeStream()),
+        ):
+            _enforce_lf_stdio()
+        assert calls == [{"newline": ""}, {"newline": ""}]
+
+    def test_windows_without_reconfigure_is_tolerated(self):
+        """Some redirected streams lack reconfigure(); must not raise."""
+
+        class BareStream:
+            # Intentionally no reconfigure attribute
+            pass
+
+        with (
+            patch("mcp_stdio.relay.sys.platform", "win32"),
+            patch("mcp_stdio.relay.sys.stdin", BareStream()),
+            patch("mcp_stdio.relay.sys.stdout", BareStream()),
+        ):
+            _enforce_lf_stdio()  # should not raise
 
 
 # --- _extract_id ---

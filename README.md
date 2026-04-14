@@ -188,6 +188,10 @@ Works around known issues in Claude Code's HTTP transport:
 
 - **OAuth discovery fails for auth server with path** — mcp-remote does not implement the RFC 8414 §3 path insertion rule, causing OAuth metadata discovery to fail when the authorization server URL contains a path component (e.g. multi-tenant or realm-based servers) ([mcp-remote#207](https://github.com/geelen/mcp-remote/issues/207)); mcp-stdio constructs the correct well-known metadata URL.
 
+### Windows
+
+- **CRLF translation on stdio** — Python's default `TextIOWrapper` rewrites `\n` to `\r\n` on Windows, corrupting the NDJSON wire format used by MCP. mcp-stdio reconfigures `sys.stdin`/`sys.stdout` to bare LF mode so messages stay spec-compliant regardless of host OS (cf. [modelcontextprotocol/python-sdk#2433](https://github.com/modelcontextprotocol/python-sdk/issues/2433) for the same class of bug in `stdio_server`).
+
 ## How It Works
 
 1. If `--oauth` is set, obtains an access token (cached → refresh → browser flow)

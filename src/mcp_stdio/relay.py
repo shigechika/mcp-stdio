@@ -18,6 +18,24 @@ MAX_RETRIES = 3
 RETRY_DELAY = 1  # seconds
 
 
+def _enforce_lf_stdio() -> None:
+    """Force bare LF line endings on stdin/stdout.
+
+    Python's default ``TextIOWrapper`` on Windows translates ``\\n`` to
+    ``\\r\\n`` on output, which corrupts the NDJSON wire format used by
+    MCP. A no-op on POSIX where LF is already the default. See
+    modelcontextprotocol/python-sdk#2433 for the same class of bug.
+    """
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdin, sys.stdout):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(newline="")
+
+
+_enforce_lf_stdio()
+
+
 def log(msg: str) -> None:
     """Log to stderr (visible in Claude Desktop/Code logs)."""
     print(f"[mcp-stdio] {msg}", file=sys.stderr, flush=True)

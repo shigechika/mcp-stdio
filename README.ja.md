@@ -186,6 +186,10 @@ Claude Code の HTTP transport の既知の問題を回避できます：
 
 - **パス付き auth server で OAuth 検出が失敗する** — RFC 8414 §3 のパス挿入ルール未実装のため、auth server URL にパスが含まれるサーバー（マルチテナント・Keycloak 等）で検出が失敗する（[mcp-remote#207](https://github.com/geelen/mcp-remote/issues/207)）; mcp-stdio は正しい well-known URL を構築する
 
+### Windows
+
+- **stdio の CRLF 変換** — Python のデフォルトの `TextIOWrapper` は Windows で `\n` を `\r\n` に変換してしまい、MCP が使う NDJSON ワイヤーフォーマットを壊す。mcp-stdio は `sys.stdin`/`sys.stdout` を素の LF モードに設定し直して、ホスト OS に関係なくメッセージが仕様に沿うようにしている（`stdio_server` における同種のバグは [modelcontextprotocol/python-sdk#2433](https://github.com/modelcontextprotocol/python-sdk/issues/2433) を参照）。
+
 ## 仕組み
 
 1. `--oauth` 指定時、アクセストークンを取得（キャッシュ → リフレッシュ → ブラウザ認証）
