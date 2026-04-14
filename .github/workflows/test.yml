@@ -7,10 +7,18 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          # Smoke-test on Windows to guard against stdio newline regressions
+          # (cf. modelcontextprotocol/python-sdk#2433). One Python version is
+          # sufficient since the bug is platform-level, not version-specific.
+          - os: windows-latest
+            python-version: "3.12"
     steps:
       - uses: actions/checkout@v6
 
