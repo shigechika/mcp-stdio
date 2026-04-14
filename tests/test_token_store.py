@@ -2,6 +2,9 @@
 
 import os
 import stat
+import sys
+
+import pytest
 
 from mcp_stdio.token_store import TokenData, delete_token, load_token, save_token
 
@@ -75,6 +78,10 @@ class TestLoadSaveDelete:
         # Should not raise
         delete_token("https://nonexistent.com/mcp")
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX mode bits don't model the NTFS ACL Windows uses for access control",
+    )
     def test_file_permissions(self, tmp_path, monkeypatch):
         store_file = tmp_path / "tokens.json"
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
