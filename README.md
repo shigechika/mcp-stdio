@@ -27,7 +27,8 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
 - **OAuth 2.1 client** — built-in authorization code flow with PKCE, dynamic client registration, token refresh, and secure token persistence. Implements the full MCP authorization spec at the section level:
   - [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) Protected Resource Metadata
     - §3 discovery of authorization servers via `/.well-known/oauth-protected-resource`
-    - §3 `resource` field validation — warn on mismatch, continue
+    - §3.1 path-aware well-known URL construction for path-based reverse-proxy deployments, with host-root fallback
+    - §3.3 `resource` field validation — warn on mismatch, continue
   - [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) Authorization Server Metadata
     - §3 well-known URL construction, including path insertion for issuers with path components
     - §3 `issuer` validation — warn on mismatch, continue
@@ -187,6 +188,7 @@ Works around known issues in Claude Code's HTTP transport:
 ### mcp-remote
 
 - **OAuth discovery fails for auth server with path** — mcp-remote does not implement the RFC 8414 §3 path insertion rule, causing OAuth metadata discovery to fail when the authorization server URL contains a path component (e.g. multi-tenant or realm-based servers) ([mcp-remote#207](https://github.com/geelen/mcp-remote/issues/207)); mcp-stdio constructs the correct well-known metadata URL.
+- **OAuth discovery fails for MCP server behind path-based reverse proxy** — when an MCP server is mounted under a sub-path (e.g. Tailscale serve, nginx `location /mcp/`), Protected Resource Metadata must be fetched at `/.well-known/oauth-protected-resource/{path}` per RFC 9728 §3.1, not at the host root ([mcp-remote#249](https://github.com/geelen/mcp-remote/issues/249)); mcp-stdio tries the path-aware URL first and falls back to host-root for compatibility.
 
 ### Windows
 

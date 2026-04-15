@@ -102,15 +102,23 @@ class TestPKCE:
 
 
 class TestDiscoverMetadata:
-    def _mock_no_prm(self, httpx_mock, base="https://api.example.com"):
-        """Mock RFC 9728 endpoint returning 404 (no protected resource metadata)."""
+    def _mock_no_prm(self, httpx_mock, base="https://api.example.com", path="/mcp"):
+        """Mock RFC 9728 endpoints returning 404 (no protected resource metadata).
+
+        Covers both the path-aware URL (RFC 9728 §3.1) and the host-root fallback.
+        """
+        if path:
+            httpx_mock.add_response(
+                url=f"{base}/.well-known/oauth-protected-resource{path}",
+                status_code=404,
+            )
         httpx_mock.add_response(
             url=f"{base}/.well-known/oauth-protected-resource",
             status_code=404,
         )
 
     def test_from_well_known(self, httpx_mock):
-        self._mock_no_prm(httpx_mock)
+        self._mock_no_prm(httpx_mock, path="/v1/mcp")
         httpx_mock.add_response(
             url="https://api.example.com/.well-known/oauth-authorization-server",
             json={
@@ -138,7 +146,8 @@ class TestDiscoverMetadata:
         assert meta.registration_endpoint == "https://api.example.com/register"
 
     def test_fallback_on_connection_error(self, httpx_mock):
-        # ConnectError affects both PRM and AS metadata requests
+        # ConnectError affects path-aware PRM, host-root PRM, and AS metadata
+        httpx_mock.add_exception(httpx.ConnectError("refused"))
         httpx_mock.add_exception(httpx.ConnectError("refused"))
         httpx_mock.add_exception(httpx.ConnectError("refused"))
         client = httpx.Client()
@@ -206,9 +215,9 @@ class TestDiscoverMetadata:
 
     def test_rfc9728_then_rfc8414(self, httpx_mock):
         """Full discovery: RFC 9728 finds auth server, RFC 8414 gets metadata."""
-        # Phase 1: Protected Resource Metadata
+        # Phase 1: Protected Resource Metadata (RFC 9728 §3.1 path-aware URL)
         httpx_mock.add_response(
-            url="https://api.example.com/.well-known/oauth-protected-resource",
+            url="https://api.example.com/.well-known/oauth-protected-resource/mcp",
             json={
                 "resource": "https://api.example.com/mcp",
                 "authorization_servers": ["https://auth.example.com"],
@@ -230,10 +239,7 @@ class TestDiscoverMetadata:
 
     def test_rfc9728_fails_falls_through_to_rfc8414(self, httpx_mock):
         """RFC 9728 returns 404, falls through to RFC 8414 on base URL."""
-        httpx_mock.add_response(
-            url="https://api.example.com/.well-known/oauth-protected-resource",
-            status_code=404,
-        )
+        self._mock_no_prm(httpx_mock, path="/mcp")
         httpx_mock.add_response(
             url="https://api.example.com/.well-known/oauth-authorization-server",
             json={
@@ -247,12 +253,16 @@ class TestDiscoverMetadata:
 
     def test_rfc9728_non_json_404_handled(self, httpx_mock):
         """#34008 comment: non-JSON 404 from protected-resource must not crash."""
-        httpx_mock.add_response(
-            url="https://api.example.com/.well-known/oauth-protected-resource",
-            status_code=404,
-            text="<html>Not Found</html>",
-            headers={"content-type": "text/html"},
-        )
+        for prm_url in (
+            "https://api.example.com/.well-known/oauth-protected-resource/mcp",
+            "https://api.example.com/.well-known/oauth-protected-resource",
+        ):
+            httpx_mock.add_response(
+                url=prm_url,
+                status_code=404,
+                text="<html>Not Found</html>",
+                headers={"content-type": "text/html"},
+            )
         httpx_mock.add_response(
             url="https://api.example.com/.well-known/oauth-authorization-server",
             status_code=404,
@@ -265,7 +275,7 @@ class TestDiscoverMetadata:
     def test_separate_auth_server_rfc8414_fails_tries_base(self, httpx_mock):
         """RFC 9728 gives auth server, but its RFC 8414 fails — try base."""
         httpx_mock.add_response(
-            url="https://api.example.com/.well-known/oauth-protected-resource",
+            url="https://api.example.com/.well-known/oauth-protected-resource/mcp",
             json={"authorization_servers": ["https://auth.broken.com"]},
         )
         httpx_mock.add_response(
@@ -282,6 +292,32 @@ class TestDiscoverMetadata:
         client = httpx.Client()
         meta = discover_oauth_metadata("https://api.example.com/mcp", client)
         assert meta.authorization_endpoint == "https://api.example.com/authorize"
+
+    def test_rfc9728_path_based_reverse_proxy(self, httpx_mock):
+        """RFC 9728 §3.1: path-aware PRM URL for path-based reverse proxy.
+
+        Regression for the geelen/mcp-remote#249 class of bug — when an MCP
+        server is mounted under a sub-path (e.g. Tailscale serve --path /mcp),
+        PRM must be fetched at /.well-known/oauth-protected-resource/{path},
+        not at the host root.
+        """
+        httpx_mock.add_response(
+            url="https://proxy.example.com/.well-known/oauth-protected-resource/mcp/srv",
+            json={
+                "resource": "https://proxy.example.com/mcp/srv",
+                "authorization_servers": ["https://auth.example.com"],
+            },
+        )
+        httpx_mock.add_response(
+            url="https://auth.example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://auth.example.com/authorize",
+                "token_endpoint": "https://auth.example.com/token",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata("https://proxy.example.com/mcp/srv", client)
+        assert meta.authorization_endpoint == "https://auth.example.com/authorize"
 
     def test_null_registration_endpoint(self, httpx_mock):
         """#38102: registration_endpoint: null should not crash."""
@@ -324,7 +360,7 @@ class TestDiscoverMetadata:
         """
         # Phase 1: RFC 9728 returns auth server URL with path
         httpx_mock.add_response(
-            url="https://api.example.com/.well-known/oauth-protected-resource",
+            url="https://api.example.com/.well-known/oauth-protected-resource/mcp",
             json={
                 "resource": "https://api.example.com/mcp",
                 "authorization_servers": ["https://auth.example.com/v2"],
@@ -414,7 +450,7 @@ class TestDiscoverMetadata:
     def test_rfc9728_resource_mismatch_warns_but_continues(self, httpx_mock):
         """RFC 9728 §3: PRM resource field mismatches server URL — warn, don't fail."""
         httpx_mock.add_response(
-            url="https://api.example.com/.well-known/oauth-protected-resource",
+            url="https://api.example.com/.well-known/oauth-protected-resource/mcp",
             json={
                 "resource": "https://other.example.com/mcp",  # mismatch
                 "authorization_servers": ["https://auth.example.com"],
@@ -435,7 +471,7 @@ class TestDiscoverMetadata:
     def test_rfc9728_resource_match_no_warning(self, httpx_mock):
         """RFC 9728 §3: PRM resource field matches server URL — proceeds normally."""
         httpx_mock.add_response(
-            url="https://api.example.com/.well-known/oauth-protected-resource",
+            url="https://api.example.com/.well-known/oauth-protected-resource/mcp",
             json={
                 "resource": "https://api.example.com/mcp",  # matches
                 "authorization_servers": ["https://auth.example.com"],
@@ -1287,6 +1323,10 @@ class TestEnsureToken:
         )
         # Discovery for full flow (will be attempted after refresh fails)
         httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource/mcp",
+            status_code=404,
+        )
+        httpx_mock.add_response(
             url="https://example.com/.well-known/oauth-protected-resource",
             status_code=404,
         )
@@ -1313,6 +1353,10 @@ class TestEnsureToken:
         monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
 
         # Discovery
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource/mcp",
+            status_code=404,
+        )
         httpx_mock.add_response(
             url="https://example.com/.well-known/oauth-protected-resource",
             status_code=404,
@@ -1391,6 +1435,10 @@ class TestClientSecretExpiry:
         )
 
         # Discovery for full flow (which will run after refresh is skipped)
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource/mcp",
+            status_code=404,
+        )
         httpx_mock.add_response(
             url="https://example.com/.well-known/oauth-protected-resource",
             status_code=404,
@@ -1482,6 +1530,10 @@ class TestClientSecretExpiry:
         )
 
         # Discovery
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource/mcp",
+            status_code=404,
+        )
         httpx_mock.add_response(
             url="https://example.com/.well-known/oauth-protected-resource",
             status_code=404,

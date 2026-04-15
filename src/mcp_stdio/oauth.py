@@ -47,20 +47,27 @@ def _authorization_base_url(server_url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def _build_metadata_url(issuer: str) -> str:
-    """Build the RFC 8414 Section 3 well-known metadata URL for an issuer.
+def _build_well_known_url(resource_url: str, suffix: str) -> str:
+    """Build a well-known URL by inserting the suffix between host and path.
 
-    If the issuer has a path component, the well-known string is inserted
-    *before* the path (not appended):
-      https://auth.example.com/v2 -> https://auth.example.com/.well-known/oauth-authorization-server/v2
-    If no path:
-      https://auth.example.com -> https://auth.example.com/.well-known/oauth-authorization-server
+    Used for both RFC 8414 §3 (oauth-authorization-server) and RFC 9728 §3.1
+    (oauth-protected-resource). When the resource URL has a path component, the
+    well-known string is inserted *before* the path (not appended):
+      https://host/v2 + oauth-authorization-server ->
+        https://host/.well-known/oauth-authorization-server/v2
+      https://host + oauth-protected-resource ->
+        https://host/.well-known/oauth-protected-resource
     """
-    parsed = urlparse(issuer)
+    parsed = urlparse(resource_url)
     path = parsed.path.rstrip("/")
     if path:
-        return f"{parsed.scheme}://{parsed.netloc}/.well-known/oauth-authorization-server{path}"
-    return f"{parsed.scheme}://{parsed.netloc}/.well-known/oauth-authorization-server"
+        return f"{parsed.scheme}://{parsed.netloc}/.well-known/{suffix}{path}"
+    return f"{parsed.scheme}://{parsed.netloc}/.well-known/{suffix}"
+
+
+def _build_metadata_url(issuer: str) -> str:
+    """RFC 8414 §3 well-known metadata URL for an issuer (back-compat shim)."""
+    return _build_well_known_url(issuer, "oauth-authorization-server")
 
 
 def _fetch_authorization_server_metadata(
@@ -109,28 +116,44 @@ def discover_oauth_metadata(server_url: str, client: httpx.Client) -> OAuthMetad
     """
     base = _authorization_base_url(server_url)
 
-    # Phase 1: RFC 9728 Protected Resource Metadata
+    # Phase 1: RFC 9728 Protected Resource Metadata.
+    # Per RFC 9728 §3.1, the well-known URI is inserted between host and path
+    # components of the resource identifier. Try the path-aware URL first for
+    # path-based reverse-proxy deployments (cf. geelen/mcp-remote#249), then
+    # fall back to host-root for servers that publish PRM at the origin.
     auth_server_url = base
-    prm_url = f"{base}/.well-known/oauth-protected-resource"
-    try:
-        resp = client.get(prm_url)
-        if resp.status_code == 200:
+    prm_candidates: list[str] = []
+    path_aware = _build_well_known_url(server_url, "oauth-protected-resource")
+    host_root = f"{base}/.well-known/oauth-protected-resource"
+    prm_candidates.append(path_aware)
+    if host_root != path_aware:
+        prm_candidates.append(host_root)
+
+    for prm_url in prm_candidates:
+        try:
+            resp = client.get(prm_url)
+        except Exception:
+            continue
+        if resp.status_code != 200:
+            continue
+        try:
             prm_data = resp.json()
-            # RFC 9728 §3: the `resource` field in the PRM response should match
-            # the server URL. Log a warning on mismatch but continue — strict
-            # rejection would break servers that normalise URLs differently.
-            prm_resource = prm_data.get("resource")
-            if prm_resource and prm_resource.rstrip("/") != server_url.rstrip("/"):
-                log(
-                    f"warning: RFC 9728 §3 resource mismatch — "
-                    f"expected {server_url!r}, got {prm_resource!r}"
-                )
-            auth_servers = prm_data.get("authorization_servers")
-            if auth_servers and isinstance(auth_servers, list):
-                auth_server_url = auth_servers[0]
-                log(f"discovered authorization server: {auth_server_url}")
-    except Exception:
-        pass
+        except Exception:
+            continue
+        # RFC 9728 §3.3: the `resource` field in the PRM response should match
+        # the server URL. Log a warning on mismatch but continue — strict
+        # rejection would break servers that normalise URLs differently.
+        prm_resource = prm_data.get("resource")
+        if prm_resource and prm_resource.rstrip("/") != server_url.rstrip("/"):
+            log(
+                f"warning: RFC 9728 §3.3 resource mismatch — "
+                f"expected {server_url!r}, got {prm_resource!r}"
+            )
+        auth_servers = prm_data.get("authorization_servers")
+        if auth_servers and isinstance(auth_servers, list):
+            auth_server_url = auth_servers[0]
+            log(f"discovered authorization server: {auth_server_url}")
+        break
 
     # Phase 2: RFC 8414 Authorization Server Metadata
     meta = _fetch_authorization_server_metadata(auth_server_url, client)
