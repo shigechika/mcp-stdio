@@ -12,7 +12,7 @@ import webbrowser
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlsplit, urlunsplit
 
 import httpx
 
@@ -51,18 +51,19 @@ def _build_well_known_url(resource_url: str, suffix: str) -> str:
     """Build a well-known URL by inserting the suffix between host and path.
 
     Used for both RFC 8414 §3 (oauth-authorization-server) and RFC 9728 §3.1
-    (oauth-protected-resource). When the resource URL has a path component, the
-    well-known string is inserted *before* the path (not appended):
-      https://host/v2 + oauth-authorization-server ->
-        https://host/.well-known/oauth-authorization-server/v2
+    (oauth-protected-resource). Per RFC 9728 §3.1, the well-known suffix is
+    inserted between the host component and the path and/or query components
+    of the resource identifier; any terminating slash following the host is
+    removed first. The query string is preserved on the constructed URL:
+      https://host/v2?t=1 + oauth-authorization-server ->
+        https://host/.well-known/oauth-authorization-server/v2?t=1
       https://host + oauth-protected-resource ->
         https://host/.well-known/oauth-protected-resource
     """
-    parsed = urlparse(resource_url)
+    parsed = urlsplit(resource_url)
     path = parsed.path.rstrip("/")
-    if path:
-        return f"{parsed.scheme}://{parsed.netloc}/.well-known/{suffix}{path}"
-    return f"{parsed.scheme}://{parsed.netloc}/.well-known/{suffix}"
+    well_known_path = f"/.well-known/{suffix}{path}"
+    return urlunsplit((parsed.scheme, parsed.netloc, well_known_path, parsed.query, ""))
 
 
 def _build_metadata_url(issuer: str) -> str:

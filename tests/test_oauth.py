@@ -319,6 +319,31 @@ class TestDiscoverMetadata:
         meta = discover_oauth_metadata("https://proxy.example.com/mcp/srv", client)
         assert meta.authorization_endpoint == "https://auth.example.com/authorize"
 
+    def test_rfc9728_preserves_query_component(self, httpx_mock):
+        """RFC 9728 §3.1: well-known suffix inserted between host and path+query.
+
+        The resource identifier's query component must be preserved on the
+        constructed metadata URL. mcp-stdio is (as of this test) the only
+        MCP client that honours this corner of §3.1.
+        """
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource/mcp?tenant=t1",
+            json={
+                "resource": "https://api.example.com/mcp?tenant=t1",
+                "authorization_servers": ["https://auth.example.com"],
+            },
+        )
+        httpx_mock.add_response(
+            url="https://auth.example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://auth.example.com/authorize",
+                "token_endpoint": "https://auth.example.com/token",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata("https://api.example.com/mcp?tenant=t1", client)
+        assert meta.authorization_endpoint == "https://auth.example.com/authorize"
+
     def test_null_registration_endpoint(self, httpx_mock):
         """#38102: registration_endpoint: null should not crash."""
         self._mock_no_prm(httpx_mock)
