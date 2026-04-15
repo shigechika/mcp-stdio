@@ -27,7 +27,7 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
 - **OAuth 2.1 client** — built-in authorization code flow with PKCE, dynamic client registration, token refresh, and secure token persistence. Implements the full MCP authorization spec at the section level:
   - [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) Protected Resource Metadata
     - §3 discovery of authorization servers via `/.well-known/oauth-protected-resource`
-    - §3.1 path-aware well-known URL construction for path-based reverse-proxy deployments, with host-root fallback. Preserves the resource URL's query component on the constructed metadata URL — a corner of §3.1 that, as of v0.4.6, no other MCP SDK honours.
+    - §3.1 path-aware well-known URL construction for path-based reverse-proxy deployments, with host-root fallback; preserves the resource URL's query component on the constructed metadata URL
     - §3.3 `resource` field validation — warn on mismatch, continue
   - [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) Authorization Server Metadata
     - §3 well-known URL construction, including path insertion for issuers with path components
