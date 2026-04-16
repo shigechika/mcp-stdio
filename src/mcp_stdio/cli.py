@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import time
 from typing import Callable
 
 import httpx
@@ -39,12 +38,7 @@ def _build_token_refresher(
     """
 
     def refresher() -> dict[str, str] | None:
-        from .oauth import refresh_access_token
-        from .token_store import load_token, save_token
-
-        cached = load_token(server_url)
-        if not cached or not cached.refresh_token or not cached.token_endpoint:
-            return None
+        from .oauth import refresh_cached_token
 
         client = httpx.Client(
             timeout=httpx.Timeout(
@@ -52,28 +46,12 @@ def _build_token_refresher(
             )
         )
         try:
-            raw = refresh_access_token(
-                cached.token_endpoint,
-                cached.client_id or "",
-                cached.client_secret,
-                cached.refresh_token,
-                client,
-            )
-            # Update stored token
-            cached.access_token = raw["access_token"]
-            if "refresh_token" in raw:
-                cached.refresh_token = raw["refresh_token"]
-            if "expires_in" in raw:
-                cached.expires_at = time.time() + raw["expires_in"]
-            save_token(server_url, cached)
-
+            data = refresh_cached_token(server_url, client)
+            if data is None:
+                return None
             new_headers = dict(headers)
-            new_headers["Authorization"] = f"Bearer {cached.access_token}"
-            log("token refreshed successfully")
+            new_headers["Authorization"] = f"Bearer {data.access_token}"
             return new_headers
-        except Exception as e:
-            log(f"token refresh failed: {e}")
-            return None
         finally:
             client.close()
 

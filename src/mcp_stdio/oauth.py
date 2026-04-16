@@ -66,11 +66,6 @@ def _build_well_known_url(resource_url: str, suffix: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, well_known_path, parsed.query, ""))
 
 
-def _build_metadata_url(issuer: str) -> str:
-    """RFC 8414 §3 well-known metadata URL for an issuer (back-compat shim)."""
-    return _build_well_known_url(issuer, "oauth-authorization-server")
-
-
 def _fetch_authorization_server_metadata(
     auth_server_url: str, client: httpx.Client
 ) -> OAuthMetadata | None:
@@ -78,7 +73,7 @@ def _fetch_authorization_server_metadata(
 
     Returns None on any failure (404, invalid JSON, connection error).
     """
-    well_known = _build_metadata_url(auth_server_url)
+    well_known = _build_well_known_url(auth_server_url, "oauth-authorization-server")
     try:
         resp = client.get(well_known)
         if resp.status_code == 200:
@@ -444,6 +439,61 @@ def _token_response_to_data(
     )
 
 
+def refresh_cached_token(
+    server_url: str, client: httpx.Client
+) -> TokenData | None:
+    """Refresh the cached token for a server using its stored refresh_token.
+
+    Returns updated TokenData on success, or None if no usable cached token
+    exists (missing refresh_token / endpoint / client_id, or expired
+    client_secret per RFC 7591 §3.2.1) or the refresh request fails. The
+    refresh request always includes the RFC 8707 resource indicator.
+
+    Does not delete stale tokens on failure — callers decide the retry
+    policy.
+    """
+    cached = load_token(server_url)
+    if not (
+        cached
+        and cached.refresh_token
+        and cached.token_endpoint
+        and cached.client_id
+    ):
+        return None
+    if _is_client_secret_expired(cached):
+        log("OAuth client_secret expired (RFC 7591 §3.2.1) — cannot refresh")
+        return None
+    log("access token expired, attempting refresh")
+    try:
+        raw = refresh_access_token(
+            cached.token_endpoint,
+            cached.client_id,
+            cached.client_secret,
+            cached.refresh_token,
+            client,
+            resource=server_url,
+        )
+    except Exception as e:
+        log(f"token refresh failed: {e}")
+        return None
+    metadata = OAuthMetadata(
+        authorization_endpoint=cached.authorization_endpoint,
+        token_endpoint=cached.token_endpoint,
+        registration_endpoint=cached.registration_endpoint,
+    )
+    data = _token_response_to_data(
+        raw,
+        metadata,
+        cached.client_id,
+        cached.client_secret,
+        previous_refresh_token=cached.refresh_token,
+        client_secret_expires_at=cached.client_secret_expires_at,
+    )
+    save_token(server_url, data)
+    log("token refreshed successfully")
+    return data
+
+
 def ensure_token(
     server_url: str,
     client: httpx.Client,
@@ -469,44 +519,13 @@ def ensure_token(
 
         # 2. Try refresh (skip if client_secret has expired per RFC 7591 §3.2.1)
         if cached.refresh_token and cached.token_endpoint and cached.client_id:
-            if _is_client_secret_expired(cached):
-                log(
-                    "OAuth client_secret expired (RFC 7591) — "
-                    "skipping refresh, will re-register"
-                )
-                delete_token(server_url)
-            else:
-                log("access token expired, attempting refresh")
-                try:
-                    raw = refresh_access_token(
-                        cached.token_endpoint,
-                        cached.client_id,
-                        cached.client_secret,
-                        cached.refresh_token,
-                        client,
-                        resource=server_url,
-                    )
-                    metadata = OAuthMetadata(
-                        authorization_endpoint=cached.authorization_endpoint,
-                        token_endpoint=cached.token_endpoint,
-                        registration_endpoint=cached.registration_endpoint,
-                    )
-                    data = _token_response_to_data(
-                        raw,
-                        metadata,
-                        cached.client_id,
-                        cached.client_secret,
-                        previous_refresh_token=cached.refresh_token,
-                        client_secret_expires_at=cached.client_secret_expires_at,
-                    )
-                    save_token(server_url, data)
-                    log("token refreshed successfully")
-                    return data
-                except Exception as e:
-                    log(f"token refresh failed: {e}")
-                    # Clear stale token to prevent cached failure blocking retry
-                    # (#37747: failed auth state cached, preventing retry)
-                    delete_token(server_url)
+            refreshed = refresh_cached_token(server_url, client)
+            if refreshed:
+                return refreshed
+            # Refresh failed or was skipped — clear stale token so the full
+            # flow below isn't blocked by cached failure state
+            # (cf. anthropics/claude-code#37747).
+            delete_token(server_url)
 
     # 3. Full OAuth flow
     log("starting OAuth 2.1 authorization flow")

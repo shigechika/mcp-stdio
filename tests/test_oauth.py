@@ -13,7 +13,7 @@ from mcp_stdio.oauth import (
     CallbackResult,
     OAuthMetadata,
     _authorization_base_url,
-    _build_metadata_url,
+    _build_well_known_url,
     _is_client_secret_expired,
     _make_callback_handler,
     _parse_token_response,
@@ -23,6 +23,7 @@ from mcp_stdio.oauth import (
     exchange_code,
     generate_pkce,
     refresh_access_token,
+    refresh_cached_token,
     register_client,
 )
 from mcp_stdio.token_store import TokenData
@@ -406,31 +407,39 @@ class TestDiscoverMetadata:
         assert meta.token_endpoint == "https://auth.example.com/v2/token"
         assert meta.registration_endpoint == "https://auth.example.com/v2/register"
 
-    def test_build_metadata_url_no_path(self):
-        """_build_metadata_url: issuer without path."""
+    def test_build_well_known_url_no_path(self):
+        """_build_well_known_url: issuer without path."""
         assert (
-            _build_metadata_url("https://auth.example.com")
+            _build_well_known_url(
+                "https://auth.example.com", "oauth-authorization-server"
+            )
             == "https://auth.example.com/.well-known/oauth-authorization-server"
         )
 
-    def test_build_metadata_url_with_path(self):
-        """_build_metadata_url: issuer with path uses RFC 8414 Section 3 path insertion."""
+    def test_build_well_known_url_with_path(self):
+        """RFC 8414 §3 / RFC 9728 §3.1: suffix inserted between host and path."""
         assert (
-            _build_metadata_url("https://auth.example.com/v2")
+            _build_well_known_url(
+                "https://auth.example.com/v2", "oauth-authorization-server"
+            )
             == "https://auth.example.com/.well-known/oauth-authorization-server/v2"
         )
 
-    def test_build_metadata_url_with_trailing_slash(self):
-        """_build_metadata_url: trailing slash on issuer path is stripped."""
+    def test_build_well_known_url_with_trailing_slash(self):
+        """_build_well_known_url: trailing slash on path is stripped."""
         assert (
-            _build_metadata_url("https://auth.example.com/v2/")
+            _build_well_known_url(
+                "https://auth.example.com/v2/", "oauth-authorization-server"
+            )
             == "https://auth.example.com/.well-known/oauth-authorization-server/v2"
         )
 
-    def test_build_metadata_url_deep_path(self):
-        """_build_metadata_url: multi-segment path is preserved."""
+    def test_build_well_known_url_deep_path(self):
+        """_build_well_known_url: multi-segment path is preserved."""
         assert (
-            _build_metadata_url("https://auth.example.com/a/b/c")
+            _build_well_known_url(
+                "https://auth.example.com/a/b/c", "oauth-authorization-server"
+            )
             == "https://auth.example.com/.well-known/oauth-authorization-server/a/b/c"
         )
 
@@ -890,6 +899,80 @@ class TestRefreshToken:
         )
         req = httpx_mock.get_requests()[0]
         assert b"resource=" not in req.content
+
+
+# --- refresh_cached_token ---
+
+
+class TestRefreshCachedToken:
+    """High-level refresh wrapper used by both ensure_token and the
+    relay loop's 401 handler. Guards that resource indicator (RFC 8707)
+    is sent regardless of call site — a regression previously let the
+    relay path skip it."""
+
+    def test_sends_rfc8707_resource_indicator(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        from mcp_stdio.token_store import save_token
+
+        save_token(
+            "https://api.example.com/mcp",
+            TokenData(
+                access_token="old_at",
+                refresh_token="rt123",
+                expires_at=time.time() - 10,
+                client_id="cid",
+                token_endpoint="https://auth.example.com/token",
+                authorization_endpoint="https://auth.example.com/authorize",
+            ),
+        )
+        httpx_mock.add_response(
+            url="https://auth.example.com/token",
+            json={"access_token": "new_at", "expires_in": 3600},
+        )
+        client = httpx.Client()
+        data = refresh_cached_token("https://api.example.com/mcp", client)
+        assert data is not None
+        assert data.access_token == "new_at"
+        req = httpx_mock.get_requests()[0]
+        assert b"resource=https%3A%2F%2Fapi.example.com%2Fmcp" in req.content
+
+    def test_returns_none_when_no_cached_token(self, tmp_path, monkeypatch):
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        client = httpx.Client()
+        assert refresh_cached_token("https://api.example.com/mcp", client) is None
+
+    def test_returns_none_when_client_secret_expired(
+        self, tmp_path, monkeypatch
+    ):
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        from mcp_stdio.token_store import save_token
+
+        save_token(
+            "https://api.example.com/mcp",
+            TokenData(
+                access_token="old_at",
+                refresh_token="rt123",
+                expires_at=time.time() - 10,
+                client_id="cid",
+                client_secret="csec",
+                client_secret_expires_at=time.time() - 1,  # expired
+                token_endpoint="https://auth.example.com/token",
+                authorization_endpoint="https://auth.example.com/authorize",
+            ),
+        )
+        client = httpx.Client()
+        assert refresh_cached_token("https://api.example.com/mcp", client) is None
 
 
 # --- _token_response_to_data ---
