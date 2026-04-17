@@ -15,9 +15,11 @@ from mcp_stdio.oauth import (
     _authorization_base_url,
     _build_well_known_url,
     _is_client_secret_expired,
+    _is_loopback,
     _make_callback_handler,
     _parse_token_response,
     _token_response_to_data,
+    _validate_auth_server_url,
     discover_oauth_metadata,
     ensure_token,
     exchange_code,
@@ -2039,3 +2041,140 @@ class TestStepUpAuthorize:
         client = httpx.Client()
         data = step_up_authorize(self.SERVER_URL, client, "hr:read", timeout=5)
         assert data.access_token == "upgraded_at"
+
+
+# --- RFC 9728 authorization_server validation (SSRF hardening, #13) ---
+
+
+class TestIsLoopback:
+    def test_localhost(self):
+        assert _is_loopback("localhost") is True
+        assert _is_loopback("LOCALHOST") is True
+
+    def test_ipv4_loopback(self):
+        assert _is_loopback("127.0.0.1") is True
+
+    def test_ipv6_loopback(self):
+        assert _is_loopback("::1") is True
+
+    def test_public_hosts_are_not_loopback(self):
+        assert _is_loopback("example.com") is False
+        assert _is_loopback("auth.example.com") is False
+        assert _is_loopback("10.0.0.1") is False  # RFC 1918 is NOT loopback
+        assert _is_loopback("") is False
+
+
+class TestValidateAuthServerUrl:
+    SERVER_URL = "https://mcp.example.com/mcp"
+
+    def test_same_origin_https_accepted(self, capsys):
+        assert (
+            _validate_auth_server_url(
+                "https://mcp.example.com/authorize", self.SERVER_URL
+            )
+            is True
+        )
+        # No cross-origin warning on same-netloc
+        assert "cross-origin" not in capsys.readouterr().err
+
+    def test_cross_origin_https_accepted_with_warning(self, capsys):
+        """RFC 9728 §2 permits federation; warn loudly but don't block."""
+        assert (
+            _validate_auth_server_url(
+                "https://auth.example.com/authorize", self.SERVER_URL
+            )
+            is True
+        )
+        err = capsys.readouterr().err
+        assert "cross-origin" in err
+
+    def test_plaintext_http_to_public_host_rejected(self, capsys):
+        assert (
+            _validate_auth_server_url(
+                "http://evil.example.net/authorize", self.SERVER_URL
+            )
+            is False
+        )
+        err = capsys.readouterr().err
+        assert "cleartext" in err or "non-loopback" in err
+
+    def test_plaintext_http_to_loopback_accepted(self):
+        """Local development servers commonly use http://localhost."""
+        assert (
+            _validate_auth_server_url(
+                "http://localhost:8080/authorize", self.SERVER_URL
+            )
+            is True
+        )
+        assert (
+            _validate_auth_server_url(
+                "http://127.0.0.1:9000/authorize", self.SERVER_URL
+            )
+            is True
+        )
+
+    def test_non_http_scheme_rejected(self, capsys):
+        for bad in (
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "ftp://ftp.example.com/",
+            "data:text/html,<script>",
+        ):
+            assert _validate_auth_server_url(bad, self.SERVER_URL) is False
+        err = capsys.readouterr().err
+        assert "unsupported" in err or "ignoring" in err
+
+    def test_malformed_url_rejected(self):
+        assert _validate_auth_server_url("", self.SERVER_URL) is False
+
+    def test_discover_skips_plaintext_auth_server_and_tries_fallback(
+        self, httpx_mock
+    ):
+        """End-to-end: PRM advertises an HTTP auth server → validation
+        rejects → discovery falls back to the base host for AS metadata."""
+        server_url = "https://mcp.example.com/mcp"
+        httpx_mock.add_response(
+            url="https://mcp.example.com/.well-known/oauth-protected-resource/mcp",
+            json={
+                "resource": server_url,
+                "authorization_servers": ["http://evil.example.net/authorize"],
+            },
+        )
+        httpx_mock.add_response(
+            url="https://mcp.example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://mcp.example.com/authorize",
+                "token_endpoint": "https://mcp.example.com/token",
+            },
+        )
+
+        client = httpx.Client()
+        meta = discover_oauth_metadata(server_url, client)
+        assert meta.authorization_endpoint == "https://mcp.example.com/authorize"
+
+        urls = [str(r.url) for r in httpx_mock.get_requests()]
+        assert not any("evil.example.net" in u for u in urls)
+
+    def test_discover_accepts_second_valid_entry(self, httpx_mock):
+        """First entry invalid → try the next one."""
+        server_url = "https://mcp.example.com/mcp"
+        httpx_mock.add_response(
+            url="https://mcp.example.com/.well-known/oauth-protected-resource/mcp",
+            json={
+                "resource": server_url,
+                "authorization_servers": [
+                    "http://evil.example.net/authorize",
+                    "https://auth.example.com",
+                ],
+            },
+        )
+        httpx_mock.add_response(
+            url="https://auth.example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://auth.example.com/authorize",
+                "token_endpoint": "https://auth.example.com/token",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata(server_url, client)
+        assert meta.authorization_endpoint == "https://auth.example.com/authorize"

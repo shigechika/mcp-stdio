@@ -47,6 +47,65 @@ def _authorization_base_url(server_url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
+# Loopback hostnames per RFC 6761. HTTP against these is tolerated for local
+# development; HTTP against anything else is rejected when it would send the
+# user's authorization code over the wire in cleartext.
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _is_loopback(host: str) -> bool:
+    """Return True for loopback hostnames per RFC 6761."""
+    if not host:
+        return False
+    return host.lower() in _LOOPBACK_HOSTS
+
+
+def _validate_auth_server_url(auth_server_url: str, mcp_server_url: str) -> bool:
+    """Validate a PRM-advertised authorization_server URL.
+
+    Rejects the URL (returns False and logs a warning) when the scheme is
+    not ``https://`` and the host is not loopback — a malicious MCP server
+    could otherwise redirect the OAuth flow over plaintext HTTP and capture
+    the resulting tokens. Cross-origin authorization servers are permitted
+    by RFC 9728 §2 for federated setups; they produce a prominent warning
+    so the user can abort before the browser opens. See #13.
+    """
+    try:
+        parsed = urlparse(auth_server_url)
+    except Exception:
+        log(
+            f"warning: malformed authorization_server URL "
+            f"{auth_server_url!r}, ignoring"
+        )
+        return False
+
+    if parsed.scheme not in ("https", "http"):
+        log(
+            f"warning: unsupported authorization_server scheme "
+            f"{parsed.scheme!r} in {auth_server_url!r}, ignoring"
+        )
+        return False
+
+    if parsed.scheme == "http" and not _is_loopback(parsed.hostname or ""):
+        log(
+            f"warning: refusing to follow non-loopback HTTP "
+            f"authorization_server {auth_server_url!r} — OAuth tokens "
+            f"would traverse the wire in cleartext. Ignoring. See #13."
+        )
+        return False
+
+    mcp_parsed = urlparse(mcp_server_url)
+    if parsed.netloc and mcp_parsed.netloc and parsed.netloc != mcp_parsed.netloc:
+        log(
+            f"warning: authorization_server {auth_server_url!r} is "
+            f"cross-origin to the MCP server {mcp_server_url!r}. "
+            f"Tokens will be issued by a different host than the one "
+            f"serving MCP. Abort if you did not expect federation."
+        )
+
+    return True
+
+
 def _build_well_known_url(resource_url: str, suffix: str) -> str:
     """Build a well-known URL by inserting the suffix between host and path.
 
@@ -147,8 +206,17 @@ def discover_oauth_metadata(server_url: str, client: httpx.Client) -> OAuthMetad
             )
         auth_servers = prm_data.get("authorization_servers")
         if auth_servers and isinstance(auth_servers, list):
-            auth_server_url = auth_servers[0]
-            log(f"discovered authorization server: {auth_server_url}")
+            # Walk the list and pick the first entry that passes validation.
+            # A malicious or misconfigured MCP server might otherwise send
+            # us at a plaintext / cross-origin authorization server we
+            # should never follow. See #13.
+            for candidate in auth_servers:
+                if isinstance(candidate, str) and _validate_auth_server_url(
+                    candidate, server_url
+                ):
+                    auth_server_url = candidate
+                    log(f"discovered authorization server: {auth_server_url}")
+                    break
         break
 
     # Phase 2: RFC 8414 Authorization Server Metadata
