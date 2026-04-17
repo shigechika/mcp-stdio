@@ -274,7 +274,18 @@ def _make_callback_handler(
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
-            params = parse_qs(urlparse(self.path).query)
+            # Reject everything that isn't the registered redirect_uri path.
+            # Browser prefetch / favicon / stray tabs on 127.0.0.1 would
+            # otherwise land in this handler and — if they happened to
+            # carry `code` and `state` — be treated as the authoritative
+            # authorization response. See #15.
+            parsed = urlparse(self.path)
+            if parsed.path != "/callback":
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            params = parse_qs(parsed.query)
 
             if "error" in params:
                 result.error = params["error"][0]
