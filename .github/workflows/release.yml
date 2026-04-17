@@ -129,21 +129,13 @@ jobs:
           mcp-publisher login github-oidc
           mcp-publisher publish
 
-  github-release:
-    needs: publish
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" --generate-notes
+  # The GitHub Release itself is created by the release-please workflow
+  # when its generated release PR is merged. This pipeline only needs to
+  # react to the tag release-please pushes: publish to PyPI, MCP Registry,
+  # and the homebrew tap.
 
   notify-homebrew:
-    needs: github-release
+    needs: [publish, mcp-registry]
     runs-on: ubuntu-latest
     steps:
       - name: Trigger homebrew-tap update
