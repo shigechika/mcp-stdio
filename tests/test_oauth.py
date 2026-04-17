@@ -1454,6 +1454,131 @@ class TestEnsureToken:
         # Verify stale token was cleared
         assert load_token("https://example.com/mcp") is None
 
+    def test_double_401_recovers_via_full_flow(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """mcp-remote #256 regression: when both access_token and refresh_token
+        are invalid server-side, the full authorization flow must run and
+        exchange the new code. mcp-remote gets stuck because the callback code
+        is received but POST /token is never called; mcp-stdio must drive the
+        code exchange to completion."""
+        from urllib.parse import parse_qs, urlparse
+        from urllib.request import urlopen
+
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        from mcp_stdio.token_store import load_token, save_token
+
+        # Both access and refresh tokens stale (e.g. revoked server-side after
+        # 30 days of inactivity, matching the mcp-remote #256 scenario).
+        save_token(
+            "https://example.com/mcp",
+            TokenData(
+                access_token="stale_at",
+                expires_at=time.time() - 100,
+                refresh_token="stale_rt",
+                client_id="cached_cid",
+                token_endpoint="https://example.com/token",
+                authorization_endpoint="https://example.com/authorize",
+                registration_endpoint="https://example.com/register",
+            ),
+        )
+
+        # Step 1: refresh_token is rejected by the server.
+        httpx_mock.add_response(
+            url="https://example.com/token",
+            status_code=400,
+            json={"error": "invalid_grant"},
+            match_content=b"grant_type=refresh_token&refresh_token=stale_rt"
+            b"&client_id=cached_cid&resource=https%3A%2F%2Fexample.com%2Fmcp",
+        )
+        # Step 2: discovery for the full flow.
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource/mcp",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://example.com/authorize",
+                "token_endpoint": "https://example.com/token",
+                "registration_endpoint": "https://example.com/register",
+            },
+        )
+        # Step 3: the code exchange that mcp-remote #256 never reaches.
+        httpx_mock.add_response(
+            url="https://example.com/token",
+            json={
+                "access_token": "fresh_at",
+                "refresh_token": "fresh_rt",
+                "expires_in": 3600,
+            },
+            match_content=None,  # matched by the preceding refresh mock first
+        )
+
+        # Simulate the user completing the browser auth: when webbrowser.open
+        # is called, hit the local callback server with a code + the state
+        # parameter from the authorization URL.
+        def fake_open(auth_url: str) -> bool:
+            q = parse_qs(urlparse(auth_url).query)
+            redirect_uri = q["redirect_uri"][0]
+            state = q["state"][0]
+
+            def hit_callback() -> None:
+                cb_url = f"{redirect_uri}?code=the_code&state={state}"
+                try:
+                    urlopen(cb_url, timeout=5).read()
+                except Exception:
+                    pass
+
+            threading.Thread(target=hit_callback, daemon=True).start()
+            return True
+
+        monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", fake_open)
+
+        client = httpx.Client()
+        data = ensure_token("https://example.com/mcp", client, timeout=5)
+
+        # Full recovery — the new tokens from the code exchange are returned.
+        assert data.access_token == "fresh_at"
+        assert data.refresh_token == "fresh_rt"
+
+        # Both /token POSTs must have happened in order: failed refresh, then
+        # authorization_code exchange. Missing the second call is exactly the
+        # mcp-remote #256 symptom.
+        token_calls = [
+            r
+            for r in httpx_mock.get_requests()
+            if str(r.url) == "https://example.com/token"
+        ]
+        assert len(token_calls) == 2
+        assert b"grant_type=refresh_token" in token_calls[0].content
+        assert b"grant_type=authorization_code" in token_calls[1].content
+        assert b"code=the_code" in token_calls[1].content
+        # RFC 8707 resource indicator must be sent on the code exchange too.
+        assert (
+            b"resource=https%3A%2F%2Fexample.com%2Fmcp" in token_calls[1].content
+        )
+
+        # The cached client_id is reused — no DCR retry on the rejected token.
+        register_calls = [
+            r
+            for r in httpx_mock.get_requests()
+            if str(r.url) == "https://example.com/register"
+        ]
+        assert register_calls == []
+
+        # Final persisted state has the new tokens.
+        stored = load_token("https://example.com/mcp")
+        assert stored.access_token == "fresh_at"
+        assert stored.refresh_token == "fresh_rt"
+
     def test_preconfigured_client_id_skips_dcr(self, tmp_path, monkeypatch, httpx_mock):
         """#38102, #3273: pre-configured client_id should skip DCR."""
         store_file = tmp_path / "tokens.json"

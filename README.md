@@ -189,6 +189,7 @@ Works around known issues in Claude Code's HTTP transport:
 
 - **OAuth discovery fails for auth server with path** — mcp-remote does not implement the RFC 8414 §3 path insertion rule, causing OAuth metadata discovery to fail when the authorization server URL contains a path component (e.g. multi-tenant or realm-based servers) ([mcp-remote#207](https://github.com/geelen/mcp-remote/issues/207)); mcp-stdio constructs the correct well-known metadata URL.
 - **OAuth discovery fails for MCP server behind path-based reverse proxy** — when an MCP server is mounted under a sub-path (e.g. Tailscale serve, nginx `location /mcp/`), Protected Resource Metadata must be fetched at `/.well-known/oauth-protected-resource/{path}` per RFC 9728 §3.1, not at the host root ([mcp-remote#249](https://github.com/geelen/mcp-remote/issues/249)); mcp-stdio tries the path-aware URL first and falls back to host-root for compatibility.
+- **Re-authentication loop when both tokens are rejected** — after long inactivity or server-side token revocation, mcp-remote receives the authorization code at the localhost callback but does not exchange it for new tokens, leaving the client looping on the login screen ([mcp-remote#256](https://github.com/geelen/mcp-remote/issues/256)); mcp-stdio clears the stale cache after a failed refresh and drives the full authorization flow through code exchange.
 
 ### Windows
 

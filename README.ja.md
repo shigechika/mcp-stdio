@@ -187,6 +187,7 @@ Claude Code の HTTP transport の既知の問題を回避できます：
 
 - **パス付き auth server で OAuth 検出が失敗する** — RFC 8414 §3 のパス挿入ルール未実装のため、auth server URL にパスが含まれるサーバー（マルチテナント・Keycloak 等）で検出が失敗する（[mcp-remote#207](https://github.com/geelen/mcp-remote/issues/207)）; mcp-stdio は正しい well-known URL を構築する
 - **パスベースのリバースプロキシ配下の MCP サーバーで OAuth 検出が失敗する** — サブパスにマウントされた MCP サーバー（Tailscale serve、nginx `location /mcp/` 等）では、RFC 9728 §3.1 に従い Protected Resource Metadata を `/.well-known/oauth-protected-resource/{path}` から取得する必要がある（ホストルートでは 404）（[mcp-remote#249](https://github.com/geelen/mcp-remote/issues/249)）; mcp-stdio はパス挿入した URL を先に試し、ホストルートにフォールバックする
+- **access / refresh 両方失効時の再認証ループ** — 長期未使用やサーバー側失効で両トークンが無効になると、mcp-remote は localhost コールバックで認可コードを受信するものの新トークン交換を行わず、ログイン画面のループに陥る（[mcp-remote#256](https://github.com/geelen/mcp-remote/issues/256)）; mcp-stdio はリフレッシュ失敗時にキャッシュを破棄し、full flow を認可コード交換まで完走させる
 
 ### Windows
 
