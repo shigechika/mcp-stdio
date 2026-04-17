@@ -25,6 +25,7 @@ from mcp_stdio.oauth import (
     refresh_access_token,
     refresh_cached_token,
     register_client,
+    step_up_authorize,
 )
 from mcp_stdio.token_store import TokenData
 
@@ -1796,3 +1797,197 @@ class TestClientSecretExpiry:
             if str(r.url) == "https://example.com/register"
         ]
         assert len(register_calls) == 1
+
+
+# --- RFC 9470 / MCP step-up authorization (claude-code#44652) ---
+
+
+class TestStepUpAuthorize:
+    """Step-up re-authorization triggered by a 403 insufficient_scope challenge."""
+
+    SERVER_URL = "https://example.com/mcp"
+
+    def _drive_callback(self, monkeypatch, code: str = "the_code") -> None:
+        """Monkeypatch webbrowser.open to complete the callback flow."""
+        from urllib.parse import parse_qs, urlparse
+        from urllib.request import urlopen
+
+        def fake_open(auth_url: str) -> bool:
+            q = parse_qs(urlparse(auth_url).query)
+            redirect_uri = q["redirect_uri"][0]
+            state = q["state"][0]
+
+            def hit_callback() -> None:
+                cb_url = f"{redirect_uri}?code={code}&state={state}"
+                try:
+                    urlopen(cb_url, timeout=5).read()
+                except Exception:
+                    pass
+
+            threading.Thread(target=hit_callback, daemon=True).start()
+            return True
+
+        monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", fake_open)
+
+    def _cached_token(
+        self, tmp_path, monkeypatch, *, scope: str | None = None
+    ) -> None:
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+        from mcp_stdio.token_store import save_token
+
+        save_token(
+            self.SERVER_URL,
+            TokenData(
+                access_token="old_at",
+                expires_at=time.time() + 3600,
+                refresh_token="rt",
+                client_id="cached_cid",
+                scope=scope,
+                token_endpoint="https://example.com/token",
+                authorization_endpoint="https://example.com/authorize",
+                registration_endpoint="https://example.com/register",
+            ),
+        )
+
+    def test_scope_is_union_of_cached_and_required(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """Challenge scopes are merged with the previously granted scopes."""
+        self._cached_token(
+            tmp_path, monkeypatch, scope="mcp:connect mcp:tools:read"
+        )
+        self._drive_callback(monkeypatch)
+
+        # Token exchange returns upgraded token
+        httpx_mock.add_response(
+            url="https://example.com/token",
+            json={
+                "access_token": "upgraded_at",
+                "expires_in": 3600,
+                "scope": "mcp:connect mcp:tools:read hr:read",
+            },
+        )
+
+        captured_auth_urls: list[str] = []
+        real_open = __import__(
+            "mcp_stdio.oauth", fromlist=["webbrowser"]
+        ).webbrowser.open
+
+        def spying_open(auth_url: str) -> bool:
+            captured_auth_urls.append(auth_url)
+            return real_open(auth_url)
+
+        monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", spying_open)
+
+        client = httpx.Client()
+        data = step_up_authorize(self.SERVER_URL, client, "hr:read", timeout=5)
+        assert data.access_token == "upgraded_at"
+
+        assert len(captured_auth_urls) == 1
+        from urllib.parse import parse_qs, urlparse
+
+        params = parse_qs(urlparse(captured_auth_urls[0]).query)
+        scope_param = params["scope"][0]
+        requested = set(scope_param.split())
+        # Union: every cached and challenge scope appears exactly once
+        assert requested == {"mcp:connect", "mcp:tools:read", "hr:read"}
+
+    def test_reuses_cached_client_credentials_without_dcr(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """Cached client_id and endpoints must be reused — no DCR, no discovery."""
+        self._cached_token(tmp_path, monkeypatch, scope="mcp:connect")
+        self._drive_callback(monkeypatch)
+
+        httpx_mock.add_response(
+            url="https://example.com/token",
+            json={"access_token": "upgraded_at", "expires_in": 3600},
+        )
+
+        client = httpx.Client()
+        step_up_authorize(self.SERVER_URL, client, "hr:read", timeout=5)
+
+        urls = [str(r.url) for r in httpx_mock.get_requests()]
+        # No discovery, no dynamic client registration — only the code exchange
+        assert not any(".well-known" in u for u in urls)
+        assert "https://example.com/register" not in urls
+
+    def test_saves_new_token_with_resource_indicator(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """RFC 8707: the resource indicator must appear on the code exchange."""
+        self._cached_token(tmp_path, monkeypatch)
+        self._drive_callback(monkeypatch)
+
+        httpx_mock.add_response(
+            url="https://example.com/token",
+            json={
+                "access_token": "upgraded_at",
+                "refresh_token": "new_rt",
+                "expires_in": 3600,
+            },
+        )
+
+        client = httpx.Client()
+        data = step_up_authorize(self.SERVER_URL, client, "hr:read", timeout=5)
+
+        assert data.refresh_token == "new_rt"
+
+        from mcp_stdio.token_store import load_token
+
+        stored = load_token(self.SERVER_URL)
+        assert stored.access_token == "upgraded_at"
+
+        token_calls = [
+            r
+            for r in httpx_mock.get_requests()
+            if str(r.url) == "https://example.com/token"
+        ]
+        assert len(token_calls) == 1
+        # RFC 8707 resource indicator on the code exchange
+        assert (
+            b"resource=https%3A%2F%2Fexample.com%2Fmcp" in token_calls[0].content
+        )
+        # The grant is authorization_code (full flow), not refresh_token
+        assert b"grant_type=authorization_code" in token_calls[0].content
+
+    def test_rediscovers_when_cache_is_empty(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """If the cache is gone, discovery runs before the auth flow."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+        self._drive_callback(monkeypatch)
+
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource/mcp",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://example.com/authorize",
+                "token_endpoint": "https://example.com/token",
+                "registration_endpoint": "https://example.com/register",
+            },
+        )
+        # No cached client → DCR runs too
+        httpx_mock.add_response(
+            url="https://example.com/register",
+            json={"client_id": "fresh_cid"},
+        )
+        httpx_mock.add_response(
+            url="https://example.com/token",
+            json={"access_token": "upgraded_at", "expires_in": 3600},
+        )
+
+        client = httpx.Client()
+        data = step_up_authorize(self.SERVER_URL, client, "hr:read", timeout=5)
+        assert data.access_token == "upgraded_at"

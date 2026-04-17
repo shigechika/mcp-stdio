@@ -1,3 +1,3 @@
 """mcp-stdio: Stdio-to-HTTP relay for MCP servers."""
 
-__version__ = "0.4.8"
+__version__ = "0.4.9"

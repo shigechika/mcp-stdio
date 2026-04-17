@@ -58,6 +58,41 @@ def _build_token_refresher(
     return refresher
 
 
+def _build_scope_upgrader(
+    server_url: str,
+    headers: dict[str, str],
+    timeout_connect: float,
+    timeout_read: float,
+) -> Callable[[str], dict[str, str] | None]:
+    """Build a scope-upgrade callback for the relay loop.
+
+    Returns a callable that triggers an RFC 9470 / MCP step-up
+    authorization flow for a given challenge scope and returns updated
+    headers on success, or None on failure.
+    """
+
+    def upgrader(required_scope: str) -> dict[str, str] | None:
+        from .oauth import step_up_authorize
+
+        client = httpx.Client(
+            timeout=httpx.Timeout(
+                connect=timeout_connect, read=timeout_read, write=30, pool=10
+            )
+        )
+        try:
+            data = step_up_authorize(server_url, client, required_scope)
+        except Exception as e:
+            print(f"error: step-up authorization failed: {e}", file=sys.stderr)
+            return None
+        finally:
+            client.close()
+        new_headers = dict(headers)
+        new_headers["Authorization"] = f"Bearer {data.access_token}"
+        return new_headers
+
+    return upgrader
+
+
 def main() -> None:
     """Entry point for mcp-stdio CLI."""
     parser = argparse.ArgumentParser(
@@ -156,6 +191,7 @@ def main() -> None:
 
     # OAuth flow (before relay starts)
     token_refresher: Callable[[], dict[str, str] | None] | None = None
+    scope_upgrader: Callable[[str], dict[str, str] | None] | None = None
     if args.oauth:
         from .oauth import ensure_token
 
@@ -176,6 +212,9 @@ def main() -> None:
             )
             headers["Authorization"] = f"Bearer {token_data.access_token}"
             token_refresher = _build_token_refresher(
+                args.url, headers, args.timeout_connect, args.timeout_read
+            )
+            scope_upgrader = _build_scope_upgrader(
                 args.url, headers, args.timeout_connect, args.timeout_read
             )
         except Exception as e:
@@ -201,11 +240,20 @@ def main() -> None:
         )
         sys.exit(0 if ok else 1)
 
-    relay_fn = run_sse if args.transport == "sse" else run
-    relay_fn(
-        url=args.url,
-        headers=headers,
-        timeout_connect=args.timeout_connect,
-        timeout_read=args.timeout_read,
-        token_refresher=token_refresher,
-    )
+    if args.transport == "sse":
+        run_sse(
+            url=args.url,
+            headers=headers,
+            timeout_connect=args.timeout_connect,
+            timeout_read=args.timeout_read,
+            token_refresher=token_refresher,
+        )
+    else:
+        run(
+            url=args.url,
+            headers=headers,
+            timeout_connect=args.timeout_connect,
+            timeout_read=args.timeout_read,
+            token_refresher=token_refresher,
+            scope_upgrader=scope_upgrader,
+        )

@@ -494,44 +494,23 @@ def refresh_cached_token(
     return data
 
 
-def ensure_token(
+def _run_authorization_flow(
     server_url: str,
     client: httpx.Client,
     *,
-    client_id: str | None = None,
+    metadata: OAuthMetadata,
+    cached: TokenData | None,
+    client_id_override: str | None = None,
     scope: str | None = None,
     timeout: float = 120,
 ) -> TokenData:
-    """Ensure a valid access token is available.
+    """Run the browser-based authorization code flow.
 
-    1. Check cached token — use if not expired
-    2. If expired, try refresh
-    3. If no token or refresh fails, run full OAuth flow
-
-    Returns TokenData with a valid access_token.
+    Shared by both ``ensure_token`` (initial auth) and ``step_up_authorize``
+    (RFC 9470 / MCP step-up for 403 insufficient_scope). Handles callback
+    server setup, DCR (when no usable cached client credentials exist),
+    PKCE, browser launch, code exchange, and persistence.
     """
-    # 1. Check cache
-    cached = load_token(server_url)
-    if cached and cached.access_token:
-        if cached.expires_at is None or cached.expires_at > time.time() + 60:
-            log("using cached OAuth token")
-            return cached
-
-        # 2. Try refresh (skip if client_secret has expired per RFC 7591 §3.2.1)
-        if cached.refresh_token and cached.token_endpoint and cached.client_id:
-            refreshed = refresh_cached_token(server_url, client)
-            if refreshed:
-                return refreshed
-            # Refresh failed or was skipped — clear stale token so the full
-            # flow below isn't blocked by cached failure state
-            # (cf. anthropics/claude-code#37747).
-            delete_token(server_url)
-
-    # 3. Full OAuth flow
-    log("starting OAuth 2.1 authorization flow")
-    metadata = discover_oauth_metadata(server_url, client)
-
-    # Start callback server early to get the port for redirect_uri
     cb_result = CallbackResult()
     handler_cls = _make_callback_handler(cb_result)
 
@@ -539,8 +518,7 @@ def ensure_token(
     port = callback_server.server_address[1]
     redirect_uri = f"http://127.0.0.1:{port}/callback"
 
-    # Dynamic Client Registration
-    cid = client_id
+    cid = client_id_override
     csecret: str | None = None
     cse_at: float | None = None
     if not cid:
@@ -557,7 +535,6 @@ def ensure_token(
             log(f"registered client: {cid}")
     assert cid is not None
 
-    # PKCE
     code_verifier, code_challenge = generate_pkce()
 
     # Authorization (RFC 8707: include resource indicator)
@@ -579,7 +556,6 @@ def ensure_token(
 
     webbrowser.open(auth_url)
 
-    # Wait for callback
     done = threading.Event()
 
     def serve() -> None:
@@ -630,3 +606,94 @@ def ensure_token(
     save_token(server_url, data)
     log("OAuth token obtained and saved")
     return data
+
+
+def ensure_token(
+    server_url: str,
+    client: httpx.Client,
+    *,
+    client_id: str | None = None,
+    scope: str | None = None,
+    timeout: float = 120,
+) -> TokenData:
+    """Ensure a valid access token is available.
+
+    1. Check cached token — use if not expired
+    2. If expired, try refresh
+    3. If no token or refresh fails, run full OAuth flow
+
+    Returns TokenData with a valid access_token.
+    """
+    cached = load_token(server_url)
+    if cached and cached.access_token:
+        if cached.expires_at is None or cached.expires_at > time.time() + 60:
+            log("using cached OAuth token")
+            return cached
+
+        # Try refresh (skip if client_secret has expired per RFC 7591 §3.2.1)
+        if cached.refresh_token and cached.token_endpoint and cached.client_id:
+            refreshed = refresh_cached_token(server_url, client)
+            if refreshed:
+                return refreshed
+            # Refresh failed or was skipped — clear stale token so the full
+            # flow below isn't blocked by cached failure state
+            # (cf. anthropics/claude-code#37747).
+            delete_token(server_url)
+
+    log("starting OAuth 2.1 authorization flow")
+    metadata = discover_oauth_metadata(server_url, client)
+    return _run_authorization_flow(
+        server_url,
+        client,
+        metadata=metadata,
+        cached=cached,
+        client_id_override=client_id,
+        scope=scope,
+        timeout=timeout,
+    )
+
+
+def step_up_authorize(
+    server_url: str,
+    client: httpx.Client,
+    required_scope: str,
+    *,
+    timeout: float = 120,
+) -> TokenData:
+    """Re-authorize with broader scopes after a 403 insufficient_scope.
+
+    Implements the RFC 9470 / MCP spec step-up flow: the server has
+    signaled that the current token lacks scopes required for the call,
+    and the client must obtain a new token covering the **union** of the
+    previously granted scopes and the scopes named in the challenge.
+
+    Reuses the cached client_id (no re-DCR unless the cached client
+    secret has expired per RFC 7591 §3.2.1). Endpoints come from the
+    cached TokenData; if the cache is gone (rare), discovery is rerun.
+    """
+    cached = load_token(server_url)
+
+    scope_parts: set[str] = set()
+    if cached and cached.scope:
+        scope_parts.update(cached.scope.split())
+    scope_parts.update(required_scope.split())
+    merged_scope = " ".join(sorted(scope_parts))
+    log(f"step-up authorization requested with scope: {merged_scope}")
+
+    if cached and cached.token_endpoint and cached.authorization_endpoint:
+        metadata = OAuthMetadata(
+            authorization_endpoint=cached.authorization_endpoint,
+            token_endpoint=cached.token_endpoint,
+            registration_endpoint=cached.registration_endpoint,
+        )
+    else:
+        metadata = discover_oauth_metadata(server_url, client)
+
+    return _run_authorization_flow(
+        server_url,
+        client,
+        metadata=metadata,
+        cached=cached,
+        scope=merged_scope or None,
+        timeout=timeout,
+    )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import signal
 import sys
 import threading
@@ -76,11 +77,46 @@ def _error_response(message: str, req_id: Any = None) -> str:
 class _StreamResult:
     """Result of a streaming request."""
 
-    __slots__ = ("session_id", "status_code")
+    __slots__ = ("session_id", "status_code", "www_authenticate")
 
-    def __init__(self, session_id: str | None, status_code: int):
+    def __init__(
+        self,
+        session_id: str | None,
+        status_code: int,
+        www_authenticate: str | None = None,
+    ):
         self.session_id = session_id
         self.status_code = status_code
+        self.www_authenticate = www_authenticate
+
+
+_INSUFFICIENT_SCOPE_RE = re.compile(r'error\s*=\s*"?insufficient_scope"?')
+_SCOPE_QUOTED_RE = re.compile(r'scope\s*=\s*"([^"]*)"')
+_SCOPE_UNQUOTED_RE = re.compile(r'scope\s*=\s*([^,\s]+)')
+
+
+def _parse_www_authenticate_scope(header: str | None) -> str | None:
+    """Extract the required scope from a Bearer insufficient_scope challenge.
+
+    Returns the scope string when the challenge signals
+    ``error="insufficient_scope"`` and carries a ``scope`` parameter;
+    otherwise returns ``None``. Handles both quoted and unquoted
+    parameter values per RFC 7235.
+
+    Used to drive RFC 9470 / MCP step-up authorization (cf.
+    anthropics/claude-code#44652).
+    """
+    if not header:
+        return None
+    if not _INSUFFICIENT_SCOPE_RE.search(header):
+        return None
+    match = _SCOPE_QUOTED_RE.search(header)
+    if match:
+        return match.group(1).strip()
+    match = _SCOPE_UNQUOTED_RE.search(header)
+    if match:
+        return match.group(1).strip()
+    return None
 
 
 def _post_and_stream(
@@ -101,10 +137,11 @@ def _post_and_stream(
         try:
             with client.stream("POST", url, content=content, headers=headers) as resp:
                 session = resp.headers.get("mcp-session-id")
+                www_auth = resp.headers.get("www-authenticate")
 
                 if resp.status_code != 200:
                     resp.read()
-                    return _StreamResult(session, resp.status_code)
+                    return _StreamResult(session, resp.status_code, www_auth)
 
                 content_type = resp.headers.get("content-type", "")
                 if "text/event-stream" in content_type:
@@ -158,8 +195,9 @@ def _post_parsed(
         try:
             resp = client.post(url, content=content, headers=headers)
             session = resp.headers.get("mcp-session-id")
+            www_auth = resp.headers.get("www-authenticate")
             if resp.status_code != 200:
-                return None, _StreamResult(session, resp.status_code)
+                return None, _StreamResult(session, resp.status_code, www_auth)
 
             content_type = resp.headers.get("content-type", "")
             if "text/event-stream" in content_type:
@@ -484,6 +522,7 @@ def run(
     timeout_read: float = 120,
     timeout_write: float = 30,
     token_refresher: Any = None,
+    scope_upgrader: Any = None,
 ) -> None:
     """Run the stdio-to-HTTP relay loop.
 
@@ -499,6 +538,12 @@ def run(
         token_refresher: Optional callable that returns updated headers
             on successful token refresh, or None on failure. Called when
             the server returns HTTP 401.
+        scope_upgrader: Optional callable invoked when the server
+            returns HTTP 403 with a ``Bearer error="insufficient_scope"``
+            challenge. It receives the scope string from the challenge
+            and returns updated headers containing a broader-scope
+            token, or None on failure (RFC 9470 step-up authorization;
+            cf. anthropics/claude-code#44652).
     """
 
     # Graceful shutdown on SIGTERM/SIGINT
@@ -566,6 +611,33 @@ def run(
                         flush=True,
                     )
                     continue
+
+            # Insufficient scope (403) — step-up authorization and retry once
+            if result.status_code == 403 and scope_upgrader:
+                required_scope = _parse_www_authenticate_scope(
+                    result.www_authenticate
+                )
+                if required_scope is not None:
+                    log(
+                        f"received 403 insufficient_scope "
+                        f"(required: {required_scope}), attempting step-up"
+                    )
+                    new_headers = scope_upgrader(required_scope)
+                    if new_headers:
+                        headers.update(new_headers)
+                        req_headers = dict(headers)
+                        if session_id:
+                            req_headers["Mcp-Session-Id"] = session_id
+                        result = _dispatch(line, req_headers)
+                        if result is None:
+                            continue
+                    else:
+                        log("step-up authorization failed, returning error")
+                        print(
+                            _error_response("authorization failed", req_id),
+                            flush=True,
+                        )
+                        continue
 
             # Session expired (404) — reset, re-initialize, then retry
             if result.status_code == 404 and session_id:

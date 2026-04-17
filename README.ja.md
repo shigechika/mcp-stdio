@@ -183,6 +183,7 @@ Claude Code の HTTP transport の既知の問題を回避できます：
 - **OAuth scope が送信されない** — 認可リクエストに `scope` パラメータが含まれず、厳格な OAuth サーバーがフローを拒否する（[#4540](https://github.com/anthropics/claude-code/issues/4540)）; mcp-stdio は `--oauth-scope` でスコープを送信
 - **プロキシ設定が無視される** — Claude Code が `NO_PROXY` を尊重しない（[#34804](https://github.com/anthropics/claude-code/issues/34804)）; mcp-stdio は httpx 経由でプロキシ設定を継承
 - **`tools/list` ページネーションを無視** — Claude Code は最初の `tools/list` 応答しか受けず `nextCursor` を黙って捨てるため、2 ページ目以降の tool が見えない（MCP gateway や大規模ツールカタログが壊れる）（[#39586](https://github.com/anthropics/claude-code/issues/39586)）; mcp-stdio は `tools/list` / `resources/list` / `resources/templates/list` / `prompts/list` の `nextCursor` を透過的に追跡し、1 つの応答にマージして返す
+- **403 `insufficient_scope` の step-up が動かない** — tool 単位で広い scope を要求するサーバーが 403 に `WWW-Authenticate: Bearer error="insufficient_scope", scope="..."` を付けて返しても、Claude Code は Protected Resource Metadata を取り直すだけで新しいトークンを要求せず、段階的 scope のサーバーが事実上使えない（[#44652](https://github.com/anthropics/claude-code/issues/44652)）; mcp-stdio は challenge を解析し、既存 scope ∪ challenge scope で RFC 9470 step-up 認可フローを回し（キャッシュ済みクライアントを再利用、DCR はやり直さない）、元のリクエストを自動リトライする
 
 ### mcp-remote
 

@@ -185,6 +185,7 @@ Works around known issues in Claude Code's HTTP transport:
 - **OAuth scope omitted** — Claude Code sends no `scope` parameter in authorization requests, causing strict OAuth servers to reject the flow ([#4540](https://github.com/anthropics/claude-code/issues/4540)); mcp-stdio sends scopes via `--oauth-scope`
 - **Proxy settings ignored** — Claude Code does not respect `NO_PROXY` ([#34804](https://github.com/anthropics/claude-code/issues/34804)); mcp-stdio inherits proxy settings from httpx
 - **`tools/list` pagination ignored** — Claude Code sends only the first `tools/list` request and silently discards `nextCursor`, so tools beyond page 1 are invisible (breaks MCP gateways and large tool catalogs) ([#39586](https://github.com/anthropics/claude-code/issues/39586)); mcp-stdio follows `nextCursor` transparently across `tools/list`, `resources/list`, `resources/templates/list`, and `prompts/list`, returning a single merged response
+- **403 `insufficient_scope` step-up never runs** — when an MCP server requires broader scopes for a specific tool and returns 403 with a `WWW-Authenticate: Bearer error="insufficient_scope", scope="..."` challenge, Claude Code only re-fetches Protected Resource Metadata and never requests a new token, so tiered-scope servers are unusable ([#44652](https://github.com/anthropics/claude-code/issues/44652)); mcp-stdio parses the challenge, runs an RFC 9470 step-up authorization with the union of cached and challenge scopes (reusing the cached client — no DCR retry), and retries the original call
 
 ### mcp-remote
 

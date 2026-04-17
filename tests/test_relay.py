@@ -19,6 +19,7 @@ from mcp_stdio.relay import (
     _enforce_lf_stdio,
     _error_response,
     _extract_id,
+    _parse_www_authenticate_scope,
     _post_and_stream,
     _sse_reader_loop,
     check_connection,
@@ -448,6 +449,188 @@ class TestRun:
         )
         # No output because 401 is non-200 and no refresher
         assert output.strip() == ""
+
+
+# --- step-up authorization (anthropics/claude-code#44652) ---
+
+
+class TestParseWwwAuthenticateScope:
+    """Parse RFC 9470 insufficient_scope challenges."""
+
+    def test_quoted_scope_and_error(self):
+        header = 'Bearer error="insufficient_scope", scope="mcp:read hr:read"'
+        assert _parse_www_authenticate_scope(header) == "mcp:read hr:read"
+
+    def test_unquoted_scope(self):
+        header = "Bearer error=insufficient_scope, scope=mcp:read"
+        assert _parse_www_authenticate_scope(header) == "mcp:read"
+
+    def test_with_realm_and_description(self):
+        header = (
+            'Bearer realm="mcp", error="insufficient_scope", '
+            'scope="hr:read hr:write", '
+            'error_description="tool requires HR access"'
+        )
+        assert _parse_www_authenticate_scope(header) == "hr:read hr:write"
+
+    def test_invalid_token_error_not_triggered(self):
+        """Regular 401 invalid_token challenges should not trigger step-up."""
+        header = 'Bearer error="invalid_token", scope="mcp:read"'
+        assert _parse_www_authenticate_scope(header) is None
+
+    def test_insufficient_scope_without_scope_param(self):
+        """Challenge missing the scope parameter is unusable for step-up."""
+        header = 'Bearer error="insufficient_scope"'
+        assert _parse_www_authenticate_scope(header) is None
+
+    def test_empty_or_none(self):
+        assert _parse_www_authenticate_scope(None) is None
+        assert _parse_www_authenticate_scope("") is None
+
+    def test_non_bearer_challenge_ignored(self):
+        """Basic / Digest challenges must not be misread as Bearer."""
+        header = 'Basic realm="private"'
+        assert _parse_www_authenticate_scope(header) is None
+
+
+class TestStepUpScopeChallenge:
+    """403 insufficient_scope handling in run()."""
+
+    URL = "https://example.com/mcp"
+
+    def _run_with_stdin(self, httpx_mock, stdin_lines, **kwargs):
+        stdin_data = "\n".join(stdin_lines) + "\n"
+        stdout = StringIO()
+        with patch("sys.stdin", StringIO(stdin_data)), patch("sys.stdout", stdout):
+            run(
+                self.URL,
+                {"Content-Type": "application/json"},
+                **kwargs,
+            )
+        return stdout.getvalue()
+
+    def test_403_triggers_scope_upgrader_and_retries(self, httpx_mock):
+        """Happy path: 403 insufficient_scope → step-up → retry succeeds."""
+        httpx_mock.add_response(
+            url=self.URL,
+            status_code=403,
+            text="",
+            headers={
+                "content-type": "application/json",
+                "www-authenticate": (
+                    'Bearer error="insufficient_scope", '
+                    'scope="mcp:read hr:read"'
+                ),
+            },
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","result":{"data":"ok"},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+
+        seen_scopes: list[str] = []
+
+        def mock_upgrader(required_scope: str):
+            seen_scopes.append(required_scope)
+            return {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer upgraded-token",
+            }
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+                '"params":{"name":"get_salary"}}'
+            ],
+            scope_upgrader=mock_upgrader,
+        )
+
+        result = json.loads(output.strip())
+        assert result["result"]["data"] == "ok"
+        # Upgrader was invoked with the challenge scope verbatim
+        assert seen_scopes == ["mcp:read hr:read"]
+        # Retry used the upgraded bearer
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 2
+        assert requests[1].headers["authorization"] == "Bearer upgraded-token"
+
+    def test_403_without_insufficient_scope_passes_through(self, httpx_mock):
+        """Plain 403 (non-scope challenge) must not invoke the upgrader."""
+        httpx_mock.add_response(
+            url=self.URL,
+            status_code=403,
+            text="",
+            headers={"content-type": "application/json"},
+        )
+
+        called = []
+
+        def mock_upgrader(_scope: str):
+            called.append(True)
+            return {"Authorization": "Bearer should-not-be-used"}
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","id":1,"method":"tools/call"}'],
+            scope_upgrader=mock_upgrader,
+        )
+
+        # No retry, no upgrader call, no output (403 was not handled)
+        assert called == []
+        assert output.strip() == ""
+        assert len(httpx_mock.get_requests()) == 1
+
+    def test_403_without_upgrader_passes_through(self, httpx_mock):
+        """If scope_upgrader is not configured, 403 is surfaced unchanged."""
+        httpx_mock.add_response(
+            url=self.URL,
+            status_code=403,
+            text="",
+            headers={
+                "content-type": "application/json",
+                "www-authenticate": (
+                    'Bearer error="insufficient_scope", scope="mcp:read"'
+                ),
+            },
+        )
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","id":1,"method":"tools/call"}'],
+        )
+        # No retry, no output — client sees the upstream 403
+        assert output.strip() == ""
+        assert len(httpx_mock.get_requests()) == 1
+
+    def test_upgrader_failure_returns_error(self, httpx_mock):
+        """If the upgrader returns None (e.g. user aborted), emit an error."""
+        httpx_mock.add_response(
+            url=self.URL,
+            status_code=403,
+            text="",
+            headers={
+                "content-type": "application/json",
+                "www-authenticate": (
+                    'Bearer error="insufficient_scope", scope="mcp:read"'
+                ),
+            },
+        )
+
+        def mock_upgrader(_scope: str):
+            return None
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","id":1,"method":"tools/call"}'],
+            scope_upgrader=mock_upgrader,
+        )
+        err = json.loads(output.strip())
+        assert err["error"]["message"] == "authorization failed"
+        assert err["id"] == 1
+        # No retry issued after upgrader failure
+        assert len(httpx_mock.get_requests()) == 1
 
 
 # --- auto-pagination (anthropics/claude-code#39586) ---
