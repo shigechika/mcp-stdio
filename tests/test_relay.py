@@ -455,6 +455,42 @@ class TestRun:
         assert result["error"]["message"] == f"HTTP {status_code}"
         assert result["id"] == 42
 
+    def test_401_refresh_then_retry_500_emits_error(self, httpx_mock):
+        """#11 sentinel: a successful token refresh followed by a 5xx on the
+        retry must still surface a JSON-RPC error. Proves the fall-through
+        error block fires on post-recovery failures, not just first-pass."""
+        # 1st: 401 triggers refresh
+        httpx_mock.add_response(
+            status_code=401,
+            text="",
+            headers={"content-type": "application/json"},
+        )
+        # 2nd (after refresh): 500 — must surface as JSON-RPC error
+        httpx_mock.add_response(
+            status_code=500,
+            text="",
+            headers={"content-type": "application/json"},
+        )
+
+        def mock_refresher():
+            return {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer refreshed",
+            }
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","method":"tools/call","id":7}'],
+            token_refresher=mock_refresher,
+        )
+        result = json.loads(output.strip())
+        assert result["error"]["message"] == "HTTP 500"
+        assert result["id"] == 7
+        # Refresh was attempted (second request used the new bearer)
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 2
+        assert requests[1].headers["authorization"] == "Bearer refreshed"
+
     def test_202_notification_produces_no_stdout(self, httpx_mock):
         """#11: 202 Accepted (MCP notification ack) is intentionally silent."""
         httpx_mock.add_response(
