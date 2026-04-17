@@ -460,7 +460,11 @@ def check_connection(
         resp = client.post(url, content=initialize_msg, headers=headers)
 
         if resp.status_code != 200:
-            log(f"✗ HTTP {resp.status_code}: {resp.text[:200]}")
+            # Do not surface the response body — server error responses
+            # commonly carry session IDs, stack traces, or echoed request
+            # data. The status code alone is the right operational signal
+            # for the --check probe. See #16.
+            log(f"✗ HTTP {resp.status_code}")
             return False
 
         log(f"✓ Connected (HTTP {resp.status_code})")

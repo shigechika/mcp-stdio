@@ -1070,6 +1070,21 @@ class TestCheckConnection:
         httpx_mock.add_response(status_code=500, text="oops")
         assert check_connection(self.URL, dict(self.HEADERS)) is False
 
+    def test_non_200_does_not_leak_body_to_stderr(self, httpx_mock, capsys):
+        """#16: response body must not appear in --check stderr output.
+
+        Error bodies regularly contain session IDs, stack traces, or
+        echoed request data, and --check logs are prone to retention
+        in CI / aggregation pipelines.
+        """
+        secret = "session=SENSITIVE-sess-id-echoed-in-500-page"
+        httpx_mock.add_response(status_code=500, text=secret)
+        check_connection(self.URL, dict(self.HEADERS))
+        captured = capsys.readouterr()
+        assert secret not in captured.err
+        # Status code is still logged — that's the operational signal
+        assert "HTTP 500" in captured.err
+
     def test_unauthorized_returns_false(self, httpx_mock):
         httpx_mock.add_response(status_code=401, text="nope")
         assert check_connection(self.URL, dict(self.HEADERS)) is False
