@@ -657,6 +657,17 @@ def run(
 
             if result.session_id:
                 session_id = result.session_id
+
+            # Fall-through error for any unhandled 4xx/5xx so the MCP client
+            # never hangs waiting for a response. 200 bodies were already
+            # streamed by _post_and_stream; 202 is reserved for notifications
+            # and intentionally produces no stdout. See #11.
+            if result.status_code >= 400:
+                log(f"upstream returned HTTP {result.status_code}")
+                print(
+                    _error_response(f"HTTP {result.status_code}", req_id),
+                    flush=True,
+                )
     finally:
         client.close()
 
