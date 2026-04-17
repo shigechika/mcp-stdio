@@ -8,10 +8,14 @@ from io import StringIO
 from unittest.mock import patch
 
 import httpx
+import pytest
 from pytest_httpx import IteratorStream
 
 from mcp_stdio.relay import (
+    MAX_LIST_PAGES,
+    PAGINATED_LIST_METHODS,
     _SseState,
+    _detect_paginated_list,
     _enforce_lf_stdio,
     _error_response,
     _extract_id,
@@ -444,6 +448,308 @@ class TestRun:
         )
         # No output because 401 is non-200 and no refresher
         assert output.strip() == ""
+
+
+# --- auto-pagination (anthropics/claude-code#39586) ---
+
+
+class TestDetectPaginatedList:
+    @pytest.mark.parametrize(
+        "method,result_key",
+        list(PAGINATED_LIST_METHODS.items()),
+    )
+    def test_detects_each_paginated_method(self, method, result_key):
+        line = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method})
+        assert _detect_paginated_list(line) == (method, result_key)
+
+    def test_non_paginated_method_returns_none(self):
+        line = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call"})
+        assert _detect_paginated_list(line) is None
+
+    def test_explicit_cursor_opts_out(self):
+        """Client that drives pagination itself must get raw passthrough."""
+        line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {"cursor": "client-driven"},
+            }
+        )
+        assert _detect_paginated_list(line) is None
+
+    def test_empty_params_dict_is_paginated(self):
+        line = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        )
+        assert _detect_paginated_list(line) == ("tools/list", "tools")
+
+    def test_malformed_json_returns_none(self):
+        assert _detect_paginated_list("not json") is None
+
+    def test_non_object_returns_none(self):
+        assert _detect_paginated_list("[1,2,3]") is None
+
+
+class TestPagination:
+    """Auto-pagination for MCP list methods (claude-code#39586)."""
+
+    URL = "https://example.com/mcp"
+
+    def _run_with_stdin(self, httpx_mock, stdin_lines, **kwargs):
+        stdin_data = "\n".join(stdin_lines) + "\n"
+        stdout = StringIO()
+        with patch("sys.stdin", StringIO(stdin_data)), patch("sys.stdout", stdout):
+            run(
+                self.URL,
+                {"Content-Type": "application/json"},
+                **kwargs,
+            )
+        return stdout.getvalue()
+
+    @pytest.mark.parametrize(
+        "method,result_key",
+        list(PAGINATED_LIST_METHODS.items()),
+    )
+    def test_three_pages_merged_into_one(self, httpx_mock, method, result_key):
+        """Response from 3 paginated pages is merged into a single response."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                result_key: [{"name": "a"}, {"name": "b"}],
+                "nextCursor": "p2",
+            },
+        }
+        page2 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                result_key: [{"name": "c"}],
+                "nextCursor": "p3",
+            },
+        }
+        page3 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {result_key: [{"name": "d"}, {"name": "e"}]},
+        }
+        for page in (page1, page2, page3):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=json.dumps(page),
+                headers={"content-type": "application/json"},
+            )
+
+        request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method})
+        output = self._run_with_stdin(httpx_mock, [request])
+
+        lines = [x for x in output.strip().splitlines() if x]
+        assert len(lines) == 1
+        merged = json.loads(lines[0])
+        assert merged["id"] == 1
+        assert "nextCursor" not in merged["result"]
+        names = [item["name"] for item in merged["result"][result_key]]
+        assert names == ["a", "b", "c", "d", "e"]
+
+        # Verify cursor was threaded through requests
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 3
+        assert "cursor" not in json.loads(requests[0].content).get("params", {})
+        assert json.loads(requests[1].content)["params"]["cursor"] == "p2"
+        assert json.loads(requests[2].content)["params"]["cursor"] == "p3"
+
+    def test_single_page_passthrough(self, httpx_mock):
+        """A list response without nextCursor still produces exactly one POST."""
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "only"}]},
+        }
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(body),
+            headers={"content-type": "application/json"},
+        )
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())
+        assert merged["result"]["tools"] == [{"name": "only"}]
+        assert len(httpx_mock.get_requests()) == 1
+
+    def test_client_supplied_cursor_is_not_auto_paginated(self, httpx_mock):
+        """Passing ``cursor`` explicitly opts out of auto-pagination."""
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [{"name": "a"}],
+                "nextCursor": "p2",  # would be followed if auto-paginating
+            },
+        }
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(body),
+            headers={"content-type": "application/json"},
+        )
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/list",
+                        "params": {"cursor": "client-driven"},
+                    }
+                )
+            ],
+        )
+        raw = json.loads(output.strip())
+        # nextCursor must be preserved — client is handling pagination itself
+        assert raw["result"]["nextCursor"] == "p2"
+        # Exactly one request, with the client-supplied cursor
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 1
+        assert json.loads(requests[0].content)["params"]["cursor"] == "client-driven"
+
+    def test_sse_response_is_paginated(self, httpx_mock):
+        """Pagination works when the server responds with SSE framing."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "a"}], "nextCursor": "p2"},
+        }
+        page2 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "b"}]},
+        }
+        httpx_mock.add_response(
+            url=self.URL,
+            text=f"data: {json.dumps(page1)}\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text=f"data: {json.dumps(page2)}\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())
+        assert [t["name"] for t in merged["result"]["tools"]] == ["a", "b"]
+
+    def test_page_cap_truncates_runaway_cursor(self, httpx_mock, monkeypatch):
+        """An endless cursor chain is bounded by MAX_LIST_PAGES."""
+        # Lower the cap to keep the test fast while exercising the branch.
+        monkeypatch.setattr("mcp_stdio.relay.MAX_LIST_PAGES", 3)
+
+        def make_page(n: int) -> str:
+            return json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "tools": [{"name": f"t{n}"}],
+                        "nextCursor": f"p{n + 1}",  # never terminates
+                    },
+                }
+            )
+
+        # Register exactly MAX_LIST_PAGES responses. If the implementation
+        # forgot the cap it would send a 4th request and fail with an
+        # unmatched httpx_mock response.
+        for n in range(1, 4):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=make_page(n),
+                headers={"content-type": "application/json"},
+            )
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())
+        names = [t["name"] for t in merged["result"]["tools"]]
+        assert names == ["t1", "t2", "t3"]  # exactly MAX_LIST_PAGES pages
+        assert len(httpx_mock.get_requests()) == 3
+
+    def test_mid_flow_error_returns_partial_result(self, httpx_mock):
+        """Page N>=2 HTTP error returns the pages collected so far."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "ok1"}], "nextCursor": "p2"},
+        }
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(page1),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            status_code=500,
+            text="",
+            headers={"content-type": "application/json"},
+        )
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())
+        assert [t["name"] for t in merged["result"]["tools"]] == ["ok1"]
+        assert "nextCursor" not in merged["result"]
+
+    def test_first_page_401_triggers_token_refresh(self, httpx_mock):
+        """401 on page 1 must go through the normal refresh path."""
+        # First attempt: 401 — triggers refresh
+        httpx_mock.add_response(
+            url=self.URL,
+            status_code=401,
+            text="",
+            headers={"content-type": "application/json"},
+        )
+        # After refresh: page 1 returns one item, no more pages
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "after-refresh"}]},
+        }
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(page1),
+            headers={"content-type": "application/json"},
+        )
+
+        def mock_refresher():
+            return {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer new-token",
+            }
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+            token_refresher=mock_refresher,
+        )
+        merged = json.loads(output.strip())
+        assert merged["result"]["tools"] == [{"name": "after-refresh"}]
+        requests = httpx_mock.get_requests()
+        assert requests[1].headers["authorization"] == "Bearer new-token"
+
+    def test_max_list_pages_constant_is_positive(self):
+        """Sanity check on the shipped cap."""
+        assert MAX_LIST_PAGES >= 1
 
 
 # --- check_connection ---

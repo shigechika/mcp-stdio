@@ -17,6 +17,19 @@ from mcp_stdio import __version__
 MAX_RETRIES = 3
 RETRY_DELAY = 1  # seconds
 
+# MCP spec defines four paginated list methods. Some clients (notably
+# Claude Code, cf. anthropics/claude-code#39586) silently drop pages beyond
+# the first; auto-paginating in the gateway hides the bug from callers.
+PAGINATED_LIST_METHODS: dict[str, str] = {
+    "tools/list": "tools",
+    "resources/list": "resources",
+    "resources/templates/list": "resourceTemplates",
+    "prompts/list": "prompts",
+}
+
+# Safety cap for runaway or malicious cursor chains.
+MAX_LIST_PAGES = 100
+
 
 def _enforce_lf_stdio() -> None:
     """Force bare LF line endings on stdin/stdout.
@@ -119,6 +132,201 @@ def _post_and_stream(
     log(f"request failed after retries: {last_error}")
     print(_error_response(str(last_error), req_id), flush=True)
     return None
+
+
+def _post_parsed(
+    client: httpx.Client,
+    url: str,
+    content: str,
+    headers: dict[str, str],
+    req_id: Any,
+) -> tuple[dict[str, Any] | None, _StreamResult | None]:
+    """Send a POST and return the parsed JSON-RPC response.
+
+    Mirrors the retry behaviour of ``_post_and_stream`` but buffers the
+    response so that callers can inspect the JSON before writing anything
+    to stdout. Used by the pagination helper, which needs to inspect
+    ``result.nextCursor`` across multiple requests.
+
+    Returns a tuple of ``(parsed, stream_result)``. ``parsed`` is the
+    decoded response dict on success, or ``None`` on non-200 / parse
+    failure. ``stream_result`` is ``None`` only when all retries are
+    exhausted (and the error was already printed to stdout).
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = client.post(url, content=content, headers=headers)
+            session = resp.headers.get("mcp-session-id")
+            if resp.status_code != 200:
+                return None, _StreamResult(session, resp.status_code)
+
+            content_type = resp.headers.get("content-type", "")
+            if "text/event-stream" in content_type:
+                for sse_line in resp.text.splitlines():
+                    if sse_line.startswith("data: "):
+                        try:
+                            return (
+                                json.loads(sse_line[len("data: "):]),
+                                _StreamResult(session, 200),
+                            )
+                        except json.JSONDecodeError:
+                            continue
+                return None, _StreamResult(session, 200)
+
+            text = resp.text.strip()
+            if not text:
+                return None, _StreamResult(session, 200)
+            try:
+                return json.loads(text), _StreamResult(session, 200)
+            except json.JSONDecodeError:
+                return None, _StreamResult(session, 200)
+        except (
+            httpx.ConnectError,
+            httpx.ReadTimeout,
+            httpx.WriteTimeout,
+            httpx.ReadError,
+        ) as e:
+            last_error = e
+            log(f"attempt {attempt}/{MAX_RETRIES} failed: {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY * attempt)
+
+    log(f"request failed after retries: {last_error}")
+    print(_error_response(str(last_error), req_id), flush=True)
+    return None, None
+
+
+def _detect_paginated_list(line: str) -> tuple[str, str] | None:
+    """Return ``(method, result_key)`` if the request should auto-paginate.
+
+    A request auto-paginates when the method is one of the spec's
+    paginated list endpoints and the client did not supply ``cursor``.
+    If the client already supplies ``cursor`` we pass through: they are
+    driving pagination themselves and should receive the raw response.
+    """
+    try:
+        request = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(request, dict):
+        return None
+    method = request.get("method")
+    if method not in PAGINATED_LIST_METHODS:
+        return None
+    params = request.get("params")
+    if isinstance(params, dict) and "cursor" in params:
+        return None
+    return method, PAGINATED_LIST_METHODS[method]
+
+
+def _paginate_and_stream(
+    client: httpx.Client,
+    url: str,
+    line: str,
+    headers: dict[str, str],
+    req_id: Any,
+    result_key: str,
+) -> _StreamResult | None:
+    """Transparently follow ``result.nextCursor`` and emit one merged response.
+
+    Issues up to ``MAX_LIST_PAGES`` POSTs, threading each response's
+    ``nextCursor`` into the next request's ``params.cursor``. The final
+    response written to stdout contains the concatenated list items and
+    no ``nextCursor``.
+
+    Non-200 on page 1 is propagated to the caller so the outer loop can
+    handle 401 / 404 recovery just like a non-paginated request. Errors
+    on page 2+ return the accumulated partial result rather than losing
+    items already collected.
+    """
+    try:
+        request = json.loads(line)
+    except json.JSONDecodeError:
+        return _post_and_stream(client, url, line, headers, req_id)
+
+    base_params = request.get("params")
+    params: dict[str, Any] = dict(base_params) if isinstance(base_params, dict) else {}
+    merged_result: dict[str, Any] | None = None
+    last_session: str | None = None
+    truncated = False
+
+    for page in range(1, MAX_LIST_PAGES + 1):
+        page_request = dict(request)
+        page_request["params"] = params
+        page_content = json.dumps(page_request)
+
+        parsed, stream = _post_parsed(client, url, page_content, headers, req_id)
+        if stream is None:
+            if page == 1:
+                return None  # error already printed
+            log(
+                f"pagination: page {page} exhausted retries, "
+                f"returning partial result"
+            )
+            break
+
+        if stream.session_id:
+            last_session = stream.session_id
+
+        if stream.status_code != 200:
+            if page == 1:
+                return stream  # let outer 401/404 recovery run
+            log(
+                f"pagination: page {page} returned HTTP {stream.status_code}, "
+                f"returning partial result"
+            )
+            break
+
+        if parsed is None:
+            if page == 1:
+                return _post_and_stream(client, url, line, headers, req_id)
+            log(
+                f"pagination: page {page} response not parseable, "
+                f"returning partial result"
+            )
+            break
+
+        page_result = parsed.get("result")
+        if not isinstance(page_result, dict):
+            # Error response or unexpected shape — forward as-is from page 1,
+            # otherwise stop and flush what we have.
+            if page == 1:
+                print(json.dumps(parsed), flush=True)
+                return stream
+            break
+
+        if merged_result is None:
+            merged_result = {k: v for k, v in page_result.items() if k != "nextCursor"}
+            if not isinstance(merged_result.get(result_key), list):
+                merged_result[result_key] = []
+        else:
+            items = page_result.get(result_key)
+            if isinstance(items, list):
+                merged_result[result_key].extend(items)
+
+        next_cursor = page_result.get("nextCursor")
+        if not next_cursor:
+            break
+        params["cursor"] = next_cursor
+    else:
+        truncated = True
+        log(
+            f"pagination: reached MAX_LIST_PAGES={MAX_LIST_PAGES}, "
+            f"truncating results"
+        )
+
+    if merged_result is None:
+        merged_result = {result_key: []}
+
+    merged_response: dict[str, Any] = {
+        "jsonrpc": request.get("jsonrpc", "2.0"),
+        "id": request.get("id"),
+        "result": merged_result,
+    }
+    print(json.dumps(merged_response), flush=True)
+    _ = truncated  # kept for future _meta annotation
+    return _StreamResult(last_session, 200)
 
 
 def _reinitialize(
@@ -325,7 +533,15 @@ def run(
             if session_id:
                 req_headers["Mcp-Session-Id"] = session_id
 
-            result = _post_and_stream(client, url, line, req_headers, req_id)
+            def _dispatch(content: str, h: dict[str, str]) -> _StreamResult | None:
+                detected = _detect_paginated_list(content)
+                if detected:
+                    return _paginate_and_stream(
+                        client, url, content, h, req_id, detected[1]
+                    )
+                return _post_and_stream(client, url, content, h, req_id)
+
+            result = _dispatch(line, req_headers)
             if result is None:
                 # All retries exhausted — error already printed
                 session_id = None
@@ -340,7 +556,7 @@ def run(
                     req_headers = dict(headers)
                     if session_id:
                         req_headers["Mcp-Session-Id"] = session_id
-                    result = _post_and_stream(client, url, line, req_headers, req_id)
+                    result = _dispatch(line, req_headers)
                     if result is None:
                         continue
                 else:
@@ -363,7 +579,7 @@ def run(
                 session_id = new_session_id
                 req_headers = dict(headers)
                 req_headers["Mcp-Session-Id"] = session_id
-                result = _post_and_stream(client, url, line, req_headers, req_id)
+                result = _dispatch(line, req_headers)
                 if result is None:
                     continue
 

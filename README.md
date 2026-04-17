@@ -184,6 +184,7 @@ Works around known issues in Claude Code's HTTP transport:
 - **Session lost after disconnect** — mcp-stdio recovers MCP sessions automatically on 404 ([#34498](https://github.com/anthropics/claude-code/issues/34498), [#38631](https://github.com/anthropics/claude-code/issues/38631))
 - **OAuth scope omitted** — Claude Code sends no `scope` parameter in authorization requests, causing strict OAuth servers to reject the flow ([#4540](https://github.com/anthropics/claude-code/issues/4540)); mcp-stdio sends scopes via `--oauth-scope`
 - **Proxy settings ignored** — Claude Code does not respect `NO_PROXY` ([#34804](https://github.com/anthropics/claude-code/issues/34804)); mcp-stdio inherits proxy settings from httpx
+- **`tools/list` pagination ignored** — Claude Code sends only the first `tools/list` request and silently discards `nextCursor`, so tools beyond page 1 are invisible (breaks MCP gateways and large tool catalogs) ([#39586](https://github.com/anthropics/claude-code/issues/39586)); mcp-stdio follows `nextCursor` transparently across `tools/list`, `resources/list`, `resources/templates/list`, and `prompts/list`, returning a single merged response
 
 ### mcp-remote
 
