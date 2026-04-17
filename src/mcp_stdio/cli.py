@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from typing import Callable
 
@@ -12,9 +13,24 @@ import httpx
 from . import __version__
 from .relay import check_connection, log, run, run_sse
 
+# RFC 7230 §3.2.6 field-name = token = 1*tchar. tchar covers
+# "!#$%&'*+-.^_`|~" plus DIGIT and ALPHA. Used to reject header names
+# that could be misinterpreted by downstream HTTP parsers.
+_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+
+# Characters that terminate or re-open an HTTP header and must never
+# appear in a user-supplied value. CR / LF enable request smuggling and
+# arbitrary header injection; NUL terminates C-string parsing.
+_HEADER_VALUE_FORBIDDEN = ("\r", "\n", "\0")
+
 
 def _parse_header(header: str) -> tuple[str, str]:
-    """Parse a header string 'Key: Value' into a tuple."""
+    """Parse a header string 'Key: Value' into a tuple.
+
+    Rejects header names that violate RFC 7230 §3.2.6 (`token` grammar)
+    and values containing CR, LF, or NUL (RFC 7230 §3.2) to guard
+    against CRLF / NUL injection via `-H`. See #14.
+    """
     if ":" not in header:
         print(
             f"error: invalid header format (expected 'Key: Value'): {header}",
@@ -22,7 +38,24 @@ def _parse_header(header: str) -> tuple[str, str]:
         )
         sys.exit(1)
     key, _, value = header.partition(":")
-    return key.strip(), value.strip()
+    key = key.strip()
+    value = value.strip()
+    if not _HEADER_NAME_RE.match(key):
+        print(
+            f"error: invalid header name {key!r} "
+            f"(must match RFC 7230 token grammar)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    for bad in _HEADER_VALUE_FORBIDDEN:
+        if bad in value:
+            print(
+                f"error: header value for {key!r} contains "
+                f"a forbidden control character",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    return key, value
 
 
 def _build_token_refresher(
