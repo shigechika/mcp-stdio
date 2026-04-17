@@ -766,6 +766,7 @@ def run_sse(
     timeout_read: float = 120,
     timeout_write: float = 30,
     token_refresher: Any = None,
+    scope_upgrader: Any = None,
 ) -> None:
     """Run the stdio-to-SSE relay loop (MCP 2024-11-05 legacy transport).
 
@@ -791,6 +792,11 @@ def run_sse(
         token_refresher: Optional callable that returns updated headers
             on successful token refresh, or None on failure. Called when
             the server returns HTTP 401 on POST.
+        scope_upgrader: Optional callable invoked when the server returns
+            HTTP 403 with a ``Bearer error="insufficient_scope"``
+            challenge on POST. Receives the scope string from the
+            challenge and returns updated headers containing a
+            broader-scope token, or None on failure. See #17.
     """
 
     def _shutdown(signum: int, _: Any) -> None:
@@ -893,6 +899,39 @@ def run_sse(
                             flush=True,
                         )
                         continue
+
+                if resp.status_code == 403 and scope_upgrader:
+                    required_scope = _parse_www_authenticate_scope(
+                        resp.headers.get("www-authenticate")
+                    )
+                    if required_scope is not None:
+                        log(
+                            f"received 403 insufficient_scope "
+                            f"(required: {required_scope}), attempting step-up"
+                        )
+                        new_headers = scope_upgrader(required_scope)
+                        if new_headers:
+                            headers.update(new_headers)
+                            resp = client.post(
+                                endpoint,
+                                content=line,
+                                headers=headers,
+                                timeout=httpx.Timeout(
+                                    connect=timeout_connect,
+                                    read=timeout_read,
+                                    write=timeout_write,
+                                    pool=10,
+                                ),
+                            )
+                        else:
+                            log(
+                                "step-up authorization failed, returning error"
+                            )
+                            print(
+                                _error_response("authorization failed", req_id),
+                                flush=True,
+                            )
+                            continue
 
                 if resp.status_code not in (200, 202):
                     log(f"POST returned HTTP {resp.status_code}")
