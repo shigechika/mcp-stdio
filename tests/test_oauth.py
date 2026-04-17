@@ -1176,6 +1176,54 @@ class TestCallbackServer:
         assert cb_result.error == "access_denied"
         assert cb_result.auth_code is None
 
+    def test_non_callback_path_returns_404_and_does_not_capture(self):
+        """#15: favicon / prefetch / stray tabs must not deliver a code.
+
+        Only requests to `/callback` may be treated as the authoritative
+        authorization response; everything else is rejected.
+        """
+        cb_result = CallbackResult()
+        handler_cls = _make_callback_handler(cb_result)
+
+        from http.server import HTTPServer
+
+        server = HTTPServer(("127.0.0.1", 0), handler_cls)
+        port = server.server_address[1]
+        done = threading.Event()
+
+        def serve():
+            while not done.is_set():
+                server.handle_request()
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        time.sleep(0.3)
+
+        try:
+            # Paths that are NOT /callback must return 404 even when they
+            # carry query parameters that look like an authorization code.
+            for path in (
+                "/favicon.ico",
+                "/?code=bogus&state=attacker",
+                "/callback/extra?code=bogus&state=attacker",
+                "/CALLBACK?code=bogus&state=attacker",  # case-sensitive per spec
+            ):
+                resp = httpx.get(f"http://127.0.0.1:{port}{path}")
+                assert resp.status_code == 404, path
+
+            # Sanity: the legitimate path still works after rejections
+            resp = httpx.get(
+                f"http://127.0.0.1:{port}/callback?code=good_code&state=good_state"
+            )
+            assert resp.status_code == 200
+        finally:
+            done.set()
+            server.server_close()
+
+        # The bogus codes must not have been captured
+        assert cb_result.auth_code == "good_code"
+        assert cb_result.state == "good_state"
+
     def test_concurrent_flows_isolated(self):
         """Two callback handlers with separate result objects don't interfere."""
         result_a = CallbackResult()
