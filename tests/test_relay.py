@@ -1467,6 +1467,143 @@ class TestRunSse:
         assert refresher_called["n"] == 1
         assert call_count["n"] == 2
 
+    def test_post_403_triggers_scope_upgrader(self, httpx_mock):
+        """#17: SSE transport must run step-up on 403 insufficient_scope."""
+        post_received = threading.Event()
+        release_stdin = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=xyz\n\n"
+            post_received.wait(timeout=3)
+            yield b'event: message\ndata: {"jsonrpc":"2.0","result":{},"id":1}\n\n'
+            time.sleep(0.1)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        call_count = {"n": 0}
+
+        def post_callback(request):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return httpx.Response(
+                    status_code=403,
+                    headers={
+                        "www-authenticate": (
+                            'Bearer error="insufficient_scope", '
+                            'scope="hr:read hr:write"'
+                        ),
+                    },
+                )
+            post_received.set()
+            return httpx.Response(status_code=202)
+
+        httpx_mock.add_callback(
+            post_callback,
+            url="https://example.com/messages?sessionId=xyz",
+            method="POST",
+            is_reusable=True,
+        )
+
+        seen_scopes: list[str] = []
+
+        def mock_upgrader(required_scope: str):
+            seen_scopes.append(required_scope)
+            return {"Authorization": "Bearer upgraded"}
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"test","id":1}\n', release_stdin
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {}, scope_upgrader=mock_upgrader)
+
+        assert seen_scopes == ["hr:read hr:write"]
+        assert call_count["n"] == 2
+
+    def test_post_403_without_insufficient_scope_emits_error(self, httpx_mock):
+        """Plain 403 (no scope challenge) surfaces as error (#11 + #17)."""
+        release_stdin = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=xyz\n\n"
+            time.sleep(0.3)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url="https://example.com/messages?sessionId=xyz",
+            method="POST",
+            status_code=403,
+        )
+
+        called = []
+
+        def mock_upgrader(_scope):
+            called.append(True)
+            return {"Authorization": "Bearer x"}
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"t","id":3}\n', release_stdin
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {}, scope_upgrader=mock_upgrader)
+
+        # Upgrader was not invoked — no scope challenge to act on
+        assert called == []
+        parsed = json.loads(stdout.getvalue().strip())
+        assert parsed["error"]["message"] == "HTTP 403"
+        assert parsed["id"] == 3
+
+    def test_post_403_upgrader_failure_returns_error(self, httpx_mock):
+        """Step-up failure on SSE surfaces as JSON-RPC error (#17)."""
+        release_stdin = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=xyz\n\n"
+            time.sleep(0.3)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url="https://example.com/messages?sessionId=xyz",
+            method="POST",
+            status_code=403,
+            headers={
+                "www-authenticate": 'Bearer error="insufficient_scope", scope="x"'
+            },
+        )
+
+        def mock_upgrader(_scope):
+            return None  # user aborted / browser failed
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"t","id":4}\n', release_stdin
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {}, scope_upgrader=mock_upgrader)
+
+        parsed = json.loads(stdout.getvalue().strip())
+        assert parsed["error"]["message"] == "authorization failed"
+        assert parsed["id"] == 4
+
     def test_post_non_success_returns_error_response(self, httpx_mock):
         """Non-200/202 POST status maps to a JSON-RPC error response."""
         post_received = threading.Event()

@@ -240,20 +240,12 @@ def main() -> None:
         )
         sys.exit(0 if ok else 1)
 
-    if args.transport == "sse":
-        run_sse(
-            url=args.url,
-            headers=headers,
-            timeout_connect=args.timeout_connect,
-            timeout_read=args.timeout_read,
-            token_refresher=token_refresher,
-        )
-    else:
-        run(
-            url=args.url,
-            headers=headers,
-            timeout_connect=args.timeout_connect,
-            timeout_read=args.timeout_read,
-            token_refresher=token_refresher,
-            scope_upgrader=scope_upgrader,
-        )
+    relay_fn = run_sse if args.transport == "sse" else run
+    relay_fn(
+        url=args.url,
+        headers=headers,
+        timeout_connect=args.timeout_connect,
+        timeout_read=args.timeout_read,
+        token_refresher=token_refresher,
+        scope_upgrader=scope_upgrader,
+    )
