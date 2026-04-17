@@ -436,8 +436,77 @@ class TestRun:
         assert result["error"]["message"] == "authentication failed"
         assert result["id"] == 1
 
-    def test_401_without_refresher_passes_through(self, httpx_mock):
-        # 401 without token_refresher should not crash
+    @pytest.mark.parametrize("status_code", [400, 404, 409, 422, 500, 502, 503, 504])
+    def test_unhandled_error_status_surfaces_jsonrpc_error(
+        self, httpx_mock, status_code
+    ):
+        """#11: every 4xx/5xx the relay can't recover from must still produce
+        one JSON-RPC error on stdout so the MCP client never hangs waiting."""
+        httpx_mock.add_response(
+            status_code=status_code,
+            text="",
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","method":"init","id":42}'],
+        )
+        result = json.loads(output.strip())
+        assert result["error"]["message"] == f"HTTP {status_code}"
+        assert result["id"] == 42
+
+    def test_401_refresh_then_retry_500_emits_error(self, httpx_mock):
+        """#11 sentinel: a successful token refresh followed by a 5xx on the
+        retry must still surface a JSON-RPC error. Proves the fall-through
+        error block fires on post-recovery failures, not just first-pass."""
+        # 1st: 401 triggers refresh
+        httpx_mock.add_response(
+            status_code=401,
+            text="",
+            headers={"content-type": "application/json"},
+        )
+        # 2nd (after refresh): 500 — must surface as JSON-RPC error
+        httpx_mock.add_response(
+            status_code=500,
+            text="",
+            headers={"content-type": "application/json"},
+        )
+
+        def mock_refresher():
+            return {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer refreshed",
+            }
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","method":"tools/call","id":7}'],
+            token_refresher=mock_refresher,
+        )
+        result = json.loads(output.strip())
+        assert result["error"]["message"] == "HTTP 500"
+        assert result["id"] == 7
+        # Refresh was attempted (second request used the new bearer)
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 2
+        assert requests[1].headers["authorization"] == "Bearer refreshed"
+
+    def test_202_notification_produces_no_stdout(self, httpx_mock):
+        """#11: 202 Accepted (MCP notification ack) is intentionally silent."""
+        httpx_mock.add_response(
+            status_code=202,
+            text="",
+            headers={"content-type": "application/json"},
+        )
+        # Notification has no id
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","method":"notifications/initialized"}'],
+        )
+        assert output.strip() == ""
+
+    def test_401_without_refresher_emits_error(self, httpx_mock):
+        """#11: unhandled non-2xx must never produce a silent stdin hang."""
         httpx_mock.add_response(
             status_code=401,
             text="",
@@ -447,8 +516,9 @@ class TestRun:
             httpx_mock,
             ['{"jsonrpc":"2.0","method":"init","id":1}'],
         )
-        # No output because 401 is non-200 and no refresher
-        assert output.strip() == ""
+        result = json.loads(output.strip())
+        assert result["error"]["message"] == "HTTP 401"
+        assert result["id"] == 1
 
 
 # --- step-up authorization (anthropics/claude-code#44652) ---
@@ -556,8 +626,9 @@ class TestStepUpScopeChallenge:
         assert len(requests) == 2
         assert requests[1].headers["authorization"] == "Bearer upgraded-token"
 
-    def test_403_without_insufficient_scope_passes_through(self, httpx_mock):
-        """Plain 403 (non-scope challenge) must not invoke the upgrader."""
+    def test_403_without_insufficient_scope_emits_error(self, httpx_mock):
+        """Plain 403 (non-scope challenge) must not invoke the upgrader but
+        must still surface an error to the client (#11)."""
         httpx_mock.add_response(
             url=self.URL,
             status_code=403,
@@ -577,13 +648,16 @@ class TestStepUpScopeChallenge:
             scope_upgrader=mock_upgrader,
         )
 
-        # No retry, no upgrader call, no output (403 was not handled)
+        # Upgrader was not called — no scope challenge present
         assert called == []
-        assert output.strip() == ""
+        # But the error was surfaced, not silently dropped
+        result = json.loads(output.strip())
+        assert result["error"]["message"] == "HTTP 403"
+        assert result["id"] == 1
         assert len(httpx_mock.get_requests()) == 1
 
-    def test_403_without_upgrader_passes_through(self, httpx_mock):
-        """If scope_upgrader is not configured, 403 is surfaced unchanged."""
+    def test_403_without_upgrader_emits_error(self, httpx_mock):
+        """If scope_upgrader is not configured, 403 surfaces as an error (#11)."""
         httpx_mock.add_response(
             url=self.URL,
             status_code=403,
@@ -600,8 +674,9 @@ class TestStepUpScopeChallenge:
             httpx_mock,
             ['{"jsonrpc":"2.0","id":1,"method":"tools/call"}'],
         )
-        # No retry, no output — client sees the upstream 403
-        assert output.strip() == ""
+        result = json.loads(output.strip())
+        assert result["error"]["message"] == "HTTP 403"
+        assert result["id"] == 1
         assert len(httpx_mock.get_requests()) == 1
 
     def test_upgrader_failure_returns_error(self, httpx_mock):
