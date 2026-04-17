@@ -27,6 +27,36 @@ class TestParseHeader:
         with pytest.raises(SystemExit):
             _parse_header("no-colon-here")
 
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "value\r\nInjected: bad",  # classic CRLF injection
+            "value\nInjected: bad",  # bare LF
+            "value\rInjected: bad",  # bare CR
+            "value\x00hidden",  # NUL
+        ],
+    )
+    def test_value_with_control_chars_rejected(self, value, capsys):
+        """#14: CRLF / NUL in header values must never be accepted."""
+        with pytest.raises(SystemExit):
+            _parse_header(f"X-Api-Key: {value}")
+        assert "forbidden control character" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "bad key",  # whitespace
+            "(comment)",  # parens not in tchar
+            "bad\x7fkey",  # DEL
+            "",  # empty after strip
+        ],
+    )
+    def test_name_violating_token_grammar_rejected(self, name, capsys):
+        """#14: RFC 7230 §3.2.6 token grammar enforcement on header names."""
+        with pytest.raises(SystemExit):
+            _parse_header(f"{name}: value")
+        assert "invalid header name" in capsys.readouterr().err
+
 
 class TestMain:
     def test_version_flag(self, capsys):
