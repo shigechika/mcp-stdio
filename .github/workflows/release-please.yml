@@ -15,5 +15,16 @@ jobs:
     steps:
       - uses: googleapis/release-please-action@v4
         with:
+          # Use a fine-grained PAT so that tags and releases created by
+          # release-please trigger downstream workflows. Tokens attributed
+          # to GITHUB_TOKEN cannot fire other workflow runs (GitHub's
+          # recursion-prevention rule), which leaves the Release to PyPI
+          # pipeline dormant on every release. The PAT's author is a real
+          # user, so release.published propagates normally.
+          #
+          # The secret's repo scope needs Contents + Pull requests +
+          # Metadata at minimum. Falls back to GITHUB_TOKEN when the
+          # secret is unset, which lets PR CI keep working on forks.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json

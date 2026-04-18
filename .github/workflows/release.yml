@@ -1,9 +1,14 @@
 name: Release to PyPI
 
+# Fires when release-please publishes the Release after its PR is merged.
+# Previously this listened to `push: tags: ['v*']`, but release-please
+# creates tags via the default GITHUB_TOKEN which cannot trigger other
+# workflows. Moving to `release: published` plus the PAT wired in
+# release-please.yml lets the tag → Release handoff light up this
+# pipeline automatically.
 on:
-  push:
-    tags:
-      - "v*"
+  release:
+    types: [published]
 
 jobs:
   test:
