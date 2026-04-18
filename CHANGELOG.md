@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/shigechika/mcp-stdio/compare/v0.5.1...v0.5.2) (2026-04-18)
+
+
+### Bug Fixes
+
+* **sse:** add --sse-read-timeout to surface half-open TCP as reconnect ([#32](https://github.com/shigechika/mcp-stdio/issues/32)) ([0ff7bb8](https://github.com/shigechika/mcp-stdio/commit/0ff7bb835778ae2faceeb6c07a91174fadd7a07e))
+
 ## [0.5.1](https://github.com/shigechika/mcp-stdio/compare/v0.5.0...v0.5.1) (2026-04-18)
 
 
