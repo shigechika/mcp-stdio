@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/shigechika/mcp-stdio/compare/v0.5.0...v0.5.1) (2026-04-18)
+
+
+### Bug Fixes
+
+* **oauth:** compare OAuth state in constant time via secrets.compare_digest ([#27](https://github.com/shigechika/mcp-stdio/issues/27)) ([bc90557](https://github.com/shigechika/mcp-stdio/commit/bc9055790c52281eee6fdaf4729a02a0a6f943e9))
+
 ## [0.5.0](https://github.com/shigechika/mcp-stdio/compare/v0.4.9...v0.5.0) (2026-04-18)
 
 
