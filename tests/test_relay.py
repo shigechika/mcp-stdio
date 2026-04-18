@@ -1422,15 +1422,15 @@ class TestRunSse:
 
         Default of 300 seconds surfaces as httpx.Timeout(read=300.0).
         Explicit 0 and None both disable the timeout (read=None). No
-        network calls are made; the test intercepts Client construction
-        before the reader thread touches the socket.
+        network calls are made; the fake client intercepts Client
+        construction, captures the timeout, and then returns a 404 on
+        the first GET so run_sse's "SSE reader terminated before
+        endpoint event" branch fires and the main thread exits
+        deterministically via sys.exit(1) instead of blocking on stdin.
         """
         captured: list[httpx.Timeout] = []
 
         class _FakeClient:
-            """Minimal stand-in that captures the timeout then aborts
-            the reader loop with a 404 on the first GET."""
-
             def __init__(self, *, timeout, **_kwargs):
                 captured.append(timeout)
 
@@ -1438,6 +1438,10 @@ class TestRunSse:
                 pass
 
             def stream(self, method, url, headers=None):
+                # The reader sees HTTP 404 on the first GET, logs an
+                # error, sets state.ready, and returns. That's enough
+                # to make run_sse's post-startup endpoint check fail
+                # and reach the sys.exit path the test relies on.
                 class _CM:
                     status_code = 404
                     headers = {}
@@ -1468,10 +1472,6 @@ class TestRunSse:
             kwargs = {} if supplied is None else {"sse_read_timeout": supplied}
             stdin = StringIO("")
             stdout = StringIO()
-            # run_sse aborts via sys.exit(1) when the SSE reader fails to
-            # produce an endpoint (expected with the fake 404 client).
-            # All we need is for Client() to have been called with the
-            # right timeout before that exit happens.
             with (
                 patch("sys.stdin", stdin),
                 patch("sys.stdout", stdout),
@@ -1482,6 +1482,22 @@ class TestRunSse:
             assert captured[0].read == expected_read, (
                 f"sse_read_timeout={supplied!r} → expected read={expected_read}, "
                 f"got {captured[0].read!r}"
+            )
+
+    def test_run_rejects_sse_read_timeout(self):
+        """#9: the streamable-http path must not accept sse_read_timeout.
+
+        Guards the transport asymmetry documented in cli.py's dispatch:
+        run() has no long-lived GET to protect, so accidentally passing
+        sse_read_timeout into run() should surface as a TypeError —
+        future refactors that silently absorb **kwargs in run() would
+        fail this test and alert the reviewer.
+        """
+        with pytest.raises(TypeError, match="sse_read_timeout"):
+            run(
+                "https://example.com/mcp",
+                {},
+                sse_read_timeout=300,
             )
 
     def test_endpoint_then_post_then_message(self, httpx_mock):
