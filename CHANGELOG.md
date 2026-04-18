@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/shigechika/mcp-stdio/compare/v0.5.1...v0.5.2) (2026-04-18)
+
+
+### Documentation
+
+* cross-link claude-code[#49722](https://github.com/shigechika/mcp-stdio/issues/49722) prompt=consent Entra blocker ([#29](https://github.com/shigechika/mcp-stdio/issues/29)) ([39834ec](https://github.com/shigechika/mcp-stdio/commit/39834ec6a59d3b6ccb92de502731ed7d8ed29ed7))
+
 ## [0.5.1](https://github.com/shigechika/mcp-stdio/compare/v0.5.0...v0.5.1) (2026-04-18)
 
 
