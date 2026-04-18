@@ -69,10 +69,14 @@ def _tcp_keepalive_socket_options() -> list[tuple[int, int, int]]:
             (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KEEPALIVE_CNT),
         ]
     elif plat == "darwin":
-        if hasattr(socket, "TCP_KEEPALIVE"):
-            opts.append(
-                (socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, _KEEPALIVE_IDLE_SECS)
-            )
+        # TCP_KEEPALIVE is the idle timer on darwin; without it, the
+        # interval / count options alone are meaningless. Guard
+        # consistently with the Linux branch above.
+        if not hasattr(socket, "TCP_KEEPALIVE"):
+            return opts
+        opts.append(
+            (socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, _KEEPALIVE_IDLE_SECS)
+        )
         if hasattr(socket, "TCP_KEEPINTVL"):
             opts.append(
                 (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KEEPALIVE_INTVL_SECS)
@@ -83,16 +87,14 @@ def _tcp_keepalive_socket_options() -> list[tuple[int, int, int]]:
     return opts
 
 
-def _make_httpx_transport(*, enable_tcp_keepalive: bool) -> httpx.HTTPTransport:
+def _make_httpx_transport(*, tcp_keepalive: bool) -> httpx.HTTPTransport:
     """Build the HTTPTransport used by relay clients.
 
     Injects TCP keepalive socket options unless the caller opted out.
     Isolated as a helper so tests can patch it and both ``run`` and
     ``run_sse`` share the same transport construction.
     """
-    socket_options = (
-        _tcp_keepalive_socket_options() if enable_tcp_keepalive else None
-    )
+    socket_options = _tcp_keepalive_socket_options() if tcp_keepalive else None
     return httpx.HTTPTransport(socket_options=socket_options)
 
 # MCP spec defines four paginated list methods. Some clients (notably
@@ -644,7 +646,7 @@ def run(
 
     session_id: str | None = None
     client = httpx.Client(
-        transport=_make_httpx_transport(enable_tcp_keepalive=tcp_keepalive),
+        transport=_make_httpx_transport(tcp_keepalive=tcp_keepalive),
         timeout=httpx.Timeout(
             connect=timeout_connect,
             read=timeout_read,
@@ -917,7 +919,7 @@ def run_sse(
         None if sse_read_timeout in (None, 0) else sse_read_timeout
     )
     client = httpx.Client(
-        transport=_make_httpx_transport(enable_tcp_keepalive=tcp_keepalive),
+        transport=_make_httpx_transport(tcp_keepalive=tcp_keepalive),
         timeout=httpx.Timeout(
             connect=timeout_connect,
             read=effective_sse_read,
