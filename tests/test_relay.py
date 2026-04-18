@@ -1346,6 +1346,46 @@ class TestSseReaderLoop:
         assert '"id":"abc"' in stdout
         assert '"id":null' in stdout
 
+    def test_read_timeout_triggers_reconnect(self, httpx_mock):
+        """#9: a silent half-open TCP surfaces as httpx.ReadTimeout and the
+        reader loop reconnects, rather than blocking forever."""
+        state = _SseState()
+
+        # First GET: silent timeout (simulates a dropped half-open connection
+        # during a long-running tool call)
+        httpx_mock.add_exception(httpx.ReadTimeout("idle"), url=self.URL, method="GET")
+
+        # Second GET: a clean stream that terminates the test by setting stop
+        def healthy_gen():
+            yield b"event: endpoint\ndata: /messages\n\n"
+            state.stop.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream(healthy_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        client = httpx.Client()
+        stdout = StringIO()
+        try:
+            with (
+                patch("sys.stdout", stdout),
+                patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            ):
+                _sse_reader_loop(client, self.URL, {}, state)
+        finally:
+            client.close()
+
+        # After the reconnect, the endpoint event from the healthy stream
+        # must have been parsed — proof that the loop did not abort on
+        # the ReadTimeout.
+        assert state.endpoint_url == "https://example.com/messages"
+        assert state.ready.is_set()
+        # Both GETs were issued (the first one raised, the second succeeded)
+        assert len(httpx_mock.get_requests()) == 2
+
 
 class _BlockingStdin:
     """Stdin iterator that yields one line then blocks until released.
@@ -1376,6 +1416,89 @@ class TestRunSse:
     """End-to-end tests for run_sse driven from the main thread."""
 
     URL = "https://example.com/sse"
+
+    def test_sse_read_timeout_default_and_disabled(self, monkeypatch):
+        """#9: run_sse() passes sse_read_timeout through to httpx.Client.
+
+        Default of 300 seconds surfaces as httpx.Timeout(read=300.0).
+        Explicit 0 and None both disable the timeout (read=None). No
+        network calls are made; the fake client intercepts Client
+        construction, captures the timeout, and then returns a 404 on
+        the first GET so run_sse's "SSE reader terminated before
+        endpoint event" branch fires and the main thread exits
+        deterministically via sys.exit(1) instead of blocking on stdin.
+        """
+        captured: list[httpx.Timeout] = []
+
+        class _FakeClient:
+            def __init__(self, *, timeout, **_kwargs):
+                captured.append(timeout)
+
+            def close(self):
+                pass
+
+            def stream(self, method, url, headers=None):
+                # The reader sees HTTP 404 on the first GET, logs an
+                # error, sets state.ready, and returns. That's enough
+                # to make run_sse's post-startup endpoint check fail
+                # and reach the sys.exit path the test relies on.
+                class _CM:
+                    status_code = 404
+                    headers = {}
+
+                    def __enter__(self_):
+                        return self_
+
+                    def __exit__(self_, *a):
+                        return False
+
+                    def iter_lines(self_):
+                        return iter([])
+
+                return _CM()
+
+            def post(self, *_a, **_kw):
+                return httpx.Response(status_code=404)
+
+        monkeypatch.setattr("mcp_stdio.relay.httpx.Client", _FakeClient)
+
+        for supplied, expected_read in [
+            (None, 300),     # parameter default
+            (300, 300),      # explicit default
+            (60, 60),        # custom non-zero
+            (0, None),       # 0 disables
+        ]:
+            captured.clear()
+            kwargs = {} if supplied is None else {"sse_read_timeout": supplied}
+            stdin = StringIO("")
+            stdout = StringIO()
+            with (
+                patch("sys.stdin", stdin),
+                patch("sys.stdout", stdout),
+                pytest.raises(SystemExit),
+            ):
+                run_sse(self.URL, {}, **kwargs)
+            assert captured, f"Client was not constructed for {supplied!r}"
+            assert captured[0].read == expected_read, (
+                f"sse_read_timeout={supplied!r} → expected read={expected_read}, "
+                f"got {captured[0].read!r}"
+            )
+
+    def test_run_rejects_sse_read_timeout(self):
+        """#9: the streamable-http path must not accept sse_read_timeout.
+
+        Guards the transport asymmetry documented in cli.py's dispatch:
+        run() has no long-lived GET to protect, so accidentally passing
+        sse_read_timeout into run() should surface as a TypeError —
+        future refactors that silently absorb **kwargs in run() would
+        fail this test and alert the reviewer.
+        """
+        with pytest.raises(TypeError, match="sse_read_timeout"):
+            run(
+                "https://example.com/mcp",
+                {},
+                sse_read_timeout=300,
+            )
 
     def test_endpoint_then_post_then_message(self, httpx_mock):
         payload = '{"jsonrpc":"2.0","result":{},"id":42}'
