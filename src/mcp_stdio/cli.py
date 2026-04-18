@@ -185,6 +185,18 @@ def main() -> None:
         help="Read timeout in seconds (default: 120)",
     )
     parser.add_argument(
+        "--sse-read-timeout",
+        type=float,
+        default=300,
+        help=(
+            "Idle read timeout (seconds) on the SSE GET stream "
+            "(default: 300). A silent half-open TCP connection will "
+            "raise ReadTimeout and trigger auto-reconnect instead of "
+            "hanging. Set to 0 to disable. Has no effect on the "
+            "streamable-http transport. See #9."
+        ),
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="Check connection to the MCP server and exit",
@@ -273,12 +285,24 @@ def main() -> None:
         )
         sys.exit(0 if ok else 1)
 
-    relay_fn = run_sse if args.transport == "sse" else run
-    relay_fn(
-        url=args.url,
-        headers=headers,
-        timeout_connect=args.timeout_connect,
-        timeout_read=args.timeout_read,
-        token_refresher=token_refresher,
-        scope_upgrader=scope_upgrader,
-    )
+    # run() ignores sse_read_timeout (Streamable HTTP doesn't hold a
+    # long-lived GET), so only pass it through on the SSE path.
+    if args.transport == "sse":
+        run_sse(
+            url=args.url,
+            headers=headers,
+            timeout_connect=args.timeout_connect,
+            timeout_read=args.timeout_read,
+            sse_read_timeout=args.sse_read_timeout,
+            token_refresher=token_refresher,
+            scope_upgrader=scope_upgrader,
+        )
+    else:
+        run(
+            url=args.url,
+            headers=headers,
+            timeout_connect=args.timeout_connect,
+            timeout_read=args.timeout_read,
+            token_refresher=token_refresher,
+            scope_upgrader=scope_upgrader,
+        )

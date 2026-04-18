@@ -765,6 +765,7 @@ def run_sse(
     timeout_connect: float = 10,
     timeout_read: float = 120,
     timeout_write: float = 30,
+    sse_read_timeout: float | None = 300,
     token_refresher: Any = None,
     scope_upgrader: Any = None,
 ) -> None:
@@ -789,6 +790,14 @@ def run_sse(
         timeout_connect: Connection timeout in seconds
         timeout_read: Read timeout for the POST request
         timeout_write: Write timeout in seconds
+        sse_read_timeout: Idle read timeout (seconds) on the long-lived
+            SSE GET stream. A silent half-open TCP connection (dropped by
+            a proxy, NAT, or firewall during a long-running tool call)
+            will raise ``httpx.ReadTimeout`` after this interval and
+            trigger an automatic reconnect instead of hanging forever.
+            Set to ``None`` or ``0`` to restore the unbounded-read
+            behaviour used before v0.6.0. Defaults to 300 seconds,
+            matching the MCP Python SDK (#9).
         token_refresher: Optional callable that returns updated headers
             on successful token refresh, or None on failure. Called when
             the server returns HTTP 401 on POST.
@@ -808,12 +817,16 @@ def run_sse(
 
     log(f"connecting to {url} (SSE transport)")
 
-    # SSE GET is long-lived; use no read timeout for streaming.
-    # POST uses a bounded timeout via a separate per-request call.
+    # SSE GET is long-lived. Give it its own read timeout so a half-open
+    # TCP connection (silent mid-tool-call) surfaces as a ReadTimeout
+    # rather than a forever-hang; the reader loop then reconnects on
+    # its own. 0 is treated as "disabled" for parity with the old flag
+    # semantics. POST requests use the separate timeout_read below.
+    effective_sse_read = sse_read_timeout if sse_read_timeout else None
     client = httpx.Client(
         timeout=httpx.Timeout(
             connect=timeout_connect,
-            read=None,
+            read=effective_sse_read,
             write=timeout_write,
             pool=10,
         )
