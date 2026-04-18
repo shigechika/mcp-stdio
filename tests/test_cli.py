@@ -203,3 +203,42 @@ class TestMain:
             with pytest.raises(SystemExit) as exc_info:
                 main()
             assert exc_info.value.code == 1
+
+    def test_tcp_keepalive_default_on(self):
+        """#9: TCP keepalive is ON by default (no flag) → run() sees True."""
+        with (
+            patch("sys.argv", ["mcp-stdio", "https://example.com/mcp"]),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+        assert mock_run.call_args.kwargs["tcp_keepalive"] is True
+
+    def test_tcp_keepalive_opt_out(self):
+        """#9: --no-tcp-keepalive flips the flag to False."""
+        with (
+            patch(
+                "sys.argv",
+                ["mcp-stdio", "https://example.com/mcp", "--no-tcp-keepalive"],
+            ),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+        assert mock_run.call_args.kwargs["tcp_keepalive"] is False
+
+    def test_tcp_keepalive_passed_to_run_sse(self):
+        """#9: --no-tcp-keepalive reaches run_sse on the sse transport."""
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "https://example.com/mcp",
+                    "--transport",
+                    "sse",
+                    "--no-tcp-keepalive",
+                ],
+            ),
+            patch("mcp_stdio.cli.run_sse") as mock_run_sse,
+        ):
+            main()
+        assert mock_run_sse.call_args.kwargs["tcp_keepalive"] is False
