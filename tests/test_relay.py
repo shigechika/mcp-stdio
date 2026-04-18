@@ -2,6 +2,7 @@
 
 import json
 import queue
+import socket
 import threading
 import time
 from io import StringIO
@@ -19,9 +20,11 @@ from mcp_stdio.relay import (
     _enforce_lf_stdio,
     _error_response,
     _extract_id,
+    _make_httpx_transport,
     _parse_www_authenticate_scope,
     _post_and_stream,
     _sse_reader_loop,
+    _tcp_keepalive_socket_options,
     check_connection,
     run,
     run_sse,
@@ -1766,3 +1769,191 @@ class TestRunSse:
         parsed = json.loads(out)
         assert parsed["error"]["message"] == "HTTP 500"
         assert parsed["id"] == 99
+
+
+# --- TCP keepalive (#9, step 2) ---
+
+
+class TestTcpKeepaliveSocketOptions:
+    """_tcp_keepalive_socket_options must always include SO_KEEPALIVE and,
+    on platforms that support it, the TCP_KEEPIDLE/INTVL/CNT triplet."""
+
+    def _so_keepalive_tuple(self, opts):
+        return next(
+            (t for t in opts if t[:2] == (socket.SOL_SOCKET, socket.SO_KEEPALIVE)),
+            None,
+        )
+
+    @pytest.mark.skipif(
+        not hasattr(socket, "TCP_KEEPIDLE"),
+        reason="TCP_KEEPIDLE unavailable on this host (e.g. macOS dev box)",
+    )
+    def test_linux_sets_full_triplet(self, monkeypatch):
+        monkeypatch.setattr("mcp_stdio.relay.sys.platform", "linux")
+        opts = _tcp_keepalive_socket_options()
+        assert self._so_keepalive_tuple(opts) == (
+            socket.SOL_SOCKET,
+            socket.SO_KEEPALIVE,
+            1,
+        )
+        keys = [(level, opt) for (level, opt, _val) in opts]
+        assert (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE) in keys
+        assert (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL) in keys
+        assert (socket.IPPROTO_TCP, socket.TCP_KEEPCNT) in keys
+
+    @pytest.mark.skipif(
+        not hasattr(socket, "TCP_KEEPIDLE"),
+        reason="TCP_KEEPIDLE unavailable on this host",
+    )
+    def test_freebsd_sets_full_triplet(self, monkeypatch):
+        """#9: FreeBSD support relies on sys.platform.startswith('freebsd')."""
+        monkeypatch.setattr("mcp_stdio.relay.sys.platform", "freebsd14")
+        opts = _tcp_keepalive_socket_options()
+        assert self._so_keepalive_tuple(opts) is not None
+        keys = [(level, opt) for (level, opt, _val) in opts]
+        assert (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE) in keys
+
+    @pytest.mark.skipif(
+        not hasattr(socket, "TCP_KEEPIDLE"),
+        reason="TCP_KEEPIDLE unavailable on this host",
+    )
+    def test_netbsd_sets_full_triplet(self, monkeypatch):
+        monkeypatch.setattr("mcp_stdio.relay.sys.platform", "netbsd10")
+        opts = _tcp_keepalive_socket_options()
+        assert self._so_keepalive_tuple(opts) is not None
+        keys = [(level, opt) for (level, opt, _val) in opts]
+        assert (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE) in keys
+
+    def test_platform_without_tcp_keepidle_falls_back(self, monkeypatch):
+        """On a host whose socket module lacks TCP_KEEPIDLE (e.g. macOS dev
+        box running the test with sys.platform=linux monkeypatched), the
+        helper degrades to SO_KEEPALIVE alone instead of raising
+        AttributeError."""
+        monkeypatch.setattr("mcp_stdio.relay.sys.platform", "linux")
+        # Simulate a Python/OS combo that does not expose TCP_KEEPIDLE
+        import mcp_stdio.relay as relay_mod
+
+        class _FakeSocket:
+            SOL_SOCKET = socket.SOL_SOCKET
+            SO_KEEPALIVE = socket.SO_KEEPALIVE
+            IPPROTO_TCP = socket.IPPROTO_TCP
+            # Deliberately no TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT
+
+        monkeypatch.setattr(relay_mod, "socket", _FakeSocket)
+        opts = _tcp_keepalive_socket_options()
+        assert opts == [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+
+    def test_darwin_uses_tcp_keepalive_constant(self, monkeypatch):
+        """macOS exposes TCP_KEEPALIVE (not TCP_KEEPIDLE) for the idle timer.
+
+        On a darwin test host ``socket.TCP_KEEPALIVE`` is available
+        natively, so we assert the full expected option set. On other
+        hosts the constant is absent and the helper falls back to
+        SO_KEEPALIVE only — also a valid state — which this test
+        treats as the coverage boundary.
+        """
+        monkeypatch.setattr("mcp_stdio.relay.sys.platform", "darwin")
+        opts = _tcp_keepalive_socket_options()
+        assert self._so_keepalive_tuple(opts) is not None
+        if hasattr(socket, "TCP_KEEPALIVE"):
+            keys = [(level, opt) for (level, opt, _val) in opts]
+            assert (socket.IPPROTO_TCP, socket.TCP_KEEPALIVE) in keys
+
+    def test_windows_sets_only_so_keepalive(self, monkeypatch):
+        """Windows has no per-socket idle/intvl tuning via setsockopt — we
+        leave those to the SIO_KEEPALIVE_VALS ioctl (not supported here)
+        and rely on the OS default probe interval."""
+        monkeypatch.setattr("mcp_stdio.relay.sys.platform", "win32")
+        opts = _tcp_keepalive_socket_options()
+        assert opts == [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+
+    def test_unknown_platform_falls_back_to_so_keepalive(self, monkeypatch):
+        monkeypatch.setattr("mcp_stdio.relay.sys.platform", "aix7")
+        opts = _tcp_keepalive_socket_options()
+        assert opts == [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+
+    def test_darwin_without_tcp_keepalive_degrades(self, monkeypatch):
+        """Guards the macOS early-return: if a future darwin build
+        somehow exposes TCP_KEEPINTVL without TCP_KEEPALIVE (the idle
+        timer), the helper must NOT append the interval/count options
+        on their own — they're meaningless without idle."""
+        monkeypatch.setattr("mcp_stdio.relay.sys.platform", "darwin")
+        import mcp_stdio.relay as relay_mod
+
+        class _FakeSocket:
+            SOL_SOCKET = socket.SOL_SOCKET
+            SO_KEEPALIVE = socket.SO_KEEPALIVE
+            IPPROTO_TCP = socket.IPPROTO_TCP
+            # TCP_KEEPALIVE deliberately absent
+            TCP_KEEPINTVL = 0x101  # arbitrary — must not leak into output
+            TCP_KEEPCNT = 0x102
+
+        monkeypatch.setattr(relay_mod, "socket", _FakeSocket)
+        opts = _tcp_keepalive_socket_options()
+        assert opts == [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+
+
+
+class TestMakeHttpxTransport:
+    def test_enabled_injects_socket_options(self, monkeypatch):
+        captured: list[object] = []
+
+        class _FakeTransport:
+            def __init__(self, *, socket_options):
+                captured.append(socket_options)
+
+        monkeypatch.setattr("mcp_stdio.relay.httpx.HTTPTransport", _FakeTransport)
+        _make_httpx_transport(tcp_keepalive=True)
+        assert captured, "HTTPTransport was not constructed"
+        opts = captured[0]
+        assert isinstance(opts, list)
+        # SO_KEEPALIVE must always be present when enabled
+        assert any(
+            t[:2] == (socket.SOL_SOCKET, socket.SO_KEEPALIVE) for t in opts
+        )
+
+    def test_disabled_passes_none(self, monkeypatch):
+        captured: list[object] = []
+
+        class _FakeTransport:
+            def __init__(self, *, socket_options):
+                captured.append(socket_options)
+
+        monkeypatch.setattr("mcp_stdio.relay.httpx.HTTPTransport", _FakeTransport)
+        _make_httpx_transport(tcp_keepalive=False)
+        assert captured[0] is None
+
+
+class TestRunRespectsTcpKeepaliveFlag:
+    """End-to-end: run() / run_sse() actually call _make_httpx_transport
+    with the flag the caller passed. Closes the gap between the helper
+    tests and the CLI wiring tests."""
+
+    def test_run_passes_flag_to_make_transport(self, monkeypatch):
+        recorded: list[bool] = []
+
+        def spy(*, tcp_keepalive):
+            recorded.append(tcp_keepalive)
+            # Raise so run() bails before touching stdin/sockets
+            raise RuntimeError("sentinel")
+
+        monkeypatch.setattr("mcp_stdio.relay._make_httpx_transport", spy)
+        for flag in (True, False):
+            recorded.clear()
+            with pytest.raises(RuntimeError, match="sentinel"):
+                run("https://example.com/mcp", {}, tcp_keepalive=flag)
+            assert recorded == [flag]
+
+    def test_run_sse_passes_flag_to_make_transport(self, monkeypatch):
+        recorded: list[bool] = []
+
+        def spy(*, tcp_keepalive):
+            recorded.append(tcp_keepalive)
+            raise RuntimeError("sentinel")
+
+        monkeypatch.setattr("mcp_stdio.relay._make_httpx_transport", spy)
+        for flag in (True, False):
+            recorded.clear()
+            with pytest.raises(RuntimeError, match="sentinel"):
+                run_sse("https://example.com/sse", {}, tcp_keepalive=flag)
+            assert recorded == [flag]

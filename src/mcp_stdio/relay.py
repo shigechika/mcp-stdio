@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import signal
+import socket
 import sys
 import threading
 import time
@@ -17,6 +18,84 @@ from mcp_stdio import __version__
 
 MAX_RETRIES = 3
 RETRY_DELAY = 1  # seconds
+
+# TCP keepalive tuning. Together (60 s idle + 4 × 15 s probes) a silent
+# half-open TCP is surfaced as a socket error within ~120 s — fast enough
+# to matter during a long tool call, slow enough to tolerate transient
+# network blips. Used by ``_tcp_keepalive_socket_options`` below.
+_KEEPALIVE_IDLE_SECS = 60
+_KEEPALIVE_INTVL_SECS = 15
+_KEEPALIVE_CNT = 4
+
+
+def _tcp_keepalive_socket_options() -> list[tuple[int, int, int]]:
+    """Return a cross-platform socket_options list for TCP keepalive.
+
+    Portable baseline: ``SO_KEEPALIVE`` is enabled on every platform that
+    supports it. The detailed idle/interval/count tuning uses platform
+    branches:
+
+    - **Linux / FreeBSD / NetBSD** — expose ``TCP_KEEPIDLE`` /
+      ``TCP_KEEPINTVL`` / ``TCP_KEEPCNT`` via ``socket``. Numeric
+      constant values differ across OSes but Python resolves them
+      correctly per platform, so the same three tuples apply.
+    - **macOS** — ``TCP_KEEPALIVE`` sets the idle time; ``TCP_KEEPINTVL``
+      and ``TCP_KEEPCNT`` were added in macOS 10.15 and are used when
+      available.
+    - **Windows** — per-socket idle/interval tuning requires the
+      ``SIO_KEEPALIVE_VALS`` ioctl which httpx's ``socket_options``
+      mechanism cannot deliver. We set ``SO_KEEPALIVE`` alone; the
+      OS default probe interval (~2 h) still beats the current
+      forever-hang on a half-open TCP. Half-open detection under
+      Windows requires an out-of-band mechanism (e.g. MCP ``ping``)
+      for tighter bounds.
+
+    Always includes ``SO_KEEPALIVE`` so the returned list is never
+    empty; callers can therefore treat the absence of a keepalive
+    entry as "the caller opted out" rather than "the platform is
+    unsupported".
+    """
+    opts: list[tuple[int, int, int]] = [
+        (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+    ]
+    plat = sys.platform
+    if plat == "linux" or plat.startswith("freebsd") or plat.startswith("netbsd"):
+        for name in ("TCP_KEEPIDLE", "TCP_KEEPINTVL", "TCP_KEEPCNT"):
+            if not hasattr(socket, name):
+                return opts
+        opts += [
+            (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, _KEEPALIVE_IDLE_SECS),
+            (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KEEPALIVE_INTVL_SECS),
+            (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KEEPALIVE_CNT),
+        ]
+    elif plat == "darwin":
+        # TCP_KEEPALIVE is the idle timer on darwin; without it, the
+        # interval / count options alone are meaningless. Guard
+        # consistently with the Linux branch above.
+        if not hasattr(socket, "TCP_KEEPALIVE"):
+            return opts
+        opts.append(
+            (socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, _KEEPALIVE_IDLE_SECS)
+        )
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            opts.append(
+                (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KEEPALIVE_INTVL_SECS)
+            )
+        if hasattr(socket, "TCP_KEEPCNT"):
+            opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KEEPALIVE_CNT))
+    # win32 / cygwin / other: only SO_KEEPALIVE. See docstring.
+    return opts
+
+
+def _make_httpx_transport(*, tcp_keepalive: bool) -> httpx.HTTPTransport:
+    """Build the HTTPTransport used by relay clients.
+
+    Injects TCP keepalive socket options unless the caller opted out.
+    Isolated as a helper so tests can patch it and both ``run`` and
+    ``run_sse`` share the same transport construction.
+    """
+    socket_options = _tcp_keepalive_socket_options() if tcp_keepalive else None
+    return httpx.HTTPTransport(socket_options=socket_options)
 
 # MCP spec defines four paginated list methods. Some clients (notably
 # Claude Code, cf. anthropics/claude-code#39586) silently drop pages beyond
@@ -525,6 +604,7 @@ def run(
     timeout_connect: float = 10,
     timeout_read: float = 120,
     timeout_write: float = 30,
+    tcp_keepalive: bool = True,
     token_refresher: Any = None,
     scope_upgrader: Any = None,
 ) -> None:
@@ -539,6 +619,10 @@ def run(
         timeout_connect: Connection timeout in seconds
         timeout_read: Read timeout in seconds
         timeout_write: Write timeout in seconds
+        tcp_keepalive: When True (default), enable TCP keepalive on the
+            underlying socket to detect half-open connections at the
+            network layer. See ``_tcp_keepalive_socket_options`` for
+            platform-specific tuning (#9).
         token_refresher: Optional callable that returns updated headers
             on successful token refresh, or None on failure. Called when
             the server returns HTTP 401.
@@ -562,6 +646,7 @@ def run(
 
     session_id: str | None = None
     client = httpx.Client(
+        transport=_make_httpx_transport(tcp_keepalive=tcp_keepalive),
         timeout=httpx.Timeout(
             connect=timeout_connect,
             read=timeout_read,
@@ -766,6 +851,7 @@ def run_sse(
     timeout_read: float = 120,
     timeout_write: float = 30,
     sse_read_timeout: float | None = 300,
+    tcp_keepalive: bool = True,
     token_refresher: Any = None,
     scope_upgrader: Any = None,
 ) -> None:
@@ -798,6 +884,12 @@ def run_sse(
             Set to ``None`` or ``0`` to opt out of the timeout and
             restore the previous unbounded-read behaviour. Defaults to
             300 seconds, matching the MCP Python SDK (#9).
+        tcp_keepalive: When True (default), enable TCP keepalive at the
+            socket layer in addition to ``sse_read_timeout``. Keepalive
+            detects half-open TCP faster (≈120 s on Linux/macOS/BSD) and
+            works regardless of whether the server sends SSE keepalive
+            comments. See ``_tcp_keepalive_socket_options`` for the
+            platform-specific tuning, and #9 for the upstream context.
         token_refresher: Optional callable that returns updated headers
             on successful token refresh, or None on failure. Called when
             the server returns HTTP 401 on POST.
@@ -827,6 +919,7 @@ def run_sse(
         None if sse_read_timeout in (None, 0) else sse_read_timeout
     )
     client = httpx.Client(
+        transport=_make_httpx_transport(tcp_keepalive=tcp_keepalive),
         timeout=httpx.Timeout(
             connect=timeout_connect,
             read=effective_sse_read,

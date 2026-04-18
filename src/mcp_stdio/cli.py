@@ -197,6 +197,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--no-tcp-keepalive",
+        action="store_true",
+        help=(
+            "Disable TCP keepalive on the HTTP socket. TCP keepalive is "
+            "on by default (60s idle + 4 probes × 15s ≈ 120s half-open "
+            "detection on Linux/macOS/BSD; SO_KEEPALIVE-only on Windows). "
+            "Opt out for proxy/NAT paths that strip keepalive packets. "
+            "See #9."
+        ),
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="Check connection to the MCP server and exit",
@@ -287,6 +298,8 @@ def main() -> None:
 
     # run() ignores sse_read_timeout (Streamable HTTP doesn't hold a
     # long-lived GET), so only pass it through on the SSE path.
+    # tcp_keepalive applies to both transports.
+    tcp_keepalive = not args.no_tcp_keepalive
     if args.transport == "sse":
         run_sse(
             url=args.url,
@@ -294,6 +307,7 @@ def main() -> None:
             timeout_connect=args.timeout_connect,
             timeout_read=args.timeout_read,
             sse_read_timeout=args.sse_read_timeout,
+            tcp_keepalive=tcp_keepalive,
             token_refresher=token_refresher,
             scope_upgrader=scope_upgrader,
         )
@@ -303,6 +317,7 @@ def main() -> None:
             headers=headers,
             timeout_connect=args.timeout_connect,
             timeout_read=args.timeout_read,
+            tcp_keepalive=tcp_keepalive,
             token_refresher=token_refresher,
             scope_upgrader=scope_upgrader,
         )
