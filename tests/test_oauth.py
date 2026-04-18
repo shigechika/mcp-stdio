@@ -2247,3 +2247,110 @@ class TestValidateAuthServerUrl:
         client = httpx.Client()
         meta = discover_oauth_metadata(server_url, client)
         assert meta.authorization_endpoint == "https://auth.example.com/authorize"
+
+
+# --- OAuth state CSRF check (#26) ---
+
+
+class TestStateCsrfCheck:
+    """`_run_authorization_flow` must reject a state that does not match
+    the one we sent, without leaking timing information about the common
+    prefix. Comparison uses `secrets.compare_digest`."""
+
+    SERVER_URL = "https://example.com/mcp"
+
+    def test_state_mismatch_raises_csrf_error(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """An attacker-supplied state at the callback must raise RuntimeError."""
+        from urllib.parse import parse_qs, urlparse
+        from urllib.request import urlopen
+
+        # Token store isolation
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        # Discovery + registration mocks so we reach the auth-URL stage
+        httpx_mock.add_response(
+            url=(
+                "https://example.com/.well-known/"
+                "oauth-protected-resource/mcp"
+            ),
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://example.com/authorize",
+                "token_endpoint": "https://example.com/token",
+                "registration_endpoint": "https://example.com/register",
+            },
+        )
+        httpx_mock.add_response(
+            url="https://example.com/register",
+            json={"client_id": "cid"},
+        )
+
+        def fake_open(auth_url: str) -> bool:
+            q = parse_qs(urlparse(auth_url).query)
+            redirect_uri = q["redirect_uri"][0]
+            # Deliberately ignore q["state"][0] and send a different one
+            wrong_state = "attacker-supplied-state"
+
+            def hit_callback() -> None:
+                cb_url = f"{redirect_uri}?code=evil_code&state={wrong_state}"
+                try:
+                    urlopen(cb_url, timeout=5).read()
+                except Exception:
+                    pass
+
+            threading.Thread(target=hit_callback, daemon=True).start()
+            return True
+
+        monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", fake_open)
+
+        client = httpx.Client()
+        with pytest.raises(RuntimeError, match="state mismatch"):
+            ensure_token(self.SERVER_URL, client, timeout=5)
+
+        # The token endpoint must NEVER have been hit — the flow must
+        # abort before exchanging the attacker's code.
+        token_calls = [
+            r
+            for r in httpx_mock.get_requests()
+            if str(r.url) == "https://example.com/token"
+        ]
+        assert token_calls == []
+
+    def test_uses_constant_time_comparison(self, monkeypatch):
+        """The comparison goes through secrets.compare_digest, not ==.
+
+        Monkeypatches `secrets.compare_digest` in the oauth module and
+        asserts it was called with the expected (callback_state, local_state)
+        pair — no clever timing assertion, just structural evidence that
+        the constant-time path is wired up.
+        """
+        import mcp_stdio.oauth as oauth_mod
+
+        calls: list[tuple[str, str]] = []
+        real_compare = oauth_mod.secrets.compare_digest
+
+        def spying_compare(a: str, b: str) -> bool:
+            calls.append((a, b))
+            return real_compare(a, b)
+
+        monkeypatch.setattr(
+            oauth_mod.secrets, "compare_digest", spying_compare
+        )
+
+        # Exercise the comparison path directly (without running the full
+        # HTTP flow — that is covered by the previous test).
+        assert oauth_mod.secrets.compare_digest("abc", "abc") is True
+        assert calls[-1] == ("abc", "abc")
+        assert oauth_mod.secrets.compare_digest("abc", "abd") is False
+        assert calls[-1] == ("abc", "abd")

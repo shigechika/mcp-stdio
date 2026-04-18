@@ -696,7 +696,12 @@ def _run_authorization_flow(
     if cb_result.error:
         raise RuntimeError(f"OAuth error: {cb_result.error}")
 
-    if cb_result.state != state:
+    # Use a constant-time comparison so the rejection path does not leak the
+    # common-prefix length of the two state tokens via timing. Over a
+    # loopback callback the attack is theoretical, but every mainstream
+    # OAuth client does this and the line carries a CSRF-facing comment —
+    # we want it to hold up to scrutiny without caveats. See #26.
+    if not secrets.compare_digest(cb_result.state or "", state):
         raise RuntimeError("OAuth state mismatch — possible CSRF attack")
 
     code = cb_result.auth_code
