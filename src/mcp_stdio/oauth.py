@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import ipaddress
 import secrets
 import threading
 import time
@@ -12,7 +13,7 @@ import webbrowser
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.parse import ParseResult, parse_qs, urlencode, urlparse, urlsplit, urlunsplit
 
 import httpx
 
@@ -45,6 +46,99 @@ def _authorization_base_url(server_url: str) -> str:
     """
     parsed = urlparse(server_url)
     return f"{parsed.scheme}://{parsed.netloc}"
+
+
+# Default ports used when normalising a parsed URL into a RFC 6454 origin
+# tuple for comparison. Any scheme outside this table falls through as None,
+# which is fine — we only reach the cross-origin check after scheme has
+# already been constrained to http/https.
+_DEFAULT_PORTS = {"https": 443, "http": 80}
+
+
+def _is_loopback(host: str) -> bool:
+    """Return True for loopback hosts per RFC 6761 / RFC 1122 §3.2.1.3.
+
+    Recognises ``localhost`` (with optional trailing dot per RFC 6761 §6.3),
+    every textual form of the IPv6 loopback (``::1`` / ``0:0:0:0:0:0:0:1``),
+    and the entire ``127.0.0.0/8`` IPv4 loopback block — not just the
+    canonical ``127.0.0.1``. Parsing is delegated to ``ipaddress`` so any
+    valid representation works.
+    """
+    if not host:
+        return False
+    h = host.lower().rstrip(".")
+    if h == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
+def _origin(parsed: ParseResult) -> tuple[str, str, int | None]:
+    """Normalise a parsed URL to an RFC 6454 origin tuple for comparison.
+
+    ``parsed.hostname`` already lowercases and strips userinfo; ``parsed.port``
+    returns ``None`` when the authority omits an explicit port, so an explicit
+    default port (``:443`` for https, ``:80`` for http) is folded back to the
+    implicit form. Two URLs that differ only in case, explicit default port,
+    or userinfo therefore compare equal.
+    """
+    host = (parsed.hostname or "").lower()
+    port = parsed.port
+    if port is None:
+        port = _DEFAULT_PORTS.get(parsed.scheme)
+    return (parsed.scheme, host, port)
+
+
+def _validate_auth_server_url(auth_server_url: str, mcp_server_url: str) -> bool:
+    """Validate a PRM-advertised authorization_server URL.
+
+    Rejects the URL (returns False and logs a warning) when the scheme is
+    not ``https://`` and the host is not loopback — a malicious MCP server
+    could otherwise redirect the OAuth flow over plaintext HTTP and capture
+    the resulting tokens. Cross-origin authorization servers are permitted
+    by RFC 9728 §2 for federated setups; they produce a prominent warning
+    so the user can abort before the browser opens. See #13.
+    """
+    try:
+        parsed = urlparse(auth_server_url)
+    except Exception:
+        log(
+            f"warning: malformed authorization_server URL "
+            f"{auth_server_url!r}, ignoring"
+        )
+        return False
+
+    if parsed.scheme not in ("https", "http"):
+        log(
+            f"warning: unsupported authorization_server scheme "
+            f"{parsed.scheme!r} in {auth_server_url!r}, ignoring"
+        )
+        return False
+
+    if parsed.scheme == "http" and not _is_loopback(parsed.hostname or ""):
+        log(
+            f"warning: refusing to follow non-loopback HTTP "
+            f"authorization_server {auth_server_url!r} — OAuth tokens "
+            f"would traverse the wire in cleartext. Ignoring. See #13."
+        )
+        return False
+
+    mcp_parsed = urlparse(mcp_server_url)
+    if (
+        parsed.hostname
+        and mcp_parsed.hostname
+        and _origin(parsed) != _origin(mcp_parsed)
+    ):
+        log(
+            f"warning: authorization_server {auth_server_url!r} is "
+            f"cross-origin to the MCP server {mcp_server_url!r}. "
+            f"Tokens will be issued by a different host than the one "
+            f"serving MCP. Abort if you did not expect federation."
+        )
+
+    return True
 
 
 def _build_well_known_url(resource_url: str, suffix: str) -> str:
@@ -147,8 +241,17 @@ def discover_oauth_metadata(server_url: str, client: httpx.Client) -> OAuthMetad
             )
         auth_servers = prm_data.get("authorization_servers")
         if auth_servers and isinstance(auth_servers, list):
-            auth_server_url = auth_servers[0]
-            log(f"discovered authorization server: {auth_server_url}")
+            # Walk the list and pick the first entry that passes validation.
+            # A malicious or misconfigured MCP server might otherwise send
+            # us at a plaintext / cross-origin authorization server we
+            # should never follow. See #13.
+            for candidate in auth_servers:
+                if isinstance(candidate, str) and _validate_auth_server_url(
+                    candidate, server_url
+                ):
+                    auth_server_url = candidate
+                    log(f"discovered authorization server: {auth_server_url}")
+                    break
         break
 
     # Phase 2: RFC 8414 Authorization Server Metadata
