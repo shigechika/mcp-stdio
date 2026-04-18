@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/shigechika/mcp-stdio/compare/v0.5.2...v0.6.0) (2026-04-18)
+
+
+### Features
+
+* **sse:** inject TCP keepalive socket options on httpx transport ([#34](https://github.com/shigechika/mcp-stdio/issues/34)) ([463b037](https://github.com/shigechika/mcp-stdio/commit/463b0376ba579d533a692cf4ce811d05db488349))
+
 ## [0.5.2](https://github.com/shigechika/mcp-stdio/compare/v0.5.1...v0.5.2) (2026-04-18)
 
 
