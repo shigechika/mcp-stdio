@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import ipaddress
 import secrets
 import threading
 import time
@@ -12,7 +13,7 @@ import webbrowser
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.parse import ParseResult, parse_qs, urlencode, urlparse, urlsplit, urlunsplit
 
 import httpx
 
@@ -47,17 +48,47 @@ def _authorization_base_url(server_url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-# Loopback hostnames per RFC 6761. HTTP against these is tolerated for local
-# development; HTTP against anything else is rejected when it would send the
-# user's authorization code over the wire in cleartext.
-_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+# Default ports used when normalising a parsed URL into a RFC 6454 origin
+# tuple for comparison. Any scheme outside this table falls through as None,
+# which is fine — we only reach the cross-origin check after scheme has
+# already been constrained to http/https.
+_DEFAULT_PORTS = {"https": 443, "http": 80}
 
 
 def _is_loopback(host: str) -> bool:
-    """Return True for loopback hostnames per RFC 6761."""
+    """Return True for loopback hosts per RFC 6761 / RFC 1122 §3.2.1.3.
+
+    Recognises ``localhost`` (with optional trailing dot per RFC 6761 §6.3),
+    every textual form of the IPv6 loopback (``::1`` / ``0:0:0:0:0:0:0:1``),
+    and the entire ``127.0.0.0/8`` IPv4 loopback block — not just the
+    canonical ``127.0.0.1``. Parsing is delegated to ``ipaddress`` so any
+    valid representation works.
+    """
     if not host:
         return False
-    return host.lower() in _LOOPBACK_HOSTS
+    h = host.lower().rstrip(".")
+    if h == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
+def _origin(parsed: ParseResult) -> tuple[str, str, int | None]:
+    """Normalise a parsed URL to an RFC 6454 origin tuple for comparison.
+
+    ``parsed.hostname`` already lowercases and strips userinfo; ``parsed.port``
+    returns ``None`` when the authority omits an explicit port, so an explicit
+    default port (``:443`` for https, ``:80`` for http) is folded back to the
+    implicit form. Two URLs that differ only in case, explicit default port,
+    or userinfo therefore compare equal.
+    """
+    host = (parsed.hostname or "").lower()
+    port = parsed.port
+    if port is None:
+        port = _DEFAULT_PORTS.get(parsed.scheme)
+    return (parsed.scheme, host, port)
 
 
 def _validate_auth_server_url(auth_server_url: str, mcp_server_url: str) -> bool:
@@ -95,7 +126,11 @@ def _validate_auth_server_url(auth_server_url: str, mcp_server_url: str) -> bool
         return False
 
     mcp_parsed = urlparse(mcp_server_url)
-    if parsed.netloc and mcp_parsed.netloc and parsed.netloc != mcp_parsed.netloc:
+    if (
+        parsed.hostname
+        and mcp_parsed.hostname
+        and _origin(parsed) != _origin(mcp_parsed)
+    ):
         log(
             f"warning: authorization_server {auth_server_url!r} is "
             f"cross-origin to the MCP server {mcp_server_url!r}. "

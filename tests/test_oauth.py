@@ -2051,17 +2051,43 @@ class TestIsLoopback:
         assert _is_loopback("localhost") is True
         assert _is_loopback("LOCALHOST") is True
 
-    def test_ipv4_loopback(self):
+    def test_localhost_with_trailing_dot(self):
+        """RFC 6761 §6.3: the FQDN form of localhost still resolves to loopback."""
+        assert _is_loopback("localhost.") is True
+        assert _is_loopback("LOCALHOST.") is True
+
+    def test_ipv4_loopback_canonical(self):
         assert _is_loopback("127.0.0.1") is True
 
-    def test_ipv6_loopback(self):
+    def test_ipv4_loopback_range(self):
+        """RFC 1122 §3.2.1.3: 127.0.0.0/8 is all loopback, not just .0.1."""
+        for addr in ("127.0.0.2", "127.1.2.3", "127.255.255.254"):
+            assert _is_loopback(addr) is True, addr
+
+    def test_ipv6_loopback_canonical(self):
         assert _is_loopback("::1") is True
+
+    def test_ipv6_loopback_expanded_forms(self):
+        """Different textual forms of ::1 must all be recognised."""
+        for form in ("0:0:0:0:0:0:0:1", "::0001", "0:0:0:0:0:0:0:0001"):
+            assert _is_loopback(form) is True, form
 
     def test_public_hosts_are_not_loopback(self):
         assert _is_loopback("example.com") is False
         assert _is_loopback("auth.example.com") is False
         assert _is_loopback("10.0.0.1") is False  # RFC 1918 is NOT loopback
         assert _is_loopback("") is False
+
+    def test_adjacent_ranges_are_not_loopback(self):
+        """Boundary check: 126.x and 128.x must not be confused with 127/8."""
+        assert _is_loopback("126.255.255.255") is False
+        assert _is_loopback("128.0.0.0") is False
+
+    def test_malformed_hosts_return_false(self):
+        """Non-addresses (e.g. looks-like-ip-but-isn't) fail closed."""
+        assert _is_loopback("127.0.0.1.malicious.example.com") is False
+        assert _is_loopback("not-an-address") is False
+        assert _is_loopback("999.999.999.999") is False
 
 
 class TestValidateAuthServerUrl:
@@ -2087,6 +2113,49 @@ class TestValidateAuthServerUrl:
         )
         err = capsys.readouterr().err
         assert "cross-origin" in err
+
+    def test_explicit_default_port_is_not_cross_origin(self, capsys):
+        """`:443` is the implicit default for https; URLs that spell it out
+        must still compare as same-origin. A false cross-origin warning
+        here desensitises the user to the real one."""
+        assert (
+            _validate_auth_server_url(
+                "https://mcp.example.com:443/authorize", self.SERVER_URL
+            )
+            is True
+        )
+        assert "cross-origin" not in capsys.readouterr().err
+
+    def test_hostname_case_is_not_cross_origin(self, capsys):
+        """DNS is case-insensitive per RFC 4343, so uppercase hostnames in
+        either the PRM or the MCP URL must not trigger cross-origin."""
+        assert (
+            _validate_auth_server_url(
+                "https://MCP.example.com/authorize", self.SERVER_URL
+            )
+            is True
+        )
+        assert "cross-origin" not in capsys.readouterr().err
+
+    def test_userinfo_is_not_cross_origin(self, capsys):
+        """Per RFC 6454 §4, userinfo is not part of the origin."""
+        assert (
+            _validate_auth_server_url(
+                "https://user:pass@mcp.example.com/authorize", self.SERVER_URL
+            )
+            is True
+        )
+        assert "cross-origin" not in capsys.readouterr().err
+
+    def test_different_port_is_cross_origin(self, capsys):
+        """Different explicit ports ARE different origins per RFC 6454."""
+        assert (
+            _validate_auth_server_url(
+                "https://mcp.example.com:8443/authorize", self.SERVER_URL
+            )
+            is True  # accepted, but with warning
+        )
+        assert "cross-origin" in capsys.readouterr().err
 
     def test_plaintext_http_to_public_host_rejected(self, capsys):
         assert (
