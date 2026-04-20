@@ -242,3 +242,42 @@ class TestMain:
         ):
             main()
         assert mock_run_sse.call_args.kwargs["tcp_keepalive"] is False
+
+    def test_cancel_filter_default_on(self):
+        """#39: cancel filter is ON by default → run() sees True."""
+        with (
+            patch("sys.argv", ["mcp-stdio", "https://example.com/mcp"]),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+        assert mock_run.call_args.kwargs["cancel_filter"] is True
+
+    def test_cancel_filter_opt_out(self):
+        """#39: --no-cancel-filter flips the flag to False."""
+        with (
+            patch(
+                "sys.argv",
+                ["mcp-stdio", "https://example.com/mcp", "--no-cancel-filter"],
+            ),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+        assert mock_run.call_args.kwargs["cancel_filter"] is False
+
+    def test_cancel_filter_passed_to_run_sse(self):
+        """#39: --no-cancel-filter reaches run_sse on the sse transport."""
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "https://example.com/mcp",
+                    "--transport",
+                    "sse",
+                    "--no-cancel-filter",
+                ],
+            ),
+            patch("mcp_stdio.cli.run_sse") as mock_run_sse,
+        ):
+            main()
+        assert mock_run_sse.call_args.kwargs["cancel_filter"] is False

@@ -142,6 +142,96 @@ def _extract_id(line: str) -> Any:
         return None
 
 
+# Cancel-aware response filter (MCP cancellation spec SHOULDs).
+#
+# The MCP cancellation utility mandates two reciprocal SHOULDs:
+# - a *receiver* must not send a response for a cancelled request;
+# - a *canceller* must ignore any late response for a cancelled request.
+# Both are violated in the wild (cf. anthropics/claude-code#51073 for the
+# canceller side; modelcontextprotocol/python-sdk#2480 for the receiver
+# side). As a stdin-to-HTTP middleman, mcp-stdio can enforce the receiver
+# SHOULD on the wire by dropping any upstream response whose id has been
+# cancelled by the client — see _CancelTracker and _emit below.
+_CANCEL_TTL_SECS = 60.0
+_CANCEL_GC_THRESHOLD = 256
+_CANCELLED_METHOD_RE = re.compile(r'"method"\s*:\s*"notifications/cancelled"')
+
+
+class _CancelTracker:
+    """Thread-safe id→timestamp map of cancelled in-flight request ids.
+
+    Callers on the stdin side push ids with ``add(id)`` when they see a
+    ``notifications/cancelled``; the response-emit path queries with
+    ``contains(id)`` and drops matching responses. Entries expire after
+    ``ttl`` seconds (monotonic clock — immune to NTP jumps), and the
+    internal map is opportunistically garbage-collected when it grows
+    past ``_CANCEL_GC_THRESHOLD`` entries so an adversarial peer cannot
+    leak memory. Both transports share one instance; the SSE reader
+    thread in ``run_sse`` reads concurrently with the main loop, hence
+    the lock.
+    """
+
+    __slots__ = ("_seen", "_lock", "_ttl", "_now")
+
+    def __init__(
+        self,
+        ttl: float = _CANCEL_TTL_SECS,
+        now: Any = time.monotonic,
+    ) -> None:
+        self._seen: dict[Any, float] = {}
+        self._lock = threading.Lock()
+        self._ttl = ttl
+        self._now = now
+
+    def add(self, req_id: Any) -> None:
+        if req_id is None:
+            return
+        with self._lock:
+            self._seen[req_id] = self._now()
+            if len(self._seen) > _CANCEL_GC_THRESHOLD:
+                self._gc_locked()
+
+    def contains(self, req_id: Any) -> bool:
+        if req_id is None:
+            return False
+        with self._lock:
+            ts = self._seen.get(req_id)
+            if ts is None:
+                return False
+            if self._now() - ts > self._ttl:
+                del self._seen[req_id]
+                return False
+            return True
+
+    def _gc_locked(self) -> None:
+        cutoff = self._now() - self._ttl
+        expired = [k for k, ts in self._seen.items() if ts < cutoff]
+        for k in expired:
+            del self._seen[k]
+
+
+def _extract_cancel_id(line: str) -> Any:
+    """Return ``params.requestId`` if ``line`` is a ``notifications/cancelled``.
+
+    Uses a cheap regex pre-check to avoid a full ``json.loads`` on every
+    stdin line — only cancellation notifications go through the slow
+    path. Returns ``None`` if the line is not a cancellation (malformed
+    JSON, wrong method, missing params, or missing requestId).
+    """
+    if not _CANCELLED_METHOD_RE.search(line):
+        return None
+    try:
+        msg = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(msg, dict) or msg.get("method") != "notifications/cancelled":
+        return None
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return None
+    return params.get("requestId")
+
+
 def _error_response(message: str, req_id: Any = None) -> str:
     """Build a JSON-RPC error response."""
     return json.dumps(
@@ -151,6 +241,40 @@ def _error_response(message: str, req_id: Any = None) -> str:
             "id": req_id,
         }
     )
+
+
+def _emit(line: str, tracker: "_CancelTracker | None") -> None:
+    """Write one JSON-RPC line to stdout, filtering cancelled-id responses.
+
+    When ``tracker`` is ``None`` (feature disabled) the line is written
+    unconditionally. Otherwise the line is parsed; only proper JSON-RPC
+    *responses* (objects with an id and either ``result`` or ``error``)
+    are eligible for dropping. Notifications, server-initiated requests,
+    JSON-RPC batches, and anything that fails to parse pass through —
+    the filter is narrowly scoped to the case the spec covers.
+
+    mcp-stdio's own synthesized error responses (``_error_response``)
+    intentionally bypass this gate and call ``print`` directly, so a
+    cancel arriving mid-retry never leaves the client hanging without
+    an answer for the line it just sent.
+    """
+    if tracker is None:
+        print(line, flush=True)
+        return
+    try:
+        msg = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        print(line, flush=True)
+        return
+    if not isinstance(msg, dict):
+        print(line, flush=True)
+        return
+    rid = msg.get("id")
+    if rid is not None and ("result" in msg or "error" in msg):
+        if tracker.contains(rid):
+            log(f"dropped late response for cancelled id {rid!r}")
+            return
+    print(line, flush=True)
 
 
 class _StreamResult:
@@ -204,6 +328,7 @@ def _post_and_stream(
     content: str,
     headers: dict[str, str],
     req_id: Any,
+    tracker: _CancelTracker | None = None,
 ) -> _StreamResult | None:
     """Send a POST and stream the response to stdout with retry.
 
@@ -226,12 +351,12 @@ def _post_and_stream(
                 if "text/event-stream" in content_type:
                     for line in resp.iter_lines():
                         if line.startswith("data: "):
-                            print(line[6:], flush=True)
+                            _emit(line[6:], tracker)
                 else:
                     resp.read()
                     text = resp.text.strip()
                     if text:
-                        print(text, flush=True)
+                        _emit(text, tracker)
 
                 return _StreamResult(session, 200)
         except (
@@ -344,6 +469,7 @@ def _paginate_and_stream(
     headers: dict[str, str],
     req_id: Any,
     result_key: str,
+    tracker: _CancelTracker | None = None,
 ) -> _StreamResult | None:
     """Transparently follow ``result.nextCursor`` and emit one merged response.
 
@@ -360,7 +486,7 @@ def _paginate_and_stream(
     try:
         request = json.loads(line)
     except json.JSONDecodeError:
-        return _post_and_stream(client, url, line, headers, req_id)
+        return _post_and_stream(client, url, line, headers, req_id, tracker)
 
     base_params = request.get("params")
     params: dict[str, Any] = dict(base_params) if isinstance(base_params, dict) else {}
@@ -397,7 +523,7 @@ def _paginate_and_stream(
 
         if parsed is None:
             if page == 1:
-                return _post_and_stream(client, url, line, headers, req_id)
+                return _post_and_stream(client, url, line, headers, req_id, tracker)
             log(
                 f"pagination: page {page} response not parseable, "
                 f"returning partial result"
@@ -409,7 +535,7 @@ def _paginate_and_stream(
             # Error response or unexpected shape — forward as-is from page 1,
             # otherwise stop and flush what we have.
             if page == 1:
-                print(json.dumps(parsed), flush=True)
+                _emit(json.dumps(parsed), tracker)
                 return stream
             break
 
@@ -441,7 +567,7 @@ def _paginate_and_stream(
         "id": request.get("id"),
         "result": merged_result,
     }
-    print(json.dumps(merged_response), flush=True)
+    _emit(json.dumps(merged_response), tracker)
     _ = truncated  # kept for future _meta annotation
     return _StreamResult(last_session, 200)
 
@@ -605,6 +731,7 @@ def run(
     timeout_read: float = 120,
     timeout_write: float = 30,
     tcp_keepalive: bool = True,
+    cancel_filter: bool = True,
     token_refresher: Any = None,
     scope_upgrader: Any = None,
 ) -> None:
@@ -623,6 +750,14 @@ def run(
             underlying socket to detect half-open connections at the
             network layer. See ``_tcp_keepalive_socket_options`` for
             platform-specific tuning (#9).
+        cancel_filter: When True (default), track ids from
+            ``notifications/cancelled`` seen on stdin and drop any late
+            upstream JSON-RPC response carrying one of those ids before
+            it reaches stdout. Enforces the MCP cancellation spec's
+            receiver-side SHOULD on behalf of non-compliant servers and
+            shields the downstream client from canceller-side bugs such
+            as anthropics/claude-code#51073. Disable (``False``) only
+            when debugging raw upstream traffic.
         token_refresher: Optional callable that returns updated headers
             on successful token refresh, or None on failure. Called when
             the server returns HTTP 401.
@@ -645,6 +780,7 @@ def run(
     log(f"connecting to {url}")
 
     session_id: str | None = None
+    tracker: _CancelTracker | None = _CancelTracker() if cancel_filter else None
     client = httpx.Client(
         transport=_make_httpx_transport(tcp_keepalive=tcp_keepalive),
         timeout=httpx.Timeout(
@@ -661,6 +797,11 @@ def run(
             if not line:
                 continue
 
+            if tracker is not None:
+                cid = _extract_cancel_id(line)
+                if cid is not None:
+                    tracker.add(cid)
+
             req_id = _extract_id(line)
 
             req_headers = dict(headers)
@@ -671,9 +812,9 @@ def run(
                 detected = _detect_paginated_list(content)
                 if detected:
                     return _paginate_and_stream(
-                        client, url, content, h, req_id, detected[1]
+                        client, url, content, h, req_id, detected[1], tracker
                     )
-                return _post_and_stream(client, url, content, h, req_id)
+                return _post_and_stream(client, url, content, h, req_id, tracker)
 
             result = _dispatch(line, req_headers)
             if result is None:
@@ -777,6 +918,7 @@ def _sse_reader_loop(
     url: str,
     headers: dict[str, str],
     state: _SseState,
+    tracker: _CancelTracker | None = None,
 ) -> None:
     """Reader thread: maintain SSE GET stream and dispatch events.
 
@@ -811,7 +953,7 @@ def _sse_reader_loop(
                                 state.ready.set()
                                 log(f"SSE endpoint: {resolved}")
                             elif event_type == "message":
-                                print(data, flush=True)
+                                _emit(data, tracker)
                         event_type = "message"
                         data_lines = []
                     elif line.startswith(":"):
@@ -852,6 +994,7 @@ def run_sse(
     timeout_write: float = 30,
     sse_read_timeout: float | None = 300,
     tcp_keepalive: bool = True,
+    cancel_filter: bool = True,
     token_refresher: Any = None,
     scope_upgrader: Any = None,
 ) -> None:
@@ -890,6 +1033,11 @@ def run_sse(
             works regardless of whether the server sends SSE keepalive
             comments. See ``_tcp_keepalive_socket_options`` for the
             platform-specific tuning, and #9 for the upstream context.
+        cancel_filter: When True (default), track ids from
+            ``notifications/cancelled`` seen on stdin and drop any late
+            upstream response carrying one of those ids on the SSE
+            stream before it reaches stdout. See ``run`` for the full
+            rationale.
         token_refresher: Optional callable that returns updated headers
             on successful token refresh, or None on failure. Called when
             the server returns HTTP 401 on POST.
@@ -928,10 +1076,11 @@ def run_sse(
         )
     )
 
+    tracker: _CancelTracker | None = _CancelTracker() if cancel_filter else None
     state = _SseState()
     reader = threading.Thread(
         target=_sse_reader_loop,
-        args=(client, url, headers, state),
+        args=(client, url, headers, state, tracker),
         daemon=True,
     )
     reader.start()
@@ -953,6 +1102,11 @@ def run_sse(
             line = line.strip()
             if not line:
                 continue
+
+            if tracker is not None:
+                cid = _extract_cancel_id(line)
+                if cid is not None:
+                    tracker.add(cid)
 
             if state.endpoint_url is None:
                 if not state.ready.wait(timeout=timeout_read):
