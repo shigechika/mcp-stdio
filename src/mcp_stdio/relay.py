@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import email.utils
 import json
 import re
 import signal
@@ -9,6 +10,7 @@ import socket
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urljoin
 
@@ -18,6 +20,14 @@ from mcp_stdio import __version__
 
 MAX_RETRIES = 3
 RETRY_DELAY = 1  # seconds
+
+# HTTP 429 rate-limit handling. If the server sends ``Retry-After`` we
+# honour it up to the cap; beyond the cap we give up rather than make the
+# client hang on an unreasonable server-requested wait. Missing
+# ``Retry-After`` falls back to the same linear backoff used for
+# transient connection errors. Closes the gap called out by
+# modelcontextprotocol/typescript-sdk#1892.
+_RATE_LIMIT_SLEEP_CAP_SECS = 60.0
 
 # TCP keepalive tuning. Together (60 s idle + 4 × 15 s probes) a silent
 # half-open TCP is surfaced as a socket error within ~120 s — fast enough
@@ -243,6 +253,72 @@ def _error_response(message: str, req_id: Any = None) -> str:
     )
 
 
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse an HTTP ``Retry-After`` header value.
+
+    Per RFC 7231 §7.1.3, ``Retry-After`` is either a non-negative integer
+    number of seconds (delta-seconds) or an HTTP-date. Returns the number
+    of seconds to wait, or ``None`` if the header is absent or
+    unparseable. A past HTTP-date returns ``0`` (retry immediately).
+    """
+    if not value:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    # delta-seconds is the common case; try it first.
+    try:
+        secs = float(stripped)
+    except ValueError:
+        pass
+    else:
+        if secs != secs or secs == float("inf"):  # NaN / inf guard
+            return None
+        return max(0.0, secs)
+    # Fall back to HTTP-date (RFC 7231 §7.1.1.1 — IMF-fixdate, obsolete
+    # RFC 850, or ANSI C's asctime()).
+    try:
+        dt = email.utils.parsedate_to_datetime(stripped)
+    except (TypeError, ValueError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = (dt - datetime.now(timezone.utc)).total_seconds()
+    return max(0.0, delta)
+
+
+def _handle_rate_limit(
+    resp_headers: Any,
+    attempt: int,
+) -> float | None:
+    """Decide how long to sleep for a 429 before retrying.
+
+    Returns the seconds to sleep if a retry should be attempted, or
+    ``None`` if the caller should give up (wait exceeds the cap, or this
+    was the last allowed attempt — caller must then surface the 429).
+
+    ``resp_headers`` accepts anything with ``.get("retry-after")``.
+    ``attempt`` is the 1-based retry counter shared with the surrounding
+    retry loop.
+    """
+    if attempt >= MAX_RETRIES:
+        return None
+    retry_after = _parse_retry_after(
+        resp_headers.get("retry-after") if hasattr(resp_headers, "get") else None
+    )
+    if retry_after is None:
+        # No hint from the server: reuse the transient-error backoff so
+        # retry timing stays predictable across failure modes.
+        return float(RETRY_DELAY * attempt)
+    if retry_after > _RATE_LIMIT_SLEEP_CAP_SECS:
+        # Server is asking for longer than we're willing to block. Let
+        # the 429 propagate so the client can decide what to do.
+        return None
+    return retry_after
+
+
 def _emit(line: str, tracker: "_CancelTracker | None") -> None:
     """Write one JSON-RPC line to stdout, filtering cancelled-id responses.
 
@@ -343,6 +419,18 @@ def _post_and_stream(
                 session = resp.headers.get("mcp-session-id")
                 www_auth = resp.headers.get("www-authenticate")
 
+                if resp.status_code == 429:
+                    resp.read()
+                    sleep_secs = _handle_rate_limit(resp.headers, attempt)
+                    if sleep_secs is None:
+                        return _StreamResult(session, 429, www_auth)
+                    log(
+                        f"attempt {attempt}/{MAX_RETRIES} got HTTP 429, "
+                        f"sleeping {sleep_secs:.1f}s before retry"
+                    )
+                    time.sleep(sleep_secs)
+                    continue
+
                 if resp.status_code != 200:
                     resp.read()
                     return _StreamResult(session, resp.status_code, www_auth)
@@ -400,6 +488,16 @@ def _post_parsed(
             resp = client.post(url, content=content, headers=headers)
             session = resp.headers.get("mcp-session-id")
             www_auth = resp.headers.get("www-authenticate")
+            if resp.status_code == 429:
+                sleep_secs = _handle_rate_limit(resp.headers, attempt)
+                if sleep_secs is None:
+                    return None, _StreamResult(session, 429, www_auth)
+                log(
+                    f"attempt {attempt}/{MAX_RETRIES} got HTTP 429, "
+                    f"sleeping {sleep_secs:.1f}s before retry"
+                )
+                time.sleep(sleep_secs)
+                continue
             if resp.status_code != 200:
                 return None, _StreamResult(session, resp.status_code, www_auth)
 
@@ -1127,17 +1225,33 @@ def run_sse(
                 continue
 
             try:
-                resp = client.post(
-                    endpoint,
-                    content=line,
-                    headers=headers,
-                    timeout=httpx.Timeout(
-                        connect=timeout_connect,
-                        read=timeout_read,
-                        write=timeout_write,
-                        pool=10,
-                    ),
+                post_timeout = httpx.Timeout(
+                    connect=timeout_connect,
+                    read=timeout_read,
+                    write=timeout_write,
+                    pool=10,
                 )
+                # Honour Retry-After on 429 up to the cap; over-cap or
+                # retries-exhausted falls through with the final 429 and
+                # is surfaced to the caller by the generic 4xx branch
+                # below (typescript-sdk#1892).
+                for attempt in range(1, MAX_RETRIES + 1):
+                    resp = client.post(
+                        endpoint,
+                        content=line,
+                        headers=headers,
+                        timeout=post_timeout,
+                    )
+                    if resp.status_code != 429:
+                        break
+                    sleep_secs = _handle_rate_limit(resp.headers, attempt)
+                    if sleep_secs is None:
+                        break
+                    log(
+                        f"attempt {attempt}/{MAX_RETRIES} got HTTP 429, "
+                        f"sleeping {sleep_secs:.1f}s before retry"
+                    )
+                    time.sleep(sleep_secs)
 
                 if resp.status_code == 401 and token_refresher:
                     log("received 401, attempting token refresh")
