@@ -208,6 +208,20 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--no-cancel-filter",
+        action="store_true",
+        help=(
+            "Disable the cancel-aware response filter. By default "
+            "mcp-stdio drops any late JSON-RPC response whose id was "
+            "cancelled via notifications/cancelled, enforcing the MCP "
+            "spec's receiver-side SHOULD on behalf of non-compliant "
+            "servers and shielding clients from canceller-side bugs. "
+            "See anthropics/claude-code#51073 and "
+            "modelcontextprotocol/python-sdk#2480. Opt out only when "
+            "debugging the raw upstream wire."
+        ),
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="Check connection to the MCP server and exit",
@@ -298,8 +312,9 @@ def main() -> None:
 
     # run() ignores sse_read_timeout (Streamable HTTP doesn't hold a
     # long-lived GET), so only pass it through on the SSE path.
-    # tcp_keepalive applies to both transports.
+    # tcp_keepalive and cancel_filter apply to both transports.
     tcp_keepalive = not args.no_tcp_keepalive
+    cancel_filter = not args.no_cancel_filter
     if args.transport == "sse":
         run_sse(
             url=args.url,
@@ -308,6 +323,7 @@ def main() -> None:
             timeout_read=args.timeout_read,
             sse_read_timeout=args.sse_read_timeout,
             tcp_keepalive=tcp_keepalive,
+            cancel_filter=cancel_filter,
             token_refresher=token_refresher,
             scope_upgrader=scope_upgrader,
         )
@@ -318,6 +334,7 @@ def main() -> None:
             timeout_connect=args.timeout_connect,
             timeout_read=args.timeout_read,
             tcp_keepalive=tcp_keepalive,
+            cancel_filter=cancel_filter,
             token_refresher=token_refresher,
             scope_upgrader=scope_upgrader,
         )

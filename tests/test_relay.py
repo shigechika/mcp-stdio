@@ -15,10 +15,13 @@ from pytest_httpx import IteratorStream
 from mcp_stdio.relay import (
     MAX_LIST_PAGES,
     PAGINATED_LIST_METHODS,
+    _CancelTracker,
     _SseState,
     _detect_paginated_list,
+    _emit,
     _enforce_lf_stdio,
     _error_response,
+    _extract_cancel_id,
     _extract_id,
     _make_httpx_transport,
     _parse_www_authenticate_scope,
@@ -1957,3 +1960,421 @@ class TestRunRespectsTcpKeepaliveFlag:
             with pytest.raises(RuntimeError, match="sentinel"):
                 run_sse("https://example.com/sse", {}, tcp_keepalive=flag)
             assert recorded == [flag]
+
+
+# ---------------------------------------------------------------------------
+# Cancel-aware response filter (claude-code#51073, python-sdk#2480)
+# ---------------------------------------------------------------------------
+
+
+class _FakeClock:
+    """Monotonic clock stub for _CancelTracker TTL tests."""
+
+    def __init__(self, start: float = 1000.0):
+        self.t = start
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, secs: float) -> None:
+        self.t += secs
+
+
+class TestCancelTracker:
+    def test_add_and_contains_roundtrip(self):
+        t = _CancelTracker()
+        t.add(7)
+        assert t.contains(7)
+        assert not t.contains(8)
+
+    def test_none_is_never_contained(self):
+        t = _CancelTracker()
+        t.add(None)
+        assert not t.contains(None)
+
+    def test_string_id_is_supported(self):
+        t = _CancelTracker()
+        t.add("req-42")
+        assert t.contains("req-42")
+
+    def test_id_zero_is_tracked(self):
+        t = _CancelTracker()
+        t.add(0)
+        assert t.contains(0)
+
+    def test_ttl_expires_entry(self):
+        clock = _FakeClock()
+        t = _CancelTracker(ttl=60.0, now=clock)
+        t.add(5)
+        clock.advance(30)
+        assert t.contains(5)
+        clock.advance(31)  # past 60 s
+        assert not t.contains(5)
+
+    def test_gc_bounds_memory(self):
+        clock = _FakeClock()
+        t = _CancelTracker(ttl=10.0, now=clock)
+        # Insert 200 ids at t=0, all will have expired by t=20
+        for i in range(200):
+            t.add(i)
+        clock.advance(20)
+        # Trigger GC by pushing past threshold with fresh entries
+        # (threshold is 256; we add 100 more at t=20 → _seen briefly holds
+        # 300 before _gc_locked prunes the 200 expired ones.)
+        for i in range(200, 300):
+            t.add(i)
+        # Access internals to verify GC ran (all old ids should be gone)
+        # We can only check indirectly via contains(): old ids must not
+        # be tracked any more.
+        for i in range(200):
+            assert not t.contains(i), f"old id {i} still tracked after GC"
+        for i in range(200, 300):
+            assert t.contains(i), f"fresh id {i} lost to GC"
+
+    def test_thread_safety(self):
+        t = _CancelTracker()
+        errors: list[BaseException] = []
+
+        def worker(start: int) -> None:
+            try:
+                for i in range(start, start + 100):
+                    t.add(i)
+                    t.contains(i)
+            except BaseException as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(n * 100,)) for n in range(8)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        assert not errors, f"threads raised: {errors!r}"
+        for i in range(800):
+            assert t.contains(i)
+
+
+class TestExtractCancelId:
+    def test_detects_cancelled_notification_int_id(self):
+        line = (
+            '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+            '"params":{"requestId":7}}'
+        )
+        assert _extract_cancel_id(line) == 7
+
+    def test_detects_cancelled_notification_string_id(self):
+        line = (
+            '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+            '"params":{"requestId":"req-42"}}'
+        )
+        assert _extract_cancel_id(line) == "req-42"
+
+    def test_ignores_other_notifications(self):
+        line = '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
+        assert _extract_cancel_id(line) is None
+
+    def test_ignores_plain_requests(self):
+        line = '{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{}}'
+        assert _extract_cancel_id(line) is None
+
+    def test_ignores_malformed_json(self):
+        # Passes the regex pre-check by having the method substring in
+        # the raw text, but json.loads will fail.
+        assert _extract_cancel_id('{bad json "method":"notifications/cancelled"') is None
+
+    def test_ignores_missing_params(self):
+        line = '{"jsonrpc":"2.0","method":"notifications/cancelled"}'
+        assert _extract_cancel_id(line) is None
+
+    def test_ignores_non_dict_params(self):
+        line = (
+            '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+            '"params":["requestId",1]}'
+        )
+        assert _extract_cancel_id(line) is None
+
+    def test_substring_false_positive_guard(self):
+        # The regex matches on any '"method":"notifications/cancelled"'
+        # substring, but the verify step ensures the top-level method is
+        # actually cancelled. A message where the string appears inside
+        # a params value, not as the method, must NOT be treated as a
+        # cancellation.
+        line = (
+            '{"jsonrpc":"2.0","method":"tools/call","id":1,'
+            '"params":{"note":"\\"method\\":\\"notifications/cancelled\\""}}'
+        )
+        assert _extract_cancel_id(line) is None
+
+
+class TestEmit:
+    def test_passthrough_when_tracker_is_none(self, capsys):
+        _emit('{"jsonrpc":"2.0","result":{},"id":1}', None)
+        assert capsys.readouterr().out.strip() == '{"jsonrpc":"2.0","result":{},"id":1}'
+
+    def test_drops_response_with_cancelled_id(self, capsys):
+        t = _CancelTracker()
+        t.add(1)
+        _emit('{"jsonrpc":"2.0","result":{},"id":1}', t)
+        assert capsys.readouterr().out == ""
+
+    def test_drops_error_response_with_cancelled_id(self, capsys):
+        t = _CancelTracker()
+        t.add(1)
+        _emit('{"jsonrpc":"2.0","error":{"code":0,"message":"x"},"id":1}', t)
+        assert capsys.readouterr().out == ""
+
+    def test_forwards_response_with_uncancelled_id(self, capsys):
+        t = _CancelTracker()
+        t.add(99)
+        _emit('{"jsonrpc":"2.0","result":{},"id":1}', t)
+        assert capsys.readouterr().out.strip() == '{"jsonrpc":"2.0","result":{},"id":1}'
+
+    def test_forwards_notification_without_id(self, capsys):
+        t = _CancelTracker()
+        t.add(1)
+        line = '{"jsonrpc":"2.0","method":"notifications/progress","params":{}}'
+        _emit(line, t)
+        assert capsys.readouterr().out.strip() == line
+
+    def test_forwards_server_initiated_request(self, capsys):
+        # Has an id but no result / no error — this is a server-
+        # initiated request (e.g. sampling/createMessage). Even if the
+        # numeric id coincides with a cancelled client request id, the
+        # filter must not eat it; different message direction.
+        t = _CancelTracker()
+        t.add(1)
+        line = '{"jsonrpc":"2.0","method":"sampling/createMessage","id":1,"params":{}}'
+        _emit(line, t)
+        assert capsys.readouterr().out.strip() == line
+
+    def test_forwards_malformed_json(self, capsys):
+        t = _CancelTracker()
+        t.add(1)
+        _emit("not json", t)
+        assert capsys.readouterr().out.strip() == "not json"
+
+    def test_forwards_json_batch(self, capsys):
+        # JSON-RPC batch (list) — current MCP HTTP spec forbids batches,
+        # but if one ever shows up on the wire, pass it through unchanged
+        # rather than silently dropping the whole batch.
+        t = _CancelTracker()
+        t.add(1)
+        line = '[{"jsonrpc":"2.0","result":{},"id":1}]'
+        _emit(line, t)
+        assert capsys.readouterr().out.strip() == line
+
+
+class TestRunCancelFilter:
+    """End-to-end: run() drops late responses for cancelled ids."""
+
+    def _run_with_stdin(self, httpx_mock, stdin_lines, **kwargs):
+        stdin_data = "\n".join(stdin_lines) + "\n"
+        stdout = StringIO()
+        with patch("sys.stdin", StringIO(stdin_data)), patch("sys.stdout", stdout):
+            run(
+                "https://example.com/mcp",
+                {"Content-Type": "application/json"},
+                **kwargs,
+            )
+        return stdout.getvalue()
+
+    def test_response_then_cancel_ordinary_response_is_preserved(self, httpx_mock):
+        # Baseline: request→response completes fully before the cancel is
+        # read from stdin. The filter only drops responses whose id was
+        # cancelled *before* the response reached stdout, so this normal-
+        # case response must still be delivered. The actual "late response
+        # gets dropped" case requires the response to arrive after the
+        # cancel has been processed on stdin — that race is only
+        # reproducible on the SSE transport where the reader thread
+        # emits asynchronously; see TestRunSseCancelFilter below.
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"ok":true},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(status_code=202, text="")  # cancel ACK
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","method":"tools/call","id":1}',
+                (
+                    '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+                    '"params":{"requestId":1}}'
+                ),
+            ],
+        )
+        assert '"ok":true' in output
+
+    def test_subsequent_response_for_cancelled_id_is_dropped(self, httpx_mock):
+        # Emits the cancel FIRST, then sends a subsequent request whose
+        # id collides with the cancelled one. The late response should
+        # be dropped.
+        httpx_mock.add_response(status_code=202, text="")  # cancel
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"should":"drop"},"id":7}',
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                (
+                    '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+                    '"params":{"requestId":7}}'
+                ),
+                '{"jsonrpc":"2.0","method":"tools/call","id":7}',
+            ],
+        )
+        assert "drop" not in output
+
+    def test_cancel_is_forwarded_upstream(self, httpx_mock):
+        httpx_mock.add_response(status_code=202, text="")
+        self._run_with_stdin(
+            httpx_mock,
+            [
+                (
+                    '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+                    '"params":{"requestId":9}}'
+                ),
+            ],
+        )
+        reqs = httpx_mock.get_requests()
+        assert len(reqs) == 1
+        assert b"notifications/cancelled" in reqs[0].content
+
+    def test_synthesized_error_response_bypasses_filter(self, httpx_mock):
+        """Regression guard: mcp-stdio's own synthesized error responses
+        must never be dropped even if the request id has been cancelled.
+
+        Scenario: the client cancels id=5, then issues a request with the
+        same id. The upstream is flaky — three ConnectErrors in a row
+        exhaust the retry budget, and _post_and_stream falls through to
+        ``print(_error_response(...), flush=True)``. That synthesized
+        error is the gateway's own answer to the line the client just
+        sent; if _emit were ever wired into _error_response's emit path
+        a future refactor could silently drop it and the client would
+        hang forever waiting for id=5. Guard that boundary here.
+        """
+        httpx_mock.add_response(status_code=202, text="")  # cancel ACK
+        httpx_mock.add_exception(httpx.ConnectError("simulated"))
+        httpx_mock.add_exception(httpx.ConnectError("simulated"))
+        httpx_mock.add_exception(httpx.ConnectError("simulated"))
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                (
+                    '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+                    '"params":{"requestId":5}}'
+                ),
+                '{"jsonrpc":"2.0","method":"tools/call","id":5}',
+            ],
+        )
+        # The synthesized error response must land on stdout; otherwise
+        # the client is waiting for a response that never comes.
+        lines = [x for x in output.strip().splitlines() if x]
+        decoded = [json.loads(line) for line in lines]
+        assert any(
+            d.get("id") == 5 and "error" in d for d in decoded
+        ), f"synthesized error response missing from: {lines!r}"
+
+    def test_no_cancel_filter_lets_response_through(self, httpx_mock):
+        httpx_mock.add_response(status_code=202, text="")  # cancel
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"kept":true},"id":7}',
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                (
+                    '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+                    '"params":{"requestId":7}}'
+                ),
+                '{"jsonrpc":"2.0","method":"tools/call","id":7}',
+            ],
+            cancel_filter=False,
+        )
+        assert '"kept":true' in output
+
+
+class TestRunSseCancelFilter:
+    """End-to-end: run_sse() drops late responses for cancelled ids on SSE."""
+
+    URL = "https://example.com/sse"
+
+    def test_cancel_then_sse_message_is_dropped(self, httpx_mock):
+        payload = '{"jsonrpc":"2.0","result":{"late":true},"id":11}'
+        post_received = threading.Event()
+        release_stdin = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=abc\n\n"
+            # Wait until the cancel POST has been observed before
+            # sending the late response — this guarantees the cancel id
+            # is in the tracker by the time the SSE reader emits.
+            post_received.wait(timeout=3)
+            yield f"event: message\ndata: {payload}\n\n".encode()
+            time.sleep(0.1)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        def on_post(request: httpx.Request) -> httpx.Response:
+            post_received.set()
+            return httpx.Response(status_code=202)
+
+        httpx_mock.add_callback(
+            on_post,
+            url="https://example.com/messages?sessionId=abc",
+        )
+
+        stdin = _BlockingStdin(
+            (
+                '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+                '"params":{"requestId":11}}'
+            ),
+            release_stdin,
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {"Content-Type": "application/json"})
+
+        assert "late" not in stdout.getvalue()
+
+    def test_sse_message_without_cancel_passes_through(self, httpx_mock):
+        payload = '{"jsonrpc":"2.0","result":{"kept":true},"id":21}'
+        post_received = threading.Event()
+        release_stdin = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=abc\n\n"
+            post_received.wait(timeout=3)
+            yield f"event: message\ndata: {payload}\n\n".encode()
+            time.sleep(0.1)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        def on_post(request: httpx.Request) -> httpx.Response:
+            post_received.set()
+            return httpx.Response(status_code=202)
+
+        httpx_mock.add_callback(
+            on_post,
+            url="https://example.com/messages?sessionId=abc",
+        )
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"tools/call","id":21}',
+            release_stdin,
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {"Content-Type": "application/json"})
+
+        assert "kept" in stdout.getvalue()
