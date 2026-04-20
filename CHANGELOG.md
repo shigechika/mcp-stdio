@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/shigechika/mcp-stdio/compare/v0.7.0...v0.8.0) (2026-04-20)
+
+
+### Features
+
+* honour Retry-After on HTTP 429 (typescript-sdk[#1892](https://github.com/shigechika/mcp-stdio/issues/1892)) ([#45](https://github.com/shigechika/mcp-stdio/issues/45)) ([fb5ac14](https://github.com/shigechika/mcp-stdio/commit/fb5ac148ecde6cd0252de956db934241a1941b99))
+
 ## [0.7.0](https://github.com/shigechika/mcp-stdio/compare/v0.6.0...v0.7.0) (2026-04-20)
 
 
