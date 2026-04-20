@@ -2622,3 +2622,167 @@ class TestRunSse429Retry:
 
         assert 3.0 in slept, f"expected a 3.0-second sleep, got {slept!r}"
         assert len(posts) == 2
+
+    def test_429_over_cap_surfaces_without_sleeping(self, httpx_mock, monkeypatch):
+        slept: list[float] = []
+        monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
+
+        release_stdin = threading.Event()
+        post_seen = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=abc\n\n"
+            post_seen.wait(timeout=3)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        posts: list[int] = []
+
+        def on_post(request: httpx.Request) -> httpx.Response:
+            posts.append(len(posts) + 1)
+            post_seen.set()
+            return httpx.Response(
+                status_code=429,
+                headers={"retry-after": "999999"},
+            )
+
+        httpx_mock.add_callback(
+            on_post,
+            url="https://example.com/messages?sessionId=abc",
+            is_reusable=True,
+        )
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"tools/call","id":7}',
+            release_stdin,
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {"Content-Type": "application/json"})
+
+        # Over-cap → no sleep, POST happens exactly once, client receives
+        # a synthesized HTTP 429 error response for id=7.
+        assert slept == [], f"expected no sleep for over-cap, got {slept!r}"
+        assert len(posts) == 1
+        decoded = [json.loads(x) for x in stdout.getvalue().splitlines() if x]
+        assert any(
+            d.get("id") == 7 and "error" in d and "429" in d["error"]["message"]
+            for d in decoded
+        ), f"expected HTTP 429 error response, got {decoded!r}"
+
+    def test_429_repeated_exhausts_and_surfaces(self, httpx_mock, monkeypatch):
+        slept: list[float] = []
+        monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
+
+        release_stdin = threading.Event()
+        last_post = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=abc\n\n"
+            last_post.wait(timeout=3)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        posts: list[int] = []
+
+        def on_post(request: httpx.Request) -> httpx.Response:
+            posts.append(len(posts) + 1)
+            if len(posts) >= 3:
+                last_post.set()
+            return httpx.Response(
+                status_code=429,
+                headers={"retry-after": "1"},
+            )
+
+        httpx_mock.add_callback(
+            on_post,
+            url="https://example.com/messages?sessionId=abc",
+            is_reusable=True,
+        )
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"tools/call","id":8}',
+            release_stdin,
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {"Content-Type": "application/json"})
+
+        # MAX_RETRIES = 3 → 3 POSTs, sleeps on the first two only.
+        assert len(posts) == 3
+        assert slept == [1.0, 1.0], f"expected two 1s sleeps, got {slept!r}"
+        decoded = [json.loads(x) for x in stdout.getvalue().splitlines() if x]
+        assert any(
+            d.get("id") == 8 and "error" in d and "429" in d["error"]["message"]
+            for d in decoded
+        )
+
+
+class TestPaginate429Retry:
+    """_post_parsed (pagination path) honours Retry-After on 429 too."""
+
+    URL = "https://example.com/mcp"
+
+    def _run_with_stdin(self, httpx_mock, stdin_lines, **kwargs):
+        stdin_data = "\n".join(stdin_lines) + "\n"
+        stdout = StringIO()
+        with patch("sys.stdin", StringIO(stdin_data)), patch("sys.stdout", stdout):
+            run(
+                self.URL,
+                {"Content-Type": "application/json"},
+                **kwargs,
+            )
+        return stdout.getvalue()
+
+    def test_paginated_list_429_then_200(self, httpx_mock, monkeypatch):
+        """A paginated tools/list request runs through _post_parsed; a 429
+        on page 1 must trigger the Retry-After sleep + retry exactly like
+        the streaming path, and the eventual 200 must be merged and
+        emitted normally."""
+        slept: list[float] = []
+        monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
+
+        # Page 1: 429 with Retry-After: 2
+        httpx_mock.add_response(
+            status_code=429,
+            headers={"retry-after": "2"},
+            text="",
+        )
+        # Page 1 retry: 200 with a single-page result (no nextCursor)
+        httpx_mock.add_response(
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "tools": [
+                            {"name": "t1"},
+                            {"name": "t2"},
+                        ]
+                    },
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","id":1,"method":"tools/list"}'],
+        )
+        assert 2.0 in slept, f"expected a 2.0-second sleep, got {slept!r}"
+        decoded = [json.loads(x) for x in output.strip().splitlines() if x]
+        assert len(decoded) == 1
+        merged = decoded[0]
+        names = [t["name"] for t in merged["result"]["tools"]]
+        assert names == ["t1", "t2"]
+        assert "nextCursor" not in merged["result"]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import email.utils
 import json
+import math
 import re
 import signal
 import socket
@@ -272,7 +273,7 @@ def _parse_retry_after(value: str | None) -> float | None:
     except ValueError:
         pass
     else:
-        if secs != secs or secs == float("inf"):  # NaN / inf guard
+        if math.isnan(secs) or math.isinf(secs):
             return None
         return max(0.0, secs)
     # Fall back to HTTP-date (RFC 7231 §7.1.1.1 — IMF-fixdate, obsolete
