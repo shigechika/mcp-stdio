@@ -2177,14 +2177,20 @@ class TestRunCancelFilter:
             )
         return stdout.getvalue()
 
-    def test_cancel_then_late_response_is_dropped(self, httpx_mock):
-        # Request 1: tool call id=1
+    def test_response_then_cancel_ordinary_response_is_preserved(self, httpx_mock):
+        # Baseline: request→response completes fully before the cancel is
+        # read from stdin. The filter only drops responses whose id was
+        # cancelled *before* the response reached stdout, so this normal-
+        # case response must still be delivered. The actual "late response
+        # gets dropped" case requires the response to arrive after the
+        # cancel has been processed on stdin — that race is only
+        # reproducible on the SSE transport where the reader thread
+        # emits asynchronously; see TestRunSseCancelFilter below.
         httpx_mock.add_response(
-            text='{"jsonrpc":"2.0","result":{"late":true},"id":1}',
+            text='{"jsonrpc":"2.0","result":{"ok":true},"id":1}',
             headers={"content-type": "application/json"},
         )
-        # Request 2: notifications/cancelled → server returns 202
-        httpx_mock.add_response(status_code=202, text="")
+        httpx_mock.add_response(status_code=202, text="")  # cancel ACK
         output = self._run_with_stdin(
             httpx_mock,
             [
@@ -2195,21 +2201,7 @@ class TestRunCancelFilter:
                 ),
             ],
         )
-        # The spec violation is: server responded for id=1 *after* we
-        # told it to cancel. With the filter on, nothing should land on
-        # stdout — but note that the synchronous stdin loop sends the
-        # cancel AFTER the response has already been emitted. So this
-        # specific ordering actually lets the response through. Verify
-        # the *next* cancel+late-response scenario handles correctly by
-        # pre-populating the tracker via two messages in sequence.
-        #
-        # Because of request ordering (stdin is drained synchronously),
-        # testing filter-on-first-response requires the tracker to be
-        # seeded *before* the response returns. For that, see the SSE
-        # variant below where the reader thread supplies the response
-        # asynchronously. Here we assert the mechanism at least preserves
-        # the normal-case response.
-        assert '"late":true' in output
+        assert '"ok":true' in output
 
     def test_subsequent_response_for_cancelled_id_is_dropped(self, httpx_mock):
         # Emits the cancel FIRST, then sends a subsequent request whose
@@ -2246,6 +2238,41 @@ class TestRunCancelFilter:
         reqs = httpx_mock.get_requests()
         assert len(reqs) == 1
         assert b"notifications/cancelled" in reqs[0].content
+
+    def test_synthesized_error_response_bypasses_filter(self, httpx_mock):
+        """Regression guard: mcp-stdio's own synthesized error responses
+        must never be dropped even if the request id has been cancelled.
+
+        Scenario: the client cancels id=5, then issues a request with the
+        same id. The upstream is flaky — three ConnectErrors in a row
+        exhaust the retry budget, and _post_and_stream falls through to
+        ``print(_error_response(...), flush=True)``. That synthesized
+        error is the gateway's own answer to the line the client just
+        sent; if _emit were ever wired into _error_response's emit path
+        a future refactor could silently drop it and the client would
+        hang forever waiting for id=5. Guard that boundary here.
+        """
+        httpx_mock.add_response(status_code=202, text="")  # cancel ACK
+        httpx_mock.add_exception(httpx.ConnectError("simulated"))
+        httpx_mock.add_exception(httpx.ConnectError("simulated"))
+        httpx_mock.add_exception(httpx.ConnectError("simulated"))
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                (
+                    '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+                    '"params":{"requestId":5}}'
+                ),
+                '{"jsonrpc":"2.0","method":"tools/call","id":5}',
+            ],
+        )
+        # The synthesized error response must land on stdout; otherwise
+        # the client is waiting for a response that never comes.
+        lines = [x for x in output.strip().splitlines() if x]
+        decoded = [json.loads(line) for line in lines]
+        assert any(
+            d.get("id") == 5 and "error" in d for d in decoded
+        ), f"synthesized error response missing from: {lines!r}"
 
     def test_no_cancel_filter_lets_response_through(self, httpx_mock):
         httpx_mock.add_response(status_code=202, text="")  # cancel
