@@ -1,10 +1,12 @@
 """Tests for mcp_stdio.relay module."""
 
+import email.utils
 import json
 import queue
 import socket
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from unittest.mock import patch
 
@@ -23,7 +25,9 @@ from mcp_stdio.relay import (
     _error_response,
     _extract_cancel_id,
     _extract_id,
+    _handle_rate_limit,
     _make_httpx_transport,
+    _parse_retry_after,
     _parse_www_authenticate_scope,
     _post_and_stream,
     _sse_reader_loop,
@@ -2378,3 +2382,407 @@ class TestRunSseCancelFilter:
             run_sse(self.URL, {"Content-Type": "application/json"})
 
         assert "kept" in stdout.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# HTTP 429 Retry-After handling (typescript-sdk#1892)
+# ---------------------------------------------------------------------------
+
+
+class TestParseRetryAfter:
+    def test_delta_seconds_int(self):
+        assert _parse_retry_after("5") == 5.0
+
+    def test_delta_seconds_float(self):
+        # Not technically legal per RFC 7231 (non-negative integer) but
+        # some servers send it; be permissive.
+        assert _parse_retry_after("2.5") == 2.5
+
+    def test_delta_seconds_zero(self):
+        assert _parse_retry_after("0") == 0.0
+
+    def test_delta_seconds_negative_is_clamped_to_zero(self):
+        assert _parse_retry_after("-1") == 0.0
+
+    def test_missing_header(self):
+        assert _parse_retry_after(None) is None
+
+    def test_empty_string(self):
+        assert _parse_retry_after("") is None
+
+    def test_whitespace_only(self):
+        assert _parse_retry_after("   ") is None
+
+    def test_garbage(self):
+        assert _parse_retry_after("soon") is None
+
+    def test_nan_and_inf_rejected(self):
+        assert _parse_retry_after("nan") is None
+        assert _parse_retry_after("inf") is None
+
+    def test_http_date_future(self):
+        # An IMF-fixdate 10 seconds in the future → ~10s wait
+        future = datetime.now(timezone.utc) + timedelta(seconds=10)
+        header = email.utils.format_datetime(future, usegmt=True)
+        result = _parse_retry_after(header)
+        assert result is not None
+        assert 5 < result <= 10  # tolerate clock skew
+
+    def test_http_date_past(self):
+        past = datetime.now(timezone.utc) - timedelta(seconds=30)
+        header = email.utils.format_datetime(past, usegmt=True)
+        assert _parse_retry_after(header) == 0.0
+
+    def test_http_date_malformed(self):
+        assert _parse_retry_after("Tue, 99 Feb 3000 25:99:99 ZZZ") is None
+
+
+class TestHandleRateLimit:
+    class _Hdrs:
+        def __init__(self, retry_after: str | None = None):
+            self._h = {"retry-after": retry_after} if retry_after is not None else {}
+
+        def get(self, k):
+            return self._h.get(k.lower())
+
+    def test_uses_retry_after_when_present(self):
+        assert _handle_rate_limit(self._Hdrs("7"), attempt=1) == 7.0
+
+    def test_falls_back_to_exponential_backoff_when_absent(self):
+        # RETRY_DELAY * attempt
+        assert _handle_rate_limit(self._Hdrs(), attempt=1) == 1.0
+        assert _handle_rate_limit(self._Hdrs(), attempt=2) == 2.0
+
+    def test_over_cap_gives_up(self):
+        # 120 > _RATE_LIMIT_SLEEP_CAP_SECS (60)
+        assert _handle_rate_limit(self._Hdrs("120"), attempt=1) is None
+
+    def test_at_cap_is_honoured(self):
+        assert _handle_rate_limit(self._Hdrs("60"), attempt=1) == 60.0
+
+    def test_last_attempt_returns_none(self):
+        # attempt == MAX_RETRIES means no more retries
+        from mcp_stdio.relay import MAX_RETRIES
+        assert _handle_rate_limit(self._Hdrs("5"), attempt=MAX_RETRIES) is None
+
+
+class TestRun429Retry:
+    URL = "https://example.com/mcp"
+
+    def _run_with_stdin(self, httpx_mock, stdin_lines, **kwargs):
+        stdin_data = "\n".join(stdin_lines) + "\n"
+        stdout = StringIO()
+        with patch("sys.stdin", StringIO(stdin_data)), patch("sys.stdout", stdout):
+            run(
+                self.URL,
+                {"Content-Type": "application/json"},
+                **kwargs,
+            )
+        return stdout.getvalue()
+
+    def test_429_with_retry_after_then_200(self, httpx_mock, monkeypatch):
+        slept: list[float] = []
+        monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
+
+        httpx_mock.add_response(
+            status_code=429,
+            headers={"retry-after": "2"},
+            text="",
+        )
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"ok":true},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","method":"tools/call","id":1}'],
+        )
+        assert '"ok":true' in output
+        assert 2.0 in slept, f"expected a 2.0-second sleep, got {slept!r}"
+
+    def test_429_without_retry_after_uses_backoff_then_200(
+        self, httpx_mock, monkeypatch
+    ):
+        slept: list[float] = []
+        monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
+
+        httpx_mock.add_response(status_code=429, text="")  # no retry-after
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"ok":true},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","method":"tools/call","id":1}'],
+        )
+        assert '"ok":true' in output
+        # RETRY_DELAY * 1 == 1.0
+        assert 1.0 in slept
+
+    def test_429_over_cap_surfaces_immediately(self, httpx_mock, monkeypatch):
+        slept: list[float] = []
+        monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
+
+        httpx_mock.add_response(
+            status_code=429,
+            headers={"retry-after": "999999"},
+            text="",
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","method":"tools/call","id":1}'],
+        )
+        # Client sees a synthesized HTTP 429 error — no sleep happens
+        decoded = [json.loads(x) for x in output.strip().splitlines() if x]
+        assert any(
+            d.get("id") == 1 and "error" in d and "429" in d["error"]["message"]
+            for d in decoded
+        ), f"expected HTTP 429 error response, got {decoded!r}"
+        assert slept == [], f"expected no sleep for over-cap, got {slept!r}"
+        # Only one upstream POST should have been made
+        assert len(httpx_mock.get_requests()) == 1
+
+    def test_429_repeated_exhausts_retries_and_surfaces(
+        self, httpx_mock, monkeypatch
+    ):
+        slept: list[float] = []
+        monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
+
+        # MAX_RETRIES = 3 → 3 POSTs, the first two sleep, the third
+        # exhausts the counter and propagates the 429.
+        for _ in range(3):
+            httpx_mock.add_response(
+                status_code=429,
+                headers={"retry-after": "1"},
+                text="",
+            )
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","method":"tools/call","id":1}'],
+        )
+        decoded = [json.loads(x) for x in output.strip().splitlines() if x]
+        assert any(
+            d.get("id") == 1 and "error" in d and "429" in d["error"]["message"]
+            for d in decoded
+        )
+        assert slept == [1.0, 1.0]
+        assert len(httpx_mock.get_requests()) == 3
+
+
+class TestRunSse429Retry:
+    URL = "https://example.com/sse"
+
+    def test_429_with_retry_after_then_200(self, httpx_mock, monkeypatch):
+        slept: list[float] = []
+        monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
+
+        release_stdin = threading.Event()
+        post_done = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=abc\n\n"
+            post_done.wait(timeout=3)
+            # no message event needed — the POST was 202 (notification)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        posts: list[int] = []
+
+        def on_post(request: httpx.Request) -> httpx.Response:
+            posts.append(len(posts) + 1)
+            if len(posts) == 1:
+                return httpx.Response(
+                    status_code=429,
+                    headers={"retry-after": "3"},
+                )
+            post_done.set()
+            return httpx.Response(status_code=202)
+
+        httpx_mock.add_callback(
+            on_post,
+            url="https://example.com/messages?sessionId=abc",
+            is_reusable=True,
+        )
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}',
+            release_stdin,
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {"Content-Type": "application/json"})
+
+        assert 3.0 in slept, f"expected a 3.0-second sleep, got {slept!r}"
+        assert len(posts) == 2
+
+    def test_429_over_cap_surfaces_without_sleeping(self, httpx_mock, monkeypatch):
+        slept: list[float] = []
+        monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
+
+        release_stdin = threading.Event()
+        post_seen = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=abc\n\n"
+            post_seen.wait(timeout=3)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        posts: list[int] = []
+
+        def on_post(request: httpx.Request) -> httpx.Response:
+            posts.append(len(posts) + 1)
+            post_seen.set()
+            return httpx.Response(
+                status_code=429,
+                headers={"retry-after": "999999"},
+            )
+
+        httpx_mock.add_callback(
+            on_post,
+            url="https://example.com/messages?sessionId=abc",
+            is_reusable=True,
+        )
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"tools/call","id":7}',
+            release_stdin,
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {"Content-Type": "application/json"})
+
+        # Over-cap → no sleep, POST happens exactly once, client receives
+        # a synthesized HTTP 429 error response for id=7.
+        assert slept == [], f"expected no sleep for over-cap, got {slept!r}"
+        assert len(posts) == 1
+        decoded = [json.loads(x) for x in stdout.getvalue().splitlines() if x]
+        assert any(
+            d.get("id") == 7 and "error" in d and "429" in d["error"]["message"]
+            for d in decoded
+        ), f"expected HTTP 429 error response, got {decoded!r}"
+
+    def test_429_repeated_exhausts_and_surfaces(self, httpx_mock, monkeypatch):
+        slept: list[float] = []
+        monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
+
+        release_stdin = threading.Event()
+        last_post = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=abc\n\n"
+            last_post.wait(timeout=3)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        posts: list[int] = []
+
+        def on_post(request: httpx.Request) -> httpx.Response:
+            posts.append(len(posts) + 1)
+            if len(posts) >= 3:
+                last_post.set()
+            return httpx.Response(
+                status_code=429,
+                headers={"retry-after": "1"},
+            )
+
+        httpx_mock.add_callback(
+            on_post,
+            url="https://example.com/messages?sessionId=abc",
+            is_reusable=True,
+        )
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"tools/call","id":8}',
+            release_stdin,
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {"Content-Type": "application/json"})
+
+        # MAX_RETRIES = 3 → 3 POSTs, sleeps on the first two only.
+        assert len(posts) == 3
+        assert slept == [1.0, 1.0], f"expected two 1s sleeps, got {slept!r}"
+        decoded = [json.loads(x) for x in stdout.getvalue().splitlines() if x]
+        assert any(
+            d.get("id") == 8 and "error" in d and "429" in d["error"]["message"]
+            for d in decoded
+        )
+
+
+class TestPaginate429Retry:
+    """_post_parsed (pagination path) honours Retry-After on 429 too."""
+
+    URL = "https://example.com/mcp"
+
+    def _run_with_stdin(self, httpx_mock, stdin_lines, **kwargs):
+        stdin_data = "\n".join(stdin_lines) + "\n"
+        stdout = StringIO()
+        with patch("sys.stdin", StringIO(stdin_data)), patch("sys.stdout", stdout):
+            run(
+                self.URL,
+                {"Content-Type": "application/json"},
+                **kwargs,
+            )
+        return stdout.getvalue()
+
+    def test_paginated_list_429_then_200(self, httpx_mock, monkeypatch):
+        """A paginated tools/list request runs through _post_parsed; a 429
+        on page 1 must trigger the Retry-After sleep + retry exactly like
+        the streaming path, and the eventual 200 must be merged and
+        emitted normally."""
+        slept: list[float] = []
+        monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
+
+        # Page 1: 429 with Retry-After: 2
+        httpx_mock.add_response(
+            status_code=429,
+            headers={"retry-after": "2"},
+            text="",
+        )
+        # Page 1 retry: 200 with a single-page result (no nextCursor)
+        httpx_mock.add_response(
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "tools": [
+                            {"name": "t1"},
+                            {"name": "t2"},
+                        ]
+                    },
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","id":1,"method":"tools/list"}'],
+        )
+        assert 2.0 in slept, f"expected a 2.0-second sleep, got {slept!r}"
+        decoded = [json.loads(x) for x in output.strip().splitlines() if x]
+        assert len(decoded) == 1
+        merged = decoded[0]
+        names = [t["name"] for t in merged["result"]["tools"]]
+        assert names == ["t1", "t2"]
+        assert "nextCursor" not in merged["result"]
