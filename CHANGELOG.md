@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/shigechika/mcp-stdio/compare/v0.6.0...v0.7.0) (2026-04-20)
+
+
+### Features
+
+* cancel-aware response filter (drops late responses for cancelled ids) ([#40](https://github.com/shigechika/mcp-stdio/issues/40)) ([8d4d4aa](https://github.com/shigechika/mcp-stdio/commit/8d4d4aa350a8a58017fd45c78d7df4a1ec4beabe))
+
 ## [0.6.0](https://github.com/shigechika/mcp-stdio/compare/v0.5.2...v0.6.0) (2026-04-18)
 
 
