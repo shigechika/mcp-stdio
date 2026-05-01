@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/shigechika/mcp-stdio/compare/v0.8.0...v0.9.0) (2026-05-01)
+
+
+### Features
+
+* **oauth:** use WWW-Authenticate resource_metadata hint for PRM discovery (RFC 9728 §5.1) ([#49](https://github.com/shigechika/mcp-stdio/issues/49)) ([05239be](https://github.com/shigechika/mcp-stdio/commit/05239be9e977d24768e7310f60fed9a21b7576d7))
+
 ## [0.8.0](https://github.com/shigechika/mcp-stdio/compare/v0.7.0...v0.8.0) (2026-04-20)
 
 
