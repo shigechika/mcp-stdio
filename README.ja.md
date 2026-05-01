@@ -27,6 +27,7 @@ Bearer token、カスタムヘッダー、OAuth 2.1 認証情報をリモート�
     - §3 `/.well-known/oauth-protected-resource` による認可サーバー検出
     - §3.1 パスベースのリバースプロキシ配下に対応した well-known URL 構築（ホストルートへのフォールバック付き）。リソース URL の query component も構築後の metadata URL に保持する
     - §3.3 `resource` フィールド検証（不一致は警告して続行）
+    - §5.1 `WWW-Authenticate: Bearer resource_metadata=` ヒント — discovery 前にサーバーへ probe を送り、well-known パスの推測に頼らず PRM の所在を直接特定する
   - [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) Authorization Server Metadata
     - §3 well-known URL 構築。パス付き issuer のパス挿入ルール対応
     - §3 `issuer` 検証（不一致は警告して続行）
