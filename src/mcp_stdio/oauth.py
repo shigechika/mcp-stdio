@@ -6,6 +6,7 @@ import base64
 import hashlib
 import html
 import ipaddress
+import re
 import secrets
 import threading
 import time
@@ -141,6 +142,70 @@ def _validate_auth_server_url(auth_server_url: str, mcp_server_url: str) -> bool
     return True
 
 
+_RESOURCE_METADATA_QUOTED_RE = re.compile(r'resource_metadata\s*=\s*"([^"]+)"')
+_RESOURCE_METADATA_UNQUOTED_RE = re.compile(r"resource_metadata\s*=\s*([^\s,\"]+)")
+
+
+def _parse_resource_metadata_hint(header: str | None) -> str | None:
+    """Extract the resource_metadata URL from a WWW-Authenticate Bearer challenge.
+
+    RFC 9728 §5.1 defines the ``resource_metadata`` parameter as a hint
+    pointing directly to the Protected Resource Metadata document URL.
+    Returns the URL string when present; ``None`` otherwise.
+    """
+    if not header:
+        return None
+    match = _RESOURCE_METADATA_QUOTED_RE.search(header)
+    if match:
+        return match.group(1)
+    match = _RESOURCE_METADATA_UNQUOTED_RE.search(header)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _validate_prm_hint_url(hint_url: str, server_url: str) -> bool:
+    """Validate a WWW-Authenticate resource_metadata hint URL before fetching.
+
+    Applies the same policy as ``_validate_auth_server_url``:
+    - Reject non-http/https schemes.
+    - Reject plain HTTP for non-loopback hosts (tokens would be leaked).
+    - Warn (but permit) cross-origin PRM URLs.
+
+    Returns ``True`` when the URL is safe to follow, ``False`` to skip it.
+    """
+    try:
+        parsed = urlparse(hint_url)
+    except Exception:
+        log(f"warning: malformed resource_metadata hint URL {hint_url!r}, ignoring")
+        return False
+
+    if parsed.scheme not in ("https", "http"):
+        log(f"warning: unsupported scheme in resource_metadata hint {hint_url!r}, ignoring")
+        return False
+
+    if parsed.scheme == "http" and not _is_loopback(parsed.hostname or ""):
+        log(
+            f"warning: refusing resource_metadata hint {hint_url!r} "
+            f"— plain HTTP over non-loopback would expose the OAuth flow. Ignoring."
+        )
+        return False
+
+    mcp_parsed = urlparse(server_url)
+    if (
+        parsed.hostname
+        and mcp_parsed.hostname
+        and _origin(parsed) != _origin(mcp_parsed)
+    ):
+        log(
+            f"warning: resource_metadata hint {hint_url!r} is cross-origin "
+            f"to the MCP server {server_url!r}. "
+            f"Abort if you did not expect federation."
+        )
+
+    return True
+
+
 def _build_well_known_url(resource_url: str, suffix: str) -> str:
     """Build a well-known URL by inserting the suffix between host and path.
 
@@ -192,10 +257,16 @@ def _fetch_authorization_server_metadata(
     return None
 
 
-def discover_oauth_metadata(server_url: str, client: httpx.Client) -> OAuthMetadata:
+def discover_oauth_metadata(
+    server_url: str,
+    client: httpx.Client,
+    www_authenticate: str | None = None,
+) -> OAuthMetadata:
     """Discover OAuth authorization server metadata.
 
     Follows the MCP spec discovery flow:
+    0. If ``www_authenticate`` is provided and contains a ``resource_metadata``
+       URL (RFC 9728 §5.1), try that URL first as the highest-priority PRM hint.
     1. Try RFC 9728 Protected Resource Metadata
        (/.well-known/oauth-protected-resource) to find the
        authorization server URL.
@@ -206,17 +277,26 @@ def discover_oauth_metadata(server_url: str, client: httpx.Client) -> OAuthMetad
     """
     base = _authorization_base_url(server_url)
 
+    # Phase 0: RFC 9728 §5.1 — resource_metadata hint from WWW-Authenticate.
+    # When the server already told us where its PRM lives, use that URL first
+    # instead of guessing the well-known path.
+    auth_server_url = base
+    prm_candidates: list[str] = []
+    hint = _parse_resource_metadata_hint(www_authenticate)
+    if hint and _validate_prm_hint_url(hint, server_url):
+        log(f"using resource_metadata hint from WWW-Authenticate: {hint}")
+        prm_candidates.append(hint)
+
     # Phase 1: RFC 9728 Protected Resource Metadata.
     # Per RFC 9728 §3.1, the well-known URI is inserted between host and path
     # components of the resource identifier. Try the path-aware URL first for
     # path-based reverse-proxy deployments (cf. geelen/mcp-remote#249), then
     # fall back to host-root for servers that publish PRM at the origin.
-    auth_server_url = base
-    prm_candidates: list[str] = []
     path_aware = _build_well_known_url(server_url, "oauth-protected-resource")
     host_root = f"{base}/.well-known/oauth-protected-resource"
-    prm_candidates.append(path_aware)
-    if host_root != path_aware:
+    if path_aware not in prm_candidates:
+        prm_candidates.append(path_aware)
+    if host_root != path_aware and host_root not in prm_candidates:
         prm_candidates.append(host_root)
 
     for prm_url in prm_candidates:
@@ -760,7 +840,12 @@ def ensure_token(
             delete_token(server_url)
 
     log("starting OAuth 2.1 authorization flow")
-    metadata = discover_oauth_metadata(server_url, client)
+    # Probe the MCP server for a WWW-Authenticate resource_metadata hint
+    # (RFC 9728 §5.1) before running discovery. Servers that publish PRM at
+    # a non-standard URL advertise it here, letting us skip the well-known
+    # guessing. Best-effort — failures silently fall back to normal discovery.
+    www_authenticate = _probe_www_authenticate(server_url, client)
+    metadata = discover_oauth_metadata(server_url, client, www_authenticate=www_authenticate)
     return _run_authorization_flow(
         server_url,
         client,
@@ -770,6 +855,33 @@ def ensure_token(
         scope=scope,
         timeout=timeout,
     )
+
+
+def _probe_www_authenticate(server_url: str, client: httpx.Client) -> str | None:
+    """Send a minimal MCP initialize request and return the WWW-Authenticate header.
+
+    Used before OAuth discovery to extract a ``resource_metadata`` hint
+    (RFC 9728 §5.1). Servers that check authentication before parsing the
+    request body will respond with 401, revealing their PRM URL. Any failure
+    (connection error, non-401 status, missing header) silently returns ``None``.
+    """
+    probe_body = (
+        '{"jsonrpc":"2.0","id":0,"method":"initialize","params":'
+        '{"protocolVersion":"2024-11-05","capabilities":{},'
+        '"clientInfo":{"name":"mcp-stdio-probe","version":"0"}}}'
+    )
+    try:
+        resp = client.post(
+            server_url,
+            content=probe_body,
+            headers={"Content-Type": "application/json"},
+            timeout=10.0,
+        )
+        if resp.status_code == 401:
+            return resp.headers.get("WWW-Authenticate")
+    except Exception:
+        pass
+    return None
 
 
 def step_up_authorize(
