@@ -29,6 +29,7 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
     - §3 discovery of authorization servers via `/.well-known/oauth-protected-resource`
     - §3.1 path-aware well-known URL construction for path-based reverse-proxy deployments, with host-root fallback; preserves the resource URL's query component on the constructed metadata URL
     - §3.3 `resource` field validation — warn on mismatch, continue
+    - §5.1 `WWW-Authenticate: Bearer resource_metadata=` hint — probes the server before discovery so servers that publish PRM at a non-standard URL are found without well-known path guessing
   - [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) Authorization Server Metadata
     - §3 well-known URL construction, including path insertion for issuers with path components
     - §3 `issuer` validation — warn on mismatch, continue

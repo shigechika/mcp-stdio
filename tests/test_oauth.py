@@ -17,9 +17,12 @@ from mcp_stdio.oauth import (
     _is_client_secret_expired,
     _is_loopback,
     _make_callback_handler,
+    _parse_resource_metadata_hint,
     _parse_token_response,
+    _probe_www_authenticate,
     _token_response_to_data,
     _validate_auth_server_url,
+    _validate_prm_hint_url,
     discover_oauth_metadata,
     ensure_token,
     exchange_code,
@@ -1480,6 +1483,8 @@ class TestEnsureToken:
             status_code=400,
             json={"error": "invalid_grant"},
         )
+        # Probe for WWW-Authenticate hint (no resource_metadata hint)
+        httpx_mock.add_response(url="https://example.com/mcp", status_code=401)
         # Discovery for full flow (will be attempted after refresh fails)
         httpx_mock.add_response(
             url="https://example.com/.well-known/oauth-protected-resource/mcp",
@@ -1545,7 +1550,9 @@ class TestEnsureToken:
             match_content=b"grant_type=refresh_token&refresh_token=stale_rt"
             b"&client_id=cached_cid&resource=https%3A%2F%2Fexample.com%2Fmcp",
         )
-        # Step 2: discovery for the full flow.
+        # Step 2a: probe for WWW-Authenticate hint (no resource_metadata hint)
+        httpx_mock.add_response(url="https://example.com/mcp", status_code=401)
+        # Step 2b: discovery for the full flow.
         httpx_mock.add_response(
             url="https://example.com/.well-known/oauth-protected-resource/mcp",
             status_code=404,
@@ -1636,6 +1643,8 @@ class TestEnsureToken:
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
         monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
 
+        # Probe for WWW-Authenticate hint (no resource_metadata hint)
+        httpx_mock.add_response(url="https://example.com/mcp", status_code=401)
         # Discovery
         httpx_mock.add_response(
             url="https://example.com/.well-known/oauth-protected-resource/mcp",
@@ -1718,6 +1727,8 @@ class TestClientSecretExpiry:
             ),
         )
 
+        # Probe for WWW-Authenticate hint (no resource_metadata hint)
+        httpx_mock.add_response(url="https://example.com/mcp", status_code=401)
         # Discovery for full flow (which will run after refresh is skipped)
         httpx_mock.add_response(
             url="https://example.com/.well-known/oauth-protected-resource/mcp",
@@ -1813,6 +1824,8 @@ class TestClientSecretExpiry:
             ),
         )
 
+        # Probe for WWW-Authenticate hint (no resource_metadata hint)
+        httpx_mock.add_response(url="https://example.com/mcp", status_code=401)
         # Discovery
         httpx_mock.add_response(
             url="https://example.com/.well-known/oauth-protected-resource/mcp",
@@ -2271,6 +2284,8 @@ class TestStateCsrfCheck:
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
         monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
 
+        # Probe for WWW-Authenticate hint (no resource_metadata hint)
+        httpx_mock.add_response(url="https://example.com/mcp", status_code=401)
         # Discovery + registration mocks so we reach the auth-URL stage
         httpx_mock.add_response(
             url=(
@@ -2354,3 +2369,272 @@ class TestStateCsrfCheck:
         assert calls[-1] == ("abc", "abc")
         assert oauth_mod.secrets.compare_digest("abc", "abd") is False
         assert calls[-1] == ("abc", "abd")
+
+
+# --- _parse_resource_metadata_hint ---
+
+
+class TestParseResourceMetadataHint:
+    def test_quoted_value(self):
+        """RFC 9728 §5.1: resource_metadata in double quotes."""
+        header = 'Bearer resource_metadata="https://resource.example.com/.well-known/oauth-protected-resource"'
+        assert (
+            _parse_resource_metadata_hint(header)
+            == "https://resource.example.com/.well-known/oauth-protected-resource"
+        )
+
+    def test_unquoted_value(self):
+        """Unquoted resource_metadata (some servers omit quotes)."""
+        header = "Bearer resource_metadata=https://resource.example.com/prm"
+        assert (
+            _parse_resource_metadata_hint(header)
+            == "https://resource.example.com/prm"
+        )
+
+    def test_with_other_params(self):
+        """resource_metadata combined with other Bearer parameters."""
+        header = 'Bearer realm="example", resource_metadata="https://resource.example.com/prm", error="invalid_token"'
+        assert (
+            _parse_resource_metadata_hint(header)
+            == "https://resource.example.com/prm"
+        )
+
+    def test_no_resource_metadata(self):
+        """WWW-Authenticate without resource_metadata returns None."""
+        header = 'Bearer realm="example", error="invalid_token"'
+        assert _parse_resource_metadata_hint(header) is None
+
+    def test_none_header(self):
+        """None input returns None."""
+        assert _parse_resource_metadata_hint(None) is None
+
+    def test_empty_header(self):
+        """Empty string returns None."""
+        assert _parse_resource_metadata_hint("") is None
+
+    def test_different_scheme_ignored(self):
+        """Non-Bearer scheme without resource_metadata returns None."""
+        header = "Basic realm=example"
+        assert _parse_resource_metadata_hint(header) is None
+
+
+# --- _validate_prm_hint_url ---
+
+
+class TestValidatePrmHintUrl:
+    SERVER = "https://api.example.com/mcp"
+
+    def test_https_same_origin_valid(self):
+        assert _validate_prm_hint_url("https://api.example.com/prm", self.SERVER) is True
+
+    def test_https_cross_origin_valid_with_warning(self, capsys):
+        result = _validate_prm_hint_url("https://other.example.com/prm", self.SERVER)
+        assert result is True
+        err = capsys.readouterr().err
+        assert "cross-origin" in err
+
+    def test_http_loopback_valid(self):
+        result = _validate_prm_hint_url(
+            "http://localhost/prm", "http://localhost:3000/mcp"
+        )
+        assert result is True
+
+    def test_http_non_loopback_rejected(self):
+        assert _validate_prm_hint_url("http://api.example.com/prm", self.SERVER) is False
+
+    def test_unsupported_scheme_rejected(self):
+        assert _validate_prm_hint_url("ftp://api.example.com/prm", self.SERVER) is False
+
+    def test_malformed_url_rejected(self):
+        assert _validate_prm_hint_url("not a url !!!", self.SERVER) is False
+
+
+# --- discover_oauth_metadata with www_authenticate hint ---
+
+
+class TestDiscoverMetadataWwwAuthenticate:
+    def test_hint_used_as_phase0(self, httpx_mock):
+        """RFC 9728 §5.1: resource_metadata hint URL is tried before well-known paths."""
+        hint_url = "https://resource.example.com/.well-known/oauth-protected-resource"
+        httpx_mock.add_response(
+            url=hint_url,
+            json={
+                "resource": "https://api.example.com/mcp",
+                "authorization_servers": ["https://auth.example.com"],
+            },
+        )
+        httpx_mock.add_response(
+            url="https://auth.example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://auth.example.com/authorize",
+                "token_endpoint": "https://auth.example.com/token",
+            },
+        )
+        client = httpx.Client()
+        header = f'Bearer resource_metadata="{hint_url}"'
+        meta = discover_oauth_metadata(
+            "https://api.example.com/mcp", client, www_authenticate=header
+        )
+        assert meta.authorization_endpoint == "https://auth.example.com/authorize"
+        # Hint URL was fetched — confirm by checking request history
+        urls = [str(r.url) for r in httpx_mock.get_requests()]
+        assert hint_url in urls
+
+    def test_hint_failure_falls_back_to_well_known(self, httpx_mock):
+        """Phase 0 hint 404 → falls through to normal well-known discovery."""
+        hint_url = "https://resource.example.com/.well-known/oauth-protected-resource"
+        httpx_mock.add_response(url=hint_url, status_code=404)
+        # Phase 1 well-known URLs also 404
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource/mcp",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://api.example.com/auth",
+                "token_endpoint": "https://api.example.com/token",
+            },
+        )
+        client = httpx.Client()
+        header = f'Bearer resource_metadata="{hint_url}"'
+        meta = discover_oauth_metadata(
+            "https://api.example.com/mcp", client, www_authenticate=header
+        )
+        assert meta.authorization_endpoint == "https://api.example.com/auth"
+
+    def test_no_hint_normal_discovery(self, httpx_mock):
+        """Without www_authenticate, discovery proceeds normally (no extra request)."""
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource/mcp",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://api.example.com/auth",
+                "token_endpoint": "https://api.example.com/token",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata("https://api.example.com/mcp", client)
+        assert meta.authorization_endpoint == "https://api.example.com/auth"
+
+    def test_invalid_hint_url_skipped(self, httpx_mock):
+        """Insecure http:// hint URL is rejected; well-known discovery runs instead."""
+        hint_url = "http://attacker.example.com/steal-tokens"
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource/mcp",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://api.example.com/auth",
+                "token_endpoint": "https://api.example.com/token",
+            },
+        )
+        client = httpx.Client()
+        header = f"Bearer resource_metadata={hint_url}"
+        meta = discover_oauth_metadata(
+            "https://api.example.com/mcp", client, www_authenticate=header
+        )
+        assert meta.authorization_endpoint == "https://api.example.com/auth"
+        # Attacker URL must never have been fetched
+        urls = [str(r.url) for r in httpx_mock.get_requests()]
+        assert hint_url not in urls
+
+    def test_hint_not_duplicated_when_same_as_well_known(self, httpx_mock):
+        """When hint URL equals the well-known path, it is fetched only once."""
+        # The hint happens to match the path-aware well-known URL
+        hint_url = "https://api.example.com/.well-known/oauth-protected-resource/mcp"
+        httpx_mock.add_response(
+            url=hint_url,
+            json={
+                "resource": "https://api.example.com/mcp",
+                "authorization_servers": ["https://auth.example.com"],
+            },
+        )
+        httpx_mock.add_response(
+            url="https://auth.example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://auth.example.com/authorize",
+                "token_endpoint": "https://auth.example.com/token",
+            },
+        )
+        client = httpx.Client()
+        header = f'Bearer resource_metadata="{hint_url}"'
+        meta = discover_oauth_metadata(
+            "https://api.example.com/mcp", client, www_authenticate=header
+        )
+        assert meta.authorization_endpoint == "https://auth.example.com/authorize"
+        # The hint URL must appear exactly once in request history
+        urls = [str(r.url) for r in httpx_mock.get_requests()]
+        assert urls.count(hint_url) == 1
+
+
+# --- _probe_www_authenticate ---
+
+
+class TestProbeWwwAuthenticate:
+    MCP_URL = "https://api.example.com/mcp"
+
+    def test_returns_header_on_401(self, httpx_mock):
+        """401 response with WWW-Authenticate yields the header value."""
+        httpx_mock.add_response(
+            url=self.MCP_URL,
+            status_code=401,
+            headers={
+                "WWW-Authenticate": 'Bearer resource_metadata="https://resource.example.com/prm"'
+            },
+        )
+        client = httpx.Client()
+        result = _probe_www_authenticate(self.MCP_URL, client)
+        assert result == 'Bearer resource_metadata="https://resource.example.com/prm"'
+
+    def test_returns_none_on_401_without_header(self, httpx_mock):
+        """401 without WWW-Authenticate header returns None."""
+        httpx_mock.add_response(url=self.MCP_URL, status_code=401)
+        client = httpx.Client()
+        assert _probe_www_authenticate(self.MCP_URL, client) is None
+
+    def test_returns_none_on_200(self, httpx_mock):
+        """200 response (server doesn't require auth) returns None."""
+        httpx_mock.add_response(url=self.MCP_URL, status_code=200, text="{}")
+        client = httpx.Client()
+        assert _probe_www_authenticate(self.MCP_URL, client) is None
+
+    def test_returns_none_on_405(self, httpx_mock):
+        """405 Method Not Allowed returns None."""
+        httpx_mock.add_response(url=self.MCP_URL, status_code=405)
+        client = httpx.Client()
+        assert _probe_www_authenticate(self.MCP_URL, client) is None
+
+    def test_returns_none_on_connection_error(self, httpx_mock):
+        """Connection error silently returns None."""
+        httpx_mock.add_exception(httpx.ConnectError("refused"))
+        client = httpx.Client()
+        assert _probe_www_authenticate(self.MCP_URL, client) is None
+
+    def test_probe_sends_post_with_json(self, httpx_mock):
+        """Probe uses POST with Content-Type: application/json."""
+        httpx_mock.add_response(url=self.MCP_URL, status_code=401)
+        client = httpx.Client()
+        _probe_www_authenticate(self.MCP_URL, client)
+        req = httpx_mock.get_requests()[0]
+        assert req.method == "POST"
+        assert req.headers.get("content-type") == "application/json"
+        body = json.loads(req.content)
+        assert body["method"] == "initialize"
