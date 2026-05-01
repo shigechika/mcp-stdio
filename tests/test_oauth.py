@@ -1483,6 +1483,8 @@ class TestEnsureToken:
             status_code=400,
             json={"error": "invalid_grant"},
         )
+        # Probe for WWW-Authenticate hint (no resource_metadata hint)
+        httpx_mock.add_response(url="https://example.com/mcp", status_code=401)
         # Discovery for full flow (will be attempted after refresh fails)
         httpx_mock.add_response(
             url="https://example.com/.well-known/oauth-protected-resource/mcp",
@@ -1548,7 +1550,9 @@ class TestEnsureToken:
             match_content=b"grant_type=refresh_token&refresh_token=stale_rt"
             b"&client_id=cached_cid&resource=https%3A%2F%2Fexample.com%2Fmcp",
         )
-        # Step 2: discovery for the full flow.
+        # Step 2a: probe for WWW-Authenticate hint (no resource_metadata hint)
+        httpx_mock.add_response(url="https://example.com/mcp", status_code=401)
+        # Step 2b: discovery for the full flow.
         httpx_mock.add_response(
             url="https://example.com/.well-known/oauth-protected-resource/mcp",
             status_code=404,
@@ -1639,6 +1643,8 @@ class TestEnsureToken:
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
         monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
 
+        # Probe for WWW-Authenticate hint (no resource_metadata hint)
+        httpx_mock.add_response(url="https://example.com/mcp", status_code=401)
         # Discovery
         httpx_mock.add_response(
             url="https://example.com/.well-known/oauth-protected-resource/mcp",
@@ -1721,6 +1727,8 @@ class TestClientSecretExpiry:
             ),
         )
 
+        # Probe for WWW-Authenticate hint (no resource_metadata hint)
+        httpx_mock.add_response(url="https://example.com/mcp", status_code=401)
         # Discovery for full flow (which will run after refresh is skipped)
         httpx_mock.add_response(
             url="https://example.com/.well-known/oauth-protected-resource/mcp",
@@ -1816,6 +1824,8 @@ class TestClientSecretExpiry:
             ),
         )
 
+        # Probe for WWW-Authenticate hint (no resource_metadata hint)
+        httpx_mock.add_response(url="https://example.com/mcp", status_code=401)
         # Discovery
         httpx_mock.add_response(
             url="https://example.com/.well-known/oauth-protected-resource/mcp",
@@ -2274,6 +2284,8 @@ class TestStateCsrfCheck:
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
         monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
 
+        # Probe for WWW-Authenticate hint (no resource_metadata hint)
+        httpx_mock.add_response(url="https://example.com/mcp", status_code=401)
         # Discovery + registration mocks so we reach the auth-URL stage
         httpx_mock.add_response(
             url=(
