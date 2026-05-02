@@ -348,6 +348,15 @@ def discover_oauth_metadata(
         if meta:
             return meta
 
+    # Path-scoped issuers (Keycloak realm URLs, AWS Cognito user pools, etc.)
+    # publish metadata at /.well-known/oauth-authorization-server/<path> per
+    # RFC 8414 §3 path-insertion. Try the original server_url when it has a
+    # path component that neither the PRM-discovered AS nor the base URL tried.
+    if server_url not in (auth_server_url, base):
+        meta = _fetch_authorization_server_metadata(server_url, client)
+        if meta:
+            return meta
+
     # Phase 3: Default paths
     log("OAuth metadata not found, using default endpoints")
     return OAuthMetadata(

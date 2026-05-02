@@ -147,6 +147,11 @@ class TestDiscoverMetadata:
             url="https://api.example.com/.well-known/oauth-authorization-server",
             status_code=404,
         )
+        # Path-scoped probe (new fallback for Keycloak-style issuers)
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-authorization-server/mcp",
+            status_code=404,
+        )
         client = httpx.Client()
         meta = discover_oauth_metadata("https://api.example.com/mcp", client)
         assert meta.authorization_endpoint == "https://api.example.com/authorize"
@@ -154,7 +159,8 @@ class TestDiscoverMetadata:
         assert meta.registration_endpoint == "https://api.example.com/register"
 
     def test_fallback_on_connection_error(self, httpx_mock):
-        # ConnectError affects path-aware PRM, host-root PRM, and AS metadata
+        # ConnectError for: path-aware PRM, host-root PRM, host-root AS, path-scoped AS
+        httpx_mock.add_exception(httpx.ConnectError("refused"))
         httpx_mock.add_exception(httpx.ConnectError("refused"))
         httpx_mock.add_exception(httpx.ConnectError("refused"))
         httpx_mock.add_exception(httpx.ConnectError("refused"))
@@ -206,6 +212,10 @@ class TestDiscoverMetadata:
             text="not json",
             status_code=200,
         )
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-authorization-server/mcp",
+            status_code=404,
+        )
         client = httpx.Client()
         meta = discover_oauth_metadata("https://api.example.com/mcp", client)
         # Should fallback to defaults
@@ -216,6 +226,10 @@ class TestDiscoverMetadata:
         httpx_mock.add_response(
             url="https://api.example.com/.well-known/oauth-authorization-server",
             status_code=500,
+        )
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-authorization-server/mcp",
+            status_code=404,
         )
         client = httpx.Client()
         meta = discover_oauth_metadata("https://api.example.com/mcp", client)
@@ -273,6 +287,10 @@ class TestDiscoverMetadata:
             )
         httpx_mock.add_response(
             url="https://api.example.com/.well-known/oauth-authorization-server",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-authorization-server/mcp",
             status_code=404,
         )
         client = httpx.Client()
@@ -528,6 +546,55 @@ class TestDiscoverMetadata:
         client = httpx.Client()
         meta = discover_oauth_metadata("https://api.example.com/mcp", client)
         assert meta.authorization_endpoint == "https://auth.example.com/authorize"
+
+    def test_path_scoped_issuer_keycloak_style(self, httpx_mock):
+        """#53: Keycloak/Cognito path-scoped issuers advertise metadata at RFC 8414 §3
+        path-insertion URL (/.well-known/oauth-authorization-server/<path>).
+
+        When the MCP server URL IS the issuer (no separate authorization server),
+        host-root RFC 8414 returns 404, but the path-insertion well-known succeeds.
+        Repro: mcp-stdio --oauth-device --client-id x http://keycloak/realms/test
+        """
+        # No PRM (Keycloak doesn't implement RFC 9728)
+        self._mock_no_prm(httpx_mock, base="https://keycloak.example.com", path="/realms/test")
+        # Host-root AS metadata: 404
+        httpx_mock.add_response(
+            url="https://keycloak.example.com/.well-known/oauth-authorization-server",
+            status_code=404,
+        )
+        # Path-insertion AS metadata (RFC 8414 §3): 200 with device endpoint
+        httpx_mock.add_response(
+            url="https://keycloak.example.com/.well-known/oauth-authorization-server/realms/test",
+            json={
+                "issuer": "https://keycloak.example.com/realms/test",
+                "authorization_endpoint": "https://keycloak.example.com/realms/test/protocol/openid-connect/auth",
+                "token_endpoint": "https://keycloak.example.com/realms/test/protocol/openid-connect/token",
+                "device_authorization_endpoint": "https://keycloak.example.com/realms/test/protocol/openid-connect/auth/device",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata(
+            "https://keycloak.example.com/realms/test", client
+        )
+        assert meta.authorization_endpoint == "https://keycloak.example.com/realms/test/protocol/openid-connect/auth"
+        assert meta.token_endpoint == "https://keycloak.example.com/realms/test/protocol/openid-connect/token"
+        assert meta.device_authorization_endpoint == "https://keycloak.example.com/realms/test/protocol/openid-connect/auth/device"
+
+    def test_path_scoped_issuer_does_not_shadow_host_root_match(self, httpx_mock):
+        """#53: when host-root AS metadata succeeds, path-scoped probe is not called."""
+        self._mock_no_prm(httpx_mock, path="/realms/test")
+        # Host-root AS metadata: 200
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://api.example.com/auth",
+                "token_endpoint": "https://api.example.com/token",
+            },
+        )
+        # Path-insertion URL must NOT be called (no extra mock registered)
+        client = httpx.Client()
+        meta = discover_oauth_metadata("https://api.example.com/realms/test", client)
+        assert meta.authorization_endpoint == "https://api.example.com/auth"
 
 
 # --- register_client ---
@@ -1499,6 +1566,11 @@ class TestEnsureToken:
             url="https://example.com/.well-known/oauth-authorization-server",
             status_code=404,
         )
+        # Path-scoped probe (Keycloak-style fallback)
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-authorization-server/mcp",
+            status_code=404,
+        )
 
         # Stale token should be cleared after refresh failure
         # Full OAuth flow will be attempted (and fail due to no browser),
@@ -1741,6 +1813,11 @@ class TestClientSecretExpiry:
         )
         httpx_mock.add_response(
             url="https://example.com/.well-known/oauth-authorization-server",
+            status_code=404,
+        )
+        # Path-scoped probe (Keycloak-style fallback)
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-authorization-server/mcp",
             status_code=404,
         )
         # Full flow re-registers (since client_secret expired, not reused)
