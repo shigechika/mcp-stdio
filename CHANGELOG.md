@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/shigechika/mcp-stdio/compare/v0.10.0...v0.10.1) (2026-05-02)
+
+
+### Bug Fixes
+
+* **oauth:** support path-scoped issuers in RFC 8414 discovery (Keycloak, Cognito) ([#54](https://github.com/shigechika/mcp-stdio/issues/54)) ([1916ec0](https://github.com/shigechika/mcp-stdio/commit/1916ec040cfc90fc1bcc20011f36344f0ab37a68))
+
 ## [0.10.0](https://github.com/shigechika/mcp-stdio/compare/v0.9.0...v0.10.0) (2026-05-02)
 
 
