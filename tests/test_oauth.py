@@ -2906,6 +2906,10 @@ class TestDeviceAuthorizationFlow:
     def test_metadata_discovers_device_endpoint(self, httpx_mock):
         """device_authorization_endpoint is read from RFC 8414 metadata."""
         httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource/mcp",
+            status_code=404,
+        )
+        httpx_mock.add_response(
             url="https://api.example.com/.well-known/oauth-protected-resource",
             status_code=404,
         )
