@@ -37,6 +37,10 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
     - §2 `resource` parameter in authorization, token exchange, **and refresh** requests
   - [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) PKCE
     - §4.1–4.2 S256 `code_challenge_method` with a 96-char `code_verifier`
+  - [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628) Device Authorization Grant
+    - §3.1 device authorization request with `resource` indicator (RFC 8707)
+    - §3.4–3.5 token polling with `authorization_pending` / `slow_down` (interval +=5 s) / `expired_token` / `access_denied` handling
+    - DCR registers `urn:ietf:params:oauth:grant-type:device_code` in `grant_types` (RFC 7591 §2)
   - [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591) Dynamic Client Registration
     - §3 client registration request (public client with `token_endpoint_auth_method: none`)
     - §3.2.1 `client_secret_expires_at` handling — auto re-register on expiry
@@ -107,6 +111,12 @@ mcp-stdio --oauth https://your-server.example.com:8080/mcp
 mcp-stdio --oauth --client-id YOUR_CLIENT_ID https://your-server.example.com:8080/mcp
 ```
 
+With OAuth 2.1 Device Authorization Grant (RFC 8628, for headless/SSH environments):
+
+```bash
+mcp-stdio --oauth-device https://your-server.example.com:8080/mcp
+```
+
 For legacy MCP servers using the 2024-11-05 SSE transport:
 
 ```bash
@@ -160,7 +170,8 @@ Arguments:
 
 Options:
   --bearer-token TOKEN   Bearer token (or set MCP_BEARER_TOKEN env var)
-  --oauth                Enable OAuth 2.1 authentication
+  --oauth                Enable OAuth 2.1 authentication (browser flow)
+  --oauth-device         Enable OAuth 2.1 Device Authorization Grant (RFC 8628, headless)
   --client-id ID         Pre-registered OAuth client ID (or set MCP_OAUTH_CLIENT_ID)
   --oauth-scope SCOPE    OAuth scope to request
   -H, --header 'Key: Value'  Custom header (can be repeated)

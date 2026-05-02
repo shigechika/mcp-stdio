@@ -150,6 +150,30 @@ class TestMain:
                 main()
             assert exc_info.value.code == 1
 
+    def test_oauth_device_and_oauth_mutually_exclusive(self):
+        with patch(
+            "sys.argv",
+            ["mcp-stdio", "https://example.com/mcp", "--oauth", "--oauth-device"],
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 1
+
+    def test_oauth_device_and_bearer_token_mutually_exclusive(self):
+        with patch(
+            "sys.argv",
+            [
+                "mcp-stdio",
+                "https://example.com/mcp",
+                "--oauth-device",
+                "--bearer-token",
+                "tok",
+            ],
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 1
+
     def test_check_flag_invokes_check_connection(self):
         """--check should call check_connection and exit with its result."""
         with (

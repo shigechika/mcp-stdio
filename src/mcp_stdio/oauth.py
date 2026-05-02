@@ -8,6 +8,7 @@ import html
 import ipaddress
 import re
 import secrets
+import sys
 import threading
 import time
 import webbrowser
@@ -33,6 +34,7 @@ class OAuthMetadata:
     authorization_endpoint: str
     token_endpoint: str
     registration_endpoint: str | None = None
+    device_authorization_endpoint: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +253,7 @@ def _fetch_authorization_server_metadata(
                 or f"{auth_server_url}/authorize",
                 token_endpoint=data.get("token_endpoint") or f"{auth_server_url}/token",
                 registration_endpoint=data.get("registration_endpoint") or None,
+                device_authorization_endpoint=data.get("device_authorization_endpoint") or None,
             )
     except Exception:
         pass
@@ -379,8 +382,13 @@ def register_client(
     metadata: OAuthMetadata,
     redirect_uri: str,
     client: httpx.Client,
+    *,
+    device_flow: bool = False,
 ) -> ClientRegistration:
     """Register a client via Dynamic Client Registration.
+
+    When ``device_flow=True``, registers with the device code grant type
+    (RFC 8628 §3.1) instead of the authorization code flow.
 
     Raises httpx.HTTPStatusError on failure.
     """
@@ -390,15 +398,23 @@ def register_client(
             "Provide a --client-id instead."
         )
 
-    resp = client.post(
-        metadata.registration_endpoint,
-        json={
+    if device_flow:
+        body: dict[str, object] = {
+            "client_name": "mcp-stdio",
+            "grant_types": ["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"],
+            "token_endpoint_auth_method": "none",
+        }
+    else:
+        body = {
             "client_name": "mcp-stdio",
             "redirect_uris": [redirect_uri],
             "response_types": ["code"],
             "grant_types": ["authorization_code", "refresh_token"],
             "token_endpoint_auth_method": "none",
-        },
+        }
+    resp = client.post(
+        metadata.registration_endpoint,
+        json=body,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -807,6 +823,144 @@ def _run_authorization_flow(
     return data
 
 
+def _run_device_authorization_flow(
+    server_url: str,
+    client: httpx.Client,
+    *,
+    metadata: OAuthMetadata,
+    cached: TokenData | None,
+    client_id_override: str | None = None,
+    scope: str | None = None,
+) -> TokenData:
+    """Run RFC 8628 Device Authorization Grant flow.
+
+    Displays a ``verification_uri`` + ``user_code`` on stderr so the user can
+    authorize on a separate device, then polls the token endpoint until the
+    device code expires or the user grants access.
+    """
+    if not metadata.device_authorization_endpoint:
+        raise ValueError(
+            "Server does not support Device Authorization Grant "
+            "(no device_authorization_endpoint in metadata). "
+            "Use --oauth for browser-based flow instead."
+        )
+
+    cid = client_id_override
+    csecret: str | None = None
+    cse_at: float | None = None
+    if not cid:
+        if cached and cached.client_id and not _is_client_secret_expired(cached):
+            cid = cached.client_id
+            csecret = cached.client_secret
+            cse_at = cached.client_secret_expires_at
+        elif metadata.registration_endpoint:
+            log("registering OAuth client for device flow")
+            reg = register_client(metadata, "", client, device_flow=True)
+            cid = reg.client_id
+            csecret = reg.client_secret
+            cse_at = reg.client_secret_expires_at
+            log(f"registered client: {cid}")
+        else:
+            raise ValueError(
+                "Server does not support dynamic client registration. "
+                "Provide a --client-id instead."
+            )
+    assert cid is not None
+
+    # Step 1: Device Authorization Request (RFC 8628 §3.1)
+    da_params: dict[str, str] = {
+        "client_id": cid,
+        "resource": server_url,
+    }
+    if scope:
+        da_params["scope"] = scope
+
+    da_resp = client.post(
+        metadata.device_authorization_endpoint,
+        data=da_params,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+    )
+    da_resp.raise_for_status()
+    da = da_resp.json()
+
+    device_code: str = da["device_code"]
+    user_code: str = da["user_code"]
+    verification_uri: str = da["verification_uri"]
+    verification_uri_complete: str | None = da.get("verification_uri_complete")
+    expires_in = int(da.get("expires_in", 1800))
+    poll_interval = int(da.get("interval", 5))
+
+    # Display instructions on stderr (visible even when stdout is piped to MCP client)
+    print("\nDevice authorization required:", file=sys.stderr)
+    if verification_uri_complete:
+        print(f"  Open: {verification_uri_complete}", file=sys.stderr)
+    else:
+        print(f"  Open: {verification_uri}", file=sys.stderr)
+        print(f"  Enter code: {user_code}", file=sys.stderr)
+    print(f"\nWaiting for authorization (expires in {expires_in}s)...", file=sys.stderr)
+
+    # Step 2: Poll token endpoint (RFC 8628 §3.5)
+    # Sleep is at the end of each iteration so the first poll is immediate.
+    deadline = time.monotonic() + expires_in
+    while time.monotonic() < deadline:
+        poll_data: dict[str, str] = {
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "device_code": device_code,
+            "client_id": cid,
+        }
+        if csecret:
+            poll_data["client_secret"] = csecret
+
+        try:
+            tok_resp = client.post(
+                metadata.token_endpoint,
+                data=poll_data,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                },
+            )
+        except Exception as exc:
+            log(f"device flow poll error: {exc}")
+            time.sleep(poll_interval)
+            continue
+
+        if tok_resp.status_code == 200:
+            raw = _parse_token_response(tok_resp)
+            data = _token_response_to_data(
+                raw, metadata, cid, csecret, client_secret_expires_at=cse_at
+            )
+            save_token(server_url, data)
+            log("device flow token obtained and saved")
+            return data
+
+        try:
+            err = tok_resp.json().get("error", "")
+        except Exception:
+            tok_resp.raise_for_status()
+            time.sleep(poll_interval)
+            continue
+
+        if err == "authorization_pending":
+            pass
+        elif err == "slow_down":
+            # RFC 8628 §3.5: increase interval by 5 seconds
+            poll_interval += 5
+        elif err in ("expired_token", "access_denied"):
+            raise RuntimeError(f"Device flow failed: {err}")
+        else:
+            tok_resp.raise_for_status()
+
+        time.sleep(poll_interval)
+
+    raise TimeoutError(
+        "Device authorization timed out. Please restart and try again."
+    )
+
+
 def ensure_token(
     server_url: str,
     client: httpx.Client,
@@ -814,12 +968,15 @@ def ensure_token(
     client_id: str | None = None,
     scope: str | None = None,
     timeout: float = 120,
+    device_flow: bool = False,
 ) -> TokenData:
     """Ensure a valid access token is available.
 
     1. Check cached token — use if not expired
     2. If expired, try refresh
-    3. If no token or refresh fails, run full OAuth flow
+    3. If no token or refresh fails, run OAuth flow:
+       - ``device_flow=True``: Device Authorization Grant (RFC 8628)
+       - ``device_flow=False``: Authorization Code flow with PKCE (default)
 
     Returns TokenData with a valid access_token.
     """
@@ -846,6 +1003,15 @@ def ensure_token(
     # guessing. Best-effort — failures silently fall back to normal discovery.
     www_authenticate = _probe_www_authenticate(server_url, client)
     metadata = discover_oauth_metadata(server_url, client, www_authenticate=www_authenticate)
+    if device_flow:
+        return _run_device_authorization_flow(
+            server_url,
+            client,
+            metadata=metadata,
+            cached=cached,
+            client_id_override=client_id,
+            scope=scope,
+        )
     return _run_authorization_flow(
         server_url,
         client,

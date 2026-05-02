@@ -35,6 +35,10 @@ Bearer token、カスタムヘッダー、OAuth 2.1 認証情報をリモート�
     - §2 `resource` パラメータを認可リクエスト・トークン交換・**リフレッシュ**に送信
   - [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) PKCE
     - §4.1–4.2 S256 `code_challenge_method`、96 文字の `code_verifier`
+  - [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628) Device Authorization Grant
+    - §3.1 `resource` インジケータ付きデバイス認可リクエスト（RFC 8707）
+    - §3.4–3.5 `authorization_pending` / `slow_down`（interval +=5 s）/ `expired_token` / `access_denied` ハンドリング
+    - DCR の `grant_types` に `urn:ietf:params:oauth:grant-type:device_code` を登録（RFC 7591 §2）
   - [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591) Dynamic Client Registration
     - §3 クライアント登録リクエスト（公開クライアント、`token_endpoint_auth_method: none`）
     - §3.2.1 `client_secret_expires_at` に対応、期限切れ時に自動再登録
@@ -105,6 +109,12 @@ mcp-stdio --oauth https://your-server.example.com:8080/mcp
 mcp-stdio --oauth --client-id YOUR_CLIENT_ID https://your-server.example.com:8080/mcp
 ```
 
+OAuth 2.1 Device Authorization Grant（RFC 8628）— SSH・ヘッドレス環境向け：
+
+```bash
+mcp-stdio --oauth-device https://your-server.example.com:8080/mcp
+```
+
 MCP 2024-11-05 レガシーの SSE トランスポートを使うサーバー向け：
 
 ```bash
@@ -158,7 +168,8 @@ mcp-stdio [OPTIONS] URL
 
 オプション:
   --bearer-token TOKEN   Bearer token（MCP_BEARER_TOKEN 環境変数でも指定可）
-  --oauth                OAuth 2.1 認証を有効化
+  --oauth                OAuth 2.1 認証を有効化（ブラウザフロー）
+  --oauth-device         OAuth 2.1 Device Authorization Grant（RFC 8628）— ヘッドレス環境向け
   --client-id ID         事前登録済み OAuth クライアント ID（MCP_OAUTH_CLIENT_ID 環境変数でも指定可）
   --oauth-scope SCOPE    要求する OAuth スコープ
   -H, --header 'Key: Value'  カスタムヘッダー（複数指定可）
