@@ -20,6 +20,7 @@ from mcp_stdio.oauth import (
     _parse_resource_metadata_hint,
     _parse_token_response,
     _probe_www_authenticate,
+    _run_device_authorization_flow,
     _token_response_to_data,
     _validate_auth_server_url,
     _validate_prm_hint_url,
@@ -2638,3 +2639,342 @@ class TestProbeWwwAuthenticate:
         assert req.headers.get("content-type") == "application/json"
         body = json.loads(req.content)
         assert body["method"] == "initialize"
+
+
+# --- Device Authorization Grant (RFC 8628) ---
+
+MCP_URL = "https://api.example.com/mcp"
+AUTH_URL = "https://api.example.com/authorize"
+TOKEN_URL = "https://api.example.com/token"
+REG_URL = "https://api.example.com/register"
+DEVICE_AUTH_URL = "https://api.example.com/device_authorization"
+
+
+def _device_meta(*, reg: bool = True) -> OAuthMetadata:
+    return OAuthMetadata(
+        authorization_endpoint=AUTH_URL,
+        token_endpoint=TOKEN_URL,
+        registration_endpoint=REG_URL if reg else None,
+        device_authorization_endpoint=DEVICE_AUTH_URL,
+    )
+
+
+def _da_response(**kwargs: object) -> dict:
+    base: dict = {
+        "device_code": "DEV_CODE",
+        "user_code": "ABCD-1234",
+        "verification_uri": "https://example.com/activate",
+        "expires_in": 1800,
+        "interval": 1,
+    }
+    base.update(kwargs)
+    return base
+
+
+class TestDeviceAuthorizationFlow:
+    def _patch_store(self, tmp_path: object, monkeypatch: object) -> None:
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+    def test_happy_path(self, httpx_mock, tmp_path, monkeypatch):
+        """Full successful device flow: DA request → authorization_pending → token."""
+        self._patch_store(tmp_path, monkeypatch)
+
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={"error": "authorization_pending"},
+            status_code=400,
+        )
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={
+                "access_token": "acc",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": "ref",
+            },
+        )
+
+        client = httpx.Client()
+        data = _run_device_authorization_flow(
+            MCP_URL,
+            client,
+            metadata=_device_meta(),
+            cached=None,
+        )
+        assert data.access_token == "acc"
+        assert data.refresh_token == "ref"
+        assert data.client_id == "cid"
+
+    def test_verification_uri_complete_printed(self, httpx_mock, tmp_path, monkeypatch, capsys):
+        """verification_uri_complete is shown when present."""
+        self._patch_store(tmp_path, monkeypatch)
+
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(
+            url=DEVICE_AUTH_URL,
+            json=_da_response(
+                verification_uri_complete="https://example.com/activate?code=ABCD-1234"
+            ),
+        )
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={"access_token": "acc", "token_type": "Bearer"},
+        )
+
+        client = httpx.Client()
+        _run_device_authorization_flow(MCP_URL, client, metadata=_device_meta(), cached=None)
+        err = capsys.readouterr().err
+        assert "https://example.com/activate?code=ABCD-1234" in err
+        # user_code not printed separately when verification_uri_complete is present
+        assert "Enter code:" not in err
+
+    def test_user_code_printed_without_complete_uri(self, httpx_mock, tmp_path, monkeypatch, capsys):
+        """When verification_uri_complete is absent, user_code is shown separately."""
+        self._patch_store(tmp_path, monkeypatch)
+
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={"access_token": "acc", "token_type": "Bearer"},
+        )
+
+        client = httpx.Client()
+        _run_device_authorization_flow(MCP_URL, client, metadata=_device_meta(), cached=None)
+        err = capsys.readouterr().err
+        assert "ABCD-1234" in err
+        assert "https://example.com/activate" in err
+
+    def test_slow_down_increases_interval(self, httpx_mock, tmp_path, monkeypatch):
+        """slow_down error extends the polling interval by 5 seconds."""
+        self._patch_store(tmp_path, monkeypatch)
+
+        intervals: list[float] = []
+        last_sleep = [0.0]
+
+        original_sleep = time.sleep
+
+        def mock_sleep(secs: float) -> None:
+            intervals.append(secs)
+            last_sleep[0] = secs
+
+        monkeypatch.setattr(time, "sleep", mock_sleep)
+
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response(interval=1))
+        httpx_mock.add_response(
+            url=TOKEN_URL, json={"error": "slow_down"}, status_code=400
+        )
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={"access_token": "acc", "token_type": "Bearer"},
+        )
+
+        client = httpx.Client()
+        _run_device_authorization_flow(MCP_URL, client, metadata=_device_meta(), cached=None)
+
+        # slow_down fires on the first poll: interval becomes 6, then sleep(6).
+        # Second poll succeeds immediately (no sleep).
+        assert intervals == [6]
+
+    def test_expired_token_raises(self, httpx_mock, tmp_path, monkeypatch):
+        """expired_token error raises RuntimeError immediately."""
+        self._patch_store(tmp_path, monkeypatch)
+
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(
+            url=TOKEN_URL, json={"error": "expired_token"}, status_code=400
+        )
+
+        client = httpx.Client()
+        with pytest.raises(RuntimeError, match="expired_token"):
+            _run_device_authorization_flow(
+                MCP_URL, client, metadata=_device_meta(), cached=None
+            )
+
+    def test_access_denied_raises(self, httpx_mock, tmp_path, monkeypatch):
+        """access_denied error raises RuntimeError immediately."""
+        self._patch_store(tmp_path, monkeypatch)
+
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(
+            url=TOKEN_URL, json={"error": "access_denied"}, status_code=400
+        )
+
+        client = httpx.Client()
+        with pytest.raises(RuntimeError, match="access_denied"):
+            _run_device_authorization_flow(
+                MCP_URL, client, metadata=_device_meta(), cached=None
+            )
+
+    def test_no_device_endpoint_raises(self):
+        """Missing device_authorization_endpoint raises ValueError."""
+        meta = OAuthMetadata(
+            authorization_endpoint=AUTH_URL,
+            token_endpoint=TOKEN_URL,
+            device_authorization_endpoint=None,
+        )
+        client = httpx.Client()
+        with pytest.raises(ValueError, match="device_authorization_endpoint"):
+            _run_device_authorization_flow(MCP_URL, client, metadata=meta, cached=None)
+
+    def test_no_registration_endpoint_raises(self):
+        """No registration_endpoint and no cached client raises ValueError."""
+        meta = OAuthMetadata(
+            authorization_endpoint=AUTH_URL,
+            token_endpoint=TOKEN_URL,
+            registration_endpoint=None,
+            device_authorization_endpoint=DEVICE_AUTH_URL,
+        )
+        client = httpx.Client()
+        with pytest.raises(ValueError, match="--client-id"):
+            _run_device_authorization_flow(MCP_URL, client, metadata=meta, cached=None)
+
+    def test_reuses_cached_client_id(self, httpx_mock, tmp_path, monkeypatch):
+        """Cached client_id is reused; DCR is skipped."""
+        self._patch_store(tmp_path, monkeypatch)
+
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={"access_token": "acc", "token_type": "Bearer"},
+        )
+
+        cached = TokenData(
+            access_token="",
+            token_type="Bearer",
+            token_endpoint=TOKEN_URL,
+            authorization_endpoint=AUTH_URL,
+            client_id="cached_cid",
+        )
+        client = httpx.Client()
+        data = _run_device_authorization_flow(
+            MCP_URL, client, metadata=_device_meta(), cached=cached
+        )
+        assert data.client_id == "cached_cid"
+
+        # No DCR request should have been made
+        reqs = httpx_mock.get_requests()
+        assert all(r.url.path != "/register" for r in reqs)
+
+    def test_dcr_uses_device_code_grant_type(self, httpx_mock, tmp_path, monkeypatch):
+        """DCR request must include device_code grant type (RFC 8628 §3.1)."""
+        self._patch_store(tmp_path, monkeypatch)
+
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={"access_token": "acc", "token_type": "Bearer"},
+        )
+
+        client = httpx.Client()
+        _run_device_authorization_flow(MCP_URL, client, metadata=_device_meta(), cached=None)
+
+        dcr_req = httpx_mock.get_requests()[0]
+        assert dcr_req.url.path == "/register"
+        body = json.loads(dcr_req.content)
+        assert "urn:ietf:params:oauth:grant-type:device_code" in body["grant_types"]
+        assert "redirect_uris" not in body
+
+    def test_da_request_includes_resource_indicator(self, httpx_mock, tmp_path, monkeypatch):
+        """Device Authorization Request must include resource parameter (RFC 8707)."""
+        self._patch_store(tmp_path, monkeypatch)
+
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={"access_token": "acc", "token_type": "Bearer"},
+        )
+
+        client = httpx.Client()
+        _run_device_authorization_flow(MCP_URL, client, metadata=_device_meta(), cached=None)
+
+        reqs = httpx_mock.get_requests()
+        da_req = next(r for r in reqs if str(r.url).startswith(DEVICE_AUTH_URL))
+        from urllib.parse import parse_qs
+        body = parse_qs(da_req.content.decode())
+        assert body.get("resource") == [MCP_URL]
+
+    def test_metadata_discovers_device_endpoint(self, httpx_mock):
+        """device_authorization_endpoint is read from RFC 8414 metadata."""
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource/mcp",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-authorization-server",
+            json={
+                "issuer": "https://api.example.com",
+                "authorization_endpoint": AUTH_URL,
+                "token_endpoint": TOKEN_URL,
+                "device_authorization_endpoint": DEVICE_AUTH_URL,
+            },
+        )
+
+        client = httpx.Client()
+        meta = discover_oauth_metadata(MCP_URL, client)
+        assert meta.device_authorization_endpoint == DEVICE_AUTH_URL
+
+
+class TestEnsureTokenDeviceFlow:
+    MCP_URL = "https://api.example.com/mcp"
+    WELL_KNOWN_PRM = "https://api.example.com/.well-known/oauth-protected-resource"
+    WELL_KNOWN_AS = "https://api.example.com/.well-known/oauth-authorization-server"
+
+    def _patch_store(self, tmp_path: object, monkeypatch: object) -> None:
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+    def _mock_discovery(self, httpx_mock: object) -> None:
+        # path-aware PRM URL first (path component of /mcp is inserted)
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource/mcp",
+            status_code=404,
+        )
+        # host-root PRM URL second
+        httpx_mock.add_response(url=self.WELL_KNOWN_PRM, status_code=404)
+        httpx_mock.add_response(
+            url=self.WELL_KNOWN_AS,
+            json={
+                "issuer": "https://api.example.com",
+                "authorization_endpoint": AUTH_URL,
+                "token_endpoint": TOKEN_URL,
+                "registration_endpoint": REG_URL,
+                "device_authorization_endpoint": DEVICE_AUTH_URL,
+            },
+        )
+
+    def test_device_flow_flag_routes_to_device_flow(self, httpx_mock, tmp_path, monkeypatch):
+        """ensure_token with device_flow=True uses Device Authorization Grant."""
+        self._patch_store(tmp_path, monkeypatch)
+
+        # probe
+        httpx_mock.add_response(url=self.MCP_URL, status_code=401, headers={})
+        self._mock_discovery(httpx_mock)
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={"access_token": "acc", "token_type": "Bearer"},
+        )
+
+        client = httpx.Client()
+        data = ensure_token(self.MCP_URL, client, device_flow=True)
+        assert data.access_token == "acc"
+
+        # Verify device_authorization endpoint was actually called
+        reqs = httpx_mock.get_requests()
+        assert any(str(r.url).startswith(DEVICE_AUTH_URL) for r in reqs)

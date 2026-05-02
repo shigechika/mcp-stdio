@@ -35,6 +35,10 @@ Bearer token、カスタムヘッダー、OAuth 2.1 認証情報をリモート�
     - §2 `resource` パラメータを認可リクエスト・トークン交換・**リフレッシュ**に送信
   - [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) PKCE
     - §4.1–4.2 S256 `code_challenge_method`、96 文字の `code_verifier`
+  - [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628) Device Authorization Grant
+    - §3.1 `resource` インジケータ付きデバイス認可リクエスト（RFC 8707）
+    - §3.4–3.5 `authorization_pending` / `slow_down`（interval +=5 s）/ `expired_token` / `access_denied` ハンドリング
+    - DCR の `grant_types` に `urn:ietf:params:oauth:grant-type:device_code` を登録（RFC 7591 §2）
   - [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591) Dynamic Client Registration
     - §3 クライアント登録リクエスト（公開クライアント、`token_endpoint_auth_method: none`）
     - §3.2.1 `client_secret_expires_at` に対応、期限切れ時に自動再登録
@@ -105,6 +109,12 @@ mcp-stdio --oauth https://your-server.example.com:8080/mcp
 mcp-stdio --oauth --client-id YOUR_CLIENT_ID https://your-server.example.com:8080/mcp
 ```
 
+OAuth 2.1 Device Authorization Grant（RFC 8628）— SSH・ヘッドレス環境向け：
+
+```bash
+mcp-stdio --oauth-device https://your-server.example.com:8080/mcp
+```
+
 MCP 2024-11-05 レガシーの SSE トランスポートを使うサーバー向け：
 
 ```bash
@@ -158,7 +168,8 @@ mcp-stdio [OPTIONS] URL
 
 オプション:
   --bearer-token TOKEN   Bearer token（MCP_BEARER_TOKEN 環境変数でも指定可）
-  --oauth                OAuth 2.1 認証を有効化
+  --oauth                OAuth 2.1 認証を有効化（ブラウザフロー）
+  --oauth-device         OAuth 2.1 Device Authorization Grant（RFC 8628）— ヘッドレス環境向け
   --client-id ID         事前登録済み OAuth クライアント ID（MCP_OAUTH_CLIENT_ID 環境変数でも指定可）
   --oauth-scope SCOPE    要求する OAuth スコープ
   -H, --header 'Key: Value'  カスタムヘッダー（複数指定可）
@@ -173,40 +184,7 @@ mcp-stdio [OPTIONS] URL
 
 ## ワークアラウンド
 
-### Claude Code
-
-Claude Code の HTTP transport の既知の問題を回避できます：
-
-- **Bearer token が送信されない** — ツール呼び出し時に `Authorization` ヘッダーが無視される（[#28293](https://github.com/anthropics/claude-code/issues/28293), [#33817](https://github.com/anthropics/claude-code/issues/33817)）
-- **Accept ヘッダーの欠落** — サーバーが 406 を返し、認証エラーと誤認される（[#42470](https://github.com/anthropics/claude-code/issues/42470)）
-- **OAuth フォールバックループ** — OAuth 不要なサーバーでも OAuth 検出が走る（[#34008](https://github.com/anthropics/claude-code/issues/34008), [#39271](https://github.com/anthropics/claude-code/issues/39271)）
-- **切断後にセッションが失われる** — mcp-stdio は 404 で MCP セッションを自動回復（[#34498](https://github.com/anthropics/claude-code/issues/34498), [#38631](https://github.com/anthropics/claude-code/issues/38631)）
-- **OAuth scope が送信されない** — 認可リクエストに `scope` パラメータが含まれず、厳格な OAuth サーバーがフローを拒否する（[#4540](https://github.com/anthropics/claude-code/issues/4540)）; mcp-stdio は `--oauth-scope` でスコープを送信
-- **プロキシ設定が無視される** — Claude Code が `NO_PROXY` を尊重しない（[#34804](https://github.com/anthropics/claude-code/issues/34804)）; mcp-stdio は httpx 経由でプロキシ設定を継承
-- **`prompt=consent` が authorize URL に無条件付与** — Claude Code v2.1.109 は OAuth の authorize リクエストに `prompt=consent` を常に付けるため、ユーザー同意を無効化した Microsoft Entra ID テナント（企業で一般的）では、管理者がテナント全体の同意を付与済みでもサインイン完了できない（[#49722](https://github.com/anthropics/claude-code/issues/49722)）; mcp-stdio は authorize リクエストに `prompt=` を含めず、認可サーバー側の現行同意状態に応じて同意 UI の要否を判断させる
-- **`tools/list` ページネーションを無視** — Claude Code は最初の `tools/list` 応答しか受けず `nextCursor` を黙って捨てるため、2 ページ目以降の tool が見えない（MCP gateway や大規模ツールカタログが壊れる）（[#39586](https://github.com/anthropics/claude-code/issues/39586)）; mcp-stdio は `tools/list` / `resources/list` / `resources/templates/list` / `prompts/list` の `nextCursor` を透過的に追跡し、1 つの応答にマージして返す
-- **403 `insufficient_scope` の step-up が動かない** — tool 単位で広い scope を要求するサーバーが 403 に `WWW-Authenticate: Bearer error="insufficient_scope", scope="..."` を付けて返しても、Claude Code は Protected Resource Metadata を取り直すだけで新しいトークンを要求せず、段階的 scope のサーバーが事実上使えない（[#44652](https://github.com/anthropics/claude-code/issues/44652)）; mcp-stdio は challenge を解析し、既存 scope ∪ challenge scope で RFC 9470 step-up 認可フローを回し（キャッシュ済みクライアントを再利用、DCR はやり直さない）、元のリクエストを自動リトライする
-- **`/.well-known/oauth-authorization-server` が 404 の認可サーバーで OAuth 検出が silently fail する** — 認可サーバーが Protected Resource Metadata は返すのに Authorization Server Metadata を返さない場合、Claude Code はデフォルトのエンドポイントパスにフォールバックせず、ブラウザプロンプトすら出ずに OAuth フローが止まる（Snowflake Cortex MCP 等）（[#31349](https://github.com/anthropics/claude-code/issues/31349)）; mcp-stdio は RFC 8414 §3 のパス挿入 URL → ホストルート → 最後にデフォルトパス（`/authorize` / `/token` / `/register`）の順で試行し、手動設定なしでフローを先に進める
-- **キャンセル済みツール呼び出しの late response で stdio transport が落ちる** — Claude Code が `notifications/cancelled` でキャンセルしたあと、サーバーがその id 向けに遅れて送ってくる JSON-RPC response を framing error として扱い、stdio transport を落として MCP サーバーを再接続する。1 サイクルあたり 5–10 秒のコストで、キャンセル頻度が高いと再接続ループに陥る。MCP 仕様は canceller 側に late response の silently ignore を求めている（[#51073](https://github.com/anthropics/claude-code/issues/51073)）; mcp-stdio は stdin 上で観測した cancel id を追跡し、対応する response を下流クライアントに届く前に drop する。receiver 側が相補的な SHOULD を破っているサーバーのバグも同時に吸収する（[python-sdk#2480](https://github.com/modelcontextprotocol/python-sdk/issues/2480)）。`--no-cancel-filter` で無効化可能（生の上流トラフィックを見たい debug 時のみ）
-- **GET health check の 405 でツール検出が止まる** — HTTP MCP サーバーが GET に `Method Not Allowed` を返すと、Claude Code はこれを session startup の hard failure として扱いツールロードを silently スキップしてしまう。直後の POST `initialize` は成功しているにもかかわらず、MCP Streamable HTTP 仕様の「SSE ストリームを提供しない場合は 405 を返す **MUST**」に従った spec 準拠の stateless HTTP MCP サーバー（Datadog MCP 等）が事実上使えなくなる（[#51721](https://github.com/anthropics/claude-code/issues/51721)、`stateless_http=True` で idle な GET ストリームを返すサーバー側の mirror 修正は [python-sdk#2474](https://github.com/modelcontextprotocol/python-sdk/issues/2474) で追跡中）; Claude Code は mcp-stdio を stdio MCP サーバーとして扱うので GET health check path はそもそも通らない — POST のみの relay は本質的にこの失敗モードに対して免疫を持つ
-
-### mcp-remote
-
-- **パス付き auth server で OAuth 検出が失敗する** — RFC 8414 §3 のパス挿入ルール未実装のため、auth server URL にパスが含まれるサーバー（マルチテナント・Keycloak 等）で検出が失敗する（[mcp-remote#207](https://github.com/geelen/mcp-remote/issues/207)）; mcp-stdio は正しい well-known URL を構築する
-- **パスベースのリバースプロキシ配下の MCP サーバーで OAuth 検出が失敗する** — サブパスにマウントされた MCP サーバー（Tailscale serve、nginx `location /mcp/` 等）では、RFC 9728 §3.1 に従い Protected Resource Metadata を `/.well-known/oauth-protected-resource/{path}` から取得する必要がある（ホストルートでは 404）（[mcp-remote#249](https://github.com/geelen/mcp-remote/issues/249)）; mcp-stdio はパス挿入した URL を先に試し、ホストルートにフォールバックする
-- **access / refresh 両方失効時の再認証ループ** — 長期未使用やサーバー側失効で両トークンが無効になると、mcp-remote は localhost コールバックで認可コードを受信するものの新トークン交換を行わず、ログイン画面のループに陥る（[mcp-remote#256](https://github.com/geelen/mcp-remote/issues/256)）; mcp-stdio はリフレッシュ失敗時にキャッシュを破棄し、full flow を認可コード交換まで完走させる
-- **半開 TCP で SSE ストリームが永久停止** — 長時間実行のツール呼び出し中に proxy / NAT / firewall が TCP を無言で切ると、mcp-remote は transport にアイドルタイムアウトも TCP keepalive もないため `iter_lines()` / `reader.read()` が永遠にブロックする（[mcp-remote#107](https://github.com/geelen/mcp-remote/issues/107)、[mcp-remote#226](https://github.com/geelen/mcp-remote/issues/226)、[typescript-sdk#1883](https://github.com/modelcontextprotocol/typescript-sdk/issues/1883)、[python-sdk#796](https://github.com/modelcontextprotocol/python-sdk/issues/796)）。mcp-stdio は 2 層で対策: アプリ層の 300 秒読み取りタイムアウト（`--sse-read-timeout`、Python SDK 既定と同値）で既存の再接続ループに乗せる、および httpx transport での TCP keepalive（Linux / macOS / FreeBSD / NetBSD で 60s idle + 4×15s probe ≈ 120s 半開検知、Windows は `SO_KEEPALIVE` のみ）。それぞれ `--sse-read-timeout 0` / `--no-tcp-keepalive` で無効化可能。
-- **再接続時に stale callback server で EADDRINUSE crash** — mcp-remote は OAuth コールバック用ローカルポート番号を lockfile に記録して再利用を試みるため、前インスタンスのリスナーが残っていると次起動時に EADDRINUSE で落ちる（[mcp-remote#253](https://github.com/geelen/mcp-remote/issues/253)）; mcp-stdio は認可フローごとに `("127.0.0.1", 0)` で OS に ephemeral port を割り当てさせ、終了時に `server_close()` で確実に解放する。lockfile を使わないので stale bind は構造的に発生しない
-- **重複プロセスが PKCE `code_verifier` を破壊する** — Claude Desktop が同じ MCP サーバー向けに 2 つの mcp-remote プロセスを同時起動すると、両者が DCR + PKCE を競合し、ディスク上の `code_verifier` を互いに上書きしてトークン交換時に `Invalid code_verifier` エラーになる（[mcp-remote#251](https://github.com/geelen/mcp-remote/issues/251)）; mcp-stdio は PKCE `code_verifier` を認可関数のローカル変数として in-memory で保持し、ディスクに書き出さないため、並行フローが互いの state を破壊することは起きない
-- **HTTP 429 レートリミットを尊重しない** — MCP TypeScript SDK の `StreamableHTTPClientTransport`（mcp-remote が使用）は 429 応答の `Retry-After` を読まず一般エラーを投げるため、独自リトライ機構を持たないクライアントは rate-limited なサーバー相手に即座に fail する（[typescript-sdk#1892](https://github.com/modelcontextprotocol/typescript-sdk/issues/1892)）。mcp-stdio は `Retry-After`（RFC 7231 §7.1.3、delta-seconds または HTTP-date）を解析し、60 秒の上限まで sleep してから最大 `MAX_RETRIES` 回リトライする。ヘッダー欠落時は transient error と同じ線形バックオフに fall back し、上限超過の場合は 429 をクライアントに返して再試行判断を委ねる
-- **MCP サーバー URL にクエリパラメータが含まれると Protected Resource URL が mismatch する** — MCP TypeScript SDK の `selectResourceURL` が URL を正規化する際にクエリパラメータ値をパスに混ぜて書き換えてしまうため、`?key=...` 形式で認証するサーバー（Zoho MCP 等）では `Protected resource ... does not match expected ...` で検出に失敗する（[mcp-remote#244](https://github.com/geelen/mcp-remote/issues/244)）; mcp-stdio は well-known URL を `urlunsplit((..., parsed.query, ""))` で組み立てて RFC 9728 §3.1 どおりクエリ文字列をそのまま保持し、PRM の `resource` 比較にも無加工で渡す
-- **`registration_endpoint` を無視してハードコードの `/register` に POST する** — サーバーの RFC 8414 メタデータに `/s2/oauth/register` のような非ルートの `registration_endpoint` が書かれていても、mcp-remote はこれを無視して `{issuer}/register` に決め打ちで POST するため 404 になり、仕様準拠サーバーでの DCR が動かない（[mcp-remote#241](https://github.com/geelen/mcp-remote/issues/241)）; mcp-stdio は discovery document の `registration_endpoint` を読み、その URL に無加工で POST する（RFC 7591 + RFC 8414 準拠）。ハードコードの `/register` は RFC 9728 PRM と RFC 8414 AS metadata の両方が存在しない場合の Phase 3 fallback でのみ使用する
-- **Streamable HTTP サーバーへの POST で `Accept: text/event-stream` が送られない** — mcp-remote は outbound POST に `Accept: application/json, text/event-stream` を付けないため、仕様準拠サーバー（例: AWS Lambda + lambda-web-adapter 上の MCP）が 406 Not Acceptable を返し、ユーザーが手動で `headers` オーバーライドを注入しないと session 初期化すらできない（[mcp-remote#242](https://github.com/geelen/mcp-remote/issues/242)）; mcp-stdio は全ての POST で常に `Accept: application/json, text/event-stream` を送るため、サーバー実装によらず Streamable HTTP 仕様を満たして 406 を回避する
-- **401 の `WWW-Authenticate` が `Bearer` 以外のとき OAuth 検出 fallback が走らない** — MCP TypeScript SDK の `StreamableHTTPClientTransport` は、401 応答に `WWW-Authenticate` ヘッダーが完全に欠落している場合のみ well-known PRM 検出に fallback する。`Negotiate` など Bearer 以外のチャレンジが乗っていると即 hard failure として上げてしまうため、SPNEGO と OAuth を併用する Windows 統合エンタープライズ環境（well-known URI には仕様どおり有効な metadata が公開されていても）で OAuth フローが開始できない（[typescript-sdk#1946](https://github.com/modelcontextprotocol/typescript-sdk/issues/1946)）。mcp-stdio は検出を 401 応答時ではなく pre-flight で実行する: `/.well-known/oauth-protected-resource`（path-aware → host-root）と `/.well-known/oauth-authorization-server` を直接叩くため、fallback は `WWW-Authenticate` の scheme に依存せず、サーバーが追加でどのような認証方式を advertise していても OAuth フローは進む
-
-### Windows
-
-- **stdio の CRLF 変換** — Python のデフォルトの `TextIOWrapper` は Windows で `\n` を `\r\n` に変換してしまい、MCP が使う NDJSON ワイヤーフォーマットを壊す。mcp-stdio は `sys.stdin`/`sys.stdout` を素の LF モードに設定し直して、ホスト OS に関係なくメッセージが仕様に沿うようにしている（`stdio_server` における同種のバグは [modelcontextprotocol/python-sdk#2433](https://github.com/modelcontextprotocol/python-sdk/issues/2433) を参照）。
+Claude Code・mcp-remote・Windows の既知の問題については [WORKAROUNDS.md](WORKAROUNDS.md) を参照してください。
 
 ## 仕組み
 

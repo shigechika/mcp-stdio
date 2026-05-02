@@ -148,6 +148,15 @@ def main() -> None:
         help="Enable OAuth 2.1 authentication (triggers browser flow if needed)",
     )
     parser.add_argument(
+        "--oauth-device",
+        action="store_true",
+        help=(
+            "Enable OAuth 2.1 Device Authorization Grant (RFC 8628) — "
+            "headless flow: displays a verification URI and code on stderr "
+            "instead of opening a browser"
+        ),
+    )
+    parser.add_argument(
         "--client-id",
         default=os.environ.get("MCP_OAUTH_CLIENT_ID", ""),
         help="Pre-registered OAuth client ID (or set MCP_OAUTH_CLIENT_ID env var)",
@@ -241,9 +250,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.oauth and args.bearer_token:
+    n_auth = sum([args.oauth, args.oauth_device, bool(args.bearer_token)])
+    if n_auth > 1:
         print(
-            "error: --oauth and --bearer-token are mutually exclusive",
+            "error: --oauth, --oauth-device, and --bearer-token are mutually exclusive",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -262,7 +272,7 @@ def main() -> None:
     # OAuth flow (before relay starts)
     token_refresher: Callable[[], dict[str, str] | None] | None = None
     scope_upgrader: Callable[[str], dict[str, str] | None] | None = None
-    if args.oauth:
+    if args.oauth or args.oauth_device:
         from .oauth import ensure_token
 
         client = httpx.Client(
@@ -279,6 +289,7 @@ def main() -> None:
                 client,
                 client_id=args.client_id or None,
                 scope=args.oauth_scope or None,
+                device_flow=args.oauth_device,
             )
             headers["Authorization"] = f"Bearer {token_data.access_token}"
             token_refresher = _build_token_refresher(
