@@ -576,11 +576,9 @@ class TestDiscoverMetadata:
         meta = discover_oauth_metadata(
             "https://keycloak.example.com/realms/test", client
         )
-        assert "auth" in meta.authorization_endpoint
-        assert "token" in meta.token_endpoint
-        assert meta.device_authorization_endpoint == (
-            "https://keycloak.example.com/realms/test/protocol/openid-connect/auth/device"
-        )
+        assert meta.authorization_endpoint == "https://keycloak.example.com/realms/test/protocol/openid-connect/auth"
+        assert meta.token_endpoint == "https://keycloak.example.com/realms/test/protocol/openid-connect/token"
+        assert meta.device_authorization_endpoint == "https://keycloak.example.com/realms/test/protocol/openid-connect/auth/device"
 
     def test_path_scoped_issuer_does_not_shadow_host_root_match(self, httpx_mock):
         """#53: when host-root AS metadata succeeds, path-scoped probe is not called."""
