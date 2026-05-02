@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/shigechika/mcp-stdio/compare/v0.9.0...v0.10.0) (2026-05-02)
+
+
+### Features
+
+* **oauth:** add Device Authorization Grant (RFC 8628) via --oauth-device ([#51](https://github.com/shigechika/mcp-stdio/issues/51)) ([4df5021](https://github.com/shigechika/mcp-stdio/commit/4df5021d9c9a1a731031233ab2dde9c8ed6e60f5))
+
 ## [0.9.0](https://github.com/shigechika/mcp-stdio/compare/v0.8.0...v0.9.0) (2026-05-01)
 
 
