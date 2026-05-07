@@ -35,6 +35,8 @@ class TokenData:
     token_endpoint: str = ""
     authorization_endpoint: str = ""
     registration_endpoint: str | None = None
+    # Token endpoint authentication method (RFC 6749 §2.3 / RFC 8414)
+    token_endpoint_auth_method: str = "none"
 
 
 def _ensure_store_dir() -> None:

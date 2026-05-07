@@ -15,7 +15,7 @@ import webbrowser
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
-from urllib.parse import ParseResult, parse_qs, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.parse import ParseResult, parse_qs, quote, urlencode, urlparse, urlsplit, urlunsplit
 
 import httpx
 
@@ -35,6 +35,7 @@ class OAuthMetadata:
     token_endpoint: str
     registration_endpoint: str | None = None
     device_authorization_endpoint: str | None = None
+    token_endpoint_auth_methods_supported: list[str] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -248,12 +249,14 @@ def _fetch_authorization_server_metadata(
                     f"warning: RFC 8414 §3 issuer mismatch — "
                     f"expected {auth_server_url!r}, got {issuer!r}"
                 )
+            methods = data.get("token_endpoint_auth_methods_supported")
             return OAuthMetadata(
                 authorization_endpoint=data.get("authorization_endpoint")
                 or f"{auth_server_url}/authorize",
                 token_endpoint=data.get("token_endpoint") or f"{auth_server_url}/token",
                 registration_endpoint=data.get("registration_endpoint") or None,
                 device_authorization_endpoint=data.get("device_authorization_endpoint") or None,
+                token_endpoint_auth_methods_supported=methods if isinstance(methods, list) else None,
             )
     except Exception:
         pass
@@ -370,6 +373,32 @@ def discover_oauth_metadata(
 # Dynamic Client Registration (RFC 7591)
 # ---------------------------------------------------------------------------
 
+# Methods supported by mcp-stdio, in preference order (most-compatible first).
+# "none" covers public clients; "client_secret_post" and "client_secret_basic"
+# cover confidential clients per RFC 6749 §2.3.
+_SUPPORTED_AUTH_METHODS = ("none", "client_secret_post", "client_secret_basic")
+
+
+def _pick_token_endpoint_auth_method(supported: list[str] | None) -> str:
+    """Pick the best token endpoint auth method from AS-advertised list.
+
+    Returns the first entry of ``_SUPPORTED_AUTH_METHODS`` that the AS also
+    supports.  Falls back to ``"none"`` when the AS list is absent (pre-RFC 8414
+    servers) or only advertises methods that mcp-stdio does not implement
+    (e.g. ``private_key_jwt``), with a warning in the latter case.
+    """
+    if not supported:
+        return "none"
+    for method in _SUPPORTED_AUTH_METHODS:
+        if method in supported:
+            return method
+    log(
+        f"warning: AS token_endpoint_auth_methods_supported {supported!r} "
+        f"contains no methods supported by mcp-stdio "
+        f"({', '.join(_SUPPORTED_AUTH_METHODS)}); defaulting to 'none'"
+    )
+    return "none"
+
 
 @dataclass
 class ClientRegistration:
@@ -378,6 +407,7 @@ class ClientRegistration:
     client_id: str
     client_secret: str | None = None
     client_secret_expires_at: float | None = None  # RFC 7591 §3.2.1; None = no expiry
+    auth_method: str = "none"
 
 
 def _is_client_secret_expired(cached: TokenData) -> bool:
@@ -407,11 +437,14 @@ def register_client(
             "Provide a --client-id instead."
         )
 
+    auth_method = _pick_token_endpoint_auth_method(
+        metadata.token_endpoint_auth_methods_supported
+    )
     if device_flow:
         body: dict[str, object] = {
             "client_name": "mcp-stdio",
             "grant_types": ["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"],
-            "token_endpoint_auth_method": "none",
+            "token_endpoint_auth_method": auth_method,
         }
     else:
         body = {
@@ -419,7 +452,7 @@ def register_client(
             "redirect_uris": [redirect_uri],
             "response_types": ["code"],
             "grant_types": ["authorization_code", "refresh_token"],
-            "token_endpoint_auth_method": "none",
+            "token_endpoint_auth_method": auth_method,
         }
     resp = client.post(
         metadata.registration_endpoint,
@@ -438,6 +471,7 @@ def register_client(
         client_id=data["client_id"],
         client_secret=data.get("client_secret"),
         client_secret_expires_at=expiry,
+        auth_method=auth_method,
     )
 
 
@@ -552,33 +586,47 @@ def exchange_code(
     client: httpx.Client,
     *,
     resource: str | None = None,
+    auth_method: str = "none",
 ) -> dict[str, Any]:
     """Exchange authorization code for tokens.
 
     Args:
         resource: RFC 8707 resource indicator (the MCP server URL).
+        auth_method: Token endpoint authentication method (RFC 6749 §2.3).
+            ``"client_secret_basic"`` sends credentials in an ``Authorization:
+            Basic`` header per RFC 6749 §2.3.1; ``"none"`` / ``"client_secret_post"``
+            keep them in the request body.
 
     Returns the raw token response dict.
     """
     data: dict[str, str] = {
         "grant_type": "authorization_code",
         "code": code,
-        "client_id": client_id,
         "redirect_uri": redirect_uri,
         "code_verifier": code_verifier,
     }
-    if client_secret:
-        data["client_secret"] = client_secret
+    req_headers: dict[str, str] = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+    }
+    if auth_method == "client_secret_basic" and client_secret:
+        # RFC 6749 §2.3.1: percent-encode client_id and client_secret before
+        # base64-encoding for HTTP Basic auth.
+        creds = base64.b64encode(
+            f"{quote(client_id, safe='')}:{quote(client_secret, safe='')}".encode()
+        ).decode()
+        req_headers["Authorization"] = f"Basic {creds}"
+    else:
+        data["client_id"] = client_id
+        if client_secret:
+            data["client_secret"] = client_secret
     if resource:
         data["resource"] = resource
 
     resp = client.post(
         metadata.token_endpoint,
         data=data,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        },
+        headers=req_headers,
     )
     return _parse_token_response(resp)
 
@@ -591,31 +639,40 @@ def refresh_access_token(
     client: httpx.Client,
     *,
     resource: str | None = None,
+    auth_method: str = "none",
 ) -> dict[str, Any]:
     """Refresh an access token.
 
     Args:
         resource: RFC 8707 resource indicator (the MCP server URL).
+        auth_method: Token endpoint authentication method (RFC 6749 §2.3).
 
     Returns the raw token response dict.
     """
     data: dict[str, str] = {
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
-        "client_id": client_id,
     }
-    if client_secret:
-        data["client_secret"] = client_secret
+    req_headers: dict[str, str] = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+    }
+    if auth_method == "client_secret_basic" and client_secret:
+        creds = base64.b64encode(
+            f"{quote(client_id, safe='')}:{quote(client_secret, safe='')}".encode()
+        ).decode()
+        req_headers["Authorization"] = f"Basic {creds}"
+    else:
+        data["client_id"] = client_id
+        if client_secret:
+            data["client_secret"] = client_secret
     if resource:
         data["resource"] = resource
 
     resp = client.post(
         token_endpoint,
         data=data,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        },
+        headers=req_headers,
     )
     return _parse_token_response(resp)
 
@@ -633,6 +690,7 @@ def _token_response_to_data(
     *,
     previous_refresh_token: str | None = None,
     client_secret_expires_at: float | None = None,
+    auth_method: str = "none",
 ) -> TokenData:
     """Convert a raw token response to TokenData.
 
@@ -655,6 +713,7 @@ def _token_response_to_data(
         token_endpoint=metadata.token_endpoint,
         authorization_endpoint=metadata.authorization_endpoint,
         registration_endpoint=metadata.registration_endpoint,
+        token_endpoint_auth_method=auth_method,
     )
 
 
@@ -683,6 +742,7 @@ def refresh_cached_token(
         log("OAuth client_secret expired (RFC 7591 §3.2.1) — cannot refresh")
         return None
     log("access token expired, attempting refresh")
+    auth_method = cached.token_endpoint_auth_method
     try:
         raw = refresh_access_token(
             cached.token_endpoint,
@@ -691,6 +751,7 @@ def refresh_cached_token(
             cached.refresh_token,
             client,
             resource=server_url,
+            auth_method=auth_method,
         )
     except Exception as e:
         log(f"token refresh failed: {e}")
@@ -707,6 +768,7 @@ def refresh_cached_token(
         cached.client_secret,
         previous_refresh_token=cached.refresh_token,
         client_secret_expires_at=cached.client_secret_expires_at,
+        auth_method=auth_method,
     )
     save_token(server_url, data)
     log("token refreshed successfully")
@@ -740,17 +802,20 @@ def _run_authorization_flow(
     cid = client_id_override
     csecret: str | None = None
     cse_at: float | None = None
+    auth_method = "none"
     if not cid:
         if cached and cached.client_id and not _is_client_secret_expired(cached):
             cid = cached.client_id
             csecret = cached.client_secret
             cse_at = cached.client_secret_expires_at
+            auth_method = cached.token_endpoint_auth_method
         else:
             log("registering OAuth client")
             reg = register_client(metadata, redirect_uri, client)
             cid = reg.client_id
             csecret = reg.client_secret
             cse_at = reg.client_secret_expires_at
+            auth_method = reg.auth_method
             log(f"registered client: {cid}")
     assert cid is not None
 
@@ -823,9 +888,10 @@ def _run_authorization_flow(
         redirect_uri,
         client,
         resource=server_url,
+        auth_method=auth_method,
     )
     data = _token_response_to_data(
-        raw, metadata, cid, csecret, client_secret_expires_at=cse_at
+        raw, metadata, cid, csecret, client_secret_expires_at=cse_at, auth_method=auth_method
     )
     save_token(server_url, data)
     log("OAuth token obtained and saved")
@@ -857,17 +923,20 @@ def _run_device_authorization_flow(
     cid = client_id_override
     csecret: str | None = None
     cse_at: float | None = None
+    auth_method = "none"
     if not cid:
         if cached and cached.client_id and not _is_client_secret_expired(cached):
             cid = cached.client_id
             csecret = cached.client_secret
             cse_at = cached.client_secret_expires_at
+            auth_method = cached.token_endpoint_auth_method
         elif metadata.registration_endpoint:
             log("registering OAuth client for device flow")
             reg = register_client(metadata, "", client, device_flow=True)
             cid = reg.client_id
             csecret = reg.client_secret
             cse_at = reg.client_secret_expires_at
+            auth_method = reg.auth_method
             log(f"registered client: {cid}")
         else:
             raise ValueError(
@@ -878,19 +947,28 @@ def _run_device_authorization_flow(
 
     # Step 1: Device Authorization Request (RFC 8628 §3.1)
     da_params: dict[str, str] = {
-        "client_id": cid,
         "resource": server_url,
     }
     if scope:
         da_params["scope"] = scope
+    da_headers: dict[str, str] = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+    }
+    if auth_method == "client_secret_basic" and csecret:
+        creds = base64.b64encode(
+            f"{quote(cid, safe='')}:{quote(csecret, safe='')}".encode()
+        ).decode()
+        da_headers["Authorization"] = f"Basic {creds}"
+    else:
+        da_params["client_id"] = cid
+        if csecret:
+            da_params["client_secret"] = csecret
 
     da_resp = client.post(
         metadata.device_authorization_endpoint,
         data=da_params,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        },
+        headers=da_headers,
     )
     da_resp.raise_for_status()
     da = da_resp.json()
@@ -918,19 +996,26 @@ def _run_device_authorization_flow(
         poll_data: dict[str, str] = {
             "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
             "device_code": device_code,
-            "client_id": cid,
         }
-        if csecret:
-            poll_data["client_secret"] = csecret
+        poll_headers: dict[str, str] = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        }
+        if auth_method == "client_secret_basic" and csecret:
+            creds = base64.b64encode(
+                f"{quote(cid, safe='')}:{quote(csecret, safe='')}".encode()
+            ).decode()
+            poll_headers["Authorization"] = f"Basic {creds}"
+        else:
+            poll_data["client_id"] = cid
+            if csecret:
+                poll_data["client_secret"] = csecret
 
         try:
             tok_resp = client.post(
                 metadata.token_endpoint,
                 data=poll_data,
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "application/json",
-                },
+                headers=poll_headers,
             )
         except Exception as exc:
             log(f"device flow poll error: {exc}")
@@ -940,7 +1025,7 @@ def _run_device_authorization_flow(
         if tok_resp.status_code == 200:
             raw = _parse_token_response(tok_resp)
             data = _token_response_to_data(
-                raw, metadata, cid, csecret, client_secret_expires_at=cse_at
+                raw, metadata, cid, csecret, client_secret_expires_at=cse_at, auth_method=auth_method
             )
             save_token(server_url, data)
             log("device flow token obtained and saved")

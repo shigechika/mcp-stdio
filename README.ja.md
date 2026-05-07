@@ -40,8 +40,10 @@ Bearer token、カスタムヘッダー、OAuth 2.1 認証情報をリモート�
     - §3.4–3.5 `authorization_pending` / `slow_down`（interval +=5 s）/ `expired_token` / `access_denied` ハンドリング
     - DCR の `grant_types` に `urn:ietf:params:oauth:grant-type:device_code` を登録（RFC 7591 §2）
   - [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591) Dynamic Client Registration
-    - §3 クライアント登録リクエスト（公開クライアント、`token_endpoint_auth_method: none`）
+    - §3 クライアント登録リクエスト。AS メタデータの `token_endpoint_auth_methods_supported` から最適な認証方式を選択（`none` → `client_secret_post` → `client_secret_basic` の優先順）
     - §3.2.1 `client_secret_expires_at` に対応、期限切れ時に自動再登録
+  - [RFC 6749](https://www.rfc-editor.org/rfc/rfc6749) OAuth 2.0
+    - §2.3.1 `client_secret_basic`：percent-encode した認証情報を `Authorization: Basic` ヘッダーで送信（コード交換・トークンリフレッシュ・Device Authorization Grant ポーリングに適用）
   - [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) Bearer Token の利用
     - §2.1 `Authorization: Bearer <token>` リクエストヘッダー
 - **バックオフ付きリトライ** — 接続エラー時に最大3回リトライ
