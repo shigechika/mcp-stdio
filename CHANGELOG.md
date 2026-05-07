@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.12.0](https://github.com/shigechika/mcp-stdio/compare/v0.11.0...v0.12.0) (2026-05-07)
+
+
+### Features
+
+* **oauth:** select token_endpoint_auth_method from AS metadata (RFC 8414) ([#62](https://github.com/shigechika/mcp-stdio/issues/62)) ([9e6feff](https://github.com/shigechika/mcp-stdio/commit/9e6feff050db056e039716f3bbc2ea076833dba9))
+
+
+### Bug Fixes
+
+* **test:** add missing path-aware PRM mock in TestDiscoverMetadataAuthMethods ([df06108](https://github.com/shigechika/mcp-stdio/commit/df06108a21beb468d6e38c74b24cbfc2c3b10c4b))
+
 ## [0.11.0](https://github.com/shigechika/mcp-stdio/compare/v0.10.1...v0.11.0) (2026-05-07)
 
 
