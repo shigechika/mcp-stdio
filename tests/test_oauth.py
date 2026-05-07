@@ -3188,6 +3188,11 @@ class TestPickTokenEndpointAuthMethod:
 class TestDiscoverMetadataAuthMethods:
     def test_parses_token_endpoint_auth_methods_supported(self, httpx_mock):
         """RFC 8414 token_endpoint_auth_methods_supported is captured."""
+        # path-aware PRM (RFC 9728 §3.1) then host-root PRM
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource/mcp",
+            status_code=404,
+        )
         httpx_mock.add_response(
             url="https://example.com/.well-known/oauth-protected-resource",
             status_code=404,
@@ -3205,6 +3210,10 @@ class TestDiscoverMetadataAuthMethods:
 
     def test_missing_field_is_none(self, httpx_mock):
         """Older AS metadata without the field → None (public client default)."""
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource/mcp",
+            status_code=404,
+        )
         httpx_mock.add_response(
             url="https://example.com/.well-known/oauth-protected-resource",
             status_code=404,
