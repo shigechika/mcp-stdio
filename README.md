@@ -42,8 +42,10 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
     - §3.4–3.5 token polling with `authorization_pending` / `slow_down` (interval +=5 s) / `expired_token` / `access_denied` handling
     - DCR registers `urn:ietf:params:oauth:grant-type:device_code` in `grant_types` (RFC 7591 §2)
   - [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591) Dynamic Client Registration
-    - §3 client registration request (public client with `token_endpoint_auth_method: none`)
+    - §3 client registration request; `token_endpoint_auth_method` chosen from `token_endpoint_auth_methods_supported` in AS metadata (prefers `none` → `client_secret_post` → `client_secret_basic`)
     - §3.2.1 `client_secret_expires_at` handling — auto re-register on expiry
+  - [RFC 6749](https://www.rfc-editor.org/rfc/rfc6749) OAuth 2.0
+    - §2.3.1 `client_secret_basic`: `Authorization: Basic` header with percent-encoded credentials (applied to code exchange, token refresh, and Device Authorization Grant polling)
   - [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) Bearer Token usage
     - §2.1 `Authorization: Bearer <token>` request header
 - **Retry with backoff** — retries up to 3 times on connection errors

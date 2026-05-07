@@ -19,6 +19,7 @@ from mcp_stdio.oauth import (
     _make_callback_handler,
     _parse_resource_metadata_hint,
     _parse_token_response,
+    _pick_token_endpoint_auth_method,
     _probe_www_authenticate,
     _run_device_authorization_flow,
     _token_response_to_data,
@@ -3145,3 +3146,383 @@ class TestEnsureTokenDeviceFlow:
         # Verify device_authorization endpoint was actually called
         reqs = httpx_mock.get_requests()
         assert any(str(r.url).startswith(DEVICE_AUTH_URL) for r in reqs)
+
+
+# --- _pick_token_endpoint_auth_method ---
+
+
+class TestPickTokenEndpointAuthMethod:
+    def test_none_when_supported_is_absent(self):
+        assert _pick_token_endpoint_auth_method(None) == "none"
+
+    def test_none_when_list_is_empty(self):
+        assert _pick_token_endpoint_auth_method([]) == "none"
+
+    def test_prefers_none_over_post(self):
+        assert _pick_token_endpoint_auth_method(["none", "client_secret_post"]) == "none"
+
+    def test_prefers_none_over_basic(self):
+        assert _pick_token_endpoint_auth_method(["client_secret_basic", "none"]) == "none"
+
+    def test_prefers_post_over_basic(self):
+        assert _pick_token_endpoint_auth_method(["client_secret_basic", "client_secret_post"]) == "client_secret_post"
+
+    def test_selects_client_secret_basic_when_only_option(self):
+        assert _pick_token_endpoint_auth_method(["client_secret_basic"]) == "client_secret_basic"
+
+    def test_selects_client_secret_post(self):
+        assert _pick_token_endpoint_auth_method(["client_secret_post"]) == "client_secret_post"
+
+    def test_falls_back_to_none_for_unsupported_methods(self, capsys):
+        """AS that only advertises private_key_jwt → warn + default none."""
+        result = _pick_token_endpoint_auth_method(["private_key_jwt", "tls_client_auth"])
+        assert result == "none"
+        # warning should have been emitted
+        captured = capsys.readouterr()
+        assert "warning" in captured.err.lower()
+
+
+# --- token_endpoint_auth_methods_supported in discovery ---
+
+
+class TestDiscoverMetadataAuthMethods:
+    def test_parses_token_endpoint_auth_methods_supported(self, httpx_mock):
+        """RFC 8414 token_endpoint_auth_methods_supported is captured."""
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://example.com/authorize",
+                "token_endpoint": "https://example.com/token",
+                "token_endpoint_auth_methods_supported": ["client_secret_basic", "none"],
+            },
+        )
+        meta = discover_oauth_metadata("https://example.com/mcp", httpx.Client())
+        assert meta.token_endpoint_auth_methods_supported == ["client_secret_basic", "none"]
+
+    def test_missing_field_is_none(self, httpx_mock):
+        """Older AS metadata without the field → None (public client default)."""
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://example.com/authorize",
+                "token_endpoint": "https://example.com/token",
+            },
+        )
+        meta = discover_oauth_metadata("https://example.com/mcp", httpx.Client())
+        assert meta.token_endpoint_auth_methods_supported is None
+
+
+# --- client_secret_basic in exchange_code ---
+
+
+class TestExchangeCodeBasicAuth:
+    META = OAuthMetadata(
+        authorization_endpoint="https://as.example.com/authorize",
+        token_endpoint="https://as.example.com/token",
+    )
+
+    def test_basic_auth_header_sent(self, httpx_mock):
+        """client_secret_basic: credentials in Authorization header, not body."""
+        httpx_mock.add_response(
+            url="https://as.example.com/token",
+            json={"access_token": "at"},
+        )
+        client = httpx.Client()
+        exchange_code(
+            self.META,
+            "my_client",
+            "my_secret",
+            "code",
+            "verifier",
+            "http://127.0.0.1:9/cb",
+            client,
+            auth_method="client_secret_basic",
+        )
+        req = httpx_mock.get_requests()[0]
+        expected = base64.b64encode(b"my_client:my_secret").decode()
+        assert req.headers.get("authorization") == f"Basic {expected}"
+        assert b"client_id" not in req.content
+        assert b"client_secret" not in req.content
+
+    def test_basic_auth_with_special_chars_percent_encoded(self, httpx_mock):
+        """RFC 6749 §2.3.1: client_id / client_secret are percent-encoded."""
+        httpx_mock.add_response(
+            url="https://as.example.com/token",
+            json={"access_token": "at"},
+        )
+        client = httpx.Client()
+        exchange_code(
+            self.META,
+            "c:id",
+            "s:ecret",
+            "code",
+            "v",
+            "http://127.0.0.1:9/cb",
+            client,
+            auth_method="client_secret_basic",
+        )
+        req = httpx_mock.get_requests()[0]
+        # percent-encode colons: "c%3Aid:s%3Aecret"
+        expected = base64.b64encode(b"c%3Aid:s%3Aecret").decode()
+        assert req.headers.get("authorization") == f"Basic {expected}"
+
+    def test_client_secret_post_sends_credentials_in_body(self, httpx_mock):
+        httpx_mock.add_response(
+            url="https://as.example.com/token",
+            json={"access_token": "at"},
+        )
+        client = httpx.Client()
+        exchange_code(
+            self.META,
+            "cid",
+            "csec",
+            "code",
+            "v",
+            "http://127.0.0.1:9/cb",
+            client,
+            auth_method="client_secret_post",
+        )
+        req = httpx_mock.get_requests()[0]
+        assert b"client_id=cid" in req.content
+        assert b"client_secret=csec" in req.content
+        assert "authorization" not in req.headers
+
+
+# --- client_secret_basic in refresh_access_token ---
+
+
+class TestRefreshTokenBasicAuth:
+    def test_basic_auth_header_sent(self, httpx_mock):
+        httpx_mock.add_response(
+            url="https://as.example.com/token",
+            json={"access_token": "new_at"},
+        )
+        client = httpx.Client()
+        refresh_access_token(
+            "https://as.example.com/token",
+            "my_client",
+            "my_secret",
+            "rt",
+            client,
+            auth_method="client_secret_basic",
+        )
+        req = httpx_mock.get_requests()[0]
+        expected = base64.b64encode(b"my_client:my_secret").decode()
+        assert req.headers.get("authorization") == f"Basic {expected}"
+        assert b"client_id" not in req.content
+        assert b"client_secret" not in req.content
+
+    def test_none_method_sends_credentials_in_body(self, httpx_mock):
+        httpx_mock.add_response(
+            url="https://as.example.com/token",
+            json={"access_token": "new_at"},
+        )
+        client = httpx.Client()
+        refresh_access_token(
+            "https://as.example.com/token",
+            "cid",
+            "csec",
+            "rt",
+            client,
+            auth_method="none",
+        )
+        req = httpx_mock.get_requests()[0]
+        assert b"client_id=cid" in req.content
+        assert b"client_secret=csec" in req.content
+        assert "authorization" not in req.headers
+
+
+# --- register_client picks auth method from metadata ---
+
+
+class TestRegisterClientAuthMethod:
+    def test_picks_client_secret_basic_from_metadata(self, httpx_mock):
+        """AS that only supports client_secret_basic → DCR registers with that method."""
+        httpx_mock.add_response(
+            url="https://as.example.com/register",
+            json={"client_id": "cid", "client_secret": "csec"},
+        )
+        meta = OAuthMetadata(
+            authorization_endpoint="https://as.example.com/authorize",
+            token_endpoint="https://as.example.com/token",
+            registration_endpoint="https://as.example.com/register",
+            token_endpoint_auth_methods_supported=["client_secret_basic"],
+        )
+        reg = register_client(meta, "http://127.0.0.1:9/cb", httpx.Client())
+        assert reg.auth_method == "client_secret_basic"
+        body = json.loads(httpx_mock.get_requests()[0].content)
+        assert body["token_endpoint_auth_method"] == "client_secret_basic"
+
+    def test_defaults_to_none_when_field_absent(self, httpx_mock):
+        httpx_mock.add_response(
+            url="https://as.example.com/register",
+            json={"client_id": "cid"},
+        )
+        meta = OAuthMetadata(
+            authorization_endpoint="https://as.example.com/authorize",
+            token_endpoint="https://as.example.com/token",
+            registration_endpoint="https://as.example.com/register",
+        )
+        reg = register_client(meta, "http://127.0.0.1:9/cb", httpx.Client())
+        assert reg.auth_method == "none"
+
+    def test_prefers_none_when_both_none_and_basic_supported(self, httpx_mock):
+        httpx_mock.add_response(
+            url="https://as.example.com/register",
+            json={"client_id": "cid"},
+        )
+        meta = OAuthMetadata(
+            authorization_endpoint="https://as.example.com/authorize",
+            token_endpoint="https://as.example.com/token",
+            registration_endpoint="https://as.example.com/register",
+            token_endpoint_auth_methods_supported=["client_secret_basic", "none"],
+        )
+        reg = register_client(meta, "http://127.0.0.1:9/cb", httpx.Client())
+        assert reg.auth_method == "none"
+
+
+# --- token_endpoint_auth_method persisted and reused ---
+
+
+class TestTokenEndpointAuthMethodPersistence:
+    def test_auth_method_stored_in_token_data(self):
+        """_token_response_to_data persists auth_method for subsequent refreshes."""
+        meta = OAuthMetadata(
+            authorization_endpoint="https://as.example.com/authorize",
+            token_endpoint="https://as.example.com/token",
+        )
+        data = _token_response_to_data(
+            {"access_token": "at", "expires_in": 3600},
+            meta,
+            "cid",
+            "csec",
+            auth_method="client_secret_basic",
+        )
+        assert data.token_endpoint_auth_method == "client_secret_basic"
+
+    def test_default_auth_method_is_none(self):
+        meta = OAuthMetadata(
+            authorization_endpoint="https://as.example.com/authorize",
+            token_endpoint="https://as.example.com/token",
+        )
+        data = _token_response_to_data(
+            {"access_token": "at"},
+            meta,
+            "cid",
+            None,
+        )
+        assert data.token_endpoint_auth_method == "none"
+
+    def test_legacy_token_loads_with_none_default(self, tmp_path, monkeypatch):
+        """TokenData(**old_entry) without token_endpoint_auth_method defaults to 'none'."""
+        import json as _json
+        from mcp_stdio.token_store import load_token
+
+        store = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store)
+
+        # Write a token entry WITHOUT token_endpoint_auth_method (legacy format)
+        store.write_text(_json.dumps({
+            "https://example.com/mcp": {
+                "access_token": "at",
+                "token_type": "Bearer",
+                "expires_at": None,
+                "refresh_token": "rt",
+                "scope": None,
+                "client_id": "cid",
+                "client_secret": None,
+                "client_secret_expires_at": None,
+                "token_endpoint": "https://example.com/token",
+                "authorization_endpoint": "https://example.com/authorize",
+                "registration_endpoint": None,
+            }
+        }))
+        loaded = load_token("https://example.com/mcp")
+        assert loaded is not None
+        assert loaded.token_endpoint_auth_method == "none"
+
+    def test_refresh_cached_token_uses_stored_auth_method(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """refresh_cached_token passes token_endpoint_auth_method from cache."""
+        from mcp_stdio.token_store import save_token
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", tmp_path / "tokens.json")
+
+        save_token(
+            "https://example.com/mcp",
+            TokenData(
+                access_token="stale",
+                expires_at=time.time() - 1,
+                refresh_token="rt",
+                client_id="cid",
+                client_secret="csec",
+                token_endpoint="https://example.com/token",
+                authorization_endpoint="https://example.com/authorize",
+                token_endpoint_auth_method="client_secret_basic",
+            ),
+        )
+        httpx_mock.add_response(
+            url="https://example.com/token",
+            json={"access_token": "new_at", "expires_in": 3600},
+        )
+        data = refresh_cached_token("https://example.com/mcp", httpx.Client())
+        assert data is not None
+        assert data.access_token == "new_at"
+        # Verify Basic auth header was used
+        req = httpx_mock.get_requests()[0]
+        expected = base64.b64encode(b"cid:csec").decode()
+        assert req.headers.get("authorization") == f"Basic {expected}"
+        assert b"client_id" not in req.content
+        # Persisted method is preserved in the refreshed token
+        assert data.token_endpoint_auth_method == "client_secret_basic"
+
+
+# --- client_secret_basic in device authorization request (Step 1) ---
+
+
+class TestDeviceAuthStepOneBasicAuth:
+    def test_device_authorization_request_uses_basic_auth(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """client_secret_basic: DA request (Step 1) puts credentials in Authorization header."""
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", tmp_path / "tokens.json")
+
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={"access_token": "at", "token_type": "Bearer", "expires_in": 3600},
+        )
+
+        # Provide cached client with client_secret_basic already selected.
+        cached = TokenData(
+            access_token="stale",
+            client_id="da_cid",
+            client_secret="da_secret",
+            token_endpoint="https://api.example.com/token",
+            authorization_endpoint=AUTH_URL,
+            token_endpoint_auth_method="client_secret_basic",
+        )
+        client = httpx.Client()
+        _run_device_authorization_flow(
+            MCP_URL, client, metadata=_device_meta(), cached=cached
+        )
+
+        # First request is the device authorization request (Step 1).
+        da_req = httpx_mock.get_requests()[0]
+        assert da_req.url == DEVICE_AUTH_URL
+        expected = base64.b64encode(b"da_cid:da_secret").decode()
+        assert da_req.headers.get("authorization") == f"Basic {expected}"
+        assert b"client_id" not in da_req.content
+        assert b"client_secret" not in da_req.content
