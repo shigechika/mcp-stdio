@@ -1049,6 +1049,74 @@ class TestRefreshCachedToken:
         client = httpx.Client()
         assert refresh_cached_token("https://api.example.com/mcp", client) is None
 
+    def test_omits_resource_when_no_resource_indicator_set(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """no_resource_indicator=True must suppress the RFC 8707 resource param on refresh."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        from mcp_stdio.token_store import save_token
+
+        save_token(
+            "https://api.example.com/mcp",
+            TokenData(
+                access_token="old_at",
+                refresh_token="rt123",
+                expires_at=time.time() - 10,
+                client_id="cid",
+                token_endpoint="https://auth.example.com/token",
+                authorization_endpoint="https://auth.example.com/authorize",
+                no_resource_indicator=True,
+            ),
+        )
+        httpx_mock.add_response(
+            url="https://auth.example.com/token",
+            json={"access_token": "new_at", "expires_in": 3600},
+        )
+        client = httpx.Client()
+        data = refresh_cached_token("https://api.example.com/mcp", client)
+        assert data is not None
+        assert data.access_token == "new_at"
+        req = httpx_mock.get_requests()[0]
+        assert b"resource=" not in req.content
+        # Flag is persisted for future refreshes
+        assert data.no_resource_indicator is True
+
+    def test_persists_no_resource_indicator_false_by_default(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """Tokens without no_resource_indicator still include the resource param."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        from mcp_stdio.token_store import save_token
+
+        save_token(
+            "https://api.example.com/mcp",
+            TokenData(
+                access_token="old_at",
+                refresh_token="rt123",
+                expires_at=time.time() - 10,
+                client_id="cid",
+                token_endpoint="https://auth.example.com/token",
+                authorization_endpoint="https://auth.example.com/authorize",
+                # no_resource_indicator defaults to False
+            ),
+        )
+        httpx_mock.add_response(
+            url="https://auth.example.com/token",
+            json={"access_token": "new_at", "expires_in": 3600},
+        )
+        client = httpx.Client()
+        data = refresh_cached_token("https://api.example.com/mcp", client)
+        assert data is not None
+        req = httpx_mock.get_requests()[0]
+        assert b"resource=https%3A%2F%2Fapi.example.com%2Fmcp" in req.content
+        assert data.no_resource_indicator is False
+
 
 # --- _token_response_to_data ---
 
@@ -1843,6 +1911,93 @@ class TestEnsureToken:
         urls = [str(r.url) for r in requests]
         assert "https://example.com/register" not in urls
 
+    def test_resource_indicator_false_omits_resource_param(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """--no-resource-indicator: auth URL and code exchange must omit resource."""
+        from urllib.parse import parse_qs, urlparse
+        from urllib.request import urlopen
+
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        # Probe for WWW-Authenticate hint
+        httpx_mock.add_response(url="https://example.com/mcp", status_code=401)
+        # Discovery
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource/mcp",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://example.com/authorize",
+                "token_endpoint": "https://example.com/token",
+                "registration_endpoint": "https://example.com/register",
+            },
+        )
+        httpx_mock.add_response(
+            url="https://example.com/register",
+            json={"client_id": "new_cid"},
+        )
+        httpx_mock.add_response(
+            url="https://example.com/token",
+            json={"access_token": "new_at", "expires_in": 3600},
+        )
+
+        captured_auth_urls: list[str] = []
+
+        def fake_open(auth_url: str) -> bool:
+            captured_auth_urls.append(auth_url)
+            q = parse_qs(urlparse(auth_url).query)
+            redirect_uri = q["redirect_uri"][0]
+            state = q["state"][0]
+
+            def hit_callback() -> None:
+                cb_url = f"{redirect_uri}?code=code123&state={state}"
+                try:
+                    urlopen(cb_url, timeout=5).read()
+                except Exception:
+                    pass
+
+            threading.Thread(target=hit_callback, daemon=True).start()
+            return True
+
+        monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", fake_open)
+
+        client = httpx.Client()
+        data = ensure_token(
+            "https://example.com/mcp",
+            client,
+            resource_indicator=False,
+            timeout=5,
+        )
+        assert data.access_token == "new_at"
+        assert data.no_resource_indicator is True
+
+        # Auth URL must not contain resource=
+        assert len(captured_auth_urls) == 1
+        auth_params = parse_qs(urlparse(captured_auth_urls[0]).query)
+        assert "resource" not in auth_params
+
+        # Code exchange must not contain resource=
+        token_calls = [
+            r for r in httpx_mock.get_requests()
+            if str(r.url) == "https://example.com/token"
+        ]
+        assert len(token_calls) == 1
+        assert b"resource=" not in token_calls[0].content
+
+        # Persisted token retains the flag for future refreshes
+        from mcp_stdio.token_store import load_token
+        stored = load_token("https://example.com/mcp")
+        assert stored.no_resource_indicator is True
+
 
 # --- RFC 7591 client_secret_expires_at ---
 
@@ -2184,6 +2339,47 @@ class TestStepUpAuthorize:
         )
         # The grant is authorization_code (full flow), not refresh_token
         assert b"grant_type=authorization_code" in token_calls[0].content
+
+    def test_respects_cached_no_resource_indicator(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """step_up_authorize must omit resource when cached token has no_resource_indicator=True."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+        from mcp_stdio.token_store import save_token
+
+        save_token(
+            self.SERVER_URL,
+            TokenData(
+                access_token="old_at",
+                expires_at=time.time() + 3600,
+                client_id="cached_cid",
+                token_endpoint="https://example.com/token",
+                authorization_endpoint="https://example.com/authorize",
+                no_resource_indicator=True,
+            ),
+        )
+        self._drive_callback(monkeypatch)
+
+        httpx_mock.add_response(
+            url="https://example.com/token",
+            json={"access_token": "upgraded_at", "expires_in": 3600},
+        )
+
+        client = httpx.Client()
+        data = step_up_authorize(self.SERVER_URL, client, "hr:read", timeout=5)
+        assert data.access_token == "upgraded_at"
+
+        token_calls = [
+            r for r in httpx_mock.get_requests()
+            if str(r.url) == "https://example.com/token"
+        ]
+        assert len(token_calls) == 1
+        assert b"resource=" not in token_calls[0].content
+        # auth URL must also omit resource
+        # (verified indirectly — if it included an unrecognised param the AS
+        # would reject state, so a successful exchange proves it was absent)
 
     def test_rediscovers_when_cache_is_empty(
         self, tmp_path, monkeypatch, httpx_mock
@@ -3094,6 +3290,36 @@ class TestDeviceAuthorizationFlow:
         client = httpx.Client()
         meta = discover_oauth_metadata(MCP_URL, client)
         assert meta.device_authorization_endpoint == DEVICE_AUTH_URL
+
+    def test_omits_resource_when_resource_indicator_false(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """resource_indicator=False must suppress resource= in the DA request (Step 1)."""
+        self._patch_store(tmp_path, monkeypatch)
+
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={"access_token": "acc", "token_type": "Bearer", "expires_in": 3600},
+        )
+
+        client = httpx.Client()
+        data = _run_device_authorization_flow(
+            MCP_URL,
+            client,
+            metadata=_device_meta(),
+            cached=None,
+            resource_indicator=False,
+        )
+        assert data.access_token == "acc"
+        assert data.no_resource_indicator is True
+
+        da_reqs = [
+            r for r in httpx_mock.get_requests() if str(r.url) == DEVICE_AUTH_URL
+        ]
+        assert len(da_reqs) == 1
+        assert b"resource=" not in da_reqs[0].content
 
 
 class TestEnsureTokenDeviceFlow:

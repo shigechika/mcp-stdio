@@ -374,3 +374,33 @@ class TestMain:
         ):
             main()
         assert mock_run_sse.call_args.kwargs["cancel_filter"] is False
+
+    def test_no_resource_indicator_default_is_true(self):
+        """By default resource_indicator=True is passed to ensure_token."""
+        with (
+            patch("sys.argv", ["mcp-stdio", "--oauth", "https://example.com/mcp"]),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        assert mock_ensure.call_args.kwargs["resource_indicator"] is True
+
+    def test_no_resource_indicator_flag_passes_false(self):
+        """--no-resource-indicator propagates resource_indicator=False to ensure_token."""
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--oauth",
+                    "--no-resource-indicator",
+                    "https://example.com/mcp",
+                ],
+            ),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        assert mock_ensure.call_args.kwargs["resource_indicator"] is False

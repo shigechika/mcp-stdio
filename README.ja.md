@@ -177,6 +177,11 @@ mcp-stdio [OPTIONS] URL
   --oauth-refresh-leeway SECONDS
                          アクセストークンを expire の何秒前に proactive refresh
                          するか（デフォルト: 60、または MCP_OAUTH_REFRESH_LEEWAY 環境変数）
+  --no-resource-indicator
+                         すべての OAuth リクエストから RFC 8707 resource
+                         パラメータを除外する。api:// スコープを使う Microsoft
+                         Entra ID v2 など、resource パラメータを拒否する AS
+                         （AADSTS9010010）で必要
   -H, --header 'Key: Value'  カスタムヘッダー（複数指定可）
   --transport {streamable-http,sse}
                          トランスポート種別（デフォルト: streamable-http）

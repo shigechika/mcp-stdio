@@ -179,6 +179,10 @@ Options:
   --oauth-refresh-leeway SECONDS
                          Proactively refresh tokens this many seconds before
                          expiry (default: 60, or MCP_OAUTH_REFRESH_LEEWAY)
+  --no-resource-indicator
+                         Omit the RFC 8707 resource parameter from all OAuth
+                         requests. Required for AS that reject it, such as
+                         Microsoft Entra ID v2 with api:// scopes (AADSTS9010010)
   -H, --header 'Key: Value'  Custom header (can be repeated)
   --transport {streamable-http,sse}
                          Transport type (default: streamable-http)
