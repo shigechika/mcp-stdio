@@ -172,6 +172,9 @@ mcp-stdio [OPTIONS] URL
   --oauth-device         OAuth 2.1 Device Authorization Grant（RFC 8628）— ヘッドレス環境向け
   --client-id ID         事前登録済み OAuth クライアント ID（MCP_OAUTH_CLIENT_ID 環境変数でも指定可）
   --oauth-scope SCOPE    要求する OAuth スコープ
+  --oauth-refresh-leeway SECONDS
+                         アクセストークンを expire の何秒前に proactive refresh
+                         するか（デフォルト: 60、または MCP_OAUTH_REFRESH_LEEWAY 環境変数）
   -H, --header 'Key: Value'  カスタムヘッダー（複数指定可）
   --transport {streamable-http,sse}
                          トランスポート種別（デフォルト: streamable-http）

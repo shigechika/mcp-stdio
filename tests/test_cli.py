@@ -135,6 +135,75 @@ class TestMain:
             assert kwargs.kwargs["timeout_connect"] == 5.0
             assert kwargs.kwargs["timeout_read"] == 60.0
 
+    def test_oauth_refresh_leeway_default(self, monkeypatch):
+        """#56: --oauth-refresh-leeway defaults to 60 s when env var unset and flag absent."""
+        monkeypatch.delenv("MCP_OAUTH_REFRESH_LEEWAY", raising=False)
+        with (
+            patch("sys.argv", ["mcp-stdio", "--oauth", "https://example.com/mcp"]),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        assert mock_ensure.call_args.kwargs["refresh_leeway"] == 60.0
+
+    def test_oauth_refresh_leeway_custom_flag(self):
+        """#56: --oauth-refresh-leeway flag is propagated to ensure_token."""
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--oauth",
+                    "--oauth-refresh-leeway",
+                    "300",
+                    "https://example.com/mcp",
+                ],
+            ),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        assert mock_ensure.call_args.kwargs["refresh_leeway"] == 300.0
+
+    def test_oauth_refresh_leeway_env_var(self, monkeypatch):
+        """#56: MCP_OAUTH_REFRESH_LEEWAY env var is respected when flag absent."""
+        monkeypatch.setenv("MCP_OAUTH_REFRESH_LEEWAY", "120")
+        with (
+            patch("sys.argv", ["mcp-stdio", "--oauth", "https://example.com/mcp"]),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        assert mock_ensure.call_args.kwargs["refresh_leeway"] == 120.0
+
+    def test_oauth_refresh_leeway_negative_rejected(self, capsys):
+        """#56: negative leeway values are rejected at parse time."""
+        with patch(
+            "sys.argv",
+            [
+                "mcp-stdio",
+                "--oauth-refresh-leeway",
+                "-1",
+                "https://example.com/mcp",
+            ],
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 2  # argparse error
+        assert "must be >= 0" in capsys.readouterr().err
+
+    def test_oauth_refresh_leeway_invalid_env_var_rejected(self, monkeypatch, capsys):
+        """#56: invalid env var values surface as argparse errors, not ValueError."""
+        monkeypatch.setenv("MCP_OAUTH_REFRESH_LEEWAY", "not-a-number")
+        with patch("sys.argv", ["mcp-stdio", "https://example.com/mcp"]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 2
+        assert "invalid float value" in capsys.readouterr().err
+
     def test_oauth_and_bearer_token_mutually_exclusive(self):
         with patch(
             "sys.argv",

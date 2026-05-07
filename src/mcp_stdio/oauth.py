@@ -978,20 +978,27 @@ def ensure_token(
     scope: str | None = None,
     timeout: float = 120,
     device_flow: bool = False,
+    refresh_leeway: float = 60.0,
 ) -> TokenData:
     """Ensure a valid access token is available.
 
-    1. Check cached token — use if not expired
+    1. Check cached token — use if not expired (with ``refresh_leeway`` margin)
     2. If expired, try refresh
     3. If no token or refresh fails, run OAuth flow:
        - ``device_flow=True``: Device Authorization Grant (RFC 8628)
        - ``device_flow=False``: Authorization Code flow with PKCE (default)
 
+    ``refresh_leeway`` is the proactive-refresh window in seconds: a cached
+    token is considered expired when its actual expiry is within this many
+    seconds from now. Default 60 s absorbs typical clock skew. Tune via
+    ``--oauth-refresh-leeway`` for ASes that issue extremely short-lived
+    access tokens or for deployments with larger clock skew.
+
     Returns TokenData with a valid access_token.
     """
     cached = load_token(server_url)
     if cached and cached.access_token:
-        if cached.expires_at is None or cached.expires_at > time.time() + 60:
+        if cached.expires_at is None or cached.expires_at > time.time() + refresh_leeway:
             log("using cached OAuth token")
             return cached
 

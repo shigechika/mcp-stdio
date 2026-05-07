@@ -1363,6 +1363,96 @@ class TestEnsureToken:
         data = ensure_token("https://example.com/mcp", client)
         assert data.access_token == "cached_at"
 
+    def test_refresh_leeway_zero_uses_actual_expiry(self, tmp_path, monkeypatch):
+        """#56: refresh_leeway=0 disables proactive refresh — token valid until literal expiry.
+
+        Default leeway (60 s) would treat a token expiring in 30 s as expired
+        and trigger refresh. With leeway=0, the cached token is used until the
+        actual expires_at moment.
+        """
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        from mcp_stdio.token_store import save_token
+
+        save_token(
+            "https://example.com/mcp",
+            TokenData(
+                access_token="short_lived_at",
+                expires_at=time.time() + 30,  # within default 60 s leeway
+                refresh_token="rt",
+                client_id="cid",
+                token_endpoint="https://example.com/token",
+                authorization_endpoint="https://example.com/authorize",
+            ),
+        )
+
+        client = httpx.Client()
+        data = ensure_token("https://example.com/mcp", client, refresh_leeway=0)
+        assert data.access_token == "short_lived_at"  # used as-is, no refresh
+
+    def test_refresh_leeway_large_triggers_proactive_refresh(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """#56: large refresh_leeway proactively refreshes even when token has time left."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        from mcp_stdio.token_store import save_token
+
+        save_token(
+            "https://example.com/mcp",
+            TokenData(
+                access_token="cached_at",
+                expires_at=time.time() + 200,  # 200 s left — exceeds default leeway
+                refresh_token="valid_rt",
+                client_id="cid",
+                token_endpoint="https://example.com/token",
+                authorization_endpoint="https://example.com/authorize",
+            ),
+        )
+
+        # leeway=300 — 200 < 300, treated as near-expiry → refresh
+        httpx_mock.add_response(
+            url="https://example.com/token",
+            json={"access_token": "refreshed_at", "expires_in": 3600},
+        )
+
+        client = httpx.Client()
+        data = ensure_token("https://example.com/mcp", client, refresh_leeway=300)
+        assert data.access_token == "refreshed_at"
+
+    def test_refresh_leeway_default_60s(self, tmp_path, monkeypatch, httpx_mock):
+        """#56: default leeway of 60 s — token expiring in 30 s is refreshed."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        from mcp_stdio.token_store import save_token
+
+        save_token(
+            "https://example.com/mcp",
+            TokenData(
+                access_token="near_expiry_at",
+                expires_at=time.time() + 30,  # within default leeway
+                refresh_token="valid_rt",
+                client_id="cid",
+                token_endpoint="https://example.com/token",
+                authorization_endpoint="https://example.com/authorize",
+            ),
+        )
+
+        httpx_mock.add_response(
+            url="https://example.com/token",
+            json={"access_token": "refreshed_at", "expires_in": 3600},
+        )
+
+        client = httpx.Client()
+        data = ensure_token("https://example.com/mcp", client)  # default leeway
+        assert data.access_token == "refreshed_at"
+
     def test_refreshes_expired_token(self, tmp_path, monkeypatch, httpx_mock):
         """Token expired but refresh_token available."""
         store_file = tmp_path / "tokens.json"

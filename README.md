@@ -174,6 +174,9 @@ Options:
   --oauth-device         Enable OAuth 2.1 Device Authorization Grant (RFC 8628, headless)
   --client-id ID         Pre-registered OAuth client ID (or set MCP_OAUTH_CLIENT_ID)
   --oauth-scope SCOPE    OAuth scope to request
+  --oauth-refresh-leeway SECONDS
+                         Proactively refresh tokens this many seconds before
+                         expiry (default: 60, or MCP_OAUTH_REFRESH_LEEWAY)
   -H, --header 'Key: Value'  Custom header (can be repeated)
   --transport {streamable-http,sse}
                          Transport type (default: streamable-http)
