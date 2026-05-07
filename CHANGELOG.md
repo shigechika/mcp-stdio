@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/shigechika/mcp-stdio/compare/v0.12.0...v0.13.0) (2026-05-07)
+
+
+### Features
+
+* **oauth:** add --no-resource-indicator for AS that reject RFC 8707 resource parameter ([#65](https://github.com/shigechika/mcp-stdio/issues/65)) ([7a07deb](https://github.com/shigechika/mcp-stdio/commit/7a07deb9e53d0167c3ff0f62cdcfbf1dc79c675a))
+
 ## [0.12.0](https://github.com/shigechika/mcp-stdio/compare/v0.11.0...v0.12.0) (2026-05-07)
 
 
