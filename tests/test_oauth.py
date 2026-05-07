@@ -3486,3 +3486,43 @@ class TestTokenEndpointAuthMethodPersistence:
         assert b"client_id" not in req.content
         # Persisted method is preserved in the refreshed token
         assert data.token_endpoint_auth_method == "client_secret_basic"
+
+
+# --- client_secret_basic in device authorization request (Step 1) ---
+
+
+class TestDeviceAuthStepOneBasicAuth:
+    def test_device_authorization_request_uses_basic_auth(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """client_secret_basic: DA request (Step 1) puts credentials in Authorization header."""
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", tmp_path / "tokens.json")
+
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={"access_token": "at", "token_type": "Bearer", "expires_in": 3600},
+        )
+
+        # Provide cached client with client_secret_basic already selected.
+        cached = TokenData(
+            access_token="stale",
+            client_id="da_cid",
+            client_secret="da_secret",
+            token_endpoint="https://api.example.com/token",
+            authorization_endpoint=AUTH_URL,
+            token_endpoint_auth_method="client_secret_basic",
+        )
+        client = httpx.Client()
+        _run_device_authorization_flow(
+            MCP_URL, client, metadata=_device_meta(), cached=cached
+        )
+
+        # First request is the device authorization request (Step 1).
+        da_req = httpx_mock.get_requests()[0]
+        assert da_req.url == DEVICE_AUTH_URL
+        expected = base64.b64encode(b"da_cid:da_secret").decode()
+        assert da_req.headers.get("authorization") == f"Basic {expected}"
+        assert b"client_id" not in da_req.content
+        assert b"client_secret" not in da_req.content
