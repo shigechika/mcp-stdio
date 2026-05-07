@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/shigechika/mcp-stdio/compare/v0.10.1...v0.11.0) (2026-05-07)
+
+
+### Features
+
+* **oauth:** make proactive token refresh window configurable (--oauth-refresh-leeway) ([#57](https://github.com/shigechika/mcp-stdio/issues/57)) ([10737ca](https://github.com/shigechika/mcp-stdio/commit/10737ca46f2572f352eb3f0d7ab5f3ab47c35fdd))
+
 ## [0.10.1](https://github.com/shigechika/mcp-stdio/compare/v0.10.0...v0.10.1) (2026-05-02)
 
 
