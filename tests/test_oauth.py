@@ -3291,6 +3291,36 @@ class TestDeviceAuthorizationFlow:
         meta = discover_oauth_metadata(MCP_URL, client)
         assert meta.device_authorization_endpoint == DEVICE_AUTH_URL
 
+    def test_omits_resource_when_resource_indicator_false(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """resource_indicator=False must suppress resource= in the DA request (Step 1)."""
+        self._patch_store(tmp_path, monkeypatch)
+
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={"access_token": "acc", "token_type": "Bearer", "expires_in": 3600},
+        )
+
+        client = httpx.Client()
+        data = _run_device_authorization_flow(
+            MCP_URL,
+            client,
+            metadata=_device_meta(),
+            cached=None,
+            resource_indicator=False,
+        )
+        assert data.access_token == "acc"
+        assert data.no_resource_indicator is True
+
+        da_reqs = [
+            r for r in httpx_mock.get_requests() if str(r.url) == DEVICE_AUTH_URL
+        ]
+        assert len(da_reqs) == 1
+        assert b"resource=" not in da_reqs[0].content
+
 
 class TestEnsureTokenDeviceFlow:
     MCP_URL = "https://api.example.com/mcp"
