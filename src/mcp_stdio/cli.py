@@ -13,6 +13,17 @@ import httpx
 from . import __version__
 from .relay import check_connection, log, run, run_sse
 
+def _non_negative_float(value: str) -> float:
+    """argparse type for non-negative floats (rejects negative leeway)."""
+    try:
+        f = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid float value: {value!r}") from exc
+    if f < 0:
+        raise argparse.ArgumentTypeError(f"value must be >= 0 (got {f})")
+    return f
+
+
 # RFC 7230 §3.2.6 field-name = token = 1*tchar. tchar covers
 # "!#$%&'*+-.^_`|~" plus DIGIT and ALPHA. Used to reject header names
 # that could be misinterpreted by downstream HTTP parsers.
@@ -167,6 +178,19 @@ def main() -> None:
         help="OAuth scope to request",
     )
     parser.add_argument(
+        "--oauth-refresh-leeway",
+        type=_non_negative_float,
+        default=float(os.environ.get("MCP_OAUTH_REFRESH_LEEWAY", "60")),
+        metavar="SECONDS",
+        help=(
+            "Proactively refresh access tokens this many seconds before they "
+            "expire (default: 60, or MCP_OAUTH_REFRESH_LEEWAY env var). "
+            "Increase for ASes with significant clock skew; decrease for "
+            "deployments where short-lived tokens make a 60 s window "
+            "exceed token TTL"
+        ),
+    )
+    parser.add_argument(
         "-H",
         "--header",
         action="append",
@@ -290,6 +314,7 @@ def main() -> None:
                 client_id=args.client_id or None,
                 scope=args.oauth_scope or None,
                 device_flow=args.oauth_device,
+                refresh_leeway=args.oauth_refresh_leeway,
             )
             headers["Authorization"] = f"Bearer {token_data.access_token}"
             token_refresher = _build_token_refresher(
