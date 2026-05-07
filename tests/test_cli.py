@@ -1,6 +1,5 @@
 """Tests for mcp_stdio.cli module."""
 
-import os
 from unittest.mock import patch
 
 import pytest
@@ -136,16 +135,15 @@ class TestMain:
             assert kwargs.kwargs["timeout_connect"] == 5.0
             assert kwargs.kwargs["timeout_read"] == 60.0
 
-    def test_oauth_refresh_leeway_default(self):
+    def test_oauth_refresh_leeway_default(self, monkeypatch):
         """#56: --oauth-refresh-leeway defaults to 60 s when env var unset and flag absent."""
+        monkeypatch.delenv("MCP_OAUTH_REFRESH_LEEWAY", raising=False)
         with (
-            patch.dict("os.environ", {}, clear=False) as _env,
             patch("sys.argv", ["mcp-stdio", "--oauth", "https://example.com/mcp"]),
             patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
             patch("mcp_stdio.cli.run"),
         ):
             mock_ensure.return_value.access_token = "tok"
-            os.environ.pop("MCP_OAUTH_REFRESH_LEEWAY", None)
             main()
         assert mock_ensure.call_args.kwargs["refresh_leeway"] == 60.0
 
@@ -196,6 +194,15 @@ class TestMain:
                 main()
             assert exc_info.value.code == 2  # argparse error
         assert "must be >= 0" in capsys.readouterr().err
+
+    def test_oauth_refresh_leeway_invalid_env_var_rejected(self, monkeypatch, capsys):
+        """#56: invalid env var values surface as argparse errors, not ValueError."""
+        monkeypatch.setenv("MCP_OAUTH_REFRESH_LEEWAY", "not-a-number")
+        with patch("sys.argv", ["mcp-stdio", "https://example.com/mcp"]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 2
+        assert "invalid float value" in capsys.readouterr().err
 
     def test_oauth_and_bearer_token_mutually_exclusive(self):
         with patch(

@@ -180,7 +180,10 @@ def main() -> None:
     parser.add_argument(
         "--oauth-refresh-leeway",
         type=_non_negative_float,
-        default=float(os.environ.get("MCP_OAUTH_REFRESH_LEEWAY", "60")),
+        # Pass as string so argparse re-applies _non_negative_float to the
+        # default — invalid env var values (negative, non-numeric) surface
+        # as argparse errors instead of a raw Python ValueError on startup.
+        default=os.environ.get("MCP_OAUTH_REFRESH_LEEWAY", "60"),
         metavar="SECONDS",
         help=(
             "Proactively refresh access tokens this many seconds before they "
