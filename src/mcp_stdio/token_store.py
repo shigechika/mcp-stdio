@@ -37,6 +37,8 @@ class TokenData:
     registration_endpoint: str | None = None
     # Token endpoint authentication method (RFC 6749 §2.3 / RFC 8414)
     token_endpoint_auth_method: str = "none"
+    # Suppress RFC 8707 resource parameter (for AS that reject it, e.g. Entra ID v2)
+    no_resource_indicator: bool = False
 
 
 def _ensure_store_dir() -> None:

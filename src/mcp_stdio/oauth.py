@@ -691,6 +691,7 @@ def _token_response_to_data(
     previous_refresh_token: str | None = None,
     client_secret_expires_at: float | None = None,
     auth_method: str = "none",
+    no_resource_indicator: bool = False,
 ) -> TokenData:
     """Convert a raw token response to TokenData.
 
@@ -714,6 +715,7 @@ def _token_response_to_data(
         authorization_endpoint=metadata.authorization_endpoint,
         registration_endpoint=metadata.registration_endpoint,
         token_endpoint_auth_method=auth_method,
+        no_resource_indicator=no_resource_indicator,
     )
 
 
@@ -724,8 +726,7 @@ def refresh_cached_token(
 
     Returns updated TokenData on success, or None if no usable cached token
     exists (missing refresh_token / endpoint / client_id, or expired
-    client_secret per RFC 7591 §3.2.1) or the refresh request fails. The
-    refresh request always includes the RFC 8707 resource indicator.
+    client_secret per RFC 7591 §3.2.1) or the refresh request fails.
 
     Does not delete stale tokens on failure — callers decide the retry
     policy.
@@ -743,6 +744,7 @@ def refresh_cached_token(
         return None
     log("access token expired, attempting refresh")
     auth_method = cached.token_endpoint_auth_method
+    no_resource_indicator = cached.no_resource_indicator
     try:
         raw = refresh_access_token(
             cached.token_endpoint,
@@ -750,7 +752,7 @@ def refresh_cached_token(
             cached.client_secret,
             cached.refresh_token,
             client,
-            resource=server_url,
+            resource=None if no_resource_indicator else server_url,
             auth_method=auth_method,
         )
     except Exception as e:
@@ -769,6 +771,7 @@ def refresh_cached_token(
         previous_refresh_token=cached.refresh_token,
         client_secret_expires_at=cached.client_secret_expires_at,
         auth_method=auth_method,
+        no_resource_indicator=no_resource_indicator,
     )
     save_token(server_url, data)
     log("token refreshed successfully")
@@ -784,6 +787,7 @@ def _run_authorization_flow(
     client_id_override: str | None = None,
     scope: str | None = None,
     timeout: float = 120,
+    resource_indicator: bool = True,
 ) -> TokenData:
     """Run the browser-based authorization code flow.
 
@@ -821,7 +825,7 @@ def _run_authorization_flow(
 
     code_verifier, code_challenge = generate_pkce()
 
-    # Authorization (RFC 8707: include resource indicator)
+    # Authorization URL params; RFC 8707 resource indicator included by default
     state = secrets.token_urlsafe(32)
     params: dict[str, str] = {
         "client_id": cid,
@@ -830,8 +834,9 @@ def _run_authorization_flow(
         "state": state,
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
-        "resource": server_url,
     }
+    if resource_indicator:
+        params["resource"] = server_url
     if scope:
         params["scope"] = scope
 
@@ -877,7 +882,6 @@ def _run_authorization_flow(
     code = cb_result.auth_code
     assert code is not None
 
-    # Token exchange (RFC 8707: include resource indicator)
     log("exchanging authorization code for token")
     raw = exchange_code(
         metadata,
@@ -887,11 +891,17 @@ def _run_authorization_flow(
         code_verifier,
         redirect_uri,
         client,
-        resource=server_url,
+        resource=server_url if resource_indicator else None,
         auth_method=auth_method,
     )
     data = _token_response_to_data(
-        raw, metadata, cid, csecret, client_secret_expires_at=cse_at, auth_method=auth_method
+        raw,
+        metadata,
+        cid,
+        csecret,
+        client_secret_expires_at=cse_at,
+        auth_method=auth_method,
+        no_resource_indicator=not resource_indicator,
     )
     save_token(server_url, data)
     log("OAuth token obtained and saved")
@@ -906,6 +916,7 @@ def _run_device_authorization_flow(
     cached: TokenData | None,
     client_id_override: str | None = None,
     scope: str | None = None,
+    resource_indicator: bool = True,
 ) -> TokenData:
     """Run RFC 8628 Device Authorization Grant flow.
 
@@ -946,9 +957,9 @@ def _run_device_authorization_flow(
     assert cid is not None
 
     # Step 1: Device Authorization Request (RFC 8628 §3.1)
-    da_params: dict[str, str] = {
-        "resource": server_url,
-    }
+    da_params: dict[str, str] = {}
+    if resource_indicator:
+        da_params["resource"] = server_url
     if scope:
         da_params["scope"] = scope
     da_headers: dict[str, str] = {
@@ -1025,7 +1036,13 @@ def _run_device_authorization_flow(
         if tok_resp.status_code == 200:
             raw = _parse_token_response(tok_resp)
             data = _token_response_to_data(
-                raw, metadata, cid, csecret, client_secret_expires_at=cse_at, auth_method=auth_method
+                raw,
+                metadata,
+                cid,
+                csecret,
+                client_secret_expires_at=cse_at,
+                auth_method=auth_method,
+                no_resource_indicator=not resource_indicator,
             )
             save_token(server_url, data)
             log("device flow token obtained and saved")
@@ -1064,6 +1081,7 @@ def ensure_token(
     timeout: float = 120,
     device_flow: bool = False,
     refresh_leeway: float = 60.0,
+    resource_indicator: bool = True,
 ) -> TokenData:
     """Ensure a valid access token is available.
 
@@ -1078,6 +1096,10 @@ def ensure_token(
     seconds from now. Default 60 s absorbs typical clock skew. Tune via
     ``--oauth-refresh-leeway`` for ASes that issue extremely short-lived
     access tokens or for deployments with larger clock skew.
+
+    When ``resource_indicator=False`` the RFC 8707 ``resource`` parameter is
+    omitted from all requests. Use ``--no-resource-indicator`` for AS that
+    reject the parameter (e.g. Microsoft Entra ID v2 with api:// scopes).
 
     Returns TokenData with a valid access_token.
     """
@@ -1112,6 +1134,7 @@ def ensure_token(
             cached=cached,
             client_id_override=client_id,
             scope=scope,
+            resource_indicator=resource_indicator,
         )
     return _run_authorization_flow(
         server_url,
@@ -1121,6 +1144,7 @@ def ensure_token(
         client_id_override=client_id,
         scope=scope,
         timeout=timeout,
+        resource_indicator=resource_indicator,
     )
 
 
@@ -1187,6 +1211,7 @@ def step_up_authorize(
     else:
         metadata = discover_oauth_metadata(server_url, client)
 
+    resource_indicator = not (cached.no_resource_indicator if cached else False)
     return _run_authorization_flow(
         server_url,
         client,
@@ -1194,4 +1219,5 @@ def step_up_authorize(
         cached=cached,
         scope=merged_scope or None,
         timeout=timeout,
+        resource_indicator=resource_indicator,
     )

@@ -178,6 +178,17 @@ def main() -> None:
         help="OAuth scope to request",
     )
     parser.add_argument(
+        "--no-resource-indicator",
+        action="store_true",
+        help=(
+            "Omit the RFC 8707 resource parameter from all OAuth requests. "
+            "Required for AS that reject the parameter, such as Microsoft "
+            "Entra ID v2 when using api:// scopes (AADSTS9010010). "
+            "The setting is persisted in the token store so proactive "
+            "refreshes and step-up flows behave consistently."
+        ),
+    )
+    parser.add_argument(
         "--oauth-refresh-leeway",
         type=_non_negative_float,
         # Pass as string so argparse re-applies _non_negative_float to the
@@ -318,6 +329,7 @@ def main() -> None:
                 scope=args.oauth_scope or None,
                 device_flow=args.oauth_device,
                 refresh_leeway=args.oauth_refresh_leeway,
+                resource_indicator=not args.no_resource_indicator,
             )
             headers["Authorization"] = f"Bearer {token_data.access_token}"
             token_refresher = _build_token_refresher(
