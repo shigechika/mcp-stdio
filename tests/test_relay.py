@@ -53,10 +53,11 @@ class TestWriteLine:
         """stdout stub recording every write() call argument verbatim.
 
         Guards the record list with its own lock so the test stays correct
-        even under a free-threaded interpreter, and so it does not lean on
-        the system-under-test's _STDOUT_LOCK for the recording's own
-        integrity — if that lock were ever removed, writes would still be
-        recorded intact and the assertion would catch the regression.
+        even under a free-threaded interpreter, independent of the
+        system-under-test's _STDOUT_LOCK. Note: this test guards the
+        single-write-per-line property — a revert to a two-call print()
+        would surface as bare "\\n" fragments — not _STDOUT_LOCK itself,
+        which protects the underlying buffered stream the stub does not model.
         """
 
         def __init__(self):
