@@ -50,6 +50,7 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
     - §2.1 `Authorization: Bearer <token>` request header
 - **Retry with backoff** — retries up to 3 times on connection errors
 - **Streaming resilience** — streams SSE responses in real time; auto-reconnects on mid-stream disconnect
+- **Line-separator safety** — escapes raw `U+2028` / `U+2029` (legal in JSON, but JavaScript line terminators) in upstream responses so clients that treat them as line breaks cannot mis-frame the output; lossless (cf. modelcontextprotocol/typescript-sdk#2155)
 - **Session recovery** — resets MCP session ID on 404 and retries
 - **Protocol version header** — captures the negotiated `protocolVersion` from the `initialize` response and injects `MCP-Protocol-Version` on every subsequent Streamable HTTP request (MCP spec rev 2025-06-18); servers that enforce the header would otherwise reject post-initialize requests with `400 Bad Request`
 - **Token refresh on 401** — automatically refreshes expired OAuth tokens mid-session

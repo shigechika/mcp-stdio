@@ -22,6 +22,7 @@ from mcp_stdio.relay import (
     _emit,
     _enforce_lf_stdio,
     _error_response,
+    _escape_js_line_separators,
     _extract_cancel_id,
     _extract_id,
     _handle_rate_limit,
@@ -2303,6 +2304,47 @@ class TestExtractCancelId:
             '"params":{"note":"\\"method\\":\\"notifications/cancelled\\""}}'
         )
         assert _extract_cancel_id(line) is None
+
+
+class TestEscapeJsLineSeparators:
+    """Escape raw U+2028/U+2029 so clients can't mis-frame (typescript-sdk#2155)."""
+
+    def test_clean_line_unchanged_identity(self):
+        line = '{"jsonrpc":"2.0","result":{"text":"hello"},"id":1}'
+        # Same object returned (no allocation) when there's nothing to escape.
+        assert _escape_js_line_separators(line) is line
+
+    def test_escapes_line_separator(self):
+        line = '{"result":{"text":"a\u2028b"}}'
+        out = _escape_js_line_separators(line)
+        assert "\u2028" not in out
+        assert "\\u2028" in out
+
+    def test_escapes_paragraph_separator(self):
+        line = '{"result":{"text":"a\u2029b"}}'
+        out = _escape_js_line_separators(line)
+        assert "\u2029" not in out
+        assert "\\u2029" in out
+
+    def test_escaped_form_decodes_to_identical_json(self):
+        """Lossless: the escaped wire form parses back to the same value."""
+        original = {"result": {"text": "line\u2028para\u2029end"}}
+        wire = _escape_js_line_separators(json.dumps(original, ensure_ascii=False))
+        assert "\u2028" not in wire and "\u2029" not in wire
+        assert json.loads(wire) == original
+
+    def test_emit_escapes_passthrough(self, capsys):
+        _emit('{"jsonrpc":"2.0","result":{"t":"x\u2028y"},"id":1}', None)
+        out = capsys.readouterr().out
+        assert "\u2028" not in out
+        assert "\\u2028" in out
+
+    def test_emit_escapes_and_still_filters_cancelled(self, capsys):
+        """Escaping must not defeat the cancel filter: the line still parses."""
+        t = _CancelTracker()
+        t.add(1)
+        _emit('{"jsonrpc":"2.0","result":{"t":"x\u2028y"},"id":1}', t)
+        assert capsys.readouterr().out == ""
 
 
 class TestEmit:
