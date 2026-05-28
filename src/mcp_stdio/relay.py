@@ -1011,6 +1011,12 @@ def run(
                 # first initialize. A later client-driven re-initialize that
                 # renegotiates a different version is not picked up — rare, and
                 # avoids re-parsing every response on the hot path.
+                #
+                # Response-only: the version comes from the server's
+                # InitializeResult, not the client's requested version. If a
+                # (non-compliant) server omits result.protocolVersion, no
+                # header is sent rather than guessing — a server that both
+                # omits it and enforces the header would be self-contradictory.
                 capture_init = protocol_version is None and _looks_like_initialize(content)
                 result = _post_and_stream(
                     client, url, content, h, req_id, tracker, capture_init=capture_init
