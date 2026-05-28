@@ -376,21 +376,45 @@ def _handle_rate_limit(
     return retry_after
 
 
+def _escape_js_line_separators(line: str) -> str:
+    """Escape raw U+2028 / U+2029 to their JSON ``\\uXXXX`` form.
+
+    Both are legal *unescaped* inside JSON strings but are JavaScript line
+    terminators; some clients treat them as line breaks and hang or
+    mis-frame the response (cf. modelcontextprotocol/typescript-sdk#2155).
+    Escaping is lossless — the escaped form decodes to the identical
+    character — so it is applied unconditionally, mirroring the
+    no-flag, lossless ``_enforce_lf_stdio`` normalization. The cheap
+    ``in`` pre-check keeps the common case allocation-free.
+
+    Only upstream pass-through content reaches this path with raw
+    separators: mcp-stdio's own responses go through ``json.dumps``
+    (``ensure_ascii=True``), which already escapes them.
+    """
+    if "\u2028" in line or "\u2029" in line:
+        return line.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    return line
+
+
 def _emit(line: str, tracker: "_CancelTracker | None") -> None:
     """Write one JSON-RPC line to stdout, filtering cancelled-id responses.
 
-    When ``tracker`` is ``None`` (feature disabled) the line is written
-    unconditionally. Otherwise the line is parsed; only proper JSON-RPC
-    *responses* (objects with an id and either ``result`` or ``error``)
-    are eligible for dropping. Notifications, server-initiated requests,
-    JSON-RPC batches, and anything that fails to parse pass through —
-    the filter is narrowly scoped to the case the spec covers.
+    Raw U+2028 / U+2029 are escaped first (``_escape_js_line_separators``)
+    so a client that treats them as line terminators cannot mis-frame the
+    output. The cancel filter then runs: when ``tracker`` is ``None``
+    (feature disabled) the line is written unconditionally; otherwise the
+    line is parsed and only proper JSON-RPC *responses* (objects with an id
+    and either ``result`` or ``error``) are eligible for dropping.
+    Notifications, server-initiated requests, JSON-RPC batches, and
+    anything that fails to parse pass through — the filter is narrowly
+    scoped to the case the spec covers.
 
     mcp-stdio's own synthesized error responses (``_error_response``)
-    intentionally bypass this gate and call ``print`` directly, so a
+    intentionally bypass this gate and call ``_write_line`` directly, so a
     cancel arriving mid-retry never leaves the client hanging without
     an answer for the line it just sent.
     """
+    line = _escape_js_line_separators(line)
     if tracker is None:
         _write_line(line)
         return
