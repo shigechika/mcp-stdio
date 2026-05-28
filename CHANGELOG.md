@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.14.0](https://github.com/shigechika/mcp-stdio/compare/v0.13.1...v0.14.0) (2026-05-28)
+
+
+### Features
+
+* **relay:** escape raw U+2028/U+2029 in stdout to prevent client mis-framing ([#73](https://github.com/shigechika/mcp-stdio/issues/73)) ([91840d1](https://github.com/shigechika/mcp-stdio/commit/91840d1f00bd302e756c5bbd4b0affcc4aedf450))
+* **relay:** inject MCP-Protocol-Version header on subsequent requests ([#70](https://github.com/shigechika/mcp-stdio/issues/70)) ([b4eb111](https://github.com/shigechika/mcp-stdio/commit/b4eb11127b63596e1459b73ec0d1c7ce6b1c2daf))
+* **relay:** normalize tools/call arguments:null to {} for strict servers ([#75](https://github.com/shigechika/mcp-stdio/issues/75)) ([899a707](https://github.com/shigechika/mcp-stdio/commit/899a70731fa2a1fe0d3610c6363778ae234822c7))
+
 ## [0.13.1](https://github.com/shigechika/mcp-stdio/compare/v0.13.0...v0.13.1) (2026-05-28)
 
 
