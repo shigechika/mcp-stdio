@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.1](https://github.com/shigechika/mcp-stdio/compare/v0.13.0...v0.13.1) (2026-05-28)
+
+
+### Bug Fixes
+
+* **relay:** serialize stdout writes to prevent NDJSON line interleaving ([#67](https://github.com/shigechika/mcp-stdio/issues/67)) ([ce91459](https://github.com/shigechika/mcp-stdio/commit/ce914593152efc4d0a64d0fd05105f637b6a6a86))
+
 ## [0.13.0](https://github.com/shigechika/mcp-stdio/compare/v0.12.0...v0.13.0) (2026-05-07)
 
 
