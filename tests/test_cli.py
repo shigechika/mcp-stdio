@@ -375,6 +375,45 @@ class TestMain:
             main()
         assert mock_run_sse.call_args.kwargs["cancel_filter"] is False
 
+    def test_normalize_arguments_default_on(self):
+        """tools/call argument normalization is ON by default → run() sees True."""
+        with (
+            patch("sys.argv", ["mcp-stdio", "https://example.com/mcp"]),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+        assert mock_run.call_args.kwargs["normalize_arguments"] is True
+
+    def test_normalize_arguments_opt_out(self):
+        """--no-normalize-arguments flips the flag to False."""
+        with (
+            patch(
+                "sys.argv",
+                ["mcp-stdio", "https://example.com/mcp", "--no-normalize-arguments"],
+            ),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+        assert mock_run.call_args.kwargs["normalize_arguments"] is False
+
+    def test_normalize_arguments_passed_to_run_sse(self):
+        """--no-normalize-arguments reaches run_sse on the sse transport."""
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "https://example.com/mcp",
+                    "--transport",
+                    "sse",
+                    "--no-normalize-arguments",
+                ],
+            ),
+            patch("mcp_stdio.cli.run_sse") as mock_run_sse,
+        ):
+            main()
+        assert mock_run_sse.call_args.kwargs["normalize_arguments"] is False
+
     def test_no_resource_indicator_default_is_true(self):
         """By default resource_indicator=True is passed to ensure_token."""
         with (

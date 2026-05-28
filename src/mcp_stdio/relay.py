@@ -636,6 +636,41 @@ def _post_parsed(
     return None, None
 
 
+# tools/call requests that serialize an empty argument map as ``null``.
+# Some clients (Go/Java/C# serializers) emit ``"arguments": null``; strict
+# MCP servers validate ``arguments`` as an optional object and reject the
+# null form with -32603 (cf. modelcontextprotocol/typescript-sdk#2012). The
+# regex is a cheap gate before the json round-trip; the parsed-structure
+# check below is authoritative.
+_NULL_ARGUMENTS_RE = re.compile(r'"arguments"\s*:\s*null')
+
+
+def _normalize_null_arguments(line: str) -> str:
+    """Rewrite a ``tools/call`` request's null ``arguments`` to ``{}``.
+
+    ``{}`` is accepted by both optional- and required-object servers, so it
+    is the safe normalization of the "no arguments" intent. Narrowly
+    scoped: only a ``tools/call`` whose ``params.arguments`` key is present
+    and ``null`` is rewritten — a string value that merely contains the
+    literal ``"arguments":null`` is left untouched (the parsed-structure
+    check, not the regex, decides). JSON-RPC batch arrays and other methods
+    (e.g. ``prompts/get``, a deliberate non-goal) pass through unchanged.
+    """
+    if not _NULL_ARGUMENTS_RE.search(line):
+        return line
+    try:
+        msg = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return line
+    if not isinstance(msg, dict) or msg.get("method") != "tools/call":
+        return line
+    params = msg.get("params")
+    if isinstance(params, dict) and "arguments" in params and params["arguments"] is None:
+        params["arguments"] = {}
+        return json.dumps(msg)
+    return line
+
+
 def _detect_paginated_list(line: str) -> tuple[str, str] | None:
     """Return ``(method, result_key)`` if the request should auto-paginate.
 
@@ -937,6 +972,7 @@ def run(
     timeout_write: float = 30,
     tcp_keepalive: bool = True,
     cancel_filter: bool = True,
+    normalize_arguments: bool = True,
     token_refresher: Any = None,
     scope_upgrader: Any = None,
 ) -> None:
@@ -963,6 +999,11 @@ def run(
             shields the downstream client from canceller-side bugs such
             as anthropics/claude-code#51073. Disable (``False``) only
             when debugging raw upstream traffic.
+        normalize_arguments: When True (default), rewrite a ``tools/call``
+            request whose ``params.arguments`` is ``null`` to ``{}`` before
+            forwarding, so strict servers that reject the null form
+            (modelcontextprotocol/typescript-sdk#2012) accept the call.
+            Disable (``False``) to forward the client request verbatim.
         token_refresher: Optional callable that returns updated headers
             on successful token refresh, or None on failure. Called when
             the server returns HTTP 401.
@@ -1014,6 +1055,9 @@ def run(
             line = line.strip()
             if not line:
                 continue
+
+            if normalize_arguments:
+                line = _normalize_null_arguments(line)
 
             if tracker is not None:
                 cid = _extract_cancel_id(line)
@@ -1221,6 +1265,7 @@ def run_sse(
     sse_read_timeout: float | None = 300,
     tcp_keepalive: bool = True,
     cancel_filter: bool = True,
+    normalize_arguments: bool = True,
     token_refresher: Any = None,
     scope_upgrader: Any = None,
 ) -> None:
@@ -1264,6 +1309,9 @@ def run_sse(
             upstream response carrying one of those ids on the SSE
             stream before it reaches stdout. See ``run`` for the full
             rationale.
+        normalize_arguments: When True (default), rewrite a ``tools/call``
+            request whose ``params.arguments`` is ``null`` to ``{}`` before
+            forwarding. See ``run`` for the full rationale.
         token_refresher: Optional callable that returns updated headers
             on successful token refresh, or None on failure. Called when
             the server returns HTTP 401 on POST.
@@ -1328,6 +1376,9 @@ def run_sse(
             line = line.strip()
             if not line:
                 continue
+
+            if normalize_arguments:
+                line = _normalize_null_arguments(line)
 
             if tracker is not None:
                 cid = _extract_cancel_id(line)
