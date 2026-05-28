@@ -602,6 +602,131 @@ class TestRun:
         assert result["id"] == 1
 
 
+# --- MCP-Protocol-Version header (spec rev 2025-06-18, issue #69) ---
+
+
+class TestProtocolVersionHeader:
+    """Capture the negotiated protocol version and inject it on subsequent requests.
+
+    Per the Streamable HTTP spec (2025-06-18, "Protocol Version Header"), after
+    initialization the client MUST send MCP-Protocol-Version on every subsequent
+    request. mcp-stdio captures result.protocolVersion from the InitializeResult
+    and injects it; the initialize POST itself carries no header.
+    """
+
+    def _run_with_stdin(self, stdin_lines):
+        stdin_data = "\n".join(stdin_lines) + "\n"
+        stdout = StringIO()
+        with patch("sys.stdin", StringIO(stdin_data)), patch("sys.stdout", stdout):
+            run("https://example.com/mcp", {"Content-Type": "application/json"})
+        return stdout.getvalue()
+
+    def test_captures_version_and_injects_on_subsequent_request(self, httpx_mock):
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"protocolVersion":"2025-06-18"},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":2}',
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            [
+                '{"jsonrpc":"2.0","method":"initialize","id":1}',
+                '{"jsonrpc":"2.0","method":"tools/call","id":2}',
+            ]
+        )
+        # Capture is read-only: the initialize response must still reach stdout.
+        msgs = [json.loads(x) for x in output.strip().splitlines() if x]
+        assert any(
+            m.get("result", {}).get("protocolVersion") == "2025-06-18" for m in msgs
+        )
+        reqs = httpx_mock.get_requests()
+        # initialize itself carries no header (version not yet negotiated)
+        assert "mcp-protocol-version" not in reqs[0].headers
+        # the next request carries the negotiated version
+        assert reqs[1].headers["mcp-protocol-version"] == "2025-06-18"
+
+    def test_initialized_notification_carries_header(self, httpx_mock):
+        """notifications/initialized is the first subsequent request — must carry it."""
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"protocolVersion":"2025-06-18"},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(status_code=202, text="")
+        self._run_with_stdin(
+            [
+                '{"jsonrpc":"2.0","method":"initialize","id":1}',
+                '{"jsonrpc":"2.0","method":"notifications/initialized"}',
+            ]
+        )
+        reqs = httpx_mock.get_requests()
+        assert reqs[1].headers["mcp-protocol-version"] == "2025-06-18"
+
+    def test_sse_framed_initialize_captures_version(self, httpx_mock):
+        httpx_mock.add_response(
+            text='data: {"jsonrpc":"2.0","result":{"protocolVersion":"2025-03-26"},"id":1}\n\n',
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":2}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            [
+                '{"jsonrpc":"2.0","method":"initialize","id":1}',
+                '{"jsonrpc":"2.0","method":"tools/call","id":2}',
+            ]
+        )
+        reqs = httpx_mock.get_requests()
+        assert reqs[1].headers["mcp-protocol-version"] == "2025-03-26"
+
+    def test_no_header_when_no_initialize_seen(self, httpx_mock):
+        """A request that is not preceded by an initialize carries no version header."""
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(['{"jsonrpc":"2.0","method":"tools/call","id":1}'])
+        reqs = httpx_mock.get_requests()
+        assert "mcp-protocol-version" not in reqs[0].headers
+
+    def test_reinitialize_initialized_carries_header(self, httpx_mock):
+        """After a 404, the recovered session's initialized notification carries it."""
+        # 1: initialize -> negotiate 2025-06-18, session sess-1
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"protocolVersion":"2025-06-18"},"id":1}',
+            headers={"content-type": "application/json", "mcp-session-id": "sess-1"},
+        )
+        # 2: tools/call -> 404 (session expired)
+        httpx_mock.add_response(
+            status_code=404, text="", headers={"content-type": "application/json"}
+        )
+        # 3: reinit initialize -> new session sess-2
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"protocolVersion":"2025-06-18"},"id":0}',
+            headers={"content-type": "application/json", "mcp-session-id": "sess-2"},
+        )
+        # 4: reinit notifications/initialized -> 202
+        httpx_mock.add_response(status_code=202, text="")
+        # 5: tools/call retry -> 200
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":2}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            [
+                '{"jsonrpc":"2.0","method":"initialize","id":1}',
+                '{"jsonrpc":"2.0","method":"tools/call","id":2}',
+            ]
+        )
+        reqs = httpx_mock.get_requests()
+        # reqs: 0=init, 1=call(404), 2=reinit-init, 3=reinit-initialized, 4=call-retry
+        assert "mcp-protocol-version" not in reqs[2].headers  # renegotiation
+        assert reqs[3].headers["mcp-protocol-version"] == "2025-06-18"
+        assert reqs[4].headers["mcp-protocol-version"] == "2025-06-18"
+
+
 # --- step-up authorization (anthropics/claude-code#44652) ---
 
 

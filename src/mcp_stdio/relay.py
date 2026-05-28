@@ -169,6 +169,46 @@ def _extract_id(line: str) -> Any:
         return None
 
 
+# MCP-Protocol-Version header (spec rev 2025-06-18, "Protocol Version Header").
+# After initialization the client MUST send the negotiated protocol version on
+# every subsequent HTTP request; servers that enforce it return 400 when it is
+# absent. The header is a Streamable-HTTP-era construct — it is absent from the
+# 2025-03-26 spec and from the 2024-11-05 legacy SSE transport — so it is
+# injected on the Streamable HTTP path (``run``) only. A cheap regex pre-check
+# gates the slow json.loads, mirroring ``_CANCELLED_METHOD_RE``.
+_INITIALIZE_METHOD_RE = re.compile(r'"method"\s*:\s*"initialize"')
+
+
+def _looks_like_initialize(line: str) -> bool:
+    """Return True if ``line`` looks like a JSON-RPC ``initialize`` request.
+
+    A cheap pre-filter so the relay only attempts to capture the negotiated
+    protocol version from initialize responses. The trailing quote in the
+    pattern means ``notifications/initialized`` does not match.
+    """
+    return bool(_INITIALIZE_METHOD_RE.search(line))
+
+
+def _extract_protocol_version(payload: str) -> str | None:
+    """Return ``result.protocolVersion`` from an InitializeResult, else None.
+
+    Accepts the JSON-RPC response payload (the text after ``data: `` for an
+    SSE-framed response, or the whole JSON body otherwise). Returns None for
+    anything that is not an object carrying a string ``result.protocolVersion``.
+    """
+    try:
+        msg = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(msg, dict):
+        return None
+    result = msg.get("result")
+    if not isinstance(result, dict):
+        return None
+    pv = result.get("protocolVersion")
+    return pv if isinstance(pv, str) else None
+
+
 # Cancel-aware response filter (MCP cancellation spec SHOULDs).
 #
 # The MCP cancellation utility mandates two reciprocal SHOULDs:
@@ -373,17 +413,21 @@ def _emit(line: str, tracker: "_CancelTracker | None") -> None:
 class _StreamResult:
     """Result of a streaming request."""
 
-    __slots__ = ("session_id", "status_code", "www_authenticate")
+    __slots__ = ("session_id", "status_code", "www_authenticate", "protocol_version")
 
     def __init__(
         self,
         session_id: str | None,
         status_code: int,
         www_authenticate: str | None = None,
+        protocol_version: str | None = None,
     ):
         self.session_id = session_id
         self.status_code = status_code
         self.www_authenticate = www_authenticate
+        # Negotiated MCP protocol version captured from an InitializeResult
+        # (only populated when the caller requests capture). See run().
+        self.protocol_version = protocol_version
 
 
 _INSUFFICIENT_SCOPE_RE = re.compile(r'error\s*=\s*"?insufficient_scope"?')
@@ -422,12 +466,20 @@ def _post_and_stream(
     headers: dict[str, str],
     req_id: Any,
     tracker: _CancelTracker | None = None,
+    *,
+    capture_init: bool = False,
 ) -> _StreamResult | None:
     """Send a POST and stream the response to stdout with retry.
 
     Handles both SSE and JSON responses.  Returns a ``_StreamResult``
     on success (including non-200 status for caller to handle), or
     ``None`` when all retries are exhausted (error already printed).
+
+    When ``capture_init`` is set the streamed payload is additionally
+    parsed for ``result.protocolVersion`` (the negotiated MCP protocol
+    version from an InitializeResult), surfaced via
+    ``_StreamResult.protocol_version``. Parsing is read-only and never
+    affects what is written to stdout.
     """
     last_error: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -452,18 +504,24 @@ def _post_and_stream(
                     resp.read()
                     return _StreamResult(session, resp.status_code, www_auth)
 
+                pv: str | None = None
                 content_type = resp.headers.get("content-type", "")
                 if "text/event-stream" in content_type:
                     for line in resp.iter_lines():
                         if line.startswith("data: "):
-                            _emit(line[6:], tracker)
+                            payload = line[6:]
+                            if capture_init and pv is None:
+                                pv = _extract_protocol_version(payload)
+                            _emit(payload, tracker)
                 else:
                     resp.read()
                     text = resp.text.strip()
                     if text:
+                        if capture_init:
+                            pv = _extract_protocol_version(text)
                         _emit(text, tracker)
 
-                return _StreamResult(session, 200)
+                return _StreamResult(session, 200, protocol_version=pv)
         except (
             httpx.ConnectError,
             httpx.ReadTimeout,
@@ -691,6 +749,7 @@ def _reinitialize(
     client: httpx.Client,
     url: str,
     headers: dict[str, str],
+    protocol_version: str | None = None,
 ) -> str | None:
     """Send an initialize handshake to establish a new MCP session.
 
@@ -700,6 +759,11 @@ def _reinitialize(
     1. POST an ``initialize`` request to get a new session ID
     2. POST a ``notifications/initialized`` notification to signal
        readiness (required by the MCP spec before any other requests)
+
+    ``notifications/initialized`` is the first "subsequent request" of the
+    recovered session, so it carries the ``MCP-Protocol-Version`` header
+    when ``protocol_version`` is known. The initialize POST itself omits it
+    — it is the (re)negotiation and predates a known version.
 
     Returns the new session ID on success, or None on failure. The
     initialize response payload is discarded — the caller only needs
@@ -736,6 +800,8 @@ def _reinitialize(
     )
     initialized_headers = dict(headers)
     initialized_headers["Mcp-Session-Id"] = new_session_id
+    if protocol_version:
+        initialized_headers["MCP-Protocol-Version"] = protocol_version
     try:
         resp = client.post(url, content=initialized_msg, headers=initialized_headers)
     except httpx.HTTPError as e:
@@ -895,6 +961,10 @@ def run(
     log(f"connecting to {url}")
 
     session_id: str | None = None
+    # Negotiated MCP protocol version, captured from the InitializeResult and
+    # injected as MCP-Protocol-Version on every subsequent request (spec rev
+    # 2025-06-18). Streamable HTTP only — see _looks_like_initialize.
+    protocol_version: str | None = None
     tracker: _CancelTracker | None = _CancelTracker() if cancel_filter else None
     client = httpx.Client(
         transport=_make_httpx_transport(tcp_keepalive=tcp_keepalive),
@@ -905,6 +975,15 @@ def run(
             pool=10,
         )
     )
+
+    def _prepare_headers() -> dict[str, str]:
+        """Build per-request headers with the current session + protocol version."""
+        h = dict(headers)
+        if session_id:
+            h["Mcp-Session-Id"] = session_id
+        if protocol_version:
+            h["MCP-Protocol-Version"] = protocol_version
+        return h
 
     try:
         for line in sys.stdin:
@@ -919,17 +998,37 @@ def run(
 
             req_id = _extract_id(line)
 
-            req_headers = dict(headers)
-            if session_id:
-                req_headers["Mcp-Session-Id"] = session_id
+            req_headers = _prepare_headers()
 
             def _dispatch(content: str, h: dict[str, str]) -> _StreamResult | None:
+                nonlocal protocol_version
                 detected = _detect_paginated_list(content)
                 if detected:
                     return _paginate_and_stream(
                         client, url, content, h, req_id, detected[1], tracker
                     )
-                return _post_and_stream(client, url, content, h, req_id, tracker)
+                # Capture-once semantics: we only learn the version from the
+                # first initialize. A later client-driven re-initialize that
+                # renegotiates a different version is not picked up — rare, and
+                # avoids re-parsing every response on the hot path.
+                #
+                # Response-only: the version comes from the server's
+                # InitializeResult, not the client's requested version. If a
+                # (non-compliant) server omits result.protocolVersion, no
+                # header is sent rather than guessing — a server that both
+                # omits it and enforces the header would be self-contradictory.
+                capture_init = protocol_version is None and _looks_like_initialize(content)
+                result = _post_and_stream(
+                    client, url, content, h, req_id, tracker, capture_init=capture_init
+                )
+                if (
+                    result is not None
+                    and result.protocol_version
+                    and protocol_version is None
+                ):
+                    protocol_version = result.protocol_version
+                    log(f"negotiated MCP protocol version: {protocol_version}")
+                return result
 
             result = _dispatch(line, req_headers)
             if result is None:
@@ -943,9 +1042,7 @@ def run(
                 new_headers = token_refresher()
                 if new_headers:
                     headers.update(new_headers)
-                    req_headers = dict(headers)
-                    if session_id:
-                        req_headers["Mcp-Session-Id"] = session_id
+                    req_headers = _prepare_headers()
                     result = _dispatch(line, req_headers)
                     if result is None:
                         continue
@@ -967,9 +1064,7 @@ def run(
                     new_headers = scope_upgrader(required_scope)
                     if new_headers:
                         headers.update(new_headers)
-                        req_headers = dict(headers)
-                        if session_id:
-                            req_headers["Mcp-Session-Id"] = session_id
+                        req_headers = _prepare_headers()
                         result = _dispatch(line, req_headers)
                         if result is None:
                             continue
@@ -982,14 +1077,15 @@ def run(
             if result.status_code == 404 and session_id:
                 log("session expired, re-initializing and retrying")
                 session_id = None
-                new_session_id = _reinitialize(client, url, dict(headers))
+                new_session_id = _reinitialize(
+                    client, url, dict(headers), protocol_version
+                )
                 if new_session_id is None:
                     log("re-initialize failed, dropping request")
                     _write_line(_error_response("session lost", req_id))
                     continue
                 session_id = new_session_id
-                req_headers = dict(headers)
-                req_headers["Mcp-Session-Id"] = session_id
+                req_headers = _prepare_headers()
                 result = _dispatch(line, req_headers)
                 if result is None:
                     continue
