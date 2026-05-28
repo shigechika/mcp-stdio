@@ -27,6 +27,7 @@ from mcp_stdio.relay import (
     _extract_id,
     _handle_rate_limit,
     _make_httpx_transport,
+    _normalize_null_arguments,
     _parse_retry_after,
     _parse_www_authenticate_scope,
     _post_and_stream,
@@ -913,6 +914,86 @@ class TestStepUpScopeChallenge:
         assert err["id"] == 1
         # No retry issued after upgrader failure
         assert len(httpx_mock.get_requests()) == 1
+
+
+# --- tools/call arguments:null normalization (typescript-sdk#2012, issue #74) ---
+
+
+class TestNormalizeNullArguments:
+    """Rewrite a tools/call null `arguments` to {} for strict servers."""
+
+    def test_rewrites_null_arguments_to_empty_object(self):
+        line = '{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"t","arguments":null}}'
+        out = json.loads(_normalize_null_arguments(line))
+        assert out["params"]["arguments"] == {}
+
+    def test_absent_arguments_stays_absent(self):
+        """Missing arguments must NOT be synthesized to {}."""
+        line = '{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"t"}}'
+        out = json.loads(_normalize_null_arguments(line))
+        assert "arguments" not in out["params"]
+
+    def test_empty_object_arguments_untouched(self):
+        line = '{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"t","arguments":{}}}'
+        assert _normalize_null_arguments(line) == line
+
+    def test_populated_arguments_untouched(self):
+        line = '{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"t","arguments":{"x":1}}}'
+        assert _normalize_null_arguments(line) == line
+
+    def test_non_tools_call_with_null_arguments_untouched(self):
+        line = '{"jsonrpc":"2.0","method":"prompts/get","id":1,"params":{"name":"p","arguments":null}}'
+        assert _normalize_null_arguments(line) == line
+
+    def test_false_positive_in_string_value_untouched(self):
+        """A string value containing the literal "arguments":null must not be rewritten."""
+        line = '{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"t","arguments":{"note":"\\"arguments\\":null"}}}'
+        out = json.loads(_normalize_null_arguments(line))
+        # arguments object preserved exactly (not clobbered to {})
+        assert out["params"]["arguments"] == {"note": '"arguments":null'}
+
+    def test_batch_array_passed_through(self):
+        """JSON-RPC batch arrays are out of scope and pass through unchanged."""
+        line = '[{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"t","arguments":null}}]'
+        assert _normalize_null_arguments(line) == line
+
+    def test_malformed_json_passed_through(self):
+        line = '{"method":"tools/call","arguments":null'  # truncated
+        assert _normalize_null_arguments(line) == line
+
+
+class TestRunNormalizeArguments:
+    """Integration: the flag controls outbound rewrite on the wire."""
+
+    def _run(self, httpx_mock, stdin_lines, **kwargs):
+        stdin_data = "\n".join(stdin_lines) + "\n"
+        with patch("sys.stdin", StringIO(stdin_data)), patch("sys.stdout", StringIO()):
+            run("https://example.com/mcp", {"Content-Type": "application/json"}, **kwargs)
+
+    def test_default_rewrites_on_wire(self, httpx_mock):
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+        self._run(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"t","arguments":null}}'],
+        )
+        sent = json.loads(httpx_mock.get_requests()[0].read())
+        assert sent["params"]["arguments"] == {}
+
+    def test_opt_out_forwards_verbatim(self, httpx_mock):
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+        self._run(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"t","arguments":null}}'],
+            normalize_arguments=False,
+        )
+        sent = json.loads(httpx_mock.get_requests()[0].read())
+        assert sent["params"]["arguments"] is None
 
 
 # --- auto-pagination (anthropics/claude-code#39586) ---

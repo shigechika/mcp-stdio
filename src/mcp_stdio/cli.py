@@ -269,6 +269,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--no-normalize-arguments",
+        action="store_true",
+        help=(
+            "Disable tools/call argument normalization. By default mcp-stdio "
+            "rewrites a tools/call request whose arguments field is null to "
+            "an empty object {}, so strict servers that reject the null form "
+            "(modelcontextprotocol/typescript-sdk#2012) accept the call. Opt "
+            "out to forward the client request verbatim."
+        ),
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="Check connection to the MCP server and exit",
@@ -363,9 +374,10 @@ def main() -> None:
 
     # run() ignores sse_read_timeout (Streamable HTTP doesn't hold a
     # long-lived GET), so only pass it through on the SSE path.
-    # tcp_keepalive and cancel_filter apply to both transports.
+    # tcp_keepalive, cancel_filter and normalize_arguments apply to both.
     tcp_keepalive = not args.no_tcp_keepalive
     cancel_filter = not args.no_cancel_filter
+    normalize_arguments = not args.no_normalize_arguments
     if args.transport == "sse":
         run_sse(
             url=args.url,
@@ -375,6 +387,7 @@ def main() -> None:
             sse_read_timeout=args.sse_read_timeout,
             tcp_keepalive=tcp_keepalive,
             cancel_filter=cancel_filter,
+            normalize_arguments=normalize_arguments,
             token_refresher=token_refresher,
             scope_upgrader=scope_upgrader,
         )
@@ -386,6 +399,7 @@ def main() -> None:
             timeout_read=args.timeout_read,
             tcp_keepalive=tcp_keepalive,
             cancel_filter=cancel_filter,
+            normalize_arguments=normalize_arguments,
             token_refresher=token_refresher,
             scope_upgrader=scope_upgrader,
         )
