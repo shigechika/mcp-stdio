@@ -145,6 +145,22 @@ def log(msg: str) -> None:
     print(f"[mcp-stdio] {msg}", file=sys.stderr, flush=True)
 
 
+# Serializes writes to stdout. ``run_sse`` drives two writers — the SSE
+# reader thread (message events via ``_emit``) and the main loop (error
+# responses) — and ``print`` is not atomic across the content and its
+# trailing newline, so without this lock a POST error coinciding with a
+# message event could interleave mid-line and corrupt the NDJSON wire
+# format. ``run`` is single-threaded and pays only an uncontended lock.
+_STDOUT_LOCK = threading.Lock()
+
+
+def _write_line(line: str) -> None:
+    """Write one line to stdout atomically (content + newline under a lock)."""
+    with _STDOUT_LOCK:
+        sys.stdout.write(f"{line}\n")
+        sys.stdout.flush()
+
+
 def _extract_id(line: str) -> Any:
     """Extract JSON-RPC id from request line."""
     try:
@@ -336,22 +352,22 @@ def _emit(line: str, tracker: "_CancelTracker | None") -> None:
     an answer for the line it just sent.
     """
     if tracker is None:
-        print(line, flush=True)
+        _write_line(line)
         return
     try:
         msg = json.loads(line)
     except (json.JSONDecodeError, TypeError):
-        print(line, flush=True)
+        _write_line(line)
         return
     if not isinstance(msg, dict):
-        print(line, flush=True)
+        _write_line(line)
         return
     rid = msg.get("id")
     if rid is not None and ("result" in msg or "error" in msg):
         if tracker.contains(rid):
             log(f"dropped late response for cancelled id {rid!r}")
             return
-    print(line, flush=True)
+    _write_line(line)
 
 
 class _StreamResult:
@@ -460,7 +476,7 @@ def _post_and_stream(
                 time.sleep(RETRY_DELAY * attempt)
 
     log(f"request failed after retries: {last_error}")
-    print(_error_response(str(last_error), req_id), flush=True)
+    _write_line(_error_response(str(last_error), req_id))
     return None
 
 
@@ -534,7 +550,7 @@ def _post_parsed(
                 time.sleep(RETRY_DELAY * attempt)
 
     log(f"request failed after retries: {last_error}")
-    print(_error_response(str(last_error), req_id), flush=True)
+    _write_line(_error_response(str(last_error), req_id))
     return None, None
 
 
@@ -935,10 +951,7 @@ def run(
                         continue
                 else:
                     log("token refresh failed, returning error")
-                    print(
-                        _error_response("authentication failed", req_id),
-                        flush=True,
-                    )
+                    _write_line(_error_response("authentication failed", req_id))
                     continue
 
             # Insufficient scope (403) — step-up authorization and retry once
@@ -962,10 +975,7 @@ def run(
                             continue
                     else:
                         log("step-up authorization failed, returning error")
-                        print(
-                            _error_response("authorization failed", req_id),
-                            flush=True,
-                        )
+                        _write_line(_error_response("authorization failed", req_id))
                         continue
 
             # Session expired (404) — reset, re-initialize, then retry
@@ -975,7 +985,7 @@ def run(
                 new_session_id = _reinitialize(client, url, dict(headers))
                 if new_session_id is None:
                     log("re-initialize failed, dropping request")
-                    print(_error_response("session lost", req_id), flush=True)
+                    _write_line(_error_response("session lost", req_id))
                     continue
                 session_id = new_session_id
                 req_headers = dict(headers)
@@ -993,10 +1003,7 @@ def run(
             # and intentionally produces no stdout. See #11.
             if result.status_code >= 400:
                 log(f"upstream returned HTTP {result.status_code}")
-                print(
-                    _error_response(f"HTTP {result.status_code}", req_id),
-                    flush=True,
-                )
+                _write_line(_error_response(f"HTTP {result.status_code}", req_id))
     finally:
         client.close()
 
@@ -1210,19 +1217,13 @@ def run_sse(
             if state.endpoint_url is None:
                 if not state.ready.wait(timeout=timeout_read):
                     req_id = _extract_id(line)
-                    print(
-                        _error_response("SSE endpoint unavailable", req_id),
-                        flush=True,
-                    )
+                    _write_line(_error_response("SSE endpoint unavailable", req_id))
                     continue
 
             req_id = _extract_id(line)
             endpoint = state.endpoint_url
             if endpoint is None:
-                print(
-                    _error_response("SSE endpoint unavailable", req_id),
-                    flush=True,
-                )
+                _write_line(_error_response("SSE endpoint unavailable", req_id))
                 continue
 
             try:
@@ -1272,10 +1273,7 @@ def run_sse(
                         )
                     else:
                         log("token refresh failed, returning error")
-                        print(
-                            _error_response("authentication failed", req_id),
-                            flush=True,
-                        )
+                        _write_line(_error_response("authentication failed", req_id))
                         continue
 
                 if resp.status_code == 403 and scope_upgrader:
@@ -1305,23 +1303,15 @@ def run_sse(
                             log(
                                 "step-up authorization failed, returning error"
                             )
-                            print(
-                                _error_response("authorization failed", req_id),
-                                flush=True,
-                            )
+                            _write_line(_error_response("authorization failed", req_id))
                             continue
 
                 if resp.status_code not in (200, 202):
                     log(f"POST returned HTTP {resp.status_code}")
-                    print(
-                        _error_response(
-                            f"HTTP {resp.status_code}", req_id
-                        ),
-                        flush=True,
-                    )
+                    _write_line(_error_response(f"HTTP {resp.status_code}", req_id))
             except httpx.HTTPError as e:
                 log(f"POST failed: {e}")
-                print(_error_response(str(e), req_id), flush=True)
+                _write_line(_error_response(str(e), req_id))
     finally:
         state.stop.set()
         client.close()

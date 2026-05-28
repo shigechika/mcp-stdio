@@ -11,7 +11,7 @@ from typing import Callable
 import httpx
 
 from . import __version__
-from .relay import check_connection, log, run, run_sse
+from .relay import check_connection, run, run_sse
 
 def _non_negative_float(value: str) -> float:
     """argparse type for non-negative floats (rejects negative leeway)."""

@@ -485,7 +485,7 @@ def generate_pkce() -> tuple[str, str]:
 
     Returns (code_verifier, code_challenge).
     """
-    verifier = secrets.token_urlsafe(64)[:96]  # 96 chars, within 43-128
+    verifier = secrets.token_urlsafe(64)[:96]  # ~86 chars, capped well within 43-128
     digest = hashlib.sha256(verifier.encode("ascii")).digest()
     challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
     return verifier, challenge
