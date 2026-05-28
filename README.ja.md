@@ -34,7 +34,7 @@ Bearer token、カスタムヘッダー、OAuth 2.1 認証情報をリモート�
   - [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) Resource Indicators
     - §2 `resource` パラメータを認可リクエスト・トークン交換・**リフレッシュ**に送信
   - [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) PKCE
-    - §4.1–4.2 S256 `code_challenge_method`、96 文字の `code_verifier`
+    - §4.1–4.2 S256 `code_challenge_method`、約 86 文字の `code_verifier`
   - [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628) Device Authorization Grant
     - §3.1 `resource` インジケータ付きデバイス認可リクエスト（RFC 8707）
     - §3.4–3.5 `authorization_pending` / `slow_down`（interval +=5 s）/ `expired_token` / `access_denied` ハンドリング
@@ -49,6 +49,7 @@ Bearer token、カスタムヘッダー、OAuth 2.1 認証情報をリモート�
 - **バックオフ付きリトライ** — 接続エラー時に最大3回リトライ
 - **ストリーミング耐性** — SSE レスポンスをリアルタイムで転送、ストリーム切断時に自動再接続
 - **セッション回復** — 404 でセッション ID をリセットして再試行
+- **プロトコルバージョンヘッダー** — `initialize` 応答から交渉済みの `protocolVersion` を捕捉し、以降の Streamable HTTP リクエストすべてに `MCP-Protocol-Version` を付与（MCP 仕様 rev 2025-06-18）。このヘッダーを強制するサーバーは未送信時に初期化後リクエストを `400 Bad Request` で拒否する
 - **401 時の自動トークンリフレッシュ** — セッション中に OAuth トークンが失効しても自動更新
 - **Bearer token 認証** — `--bearer-token` フラグまたは `MCP_BEARER_TOKEN` 環境変数
 - **カスタムヘッダー** — `-H` / `--header` で任意のヘッダーを送信
@@ -206,7 +207,7 @@ Claude Code・mcp-remote・Windows の既知の問題については [WORKAROUND
 
 トランスポート別の挙動：
 
-- **Streamable HTTP**（デフォルト）— 各メッセージを単一 POST で送信。`Mcp-Session-Id` ヘッダーでセッション状態を追跡し、404 時は自動で再初期化。
+- **Streamable HTTP**（デフォルト）— 各メッセージを単一 POST で送信。`Mcp-Session-Id` ヘッダーでセッション状態を追跡し、404 時は自動で再初期化。交渉済みの `MCP-Protocol-Version` ヘッダーを初期化後の全リクエストに付与（仕様 rev 2025-06-18）。
 - **SSE**（MCP 2024-11-05 レガシー）— 持続的な `GET` ストリームで応答と初回の `endpoint` イベント（POST 先 URL）を受信。ストリーム切断時は自動再接続。
 
 OAuth トークンは `~/.config/mcp-stdio/tokens.json` に保存されます（パーミッション 0600）。

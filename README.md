@@ -36,7 +36,7 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
   - [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) Resource Indicators
     - §2 `resource` parameter in authorization, token exchange, **and refresh** requests
   - [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) PKCE
-    - §4.1–4.2 S256 `code_challenge_method` with a 96-char `code_verifier`
+    - §4.1–4.2 S256 `code_challenge_method` with a ~86-char `code_verifier`
   - [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628) Device Authorization Grant
     - §3.1 device authorization request with `resource` indicator (RFC 8707)
     - §3.4–3.5 token polling with `authorization_pending` / `slow_down` (interval +=5 s) / `expired_token` / `access_denied` handling
@@ -51,6 +51,7 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
 - **Retry with backoff** — retries up to 3 times on connection errors
 - **Streaming resilience** — streams SSE responses in real time; auto-reconnects on mid-stream disconnect
 - **Session recovery** — resets MCP session ID on 404 and retries
+- **Protocol version header** — captures the negotiated `protocolVersion` from the `initialize` response and injects `MCP-Protocol-Version` on every subsequent Streamable HTTP request (MCP spec rev 2025-06-18); servers that enforce the header would otherwise reject post-initialize requests with `400 Bad Request`
 - **Token refresh on 401** — automatically refreshes expired OAuth tokens mid-session
 - **Bearer token auth** — via `--bearer-token` flag or `MCP_BEARER_TOKEN` env var
 - **Custom headers** — pass any header with `-H` / `--header`
@@ -207,7 +208,7 @@ See [WORKAROUNDS.md](WORKAROUNDS.md) for known issues in Claude Code, mcp-remote
 
 Transport details:
 
-- **Streamable HTTP** (default) — each stdin message is a single POST; session state is tracked via the `Mcp-Session-Id` header and re-initialized automatically on 404.
+- **Streamable HTTP** (default) — each stdin message is a single POST; session state is tracked via the `Mcp-Session-Id` header and re-initialized automatically on 404. The negotiated `MCP-Protocol-Version` header is sent on every post-initialize request (spec rev 2025-06-18).
 - **SSE** (MCP 2024-11-05 legacy) — a persistent `GET` stream delivers responses and the initial `endpoint` event containing the POST URL; the stream auto-reconnects on disconnect.
 
 OAuth tokens are stored in `~/.config/mcp-stdio/tokens.json` (permissions 0600).
