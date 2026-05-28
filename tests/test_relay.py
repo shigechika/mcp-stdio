@@ -50,13 +50,22 @@ class TestWriteLine:
     """
 
     class _RecordingStdout:
-        """stdout stub recording every write() call argument verbatim."""
+        """stdout stub recording every write() call argument verbatim.
+
+        Guards the record list with its own lock so the test stays correct
+        even under a free-threaded interpreter, and so it does not lean on
+        the system-under-test's _STDOUT_LOCK for the recording's own
+        integrity — if that lock were ever removed, writes would still be
+        recorded intact and the assertion would catch the regression.
+        """
 
         def __init__(self):
             self.writes = []
+            self._lock = threading.Lock()
 
         def write(self, s):
-            self.writes.append(s)
+            with self._lock:
+                self.writes.append(s)
 
         def flush(self):
             pass
