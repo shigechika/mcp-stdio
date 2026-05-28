@@ -2,7 +2,6 @@
 
 import email.utils
 import json
-import queue
 import socket
 import threading
 import time
@@ -32,10 +31,82 @@ from mcp_stdio.relay import (
     _post_and_stream,
     _sse_reader_loop,
     _tcp_keepalive_socket_options,
+    _write_line,
     check_connection,
     run,
     run_sse,
 )
+
+
+# --- _write_line ---
+
+
+class TestWriteLine:
+    """Guard the NDJSON wire format against mid-line interleaving.
+
+    run_sse writes to stdout from two threads (the SSE reader and the main
+    loop). _write_line must emit each line's content and trailing newline
+    as a single atomic write so a concurrent writer can never split a line.
+    """
+
+    class _RecordingStdout:
+        """stdout stub recording every write() call argument verbatim.
+
+        Guards the record list with its own lock so the test stays correct
+        even under a free-threaded interpreter, independent of the
+        system-under-test's _STDOUT_LOCK. Note: this test guards the
+        single-write-per-line property — a revert to a two-call print()
+        would surface as bare "\\n" fragments — not _STDOUT_LOCK itself,
+        which protects the underlying buffered stream the stub does not model.
+        """
+
+        def __init__(self):
+            self.writes = []
+            self._lock = threading.Lock()
+
+        def write(self, s):
+            with self._lock:
+                self.writes.append(s)
+
+        def flush(self):
+            pass
+
+    def test_single_write_includes_newline(self):
+        """Content and newline are written in one call, never as two writes."""
+        out = self._RecordingStdout()
+        with patch("mcp_stdio.relay.sys.stdout", out):
+            _write_line('{"id":1}')
+        assert out.writes == ['{"id":1}\n']
+
+    def test_concurrent_writers_never_interleave(self):
+        """Two threads hammering _write_line yield only whole, intact lines."""
+        out = self._RecordingStdout()
+        per_thread = 500
+        expected = {
+            f'{{"t":"{tag}","n":{i}}}\n'
+            for tag in ("a", "b")
+            for i in range(per_thread)
+        }
+
+        def writer(tag):
+            for i in range(per_thread):
+                _write_line(f'{{"t":"{tag}","n":{i}}}')
+
+        with patch("mcp_stdio.relay.sys.stdout", out):
+            threads = [
+                threading.Thread(target=writer, args=(tag,))
+                for tag in ("a", "b")
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        # Every recorded write is exactly one complete line — no bare "\n"
+        # fragments (which a two-call print() would produce) and no partials.
+        assert all(w.endswith("\n") and w.count("\n") == 1 for w in out.writes)
+        assert set(out.writes) == expected
+        assert len(out.writes) == 2 * per_thread
 
 
 # --- _enforce_lf_stdio ---
