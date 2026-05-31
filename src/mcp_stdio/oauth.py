@@ -276,13 +276,14 @@ def _fetch_authorization_server_metadata(
         resp = client.get(well_known)
         if resp.status_code == 200:
             data = resp.json()
-            # RFC 8414 §3: issuer in response must match the URL used for discovery.
-            # Log a warning on mismatch but continue — real servers may be slightly
-            # misconfigured (trailing slash, etc.) and rejecting would be too strict.
+            # RFC 8414 §3.3: the issuer in the response MUST be identical to the
+            # URL used for discovery. We log a warning on mismatch but continue
+            # (the spec says reject) — real servers may be slightly misconfigured
+            # (trailing slash, etc.) and rejecting would be too strict.
             issuer = data.get("issuer")
             if issuer and issuer.rstrip("/") != auth_server_url.rstrip("/"):
                 log(
-                    f"warning: RFC 8414 §3 issuer mismatch — "
+                    f"warning: RFC 8414 §3.3 issuer mismatch — "
                     f"expected {auth_server_url!r}, got {issuer!r}"
                 )
             methods = data.get("token_endpoint_auth_methods_supported")
@@ -518,8 +519,15 @@ def register_client(
     expiry: float | None = None
     if raw_expiry:
         expiry = float(raw_expiry)
+    # RFC 7591 §3.2.1 REQUIRES client_id; use .get() with an explicit error so a
+    # malformed registration response is actionable, not a bare KeyError.
+    client_id = data.get("client_id")
+    if not client_id:
+        raise ValueError(
+            "Client registration response is missing client_id (RFC 7591 §3.2.1)."
+        )
     return ClientRegistration(
-        client_id=data["client_id"],
+        client_id=client_id,
         client_secret=data.get("client_secret"),
         client_secret_expires_at=expiry,
         auth_method=auth_method,
@@ -603,6 +611,20 @@ def _make_callback_handler(
     return Handler
 
 
+def _raise_for_body_error(result: dict[str, Any]) -> None:
+    """Raise RuntimeError if a 200 token response carries an in-body OAuth error.
+
+    Some providers (GitHub legacy) return HTTP 200 with ``error`` /
+    ``error_description`` instead of a token. Applies to both JSON and
+    form-urlencoded bodies — GitHub legacy is precisely the provider that
+    returns the form-urlencoded variant, so skipping the check there would
+    surface as an opaque ``KeyError: 'access_token'`` downstream.
+    """
+    if "error" in result and "access_token" not in result:
+        desc = result.get("error_description", result["error"])
+        raise RuntimeError(f"OAuth token error: {desc}")
+
+
 def _parse_token_response(resp: httpx.Response) -> dict[str, Any]:
     """Parse a token response, handling both JSON and form-urlencoded formats.
 
@@ -613,17 +635,14 @@ def _parse_token_response(resp: httpx.Response) -> dict[str, Any]:
 
     content_type = resp.headers.get("content-type", "")
     if "application/x-www-form-urlencoded" in content_type:
-        result = dict(parse_qs(resp.text, keep_blank_values=True))
+        parsed = dict(parse_qs(resp.text, keep_blank_values=True))
         # parse_qs returns lists; unwrap single values
-        return {k: v[0] if len(v) == 1 else v for k, v in result.items()}
+        result = {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
+        _raise_for_body_error(result)
+        return result
 
     result = resp.json()
-
-    # Some providers return HTTP 200 with error in body (GitHub legacy)
-    if "error" in result and "access_token" not in result:
-        desc = result.get("error_description", result["error"])
-        raise RuntimeError(f"OAuth token error: {desc}")
-
+    _raise_for_body_error(result)
     return result
 
 
@@ -661,8 +680,10 @@ def exchange_code(
         "Accept": "application/json",
     }
     if auth_method == "client_secret_basic" and client_secret:
-        # RFC 6749 §2.3.1: percent-encode client_id and client_secret before
-        # base64-encoding for HTTP Basic auth.
+        # URL-encode client_id and client_secret before base64-encoding for HTTP
+        # Basic auth. RFC 6749 §2.3.1 specifies the form-urlencoded algorithm
+        # (space -> '+'); we use strict percent-encoding (space -> %20), which
+        # real client credentials never exercise and servers accept.
         creds = base64.b64encode(
             f"{quote(client_id, safe='')}:{quote(client_secret, safe='')}".encode()
         ).decode()
@@ -1047,23 +1068,34 @@ def _run_device_authorization_flow(
     da_resp.raise_for_status()
     da = da_resp.json()
 
-    device_code: str = da["device_code"]
-    user_code: str = da["user_code"]
+    # RFC 8628 §3.2 REQUIRED fields. Use .get() with an explicit error so a
+    # malformed AS response yields an actionable message, not a bare KeyError.
+    device_code = da.get("device_code")
+    user_code = da.get("user_code")
+    if not device_code or not user_code:
+        raise ValueError(
+            "Device authorization response is missing device_code/user_code "
+            "(RFC 8628 §3.2)."
+        )
     # RFC 8628 §3.2 mandates ``verification_uri``; Google's device endpoint
     # historically returns the non-standard ``verification_url``. Accept either
-    # so the advertised --oauth-device flow works against Google, with a clear
-    # error if both are absent.
-    verification_uri: str | None = da.get("verification_uri") or da.get(
-        "verification_url"
+    # so the advertised --oauth-device flow works against Google. Validate the
+    # scheme/origin (the URL is presented to the user as an actionable "Open:"
+    # instruction) so a hostile AS cannot phish via a cleartext / non-http(s)
+    # verification URL — mirroring the AS-endpoint validation. See #13.
+    verification_uri = _validate_endpoint_url(
+        da.get("verification_uri") or da.get("verification_url"),
+        label="verification_uri",
     )
     if not verification_uri:
         raise ValueError(
-            "Device authorization response is missing verification_uri "
-            "(RFC 8628 §3.2)."
+            "Device authorization response is missing or has an unsafe "
+            "verification_uri (RFC 8628 §3.2)."
         )
-    verification_uri_complete: str | None = da.get(
-        "verification_uri_complete"
-    ) or da.get("verification_url_complete")
+    verification_uri_complete = _validate_endpoint_url(
+        da.get("verification_uri_complete") or da.get("verification_url_complete"),
+        label="verification_uri_complete",
+    )
     expires_in = int(da.get("expires_in", 1800))
     poll_interval = int(da.get("interval", 5))
 
