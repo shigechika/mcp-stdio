@@ -44,14 +44,23 @@ def _normalize_key(server_url: str) -> str:
     indicator, so end-to-end behaviour is unchanged. Anything that does not
     parse as http(s) with a host is returned unchanged.
     """
+    # ``urlsplit`` is lazy: ``.hostname`` / ``.port`` are what actually raise
+    # ValueError on a malformed authority (e.g. a non-numeric or out-of-range
+    # port), so the whole parse must sit inside the try to honour the
+    # return-unchanged-on-failure contract.
     try:
         parsed = urlsplit(server_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return server_url
+        host = parsed.hostname  # urlsplit lowercases the host and strips userinfo
+        port = parsed.port
     except ValueError:
         return server_url
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        return server_url
-    host = parsed.hostname  # urlsplit lowercases the host and strips userinfo
-    port = parsed.port
+    # ``hostname`` strips the brackets from an IPv6 literal; re-add them so the
+    # rebuilt netloc is a valid, re-parsable URL and ``[::1]:8443`` cannot
+    # collide with another address whose final hextet equals a port.
+    if ":" in host:
+        host = f"[{host}]"
     if port is not None and port != _DEFAULT_PORTS.get(parsed.scheme):
         netloc = f"{host}:{port}"
     else:
@@ -117,20 +126,30 @@ def _migrate_legacy_store() -> None:
             _LEGACY_STORE_FILE.rename(_STORE_FILE)
             os.chmod(_STORE_FILE, stat.S_IRUSR | stat.S_IWUSR)
         except OSError:
-            # rename() raises EXDEV when the legacy and XDG paths are on
-            # different filesystems. Fall back to copy-via-_write_store (which
-            # creates the target 0o600 and atomically replaces) so a
-            # cross-device layout cannot brick every token operation.
-            try:
-                data = json.loads(_LEGACY_STORE_FILE.read_text())
-            except (json.JSONDecodeError, OSError):
-                data = {}
-            if isinstance(data, dict):
-                _write_store(data)
-            try:
-                _LEGACY_STORE_FILE.unlink()
-            except OSError:
-                pass
+            # rename() can fail for two reasons:
+            #  - EXDEV: the legacy and XDG paths are on different filesystems.
+            #  - a concurrent migration (this runs unlocked from load_token)
+            #    already moved the legacy file — racer A's rename() succeeded
+            #    and unlinked the source, so racer B's rename() raises ENOENT.
+            # Only copy-through when the target is still ABSENT and the legacy
+            # file still has REAL data. Guarding on existence is what prevents
+            # the catastrophe: without it, the ENOENT racer would read the now
+            # gone legacy file as {} and _write_store({}) would clobber the
+            # just-migrated store, silently destroying every cached token.
+            if _STORE_FILE.exists() or not _LEGACY_STORE_FILE.exists():
+                pass  # another process won the migration race — leave it intact
+            else:
+                try:
+                    data = json.loads(_LEGACY_STORE_FILE.read_text())
+                except (json.JSONDecodeError, OSError):
+                    data = None
+                # Never write an empty/failed read over the target.
+                if isinstance(data, dict) and data:
+                    _write_store(data)
+                    try:
+                        _LEGACY_STORE_FILE.unlink()
+                    except OSError:
+                        pass
     # Remove legacy directory if empty
     try:
         _LEGACY_STORE_DIR.rmdir()
