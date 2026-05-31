@@ -27,6 +27,12 @@ from .token_store import TokenData, delete_token, load_token, save_token
 # ---------------------------------------------------------------------------
 
 
+# Cap for the RFC 8628 device-flow polling interval (initial ``interval`` and
+# each ``slow_down`` bump). Bounds a hostile/misconfigured AS-supplied value so
+# a single sleep cannot block for hours, mirroring relay.py's Retry-After cap.
+_DEVICE_POLL_CAP_SECS = 60
+
+
 @dataclass
 class OAuthMetadata:
     """Authorization server metadata (RFC 8414)."""
@@ -245,23 +251,25 @@ def _validate_endpoint_url(endpoint_url: str | None, *, label: str) -> str | Non
     return endpoint_url
 
 
-def _build_well_known_url(resource_url: str, suffix: str) -> str:
+def _build_well_known_url(
+    resource_url: str, suffix: str, *, keep_query: bool = False
+) -> str:
     """Build a well-known URL by inserting the suffix between host and path.
 
-    Used for both RFC 8414 §3 (oauth-authorization-server) and RFC 9728 §3.1
-    (oauth-protected-resource). Per RFC 9728 §3.1, the well-known suffix is
-    inserted between the host component and the path and/or query components
-    of the resource identifier; any terminating slash following the host is
-    removed first. The query string is preserved on the constructed URL:
-      https://host/v2?t=1 + oauth-authorization-server ->
-        https://host/.well-known/oauth-authorization-server/v2?t=1
-      https://host + oauth-protected-resource ->
-        https://host/.well-known/oauth-protected-resource
+    For RFC 9728 §3.1 (oauth-protected-resource) the well-known suffix is
+    inserted between the host component and the path *and/or query* components
+    of the resource identifier, so ``keep_query=True`` preserves the query:
+      https://host/v2?t=1 + oauth-protected-resource (keep_query) ->
+        https://host/.well-known/oauth-protected-resource/v2?t=1
+    For RFC 8414 (oauth-authorization-server) the issuer grammar (§2) forbids a
+    query/fragment, so the default ``keep_query=False`` drops it. Any
+    terminating slash after the host is removed first.
     """
     parsed = urlsplit(resource_url)
     path = parsed.path.rstrip("/")
     well_known_path = f"/.well-known/{suffix}{path}"
-    return urlunsplit((parsed.scheme, parsed.netloc, well_known_path, parsed.query, ""))
+    query = parsed.query if keep_query else ""
+    return urlunsplit((parsed.scheme, parsed.netloc, well_known_path, query, ""))
 
 
 def _fetch_authorization_server_metadata(
@@ -271,6 +279,7 @@ def _fetch_authorization_server_metadata(
 
     Returns None on any failure (404, invalid JSON, connection error).
     """
+    # RFC 8414 issuer has no query component, so do not carry one through.
     well_known = _build_well_known_url(auth_server_url, "oauth-authorization-server")
     try:
         resp = client.get(well_known)
@@ -350,7 +359,10 @@ def discover_oauth_metadata(
     # components of the resource identifier. Try the path-aware URL first for
     # path-based reverse-proxy deployments (cf. geelen/mcp-remote#249), then
     # fall back to host-root for servers that publish PRM at the origin.
-    path_aware = _build_well_known_url(server_url, "oauth-protected-resource")
+    # RFC 9728 §3.1 preserves the resource identifier's query component.
+    path_aware = _build_well_known_url(
+        server_url, "oauth-protected-resource", keep_query=True
+    )
     host_root = f"{base}/.well-known/oauth-protected-resource"
     if path_aware not in prm_candidates:
         prm_candidates.append(path_aware)
@@ -780,9 +792,21 @@ def _token_response_to_data(
         except (TypeError, ValueError):
             expires_at = None
 
+    token_type = raw.get("token_type", "Bearer")
+    if token_type.lower() != "bearer":
+        # mcp-stdio always sends the access token as an Authorization: Bearer
+        # credential, so a non-Bearer token_type (e.g. DPoP / mac, RFC 9449)
+        # would be presented in a form the resource server did not issue.
+        # It fails closed (the RS rejects it), but warn so the misconfiguration
+        # is visible instead of a silent downgrade. See RFC 6749 §7.1.
+        log(
+            f"warning: non-Bearer token_type {token_type!r}; "
+            f"mcp-stdio sends it as a Bearer credential anyway"
+        )
+
     return TokenData(
         access_token=raw["access_token"],
-        token_type=raw.get("token_type", "Bearer"),
+        token_type=token_type,
         expires_at=expires_at,
         refresh_token=raw.get("refresh_token") or previous_refresh_token,
         scope=raw.get("scope"),
@@ -1097,7 +1121,11 @@ def _run_device_authorization_flow(
         label="verification_uri_complete",
     )
     expires_in = int(da.get("expires_in", 1800))
-    poll_interval = int(da.get("interval", 5))
+    # Clamp the AS-supplied polling interval to a sane window so a hostile or
+    # misconfigured AS cannot make a single time.sleep block for hours (or
+    # raise on a negative value), mirroring the cap-gated Retry-After sleep in
+    # relay.py. RFC 8628 §3.5 only mandates the +5 s slow_down bump (also capped).
+    poll_interval = max(1, min(int(da.get("interval", 5)), _DEVICE_POLL_CAP_SECS))
 
     # Display instructions on stderr (visible even when stdout is piped to MCP client)
     print("\nDevice authorization required:", file=sys.stderr)
@@ -1111,6 +1139,12 @@ def _run_device_authorization_flow(
     # Step 2: Poll token endpoint (RFC 8628 §3.4 request / §3.5 response)
     # Sleep is at the end of each iteration so the first poll is immediate.
     deadline = time.monotonic() + expires_in
+
+    def _poll_sleep() -> None:
+        # Never sleep past the deadline — a slow_down-inflated interval must not
+        # overshoot the device-code expiry by a whole interval.
+        time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+
     while time.monotonic() < deadline:
         poll_data: dict[str, str] = {
             "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
@@ -1138,7 +1172,7 @@ def _run_device_authorization_flow(
             )
         except Exception as exc:
             log(f"device flow poll error: {exc}")
-            time.sleep(poll_interval)
+            _poll_sleep()
             continue
 
         if tok_resp.status_code == 200:
@@ -1160,20 +1194,20 @@ def _run_device_authorization_flow(
             err = tok_resp.json().get("error", "")
         except Exception:
             tok_resp.raise_for_status()
-            time.sleep(poll_interval)
+            _poll_sleep()
             continue
 
         if err == "authorization_pending":
             pass
         elif err == "slow_down":
-            # RFC 8628 §3.5: increase interval by 5 seconds
-            poll_interval += 5
+            # RFC 8628 §3.5: increase interval by 5 seconds (capped)
+            poll_interval = min(poll_interval + 5, _DEVICE_POLL_CAP_SECS)
         elif err in ("expired_token", "access_denied"):
             raise RuntimeError(f"Device flow failed: {err}")
         else:
             tok_resp.raise_for_status()
 
-        time.sleep(poll_interval)
+        _poll_sleep()
 
     raise TimeoutError(
         "Device authorization timed out. Please restart and try again."
