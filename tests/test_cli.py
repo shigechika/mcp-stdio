@@ -195,6 +195,39 @@ class TestMain:
             assert exc_info.value.code == 2  # argparse error
         assert "must be >= 0" in capsys.readouterr().err
 
+    @pytest.mark.parametrize(
+        "flag", ["--timeout-connect", "--timeout-read", "--sse-read-timeout"]
+    )
+    def test_negative_timeouts_rejected(self, flag, capsys):
+        """Negative duration flags are rejected at parse time, consistent with
+        --oauth-refresh-leeway, instead of flowing into httpx.Timeout."""
+        with patch(
+            "sys.argv", ["mcp-stdio", flag, "-5", "https://example.com/mcp"]
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 2
+        assert "must be >= 0" in capsys.readouterr().err
+
+    def test_sse_read_timeout_zero_still_accepted(self):
+        """--sse-read-timeout 0 (disable) must remain valid — 0 is allowed."""
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--transport",
+                    "sse",
+                    "--sse-read-timeout",
+                    "0",
+                    "https://example.com/mcp",
+                ],
+            ),
+            patch("mcp_stdio.cli.run_sse") as mock_run_sse,
+        ):
+            main()
+            assert mock_run_sse.call_args.kwargs["sse_read_timeout"] == 0.0
+
     def test_oauth_refresh_leeway_invalid_env_var_rejected(self, monkeypatch, capsys):
         """#56: invalid env var values surface as argparse errors, not ValueError."""
         monkeypatch.setenv("MCP_OAUTH_REFRESH_LEEWAY", "not-a-number")
