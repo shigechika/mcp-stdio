@@ -3,10 +3,17 @@
 import os
 import stat
 import sys
+import threading
 
 import pytest
 
-from mcp_stdio.token_store import TokenData, delete_token, load_token, save_token
+from mcp_stdio.token_store import (
+    TokenData,
+    _normalize_key,
+    delete_token,
+    load_token,
+    save_token,
+)
 
 
 class TestTokenData:
@@ -111,6 +118,75 @@ class TestLoadSaveDelete:
         store_file.write_text("not json")
         assert load_token("https://example.com/mcp") is None
 
+    def test_load_unknown_future_field_returns_none(self, tmp_path, monkeypatch):
+        """Forward-compat: an entry written by a newer version carrying a field
+        this version doesn't know must degrade to None, not raise."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        store_file.write_text(
+            '{"https://example.com/mcp": '
+            '{"access_token": "t", "unknown_future_field": 1}}'
+        )
+        assert load_token("https://example.com/mcp") is None
+
+    def test_save_over_corrupt_store_succeeds(self, tmp_path, monkeypatch):
+        """A corrupt store file is replaced (not appended to) on the next save."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        store_file.write_text("not json")
+        save_token("https://example.com/mcp", TokenData(access_token="fresh"))
+        loaded = load_token("https://example.com/mcp")
+        assert loaded is not None and loaded.access_token == "fresh"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX mode bits don't model NTFS ACLs",
+    )
+    def test_store_dir_mode_reenforced_when_preexisting(self, tmp_path, monkeypatch):
+        """A pre-existing store dir with loose perms is tightened to 0o700."""
+        store_dir = tmp_path / "store"
+        store_dir.mkdir(mode=0o755)
+        store_file = store_dir / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", store_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        save_token("https://example.com/mcp", TokenData(access_token="tok"))
+        mode = os.stat(store_dir).st_mode
+        assert mode & stat.S_IRWXG == 0
+        assert mode & stat.S_IRWXO == 0
+
+    def test_concurrent_saves_of_distinct_keys_both_persist(
+        self, tmp_path, monkeypatch
+    ):
+        """The advisory lock serialises read-modify-write so two threads saving
+        distinct server keys merge instead of last-writer-wins."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        # Seed so both threads read a non-empty baseline they each extend.
+        save_token("https://seed.com/mcp", TokenData(access_token="seed"))
+
+        barrier = threading.Barrier(2)
+
+        def worker(n: int) -> None:
+            barrier.wait()
+            save_token(f"https://host{n}.com/mcp", TokenData(access_token=f"t{n}"))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert load_token("https://seed.com/mcp").access_token == "seed"
+        assert load_token("https://host0.com/mcp").access_token == "t0"
+        assert load_token("https://host1.com/mcp").access_token == "t1"
+
     def test_atomic_write_leaves_no_tempfile(self, tmp_path, monkeypatch):
         """Successful save should not leave .tmp files behind."""
         store_file = tmp_path / "tokens.json"
@@ -151,7 +227,120 @@ class TestLoadSaveDelete:
         assert list(tmp_path.glob("tokens.json.tmp*")) == []
 
 
+class TestNormalizeKey:
+    def test_lowercases_host(self):
+        assert (
+            _normalize_key("https://Example.COM/mcp") == "https://example.com/mcp"
+        )
+
+    def test_folds_default_port(self):
+        assert _normalize_key("https://x.com:443/mcp") == "https://x.com/mcp"
+        assert _normalize_key("http://x.com:80/mcp") == "http://x.com/mcp"
+
+    def test_keeps_non_default_port(self):
+        assert _normalize_key("https://x.com:8443/mcp") == "https://x.com:8443/mcp"
+
+    def test_strips_single_trailing_slash(self):
+        assert _normalize_key("https://x.com/mcp/") == "https://x.com/mcp"
+
+    def test_non_http_returned_unchanged(self):
+        assert _normalize_key("not a url") == "not a url"
+
+
+class TestKeyNormalizationInStore:
+    def _patch(self, tmp_path, monkeypatch):
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+        return store_file
+
+    def test_cosmetic_variants_share_one_entry(self, tmp_path, monkeypatch):
+        """Trailing slash / host case / default port resolve to the same token."""
+        self._patch(tmp_path, monkeypatch)
+        save_token("https://Example.com/mcp/", TokenData(access_token="tok"))
+        assert load_token("https://example.com:443/mcp").access_token == "tok"
+
+    def test_legacy_raw_key_still_loads(self, tmp_path, monkeypatch):
+        """An entry written by an older version under the verbatim URL is found
+        via the raw-key fallback."""
+        store_file = self._patch(tmp_path, monkeypatch)
+        store_file.write_text(
+            '{"https://x.com/mcp/": {"access_token": "legacy"}}'
+        )
+        loaded = load_token("https://x.com/mcp/")
+        assert loaded is not None and loaded.access_token == "legacy"
+
+    def test_delete_removes_normalized_and_raw(self, tmp_path, monkeypatch):
+        store_file = self._patch(tmp_path, monkeypatch)
+        # Pre-seed a stale raw-key entry plus a normalized one.
+        store_file.write_text(
+            '{"https://x.com/mcp/": {"access_token": "raw"}}'
+        )
+        save_token("https://x.com/mcp", TokenData(access_token="norm"))
+        delete_token("https://x.com/mcp/")
+        assert load_token("https://x.com/mcp") is None
+        assert load_token("https://x.com/mcp/") is None
+
+
 class TestLegacyMigration:
+    def _set_legacy_mode(self, path, mode):
+        os.chmod(path, mode)
+
+    def test_migrated_file_is_0600_even_if_legacy_was_loose(
+        self, tmp_path, monkeypatch
+    ):
+        """rename() preserves source mode bits; migration must still leave the
+        moved file at 0o600 (and never expose it looser, even transiently)."""
+        if sys.platform == "win32":
+            pytest.skip("POSIX mode bits don't model NTFS ACLs")
+        legacy_dir = tmp_path / "legacy"
+        legacy_file = legacy_dir / "tokens.json"
+        new_dir = tmp_path / "new"
+        new_file = new_dir / "tokens.json"
+        legacy_dir.mkdir()
+        legacy_file.write_text('{"https://example.com/mcp": {"access_token": "old"}}')
+        os.chmod(legacy_file, 0o644)  # loose legacy mode
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", new_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", new_file)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_DIR", legacy_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
+
+        assert load_token("https://example.com/mcp").access_token == "old"
+        mode = os.stat(new_file).st_mode
+        assert mode & stat.S_IRWXG == 0
+        assert mode & stat.S_IRWXO == 0
+
+    def test_migration_survives_cross_device_rename(self, tmp_path, monkeypatch):
+        """An EXDEV (cross-filesystem) rename must not brick the store — the
+        copy-through fallback persists the tokens at the new path."""
+        legacy_dir = tmp_path / "legacy"
+        legacy_file = legacy_dir / "tokens.json"
+        new_dir = tmp_path / "new"
+        new_file = new_dir / "tokens.json"
+        legacy_dir.mkdir()
+        legacy_file.write_text('{"https://example.com/mcp": {"access_token": "old"}}')
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", new_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", new_file)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_DIR", legacy_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
+
+        real_rename = os.rename
+
+        def exdev_rename(src, dst, *a, **k):
+            raise OSError(18, "Invalid cross-device link")  # EXDEV
+
+        monkeypatch.setattr("mcp_stdio.token_store.os.rename", exdev_rename)
+        # Path.rename goes through os.rename under the hood on CPython, but
+        # guard explicitly in case the implementation calls it differently.
+        loaded = load_token("https://example.com/mcp")
+        monkeypatch.setattr("mcp_stdio.token_store.os.rename", real_rename)
+
+        assert loaded is not None and loaded.access_token == "old"
+        assert new_file.exists()
+        assert not legacy_file.exists()
+
     def test_migrate_legacy_to_xdg(self, tmp_path, monkeypatch):
         """Legacy ~/.mcp-stdio/tokens.json is moved to new XDG path."""
         legacy_dir = tmp_path / "legacy"
