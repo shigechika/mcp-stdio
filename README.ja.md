@@ -218,7 +218,7 @@ Claude Code・mcp-remote・Windows の既知の問題については [WORKAROUND
 2. stdin から JSON-RPC メッセージを読み取り（Claude Desktop/Code が送信）
 3. HTTPS でリモート MCP サーバーへ転送
 4. レスポンスをパースして stdout に書き出し
-5. 401 で OAuth トークンをリフレッシュしてリトライ
+5. 401 で（OAuth モードのみ）アクセストークンをリフレッシュしてリトライ。静的な `--bearer-token` / `-H` 認証では 401 をそのままクライアントに返す
 
 トランスポート別の挙動：
 

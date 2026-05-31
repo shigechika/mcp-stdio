@@ -219,7 +219,7 @@ See [WORKAROUNDS.md](WORKAROUNDS.md) for known issues in Claude Code, mcp-remote
 2. Reads JSON-RPC messages from stdin (sent by Claude Desktop/Code)
 3. Relays them over HTTPS to the remote MCP server
 4. Parses responses and writes them to stdout
-5. On 401, refreshes the OAuth token and retries
+5. On 401 (OAuth mode only), refreshes the access token and retries; with static `--bearer-token` / `-H` auth the 401 is surfaced to the client
 
 Transport details:
 
