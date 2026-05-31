@@ -243,6 +243,80 @@ class TestMain:
                 main()
             assert exc_info.value.code == 1
 
+    def test_env_bearer_token_does_not_block_oauth(self, monkeypatch):
+        """An ambient MCP_BEARER_TOKEN must not trip the mutual-exclusion guard
+        against --oauth; the OAuth flow runs and supplies the header."""
+        monkeypatch.setenv("MCP_BEARER_TOKEN", "env-token")
+        with (
+            patch("sys.argv", ["mcp-stdio", "--oauth", "https://example.com/mcp"]),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            mock_ensure.return_value.access_token = "oauth-tok"
+            main()  # must NOT sys.exit(1)
+        headers = mock_run.call_args.kwargs["headers"]
+        # OAuth wins; the ambient env bearer token is ignored.
+        assert headers["Authorization"] == "Bearer oauth-tok"
+
+    def test_explicit_bearer_flag_still_conflicts_with_oauth(self, monkeypatch):
+        """An explicit --bearer-token on the command line still conflicts."""
+        monkeypatch.delenv("MCP_BEARER_TOKEN", raising=False)
+        with patch(
+            "sys.argv",
+            [
+                "mcp-stdio",
+                "https://example.com/mcp",
+                "--oauth",
+                "--bearer-token",
+                "tok",
+            ],
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 1
+
+    def test_dash_h_overrides_bearer_authorization_case_insensitively(self):
+        """A -H differing only in case from a built-in header replaces it,
+        rather than sending two same-named headers (RFC 7230 §3.2)."""
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "https://example.com/mcp",
+                    "--bearer-token",
+                    "tok123",
+                    "-H",
+                    "authorization: Bearer override",
+                ],
+            ),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+            headers = mock_run.call_args.kwargs["headers"]
+            auth_keys = [k for k in headers if k.lower() == "authorization"]
+            assert auth_keys == ["authorization"]
+            assert headers["authorization"] == "Bearer override"
+
+    def test_dash_h_overrides_default_content_type_case_insensitively(self):
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "https://example.com/mcp",
+                    "-H",
+                    "content-type: application/cbor",
+                ],
+            ),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+            headers = mock_run.call_args.kwargs["headers"]
+            ct_keys = [k for k in headers if k.lower() == "content-type"]
+            assert ct_keys == ["content-type"]
+            assert headers["content-type"] == "application/cbor"
+
     def test_check_flag_invokes_check_connection(self):
         """--check should call check_connection and exit with its result."""
         with (
