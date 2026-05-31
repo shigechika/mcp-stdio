@@ -743,6 +743,41 @@ class TestRun:
         assert len(requests) == 2
         assert requests[1].headers["authorization"] == "Bearer new-token"
 
+    def test_401_response_rotated_session_id_used_on_retry(self, httpx_mock):
+        """If the server assigns a NEW Mcp-Session-Id on the 401 response, the
+        refreshed retry must carry it, not the stale/absent one."""
+        # 1: init -> session sess-1
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json", "mcp-session-id": "sess-1"},
+        )
+        # 2: call -> 401 AND rotates the session id to sess-2
+        httpx_mock.add_response(
+            status_code=401,
+            text="",
+            headers={"content-type": "application/json", "mcp-session-id": "sess-2"},
+        )
+        # 3: refreshed retry -> 200
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"ok":true},"id":2}',
+            headers={"content-type": "application/json"},
+        )
+
+        def mock_refresher():
+            return {"Authorization": "Bearer new"}
+
+        self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","method":"init","id":1}',
+                '{"jsonrpc":"2.0","method":"call","id":2}',
+            ],
+            token_refresher=mock_refresher,
+        )
+        reqs = httpx_mock.get_requests()
+        # The refreshed retry (req 2) must carry the rotated session id.
+        assert reqs[2].headers.get("mcp-session-id") == "sess-2"
+
     def test_401_refresh_failure_returns_error(self, httpx_mock):
         httpx_mock.add_response(
             status_code=401,
@@ -1655,6 +1690,72 @@ class TestPagination:
         """Sanity check on the shipped cap."""
         assert MAX_LIST_PAGES >= 1
 
+    def test_page1_jsonrpc_error_object_forwarded_verbatim(self, httpx_mock):
+        """A paginated method answered on page 1 with a JSON-RPC error object
+        (non-dict result) is forwarded as-is, not merged."""
+        err = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32603, "message": "boom"},
+        }
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(err),
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        lines = [json.loads(x) for x in output.strip().splitlines() if x]
+        assert len(lines) == 1
+        assert lines[0]["error"]["message"] == "boom"
+        assert "result" not in lines[0]
+
+    def test_page1_unparseable_body_passes_through(self, httpx_mock):
+        """A page-1 200 with an unparseable body falls back to the streaming
+        passthrough (re-POST via _post_and_stream — idempotent for a list read),
+        forwarding the body as-is rather than merging or crashing."""
+        # Page-1 buffered parse fails, then the streaming fallback re-POSTs.
+        for _ in range(2):
+            httpx_mock.add_response(
+                url=self.URL,
+                text="{not valid json",
+                headers={"content-type": "application/json"},
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        assert output.strip() == "{not valid json"
+        assert len(httpx_mock.get_requests()) == 2
+
+    def test_page2_non_dict_result_flushes_partial(self, httpx_mock):
+        """A page-2 200 with a non-dict result stops pagination and flushes the
+        items accumulated from page 1."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "a"}], "nextCursor": "p2"},
+        }
+        page2 = {"jsonrpc": "2.0", "id": 1, "result": "not-a-dict"}
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(page1),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(page2),
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())
+        assert [t["name"] for t in merged["result"]["tools"]] == ["a"]
+
 
 # --- check_connection ---
 
@@ -1919,6 +2020,29 @@ class TestSseReaderLoop:
         assert state.ready.is_set()
         # endpoint_url stays None to signal failure
         assert state.endpoint_url is None
+
+    def test_generic_exception_safety_net_sets_ready(self, httpx_mock, monkeypatch):
+        """A non-HTTP exception inside the reader must hit the catch-all that
+        sets ready and returns — so run_sse's startup wait() unblocks instead of
+        hanging to the connect timeout."""
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream([b"event: endpoint\ndata: /post\n\n"]),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        def boom(_lines):
+            raise ValueError("unexpected reader error")
+
+        monkeypatch.setattr("mcp_stdio.relay._iter_sse_events", boom)
+        state = _SseState()
+        client = httpx.Client()
+        try:
+            _sse_reader_loop(client, self.URL, {}, state)  # must return, not raise
+        finally:
+            client.close()
+        assert state.ready.is_set()
 
     # --- WHATWG SSE spec compliance ---
 
@@ -2492,6 +2616,103 @@ class TestRunSse:
         assert parsed["error"]["message"] == "HTTP 500"
         assert parsed["id"] == 99
 
+    def test_post_transport_error_emits_single_error_no_retry(self, httpx_mock):
+        """A POST transport error on the SSE path surfaces a single JSON-RPC
+        error and is NOT retried (unlike run()'s streamable path) — pinning the
+        deliberate asymmetry."""
+        post_attempts = {"n": 0}
+        release_stdin = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=xyz\n\n"
+            time.sleep(0.1)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        def post_callback(request):
+            post_attempts["n"] += 1
+            raise httpx.ConnectError("dead")
+
+        httpx_mock.add_callback(
+            post_callback,
+            url="https://example.com/messages?sessionId=xyz",
+            method="POST",
+            is_reusable=True,
+        )
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"test","id":7}\n', release_stdin
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {})
+
+        parsed = json.loads(stdout.getvalue().strip())
+        assert parsed["id"] == 7 and "error" in parsed
+        assert post_attempts["n"] == 1  # no retry on SSE POST transport error
+
+    def test_ready_wait_timeout_during_reconnect_emits_error(self, monkeypatch):
+        """A stdin line arriving while the reader is mid-reconnect (endpoint
+        None and ready not set) must time-bound the wait and emit a single
+        'SSE endpoint unavailable' error — exercising the FIRST reconnect guard
+        (the ready.wait timeout branch). Deterministic via a fake ``ready`` that
+        passes startup once then reports the reconnect wait as timed out."""
+
+        class _FakeReady:
+            def __init__(self):
+                self._calls = 0
+
+            def wait(self, timeout=None):
+                self._calls += 1
+                return self._calls == 1  # startup True; reconnect-wait False
+
+            def set(self):
+                pass
+
+            def clear(self):
+                pass
+
+            def is_set(self):
+                return False
+
+        class _ReconnectingState:
+            def __init__(self):
+                self._reads = 0
+                self.ready = _FakeReady()
+                self.stop = threading.Event()
+
+            @property
+            def endpoint_url(self):
+                self._reads += 1
+                # Bootstrap URL for startup, then None forever (mid-reconnect).
+                return "https://example.com/messages" if self._reads == 1 else None
+
+            @endpoint_url.setter
+            def endpoint_url(self, value):
+                pass
+
+        def fake_reader(client, url, headers, state, tracker=None, headers_lock=None):
+            state.stop.wait(timeout=3)
+
+        monkeypatch.setattr("mcp_stdio.relay._SseState", _ReconnectingState)
+        monkeypatch.setattr("mcp_stdio.relay._sse_reader_loop", fake_reader)
+
+        stdin = StringIO('{"jsonrpc":"2.0","method":"test","id":3}\n')
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {}, timeout_read=0.05)
+
+        msgs = [json.loads(x) for x in stdout.getvalue().strip().splitlines() if x]
+        assert len(msgs) == 1
+        assert msgs[0]["id"] == 3
+        assert msgs[0]["error"]["message"] == "SSE endpoint unavailable"
+
 
 # --- TCP keepalive (#9, step 2) ---
 
@@ -2904,6 +3125,21 @@ class TestEmit:
         t.add(1)
         _emit('{"jsonrpc":"2.0","error":{"code":0,"message":"x"},"id":1}', t)
         assert capsys.readouterr().out == ""
+
+    def test_drops_response_with_cancelled_zero_id(self, capsys):
+        """id 0 is the canonical falsy-id regression class: the gate uses
+        `rid is not None`, so a cancelled id 0 response must still be dropped."""
+        t = _CancelTracker()
+        t.add(0)
+        _emit('{"jsonrpc":"2.0","result":{},"id":0}', t)
+        assert capsys.readouterr().out == ""
+
+    def test_forwards_uncancelled_zero_id(self, capsys):
+        """An id-0 response that was NOT cancelled passes through unchanged."""
+        t = _CancelTracker()
+        t.add(99)
+        _emit('{"jsonrpc":"2.0","result":{},"id":0}', t)
+        assert capsys.readouterr().out.strip() == '{"jsonrpc":"2.0","result":{},"id":0}'
 
     def test_forwards_response_with_uncancelled_id(self, capsys):
         t = _CancelTracker()
