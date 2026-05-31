@@ -559,12 +559,13 @@ class TestMain:
 
 
 class _SpyClient:
-    """httpx.Client stand-in that records whether close() was called."""
+    """httpx.Client stand-in that records close() and construction kwargs."""
 
     instances: list["_SpyClient"] = []
 
     def __init__(self, *a, **k):
         self.closed = False
+        self.kwargs = k
         _SpyClient.instances.append(self)
 
     def close(self):
@@ -589,6 +590,8 @@ class TestBuildTokenRefresher:
         assert out["Authorization"] == "Bearer fresh"
         assert out["X-Base"] == "1"  # base headers preserved
         assert _SpyClient.instances and _SpyClient.instances[-1].closed
+        # AS-controlled redirects must not be auto-followed on the OAuth flow.
+        assert _SpyClient.instances[-1].kwargs.get("follow_redirects") is False
 
     def test_returns_none_on_refresh_failure_and_closes(self, monkeypatch):
         _SpyClient.instances.clear()
@@ -648,3 +651,19 @@ class TestOAuthFailureExit:
                 main()
             assert exc_info.value.code == 1
         assert "OAuth authentication failed" in capsys.readouterr().err
+
+
+class TestOAuthClientHardening:
+    def test_oauth_client_disables_redirects(self, monkeypatch):
+        """The OAuth flow client must not auto-follow AS-controlled redirects."""
+        _SpyClient.instances.clear()
+        monkeypatch.setattr("mcp_stdio.cli.httpx.Client", _SpyClient)
+        with (
+            patch("sys.argv", ["mcp-stdio", "--oauth", "https://example.com/mcp"]),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        assert _SpyClient.instances
+        assert _SpyClient.instances[0].kwargs.get("follow_redirects") is False
