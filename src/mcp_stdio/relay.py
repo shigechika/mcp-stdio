@@ -484,6 +484,54 @@ def _parse_www_authenticate_scope(header: str | None) -> str | None:
     return None
 
 
+# WHATWG Server-Sent Events recognises only CR, LF, and CRLF as line
+# terminators. Python's ``str.splitlines()`` and httpx's ``iter_lines`` split on
+# a much larger set (``\n \r \x0b \x0c \x1c \x1d \x1e \x85 U+2028 U+2029``), but
+# U+2028 / U+2029 / U+0085 are legal *unescaped* inside JSON strings (RFC 8259).
+# Splitting an SSE ``data:`` payload on one of them tears the JSON-RPC message in
+# half — the first fragment is emitted truncated and the continuation is dropped
+# as an unknown field. This is the inbound mirror of the outbound hazard
+# ``_escape_js_line_separators`` already guards (typescript-sdk#2155), so the SSE
+# decoders below split on CR/LF/CRLF only.
+_SSE_LINE_SPLIT_RE = re.compile(r"\r\n|\r|\n")
+
+
+def _split_sse_text(text: str) -> list[str]:
+    """Split a fully-buffered SSE body into lines on CR / LF / CRLF only."""
+    return _SSE_LINE_SPLIT_RE.split(text)
+
+
+def _iter_sse_lines(chunks: Iterable[str]) -> Iterator[str]:
+    """Yield SSE lines from a text-chunk stream, splitting on CR/LF/CRLF only.
+
+    Buffers across chunk boundaries so a ``\\r\\n`` straddling two chunks counts
+    as a single terminator (a trailing ``\\r`` is held back until the next chunk
+    resolves whether it is a lone CR or the first half of a CRLF). The final
+    unterminated remainder is yielded last. Used for the streaming SSE paths,
+    where httpx's ``iter_lines`` would over-split (see ``_SSE_LINE_SPLIT_RE``).
+    """
+    buf = ""
+    for chunk in chunks:
+        if not chunk:
+            continue
+        buf += chunk
+        hold = ""
+        if buf.endswith("\r"):
+            # A trailing CR may be the first half of a CRLF whose LF is in the
+            # next chunk; hold it so the pair is not split into two lines.
+            hold = "\r"
+            buf = buf[:-1]
+        parts = _SSE_LINE_SPLIT_RE.split(buf)
+        buf = parts.pop() + hold
+        for line in parts:
+            yield line
+    if buf.endswith("\r"):
+        # A held CR at end of input is itself a terminator.
+        buf = buf[:-1]
+    if buf:
+        yield buf
+
+
 def _iter_sse_events(lines: Iterable[str]) -> Iterator[tuple[str, str]]:
     """Yield ``(event_type, data)`` pairs from SSE lines per the WHATWG spec.
 
@@ -582,7 +630,7 @@ def _post_and_stream(
                 pv: str | None = None
                 content_type = resp.headers.get("content-type", "")
                 if "text/event-stream" in content_type:
-                    for event_type, payload in _iter_sse_events(resp.iter_lines()):
+                    for event_type, payload in _iter_sse_events(_iter_sse_lines(resp.iter_text())):
                         if event_type != "message":
                             continue
                         if capture_init and pv is None:
@@ -664,7 +712,7 @@ def _post_parsed(
 
             content_type = resp.headers.get("content-type", "")
             if "text/event-stream" in content_type:
-                for event_type, payload in _iter_sse_events(resp.text.splitlines()):
+                for event_type, payload in _iter_sse_events(_split_sse_text(resp.text)):
                     if event_type != "message":
                         continue
                     try:
@@ -921,7 +969,7 @@ def _reinitialize(
     # the recovered session's header matches the version actually in force.
     negotiated = protocol_version
     if "text/event-stream" in resp.headers.get("content-type", ""):
-        for event_type, payload in _iter_sse_events(resp.text.splitlines()):
+        for event_type, payload in _iter_sse_events(_split_sse_text(resp.text)):
             if event_type == "message":
                 pv = _extract_protocol_version(payload)
                 if pv:
@@ -998,7 +1046,7 @@ def check_connection(
         result_data: dict[str, Any] | None = None
 
         if "text/event-stream" in content_type:
-            for event_type, payload in _iter_sse_events(resp.text.splitlines()):
+            for event_type, payload in _iter_sse_events(_split_sse_text(resp.text)):
                 if event_type != "message":
                     continue
                 try:
@@ -1324,7 +1372,7 @@ def _sse_reader_loop(
                     state.ready.set()
                     return
 
-                for event_type, data in _iter_sse_events(resp.iter_lines()):
+                for event_type, data in _iter_sse_events(_iter_sse_lines(resp.iter_text())):
                     if state.stop.is_set():
                         return
                     if event_type == "endpoint":
