@@ -87,7 +87,13 @@ def _build_token_refresher(
         client = httpx.Client(
             timeout=httpx.Timeout(
                 connect=timeout_connect, read=timeout_read, write=30, pool=10
-            )
+            ),
+            # AS-controlled redirects must never be auto-followed: a validated
+            # token endpoint could otherwise 302 the credential POST to a
+            # cleartext / cross-origin host, bypassing the #13 endpoint
+            # validators. httpx already defaults to False; pin it explicitly so
+            # the safety cannot regress.
+            follow_redirects=False,
         )
         try:
             data = refresh_cached_token(server_url, client)
@@ -121,7 +127,13 @@ def _build_scope_upgrader(
         client = httpx.Client(
             timeout=httpx.Timeout(
                 connect=timeout_connect, read=timeout_read, write=30, pool=10
-            )
+            ),
+            # AS-controlled redirects must never be auto-followed: a validated
+            # token endpoint could otherwise 302 the credential POST to a
+            # cleartext / cross-origin host, bypassing the #13 endpoint
+            # validators. httpx already defaults to False; pin it explicitly so
+            # the safety cannot regress.
+            follow_redirects=False,
         )
         try:
             data = step_up_authorize(server_url, client, required_scope)
@@ -355,7 +367,13 @@ def main() -> None:
                 read=args.timeout_read,
                 write=30,
                 pool=10,
-            )
+            ),
+            # Never auto-follow AS-controlled redirects on the OAuth flow — a
+            # validated token endpoint could otherwise 302 the credential POST
+            # (code + client_secret) to a cleartext / cross-origin host,
+            # bypassing the #13 endpoint validators. Explicit despite httpx's
+            # False default so the safety cannot regress.
+            follow_redirects=False,
         )
         try:
             token_data = ensure_token(
