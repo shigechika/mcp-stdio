@@ -162,6 +162,16 @@ def _read_store() -> dict[str, Any]:
     _migrate_legacy_store()
     if not _STORE_FILE.exists():
         return {}
+    # Opportunistically tighten the file mode on read, mirroring the directory
+    # re-chmod in _ensure_store_dir. _write_store always creates the file 0o600,
+    # but a tokens.json that pre-exists with looser permissions (restored from a
+    # backup that lost mode bits, copied under a permissive umask, or written by
+    # a third-party tool) and is only ever read would otherwise keep its mode,
+    # leaving the secrets readable.
+    try:
+        os.chmod(_STORE_FILE, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
+    except OSError:
+        pass
     try:
         return json.loads(_STORE_FILE.read_text())
     except (json.JSONDecodeError, OSError):

@@ -160,6 +160,26 @@ class TestLoadSaveDelete:
         assert mode & stat.S_IRWXG == 0
         assert mode & stat.S_IRWXO == 0
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX mode bits don't model NTFS ACLs",
+    )
+    def test_preexisting_loose_file_mode_tightened_on_read(self, tmp_path, monkeypatch):
+        """A tokens.json that pre-exists with loose perms (and is only read) is
+        tightened to 0o600 on read, not left world-readable."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        store_file.write_text('{"https://example.com/mcp": {"access_token": "t"}}')
+        os.chmod(store_file, 0o644)  # loose, as if restored from a backup
+
+        loaded = load_token("https://example.com/mcp")  # read-only path
+        assert loaded is not None and loaded.access_token == "t"
+        mode = os.stat(store_file).st_mode
+        assert mode & stat.S_IRWXG == 0
+        assert mode & stat.S_IRWXO == 0
+
     def test_concurrent_saves_of_distinct_keys_both_persist(
         self, tmp_path, monkeypatch
     ):
