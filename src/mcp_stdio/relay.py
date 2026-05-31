@@ -1244,6 +1244,16 @@ def run(
             if result.session_id:
                 session_id = result.session_id
 
+            # Recovery is single-pass and ordered auth-before-session: the three
+            # branches below are sequential `if`s (not `elif`), each firing at
+            # most once per stdin line. A 401/403 whose retry returns 404 still
+            # flows into the 404 branch and recovers; the converse does NOT — a
+            # 404 retry that comes back 401/403 (token expired during the reinit
+            # window), or a 401/403 retry that fails the same way again, is not
+            # re-recovered and surfaces as a JSON-RPC error (never a hang, #11).
+            # The downstream client retries at its own level. This bounded
+            # single attempt is deliberate: it avoids unbounded recovery loops.
+
             # Token expired (401) — refresh and retry once
             if result.status_code == 401 and token_refresher:
                 log("received 401, attempting token refresh")
