@@ -349,11 +349,9 @@ class TestDiscoverMetadata:
         assert meta.authorization_endpoint == "https://auth.example.com/authorize"
 
     def test_rfc9728_preserves_query_component(self, httpx_mock):
-        """RFC 9728 §3.1: well-known suffix inserted between host and path+query.
-
-        The resource identifier's query component must be preserved on the
-        constructed metadata URL. mcp-stdio is (as of this test) the only
-        MCP client that honours this corner of §3.1.
+        """RFC 9728 §3.1: the well-known suffix is inserted between the host and
+        the path+query, so the resource identifier's query component is
+        preserved on the constructed metadata URL.
         """
         httpx_mock.add_response(
             url="https://api.example.com/.well-known/oauth-protected-resource/mcp?tenant=t1",
@@ -460,6 +458,27 @@ class TestDiscoverMetadata:
                 "https://auth.example.com/v2/", "oauth-authorization-server"
             )
             == "https://auth.example.com/.well-known/oauth-authorization-server/v2"
+        )
+
+    def test_build_well_known_url_drops_query_for_as_metadata(self):
+        """RFC 8414 issuer has no query component — the default drops it, so a
+        sloppy authorization_servers entry with a query still discovers."""
+        assert (
+            _build_well_known_url(
+                "https://auth.example.com/v2?foo=bar", "oauth-authorization-server"
+            )
+            == "https://auth.example.com/.well-known/oauth-authorization-server/v2"
+        )
+
+    def test_build_well_known_url_keeps_query_when_requested(self):
+        """RFC 9728 §3.1 preserves the resource identifier's query."""
+        assert (
+            _build_well_known_url(
+                "https://api.example.com/mcp?tenant=t1",
+                "oauth-protected-resource",
+                keep_query=True,
+            )
+            == "https://api.example.com/.well-known/oauth-protected-resource/mcp?tenant=t1"
         )
 
     def test_build_well_known_url_deep_path(self):
@@ -1234,6 +1253,27 @@ class TestTokenResponseToData:
         )
         data = _token_response_to_data(raw, meta, "cid", None)
         assert data.expires_at is None
+
+    def test_non_bearer_token_type_warns(self, capsys):
+        """A non-Bearer token_type (DPoP/mac) is stored but warned about, since
+        mcp-stdio always presents it as a Bearer credential."""
+        raw = {"access_token": "at", "token_type": "DPoP"}
+        meta = OAuthMetadata(
+            authorization_endpoint="https://ex.com/auth",
+            token_endpoint="https://ex.com/token",
+        )
+        data = _token_response_to_data(raw, meta, "cid", None)
+        assert data.token_type == "DPoP"
+        assert "non-Bearer token_type" in capsys.readouterr().err
+
+    def test_bearer_token_type_no_warning(self, capsys):
+        raw = {"access_token": "at", "token_type": "bearer"}  # any-case Bearer
+        meta = OAuthMetadata(
+            authorization_endpoint="https://ex.com/auth",
+            token_endpoint="https://ex.com/token",
+        )
+        _token_response_to_data(raw, meta, "cid", None)
+        assert "non-Bearer" not in capsys.readouterr().err
 
 
 # --- _parse_token_response ---
@@ -3304,6 +3344,31 @@ class TestDeviceAuthorizationFlow:
         # slow_down fires on the first poll: interval becomes 6, then sleep(6).
         # Second poll succeeds immediately (no sleep).
         assert intervals == [6]
+
+    def test_hostile_interval_is_clamped(self, httpx_mock, tmp_path, monkeypatch):
+        """A huge AS-supplied interval is capped (and bounded by the deadline)
+        so a single sleep cannot block for hours."""
+        self._patch_store(tmp_path, monkeypatch)
+
+        slept: list[float] = []
+        monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
+
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        # interval=86400 (24h), expires_in=120 — must be clamped to <= 60 and
+        # further bounded by the remaining deadline (~120s).
+        httpx_mock.add_response(
+            url=DEVICE_AUTH_URL, json=_da_response(interval=86400, expires_in=120)
+        )
+        httpx_mock.add_response(
+            url=TOKEN_URL, json={"error": "authorization_pending"}, status_code=400
+        )
+        httpx_mock.add_response(
+            url=TOKEN_URL, json={"access_token": "acc", "token_type": "Bearer"}
+        )
+
+        client = httpx.Client()
+        _run_device_authorization_flow(MCP_URL, client, metadata=_device_meta(), cached=None)
+        assert slept and all(s <= 60 for s in slept)
 
     def test_expired_token_raises(self, httpx_mock, tmp_path, monkeypatch):
         """expired_token error raises RuntimeError immediately."""
