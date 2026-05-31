@@ -230,13 +230,16 @@ class _CancelTracker:
 
     Callers on the stdin side push ids with ``add(id)`` when they see a
     ``notifications/cancelled``; the response-emit path queries with
-    ``contains(id)`` and drops matching responses. Entries expire after
-    ``ttl`` seconds (monotonic clock — immune to NTP jumps), and the
-    internal map is opportunistically garbage-collected when it grows
-    past ``_CANCEL_GC_THRESHOLD`` entries so an adversarial peer cannot
-    leak memory. Both transports share one instance; the SSE reader
-    thread in ``run_sse`` reads concurrently with the main loop, hence
-    the lock.
+    ``consume(id)`` and drops a matching response. ``consume`` removes the
+    entry on the first match, so a cancelled id's late response is dropped
+    exactly once — a later request that legitimately *reuses* the same id
+    (permitted by JSON-RPC once the prior call is done) is then forwarded
+    normally instead of being dropped for the whole TTL window. Entries
+    expire after ``ttl`` seconds (monotonic clock — immune to NTP jumps),
+    and the internal map is opportunistically garbage-collected when it
+    grows past ``_CANCEL_GC_THRESHOLD`` entries so an adversarial peer cannot
+    leak memory. Both transports share one instance; the SSE reader thread
+    in ``run_sse`` reads concurrently with the main loop, hence the lock.
     """
 
     __slots__ = ("_seen", "_lock", "_ttl", "_now")
@@ -271,6 +274,33 @@ class _CancelTracker:
                 return False
             return True
 
+    def consume(self, req_id: Any) -> bool:
+        """Return True for a still-live cancelled id, removing it on match.
+
+        Consuming on the first match bounds the drop to a single response per
+        cancelled id, so a request that reuses the id within the TTL is not
+        collateral-dropped. An expired entry is also removed and returns False.
+        """
+        if req_id is None:
+            return False
+        with self._lock:
+            ts = self._seen.pop(req_id, None)
+            if ts is None:
+                return False
+            return self._now() - ts <= self._ttl
+
+    def discard(self, req_id: Any) -> None:
+        """Untrack an id when the client forwards a fresh request reusing it.
+
+        A new request with a previously-cancelled id supersedes the cancel
+        (JSON-RPC permits id reuse once the prior call is done), so its response
+        must be delivered rather than dropped as a "late cancelled response".
+        """
+        if req_id is None:
+            return
+        with self._lock:
+            self._seen.pop(req_id, None)
+
     def _gc_locked(self) -> None:
         cutoff = self._now() - self._ttl
         expired = [k for k, ts in self._seen.items() if ts < cutoff]
@@ -285,6 +315,12 @@ def _extract_cancel_id(line: str) -> Any:
     stdin line — only cancellation notifications go through the slow
     path. Returns ``None`` if the line is not a cancellation (malformed
     JSON, wrong method, missing params, or missing requestId).
+
+    Only a single (non-batch) ``notifications/cancelled`` is tracked: a
+    cancellation buried inside a JSON-RPC batch array is intentionally not
+    extracted, consistent with the cancel filter passing batches through
+    untouched (the filter's narrow scope mirrors exactly what the spec
+    covers, and batch responses are forwarded verbatim).
     """
     if not _CANCELLED_METHOD_RE.search(line):
         return None
@@ -429,7 +465,7 @@ def _emit(line: str, tracker: "_CancelTracker | None") -> None:
         return
     rid = msg.get("id")
     if rid is not None and ("result" in msg or "error" in msg):
-        if tracker.contains(rid):
+        if tracker.consume(rid):
             log(f"dropped late response for cancelled id {rid!r}")
             return
     _write_line(line)
@@ -1193,6 +1229,10 @@ def run(
                     tracker.add(cid)
 
             req_id = _extract_id(line)
+            if tracker is not None and req_id is not None:
+                # A request reusing a previously-cancelled id supersedes that
+                # cancel — untrack it so its response is delivered, not dropped.
+                tracker.discard(req_id)
 
             req_headers = _prepare_headers()
 
@@ -1567,17 +1607,24 @@ def run_sse(
                 if cid is not None:
                     tracker.add(cid)
 
-            if state.endpoint_url is None:
-                if not state.ready.wait(timeout=timeout_read):
-                    req_id = _extract_id(line)
-                    _write_line(_error_response("SSE endpoint unavailable", req_id))
-                    continue
-
             req_id = _extract_id(line)
+            if tracker is not None and req_id is not None:
+                # A request reusing a previously-cancelled id supersedes that
+                # cancel — untrack it so its response is delivered, not dropped.
+                tracker.discard(req_id)
+            # Resolve the POST endpoint, waiting out a reconnect in progress.
+            # endpoint_url is published lock-free, so a reconnect may clear it in
+            # the TOCTOU window between this check and the read below; if the
+            # capture comes back None, wait on ``ready`` (up to timeout_read) and
+            # re-read once before giving up, rather than failing an otherwise
+            # recoverable in-flight request with a spurious error.
             endpoint = state.endpoint_url
             if endpoint is None:
-                _write_line(_error_response("SSE endpoint unavailable", req_id))
-                continue
+                if state.ready.wait(timeout=timeout_read):
+                    endpoint = state.endpoint_url
+                if endpoint is None:
+                    _write_line(_error_response("SSE endpoint unavailable", req_id))
+                    continue
 
             try:
                 post_timeout = httpx.Timeout(
@@ -1669,10 +1716,13 @@ def run_sse(
                 _write_line(_error_response(str(e), req_id))
     finally:
         state.stop.set()
-        # Give the reader a moment to observe stop at a checkpoint and exit its
-        # own stream context (closing the connection from the owning thread)
-        # before we close the client out from under it. The daemon flag already
-        # guarantees process exit is never blocked; this just avoids closing an
-        # in-flight GET stream from another thread.
+        # Set stop first, then briefly join so the reader can exit its own
+        # stream context when it next reaches a checkpoint. An *idle* GET (the
+        # steady state — the reader is parked in iter_text() between events)
+        # never reaches a checkpoint within the join, so client.close() below
+        # then tears down the pool under it; that is safe — the reader catches
+        # the resulting HTTPError and, because stop is already set, returns
+        # without logging a reconnect. The daemon flag guarantees process exit
+        # is never blocked regardless.
         reader.join(timeout=1.0)
         client.close()
