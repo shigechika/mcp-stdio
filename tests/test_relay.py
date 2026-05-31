@@ -28,11 +28,13 @@ from mcp_stdio.relay import (
     _extract_id,
     _handle_rate_limit,
     _iter_sse_events,
+    _iter_sse_lines,
     _make_httpx_transport,
     _normalize_null_arguments,
     _parse_retry_after,
     _parse_www_authenticate_scope,
     _post_and_stream,
+    _split_sse_text,
     _sse_reader_loop,
     _tcp_keepalive_socket_options,
     _write_line,
@@ -295,6 +297,31 @@ class TestPostAndStream:
             _post_and_stream(client, "https://example.com/mcp", '{"id":1}', {}, 1)
         assert stdout.getvalue().strip() == "a\nb\nc"
 
+    def test_sse_payload_with_raw_unicode_separators_not_corrupted(self, httpx_mock):
+        """A spec-compliant server SSE-framing a JSON-RPC response whose string
+        value contains a raw U+2028/U+2029/U+0085 must reach stdout whole — not
+        torn in half by over-eager inbound line splitting."""
+        seps = "\u2028\u2029\x85"  # escapes in source; raw chars go on the wire
+        payload = json.dumps(
+            {"jsonrpc": "2.0", "result": {"text": f"a{seps}b"}, "id": 1},
+            ensure_ascii=False,
+        )
+        httpx_mock.add_response(
+            stream=IteratorStream([f"data:{payload}\n\n".encode()]),
+            headers={"content-type": "text/event-stream"},
+        )
+        client = httpx.Client()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            _post_and_stream(client, "https://example.com/mcp", '{"id":1}', {}, 1)
+        out = stdout.getvalue().strip()
+        # One NDJSON line (split on LF, the wire delimiter); U+2028/U+2029 are
+        # escaped (the JS line terminators that break clients) and the payload
+        # round-trips losslessly to all three separators intact.
+        assert len(out.split("\n")) == 1
+        assert "\u2028" not in out and "\u2029" not in out  # outbound-escaped
+        assert json.loads(out)["result"]["text"] == f"a{seps}b"
+
     def test_midstream_failure_does_not_retry_or_duplicate(self, httpx_mock):
         """A transient error AFTER a payload was delivered must not replay the
         non-idempotent POST (which would duplicate the response). Instead a
@@ -382,6 +409,43 @@ class TestIterSseEvents:
 
     def test_event_without_data_not_dispatched(self):
         assert list(_iter_sse_events(["event:message", ""])) == []
+
+
+class TestSseLineSplitting:
+    """SSE lines split on CR/LF/CRLF only — NOT the wider str.splitlines() set
+    that would tear a JSON payload containing raw U+2028/U+2029/U+0085."""
+
+    # U+2028 LINE SEP, U+2029 PARAGRAPH SEP, U+0085 NEL, plus VT/FF/FS/GS/RS —
+    # all legal unescaped inside JSON strings (RFC 8259) but split by
+    # str.splitlines(). Written as escapes; the raw chars exist only at runtime.
+    SEPS = "\u2028\u2029\x85\x0b\x0c\x1c\x1d\x1e"
+
+    def test_split_sse_text_only_cr_lf_crlf(self):
+        assert _split_sse_text("a\r\nb\nc\rd") == ["a", "b", "c", "d"]
+
+    def test_split_sse_text_preserves_unicode_separators(self):
+        text = f'data:{{"t":"x{self.SEPS}y"}}\n\n'
+        lines = _split_sse_text(text)
+        # The separators stay inside the single data: line, not split out.
+        assert lines[0] == f'data:{{"t":"x{self.SEPS}y"}}'
+
+    def test_iter_sse_lines_only_cr_lf_crlf(self):
+        assert list(_iter_sse_lines(["a\r", "\nb\n", "c"])) == ["a", "b", "c"]
+
+    def test_iter_sse_lines_crlf_across_chunk_boundary(self):
+        # A \r\n straddling two chunks must count as one terminator.
+        assert list(_iter_sse_lines(["line1\r", "\nline2\n"])) == ["line1", "line2"]
+
+    def test_iter_sse_lines_lone_cr_across_chunks(self):
+        assert list(_iter_sse_lines(["line1\r", "line2"])) == ["line1", "line2"]
+
+    def test_iter_sse_lines_preserves_unicode_separators(self):
+        chunks = [f'data:{{"t":"x{self.SEPS}', 'y"}\n\n']
+        lines = list(_iter_sse_lines(chunks))
+        assert lines[0] == f'data:{{"t":"x{self.SEPS}y"}}'
+
+    def test_iter_sse_lines_trailing_cr_at_eof(self):
+        assert list(_iter_sse_lines(["abc\r"])) == ["abc"]
 
 
 # --- run (integration) ---
@@ -1641,6 +1705,21 @@ class TestCheckConnection:
             'data:{"jsonrpc":"2.0","id":1,"result":'
             '{"protocolVersion":"2024-11-05","serverInfo":{"name":"sse","version":"0.1"},'
             '"capabilities":{}}}\n\n'
+        )
+        httpx_mock.add_response(
+            text=body,
+            headers={"content-type": "text/event-stream"},
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+
+    def test_sse_initialize_with_raw_unicode_separator(self, httpx_mock):
+        """A raw U+2028 in the serverInfo string of an SSE-framed initialize
+        must not split the buffered data: line — --check still parses it."""
+        name = "demo" + chr(0x2028) + "server"  # real U+2028 on the wire
+        body = (
+            f'data:{{"jsonrpc":"2.0","id":1,"result":'
+            f'{{"protocolVersion":"2024-11-05",'
+            f'"serverInfo":{{"name":"{name}","version":"1"}},"capabilities":{{}}}}}}\n\n'
         )
         httpx_mock.add_response(
             text=body,
