@@ -185,12 +185,22 @@ Options:
   --no-resource-indicator
                          Omit the RFC 8707 resource parameter from all OAuth
                          requests. Required for AS that reject it, such as
-                         Microsoft Entra ID v2 with api:// scopes (AADSTS9010010)
+                         Microsoft Entra ID v2 with api:// scopes (AADSTS9010010).
+                         Persisted in the token store so proactive refreshes
+                         and step-up flows stay consistent
   -H, --header 'Key: Value'  Custom header (can be repeated)
   --transport {streamable-http,sse}
                          Transport type (default: streamable-http)
   --timeout-connect SEC  Connection timeout (default: 10)
   --timeout-read SEC     Read timeout (default: 120)
+  --sse-read-timeout SEC Idle read timeout on the SSE GET stream
+                         (default: 300; 0 disables; SSE transport only)
+  --no-tcp-keepalive     Disable TCP keepalive on the HTTP socket
+  --no-cancel-filter     Disable the cancel-aware response filter (drops late
+                         responses for ids cancelled via notifications/cancelled)
+  --no-normalize-arguments
+                         Disable rewriting a tools/call request's
+                         arguments:null to {} before forwarding
   --check                Check connection and exit
   -V, --version          Show version
   -h, --help             Show help

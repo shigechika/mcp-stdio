@@ -184,12 +184,22 @@ mcp-stdio [OPTIONS] URL
                          すべての OAuth リクエストから RFC 8707 resource
                          パラメータを除外する。api:// スコープを使う Microsoft
                          Entra ID v2 など、resource パラメータを拒否する AS
-                         （AADSTS9010010）で必要
+                         （AADSTS9010010）で必要。トークンストアに永続化され、
+                         proactive refresh や step-up フローでも一貫して適用される
   -H, --header 'Key: Value'  カスタムヘッダー（複数指定可）
   --transport {streamable-http,sse}
                          トランスポート種別（デフォルト: streamable-http）
   --timeout-connect SEC  接続タイムアウト（デフォルト: 10秒）
   --timeout-read SEC     読み取りタイムアウト（デフォルト: 120秒）
+  --sse-read-timeout SEC SSE GET ストリームのアイドル読み取りタイムアウト
+                         （デフォルト: 300秒、0 で無効、SSE トランスポートのみ）
+  --no-tcp-keepalive     HTTP ソケットの TCP keepalive を無効化する
+  --no-cancel-filter     cancel-aware レスポンスフィルタを無効化する
+                         （notifications/cancelled でキャンセルされた id の
+                         遅延レスポンスを drop する機能）
+  --no-normalize-arguments
+                         tools/call リクエストの arguments:null を転送前に
+                         {} へ書き換える正規化を無効化する
   --check                接続確認して終了
   -V, --version          バージョン表示
   -h, --help             ヘルプ表示
