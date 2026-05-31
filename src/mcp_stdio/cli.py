@@ -221,19 +221,19 @@ def main() -> None:
     )
     parser.add_argument(
         "--timeout-connect",
-        type=float,
+        type=_non_negative_float,
         default=10,
         help="Connection timeout in seconds (default: 10)",
     )
     parser.add_argument(
         "--timeout-read",
-        type=float,
+        type=_non_negative_float,
         default=120,
         help="Read timeout in seconds (default: 120)",
     )
     parser.add_argument(
         "--sse-read-timeout",
-        type=float,
+        type=_non_negative_float,
         default=300,
         help=(
             "Idle read timeout (seconds) on the SSE GET stream "
