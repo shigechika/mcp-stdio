@@ -4,7 +4,13 @@ from unittest.mock import patch
 
 import pytest
 
-from mcp_stdio.cli import _parse_header, main
+from mcp_stdio.cli import (
+    _build_scope_upgrader,
+    _build_token_refresher,
+    _parse_header,
+    main,
+)
+from mcp_stdio.token_store import TokenData
 
 
 class TestParseHeader:
@@ -550,3 +556,95 @@ class TestMain:
             mock_ensure.return_value.access_token = "tok"
             main()
         assert mock_ensure.call_args.kwargs["resource_indicator"] is False
+
+
+class _SpyClient:
+    """httpx.Client stand-in that records whether close() was called."""
+
+    instances: list["_SpyClient"] = []
+
+    def __init__(self, *a, **k):
+        self.closed = False
+        _SpyClient.instances.append(self)
+
+    def close(self):
+        self.closed = True
+
+
+class TestBuildTokenRefresher:
+    """The refresher closure turns a refreshed token into relay 401-recovery
+    headers. Production-wired but otherwise untested."""
+
+    def test_returns_bearer_headers_and_closes_client(self, monkeypatch):
+        _SpyClient.instances.clear()
+        monkeypatch.setattr("mcp_stdio.cli.httpx.Client", _SpyClient)
+        monkeypatch.setattr(
+            "mcp_stdio.oauth.refresh_cached_token",
+            lambda url, client: TokenData(access_token="fresh"),
+        )
+        refresher = _build_token_refresher(
+            "https://example.com/mcp", {"X-Base": "1"}, 10, 120
+        )
+        out = refresher()
+        assert out["Authorization"] == "Bearer fresh"
+        assert out["X-Base"] == "1"  # base headers preserved
+        assert _SpyClient.instances and _SpyClient.instances[-1].closed
+
+    def test_returns_none_on_refresh_failure_and_closes(self, monkeypatch):
+        _SpyClient.instances.clear()
+        monkeypatch.setattr("mcp_stdio.cli.httpx.Client", _SpyClient)
+        monkeypatch.setattr(
+            "mcp_stdio.oauth.refresh_cached_token", lambda url, client: None
+        )
+        refresher = _build_token_refresher("https://example.com/mcp", {}, 10, 120)
+        assert refresher() is None
+        assert _SpyClient.instances[-1].closed
+
+
+class TestBuildScopeUpgrader:
+    """The upgrader closure runs RFC 9470 step-up and returns broader-scope
+    headers, catching exceptions (unlike the refresher)."""
+
+    def test_returns_bearer_headers_and_closes_client(self, monkeypatch):
+        _SpyClient.instances.clear()
+        monkeypatch.setattr("mcp_stdio.cli.httpx.Client", _SpyClient)
+        monkeypatch.setattr(
+            "mcp_stdio.oauth.step_up_authorize",
+            lambda url, client, scope: TokenData(access_token="upgraded"),
+        )
+        upgrader = _build_scope_upgrader(
+            "https://example.com/mcp", {"X-Base": "1"}, 10, 120
+        )
+        out = upgrader("hr:read hr:write")
+        assert out["Authorization"] == "Bearer upgraded"
+        assert out["X-Base"] == "1"
+        assert _SpyClient.instances[-1].closed
+
+    def test_returns_none_when_step_up_raises_and_closes(self, monkeypatch, capsys):
+        _SpyClient.instances.clear()
+        monkeypatch.setattr("mcp_stdio.cli.httpx.Client", _SpyClient)
+
+        def boom(url, client, scope):
+            raise RuntimeError("step-up denied")
+
+        monkeypatch.setattr("mcp_stdio.oauth.step_up_authorize", boom)
+        upgrader = _build_scope_upgrader("https://example.com/mcp", {}, 10, 120)
+        assert upgrader("hr:read") is None
+        assert _SpyClient.instances[-1].closed
+        assert "step-up authorization failed" in capsys.readouterr().err
+
+
+class TestOAuthFailureExit:
+    def test_ensure_token_failure_exits_1_with_message(self, capsys):
+        """A failing OAuth flow at startup prints a clear error and exits 1."""
+        with (
+            patch("sys.argv", ["mcp-stdio", "--oauth", "https://example.com/mcp"]),
+            patch(
+                "mcp_stdio.oauth.ensure_token",
+                side_effect=RuntimeError("browser closed"),
+            ),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 1
+        assert "OAuth authentication failed" in capsys.readouterr().err
