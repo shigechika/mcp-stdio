@@ -1,5 +1,6 @@
 """Tests for mcp_stdio.token_store module."""
 
+import json
 import os
 import stat
 import sys
@@ -246,6 +247,23 @@ class TestNormalizeKey:
     def test_non_http_returned_unchanged(self):
         assert _normalize_key("not a url") == "not a url"
 
+    def test_malformed_port_returned_unchanged_not_raised(self):
+        """A non-numeric / out-of-range port must not raise (the ValueError
+        comes from the lazy .port access) — return the URL verbatim."""
+        assert (
+            _normalize_key("http://example.com:notaport/mcp")
+            == "http://example.com:notaport/mcp"
+        )
+        huge = "https://example.com:99999999999999999999/mcp"
+        assert _normalize_key(huge) == huge
+
+    def test_ipv6_brackets_preserved(self):
+        """IPv6 literals keep their brackets so the key is re-parsable and two
+        addresses cannot collide via the host/port colon ambiguity."""
+        assert _normalize_key("https://[::1]:8443/mcp") == "https://[::1]:8443/mcp"
+        # Default port still folds out, brackets retained.
+        assert _normalize_key("https://[::1]:443/mcp") == "https://[::1]/mcp"
+
 
 class TestKeyNormalizationInStore:
     def _patch(self, tmp_path, monkeypatch):
@@ -340,6 +358,46 @@ class TestLegacyMigration:
         assert loaded is not None and loaded.access_token == "old"
         assert new_file.exists()
         assert not legacy_file.exists()
+
+    def test_concurrent_migration_race_does_not_clobber_store(
+        self, tmp_path, monkeypatch
+    ):
+        """If a concurrent migration already moved the legacy file (racer B's
+        rename raises ENOENT after racer A migrated), the fallback must NOT
+        overwrite the just-migrated store with an empty dict — the cached
+        tokens must survive."""
+        legacy_dir = tmp_path / "legacy"
+        legacy_file = legacy_dir / "tokens.json"
+        new_dir = tmp_path / "new"
+        new_file = new_dir / "tokens.json"
+        legacy_dir.mkdir()
+        legacy_file.write_text(
+            '{"https://example.com/mcp": {"access_token": "SECRET"}}'
+        )
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", new_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", new_file)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_DIR", legacy_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
+
+        real_rename = os.rename
+
+        def racing_rename(src, dst, *a, **k):
+            # Simulate racer A winning between our exists()-check and rename():
+            # actually migrate, then raise ENOENT as racer B would observe.
+            new_dir.mkdir(parents=True, exist_ok=True)
+            real_rename(src, dst)
+            raise FileNotFoundError(2, "No such file or directory")
+
+        monkeypatch.setattr("mcp_stdio.token_store.os.rename", racing_rename)
+        loaded = load_token("https://example.com/mcp")
+        monkeypatch.setattr("mcp_stdio.token_store.os.rename", real_rename)
+
+        # The migrated token must still be there — not clobbered to {}.
+        assert loaded is not None and loaded.access_token == "SECRET"
+        assert json.loads(new_file.read_text()) == {
+            "https://example.com/mcp": {"access_token": "SECRET"}
+        }
 
     def test_migrate_legacy_to_xdg(self, tmp_path, monkeypatch):
         """Legacy ~/.mcp-stdio/tokens.json is moved to new XDG path."""
