@@ -3,3 +3,9 @@ __pycache__/
 *.pyc
 dist/
 *.egg-info/
+
+# Coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
