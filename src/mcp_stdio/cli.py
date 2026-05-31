@@ -150,7 +150,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--bearer-token",
-        default=os.environ.get("MCP_BEARER_TOKEN", ""),
+        default=None,
         help="Bearer token for authentication (or set MCP_BEARER_TOKEN env var)",
     )
     parser.add_argument(
@@ -299,7 +299,21 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    n_auth = sum([args.oauth, args.oauth_device, bool(args.bearer_token)])
+    # An explicit --bearer-token on the command line is distinct from an
+    # ambient MCP_BEARER_TOKEN env var. Only the explicit flag participates in
+    # the mutual-exclusion check, so leaving MCP_BEARER_TOKEN exported in the
+    # shell / host config does not block --oauth (the OAuth flow then supplies
+    # the Authorization header and the env token is ignored).
+    bearer_from_flag = args.bearer_token is not None
+    bearer_token = (
+        args.bearer_token
+        if bearer_from_flag
+        else os.environ.get("MCP_BEARER_TOKEN", "")
+    )
+
+    n_auth = sum(
+        [args.oauth, args.oauth_device, bool(bearer_from_flag and bearer_token)]
+    )
     if n_auth > 1:
         print(
             "error: --oauth, --oauth-device, and --bearer-token are mutually exclusive",
@@ -307,15 +321,26 @@ def main() -> None:
         )
         sys.exit(1)
 
+    # When an OAuth flow is selected, ignore any ambient env bearer token —
+    # the flow below sets the Authorization header itself.
+    if args.oauth or args.oauth_device:
+        bearer_token = ""
+
     # Build headers
     headers: dict[str, str] = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
     }
-    if args.bearer_token:
-        headers["Authorization"] = f"Bearer {args.bearer_token}"
+    if bearer_token:
+        headers["Authorization"] = f"Bearer {bearer_token}"
     for h in args.headers:
         key, value = _parse_header(h)
+        # HTTP header names are case-insensitive (RFC 7230 §3.2). Drop any
+        # existing header that differs only in case so an explicit -H overrides
+        # the built-in default (e.g. -H 'authorization: ...' replaces the
+        # bearer Authorization) instead of sending two same-named headers.
+        for existing in [k for k in headers if k.lower() == key.lower()]:
+            del headers[existing]
         headers[key] = value
 
     # OAuth flow (before relay starts)
