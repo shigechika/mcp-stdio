@@ -209,6 +209,42 @@ def _validate_prm_hint_url(hint_url: str, server_url: str) -> bool:
     return True
 
 
+def _validate_endpoint_url(endpoint_url: str | None, *, label: str) -> str | None:
+    """Validate an AS-metadata-declared endpoint URL before any secret is sent.
+
+    The AS base URL is validated against the #13 "no plaintext token leak"
+    policy, but the endpoints *inside* the fetched metadata
+    (authorization/token/registration/device) are attacker-influenced: a
+    hostile or compromised authorization server could declare
+    ``token_endpoint="http://evil/token"`` and exfiltrate the authorization
+    code, client_secret, and refresh_token in cleartext. Apply the same policy
+    here — reject non-http(s) schemes and reject plain HTTP for non-loopback
+    hosts — returning ``None`` (with a warning) so the caller drops the unsafe
+    endpoint rather than POSTing credentials to it. See #13.
+    """
+    if not endpoint_url:
+        return None
+    try:
+        parsed = urlparse(endpoint_url)
+    except Exception:
+        log(f"warning: malformed {label} URL {endpoint_url!r}, ignoring")
+        return None
+    if parsed.scheme not in ("https", "http"):
+        log(
+            f"warning: unsupported {label} scheme {parsed.scheme!r} "
+            f"in {endpoint_url!r}, ignoring"
+        )
+        return None
+    if parsed.scheme == "http" and not _is_loopback(parsed.hostname or ""):
+        log(
+            f"warning: refusing non-loopback HTTP {label} {endpoint_url!r} "
+            f"— OAuth credentials would traverse the wire in cleartext. "
+            f"Ignoring. See #13."
+        )
+        return None
+    return endpoint_url
+
+
 def _build_well_known_url(resource_url: str, suffix: str) -> str:
     """Build a well-known URL by inserting the suffix between host and path.
 
@@ -250,12 +286,27 @@ def _fetch_authorization_server_metadata(
                     f"expected {auth_server_url!r}, got {issuer!r}"
                 )
             methods = data.get("token_endpoint_auth_methods_supported")
+            # Validate every endpoint the metadata declares against the #13
+            # cleartext-leak policy before it can receive a secret. An unsafe
+            # authorization/token endpoint falls back to the default path on
+            # the already-validated AS base URL; an unsafe optional endpoint is
+            # dropped to None.
             return OAuthMetadata(
-                authorization_endpoint=data.get("authorization_endpoint")
+                authorization_endpoint=_validate_endpoint_url(
+                    data.get("authorization_endpoint"), label="authorization_endpoint"
+                )
                 or f"{auth_server_url}/authorize",
-                token_endpoint=data.get("token_endpoint") or f"{auth_server_url}/token",
-                registration_endpoint=data.get("registration_endpoint") or None,
-                device_authorization_endpoint=data.get("device_authorization_endpoint") or None,
+                token_endpoint=_validate_endpoint_url(
+                    data.get("token_endpoint"), label="token_endpoint"
+                )
+                or f"{auth_server_url}/token",
+                registration_endpoint=_validate_endpoint_url(
+                    data.get("registration_endpoint"), label="registration_endpoint"
+                ),
+                device_authorization_endpoint=_validate_endpoint_url(
+                    data.get("device_authorization_endpoint"),
+                    label="device_authorization_endpoint",
+                ),
                 token_endpoint_auth_methods_supported=methods if isinstance(methods, list) else None,
             )
     except Exception:
@@ -700,7 +751,13 @@ def _token_response_to_data(
     """
     expires_at = None
     if "expires_in" in raw:
-        expires_at = time.time() + raw["expires_in"]
+        # ``expires_in`` is numeric in JSON responses but a string in
+        # form-urlencoded ones (GitHub-legacy path via _parse_token_response).
+        # Coerce defensively so a string value cannot crash the whole flow.
+        try:
+            expires_at = time.time() + float(raw["expires_in"])
+        except (TypeError, ValueError):
+            expires_at = None
 
     return TokenData(
         access_token=raw["access_token"],
@@ -841,6 +898,12 @@ def _run_authorization_flow(
         params["scope"] = scope
 
     auth_url = f"{metadata.authorization_endpoint}?{urlencode(params)}"
+    # The full URL (including the single-use CSRF ``state`` nonce and the
+    # public S256 ``code_challenge``) is logged deliberately so the user can
+    # complete the flow manually when the browser does not auto-open. ``state``
+    # is single-use and timeout-bounded and the PKCE secret (``code_verifier``)
+    # is never logged, so this is an accepted UX-over-defence-in-depth tradeoff
+    # rather than a token leak — authorize URLs do appear in stderr logs.
     log(f"authorize URL (open in browser if not auto-opened):\n{auth_url}")
 
     webbrowser.open(auth_url)
@@ -986,8 +1049,21 @@ def _run_device_authorization_flow(
 
     device_code: str = da["device_code"]
     user_code: str = da["user_code"]
-    verification_uri: str = da["verification_uri"]
-    verification_uri_complete: str | None = da.get("verification_uri_complete")
+    # RFC 8628 §3.2 mandates ``verification_uri``; Google's device endpoint
+    # historically returns the non-standard ``verification_url``. Accept either
+    # so the advertised --oauth-device flow works against Google, with a clear
+    # error if both are absent.
+    verification_uri: str | None = da.get("verification_uri") or da.get(
+        "verification_url"
+    )
+    if not verification_uri:
+        raise ValueError(
+            "Device authorization response is missing verification_uri "
+            "(RFC 8628 §3.2)."
+        )
+    verification_uri_complete: str | None = da.get(
+        "verification_uri_complete"
+    ) or da.get("verification_url_complete")
     expires_in = int(da.get("expires_in", 1800))
     poll_interval = int(da.get("interval", 5))
 
@@ -1000,7 +1076,7 @@ def _run_device_authorization_flow(
         print(f"  Enter code: {user_code}", file=sys.stderr)
     print(f"\nWaiting for authorization (expires in {expires_in}s)...", file=sys.stderr)
 
-    # Step 2: Poll token endpoint (RFC 8628 §3.5)
+    # Step 2: Poll token endpoint (RFC 8628 §3.4 request / §3.5 response)
     # Sleep is at the end of each iteration so the first poll is immediate.
     deadline = time.monotonic() + expires_in
     while time.monotonic() < deadline:
