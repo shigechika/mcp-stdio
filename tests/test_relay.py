@@ -530,6 +530,46 @@ class TestRun:
         assert replay_body["method"] == "call"
         assert replay_body["id"] == 2
 
+    def test_401_retry_exhaustion_resets_session_id(self, httpx_mock):
+        """When a 401-refresh retry exhausts all retries (connection dead), the
+        session id is reset — the next request must not re-send a maybe-stale
+        Mcp-Session-Id, matching the top-level retries-exhausted policy."""
+        # 1: init -> establishes sess-1
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json", "mcp-session-id": "sess-1"},
+        )
+        # 2: call -> 401 (triggers refresh)
+        httpx_mock.add_response(
+            status_code=401, text="", headers={"content-type": "application/json"}
+        )
+        # 3-5: refreshed retry exhausts all retries with connection errors
+        for _ in range(MAX_RETRIES):
+            httpx_mock.add_exception(httpx.ConnectError("dead"))
+        # 6: a later call -> 200 (must carry NO session header)
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":3}',
+            headers={"content-type": "application/json"},
+        )
+
+        def refresher():
+            return {"Authorization": "Bearer new"}
+
+        with patch("mcp_stdio.relay.time.sleep"):
+            self._run_with_stdin(
+                httpx_mock,
+                [
+                    '{"jsonrpc":"2.0","method":"init","id":1}',
+                    '{"jsonrpc":"2.0","method":"call","id":2}',
+                    '{"jsonrpc":"2.0","method":"call","id":3}',
+                ],
+                token_refresher=refresher,
+            )
+
+        reqs = httpx_mock.get_requests()
+        # The final request must not carry the (possibly stale) session id.
+        assert "mcp-session-id" not in reqs[-1].headers
+
     def test_reinitialize_failure_returns_error(self, httpx_mock):
         """If the post-404 re-initialize fails, we surface a JSON-RPC error
         instead of silently dropping the original request."""
@@ -891,6 +931,49 @@ class TestProtocolVersionHeader:
         assert "mcp-protocol-version" not in reqs[2].headers  # renegotiation
         assert reqs[3].headers["mcp-protocol-version"] == "2025-06-18"
         assert reqs[4].headers["mcp-protocol-version"] == "2025-06-18"
+
+    def test_reinitialize_recaptures_renegotiated_version(self, httpx_mock):
+        """If the 404-recovery handshake renegotiates a DIFFERENT version, the
+        gateway must switch to it — not keep injecting the stale original."""
+        # 1: initialize -> negotiate 2025-06-18, session sess-1
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"protocolVersion":"2025-06-18"},"id":1}',
+            headers={"content-type": "application/json", "mcp-session-id": "sess-1"},
+        )
+        # 2: tools/call -> 404 (session expired)
+        httpx_mock.add_response(
+            status_code=404, text="", headers={"content-type": "application/json"}
+        )
+        # 3: reinit initialize -> server DOWNGRADES to 2024-11-05, new session
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"protocolVersion":"2024-11-05"},"id":0}',
+            headers={"content-type": "application/json", "mcp-session-id": "sess-2"},
+        )
+        # 4: reinit notifications/initialized -> 202
+        httpx_mock.add_response(status_code=202, text="")
+        # 5: tools/call retry -> 200
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":2}',
+            headers={"content-type": "application/json"},
+        )
+        # 6: a later request -> 200 (must still carry the renegotiated version)
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":3}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            [
+                '{"jsonrpc":"2.0","method":"initialize","id":1}',
+                '{"jsonrpc":"2.0","method":"tools/call","id":2}',
+                '{"jsonrpc":"2.0","method":"tools/call","id":3}',
+            ]
+        )
+        reqs = httpx_mock.get_requests()
+        # reqs: 0=init, 1=call(404), 2=reinit-init, 3=reinit-initialized,
+        #       4=call-retry, 5=later-call
+        assert reqs[3].headers["mcp-protocol-version"] == "2024-11-05"
+        assert reqs[4].headers["mcp-protocol-version"] == "2024-11-05"
+        assert reqs[5].headers["mcp-protocol-version"] == "2024-11-05"
 
 
 # --- step-up authorization (anthropics/claude-code#44652) ---
