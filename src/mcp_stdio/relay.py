@@ -869,7 +869,7 @@ def _reinitialize(
     url: str,
     headers: dict[str, str],
     protocol_version: str | None = None,
-) -> str | None:
+) -> tuple[str | None, str | None]:
     """Send an initialize handshake to establish a new MCP session.
 
     Used to recover after a session expires (server returns 404 on the
@@ -879,14 +879,18 @@ def _reinitialize(
     2. POST a ``notifications/initialized`` notification to signal
        readiness (required by the MCP spec before any other requests)
 
-    ``notifications/initialized`` is the first "subsequent request" of the
-    recovered session, so it carries the ``MCP-Protocol-Version`` header
-    when ``protocol_version`` is known. The initialize POST itself omits it
-    — it is the (re)negotiation and predates a known version.
+    The re-handshake may renegotiate a different protocol version than the
+    one originally captured (e.g. a downgrade), so the InitializeResult is
+    parsed for ``result.protocolVersion`` and the freshly negotiated value is
+    used for the ``notifications/initialized`` header and returned to the
+    caller. ``notifications/initialized`` is the first "subsequent request"
+    of the recovered session, so it carries ``MCP-Protocol-Version``; the
+    initialize POST itself omits it — it is the (re)negotiation and predates
+    a known version.
 
-    Returns the new session ID on success, or None on failure. The
-    initialize response payload is discarded — the caller only needs
-    the session ID for subsequent requests.
+    Returns ``(new_session_id, negotiated_protocol_version)``. The session id
+    is ``None`` on failure; the protocol version falls back to the passed-in
+    ``protocol_version`` when the response omits ``result.protocolVersion``.
     """
     initialize_msg = json.dumps(
         {
@@ -904,14 +908,29 @@ def _reinitialize(
         resp = client.post(url, content=initialize_msg, headers=headers)
     except httpx.HTTPError as e:
         log(f"re-initialize request failed: {e}")
-        return None
+        return None, protocol_version
     if resp.status_code != 200:
         log(f"re-initialize returned HTTP {resp.status_code}")
-        return None
+        return None, protocol_version
     new_session_id = resp.headers.get("mcp-session-id")
     if not new_session_id:
         log("re-initialize response missing mcp-session-id header")
-        return None
+        return None, protocol_version
+
+    # Re-capture the negotiated protocol version from the InitializeResult so
+    # the recovered session's header matches the version actually in force.
+    negotiated = protocol_version
+    if "text/event-stream" in resp.headers.get("content-type", ""):
+        for event_type, payload in _iter_sse_events(resp.text.splitlines()):
+            if event_type == "message":
+                pv = _extract_protocol_version(payload)
+                if pv:
+                    negotiated = pv
+                    break
+    else:
+        pv = _extract_protocol_version(resp.text.strip())
+        if pv:
+            negotiated = pv
 
     # MCP spec: send notifications/initialized before any other requests
     initialized_msg = json.dumps(
@@ -919,17 +938,17 @@ def _reinitialize(
     )
     initialized_headers = dict(headers)
     initialized_headers["Mcp-Session-Id"] = new_session_id
-    if protocol_version:
-        initialized_headers["MCP-Protocol-Version"] = protocol_version
+    if negotiated:
+        initialized_headers["MCP-Protocol-Version"] = negotiated
     try:
         resp = client.post(url, content=initialized_msg, headers=initialized_headers)
     except httpx.HTTPError as e:
         log(f"notifications/initialized failed: {e}")
-        return None
+        return None, protocol_version
     if resp.status_code not in (200, 202):
         log(f"notifications/initialized returned HTTP {resp.status_code}")
-        return None
-    return new_session_id
+        return None, protocol_version
+    return new_session_id, negotiated
 
 
 def check_connection(
@@ -1133,6 +1152,10 @@ def run(
                 nonlocal protocol_version
                 detected = _detect_paginated_list(content)
                 if detected:
+                    # The pagination branch never captures protocol_version.
+                    # That is correct because `initialize` is not in
+                    # PAGINATED_LIST_METHODS, so an initialize request can never
+                    # take this branch — keep that invariant if the table grows.
                     return _paginate_and_stream(
                         client, url, content, h, req_id, detected[1], tracker
                     )
@@ -1174,6 +1197,9 @@ def run(
                     req_headers = _prepare_headers()
                     result = _dispatch(line, req_headers)
                     if result is None:
+                        # Retries exhausted ⇒ the session may be stale too;
+                        # reset for symmetry with the top-level None handling.
+                        session_id = None
                         continue
                 else:
                     log("token refresh failed, returning error")
@@ -1196,6 +1222,9 @@ def run(
                         req_headers = _prepare_headers()
                         result = _dispatch(line, req_headers)
                         if result is None:
+                            # Retries exhausted ⇒ assume the session is stale,
+                            # for symmetry with the top-level None handling.
+                            session_id = None
                             continue
                     else:
                         log("step-up authorization failed, returning error")
@@ -1206,7 +1235,7 @@ def run(
             if result.status_code == 404 and session_id:
                 log("session expired, re-initializing and retrying")
                 session_id = None
-                new_session_id = _reinitialize(
+                new_session_id, renegotiated = _reinitialize(
                     client, url, dict(headers), protocol_version
                 )
                 if new_session_id is None:
@@ -1214,6 +1243,11 @@ def run(
                     _write_line(_error_response("session lost", req_id))
                     continue
                 session_id = new_session_id
+                # Track the re-negotiated version so the MCP-Protocol-Version
+                # header on the retried request matches the recovered session.
+                if renegotiated and renegotiated != protocol_version:
+                    log(f"re-negotiated MCP protocol version: {renegotiated}")
+                    protocol_version = renegotiated
                 req_headers = _prepare_headers()
                 result = _dispatch(line, req_headers)
                 if result is None:
@@ -1234,7 +1268,17 @@ def run(
 
 
 class _SseState:
-    """Shared state between SSE reader thread and main stdin loop."""
+    """Shared state between SSE reader thread and main stdin loop.
+
+    ``endpoint_url`` is written by the reader thread (set on the ``endpoint``
+    event, cleared to ``None`` on stream end / disconnect) and read by the main
+    loop. It is deliberately a plain single-word attribute relied upon to be
+    atomically published under the CPython GIL — no lock — because the only
+    consumer re-checks it after a local capture and emits "SSE endpoint
+    unavailable" if it raced to ``None``. A stale-after-reconnect read is
+    acceptable in practice: legacy SSE reconnect endpoints are stable. ``ready``
+    / ``stop`` are ``threading.Event``s, which carry their own synchronization.
+    """
 
     __slots__ = ("endpoint_url", "ready", "stop")
 
@@ -1433,6 +1477,16 @@ def run_sse(
         client.close()
         sys.exit(1)
 
+    def _snapshot_headers() -> dict[str, str]:
+        """Take a consistent copy of ``headers`` under the lock for a POST.
+
+        Symmetric with the reader thread's snapshot and the 401/403 mutations
+        so every cross-thread access to ``headers`` is serialised — no POST
+        ever iterates the dict while a refresh is updating it.
+        """
+        with headers_lock:
+            return dict(headers)
+
     try:
         for line in sys.stdin:
             line = line.strip()
@@ -1474,7 +1528,7 @@ def run_sse(
                     resp = client.post(
                         endpoint,
                         content=line,
-                        headers=headers,
+                        headers=_snapshot_headers(),
                         timeout=post_timeout,
                     )
                     if resp.status_code != 429:
@@ -1497,7 +1551,7 @@ def run_sse(
                         resp = client.post(
                             endpoint,
                             content=line,
-                            headers=headers,
+                            headers=_snapshot_headers(),
                             timeout=httpx.Timeout(
                                 connect=timeout_connect,
                                 read=timeout_read,
@@ -1526,7 +1580,7 @@ def run_sse(
                             resp = client.post(
                                 endpoint,
                                 content=line,
-                                headers=headers,
+                                headers=_snapshot_headers(),
                                 timeout=httpx.Timeout(
                                     connect=timeout_connect,
                                     read=timeout_read,
