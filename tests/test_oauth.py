@@ -21,9 +21,11 @@ from mcp_stdio.oauth import (
     _parse_token_response,
     _pick_token_endpoint_auth_method,
     _probe_www_authenticate,
+    _run_authorization_flow,
     _run_device_authorization_flow,
     _token_response_to_data,
     _validate_auth_server_url,
+    _validate_endpoint_url,
     _validate_prm_hint_url,
     discover_oauth_metadata,
     ensure_token,
@@ -483,10 +485,6 @@ class TestDiscoverMetadata:
             },
         )
         client = httpx.Client()
-        import io
-        import sys
-
-        captured = io.StringIO()
         with caplog.at_level(logging.DEBUG):
             meta = discover_oauth_metadata("https://api.example.com/mcp", client)
         # Metadata is still returned despite mismatch
@@ -1198,6 +1196,28 @@ class TestTokenResponseToData:
             previous_refresh_token="old_rt",
         )
         assert data.refresh_token == "new_rt"
+
+    def test_string_expires_in_is_coerced(self):
+        """Form-urlencoded responses (GitHub App user-to-server) deliver
+        ``expires_in`` as a string; it must not crash expires_at arithmetic."""
+        raw = {"access_token": "at", "expires_in": "28800"}
+        meta = OAuthMetadata(
+            authorization_endpoint="https://ex.com/auth",
+            token_endpoint="https://ex.com/token",
+        )
+        data = _token_response_to_data(raw, meta, "cid", None)
+        assert data.expires_at is not None
+        assert data.expires_at > time.time()
+
+    def test_unparseable_expires_in_degrades_to_none(self):
+        """A non-numeric expires_in is tolerated as 'no expiry known', not a crash."""
+        raw = {"access_token": "at", "expires_in": "soon"}
+        meta = OAuthMetadata(
+            authorization_endpoint="https://ex.com/auth",
+            token_endpoint="https://ex.com/token",
+        )
+        data = _token_response_to_data(raw, meta, "cid", None)
+        assert data.expires_at is None
 
 
 # --- _parse_token_response ---
@@ -2627,6 +2647,67 @@ class TestValidateAuthServerUrl:
         assert meta.authorization_endpoint == "https://auth.example.com/authorize"
 
 
+class TestValidateEndpointUrl:
+    """AS-metadata endpoint URLs must pass the #13 cleartext-leak policy
+    before any secret is POSTed to them, mirroring the AS base-URL check."""
+
+    def test_https_accepted(self):
+        assert (
+            _validate_endpoint_url("https://as.example.com/token", label="token")
+            == "https://as.example.com/token"
+        )
+
+    def test_loopback_http_accepted(self):
+        assert (
+            _validate_endpoint_url("http://127.0.0.1:9000/token", label="token")
+            == "http://127.0.0.1:9000/token"
+        )
+
+    def test_plaintext_http_public_host_rejected(self, capsys):
+        assert _validate_endpoint_url("http://evil.example/token", label="token") is None
+        assert "cleartext" in capsys.readouterr().err
+
+    def test_non_http_scheme_rejected(self, capsys):
+        assert _validate_endpoint_url("javascript:alert(1)", label="token") is None
+        assert "unsupported" in capsys.readouterr().err
+
+    def test_empty_and_none_pass_through_silently(self, capsys):
+        assert _validate_endpoint_url(None, label="token") is None
+        assert _validate_endpoint_url("", label="token") is None
+        assert capsys.readouterr().err == ""
+
+    def test_discover_drops_cleartext_token_endpoint_and_uses_default(
+        self, httpx_mock, capsys
+    ):
+        """A (validated, https) AS metadata doc declaring an http:// token
+        endpoint must not be honoured — fall back to the default token path on
+        the validated AS base instead of POSTing credentials in cleartext."""
+        server_url = "https://mcp.example.com/mcp"
+        httpx_mock.add_response(
+            url="https://mcp.example.com/.well-known/oauth-protected-resource/mcp",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://mcp.example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://mcp.example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://mcp.example.com/authorize",
+                "token_endpoint": "http://evil.example/token",
+                "registration_endpoint": "http://evil.example/register",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata(server_url, client)
+        # Cleartext token endpoint dropped → default on the validated base.
+        assert meta.token_endpoint == "https://mcp.example.com/token"
+        # Cleartext optional endpoint dropped to None.
+        assert meta.registration_endpoint is None
+        assert "cleartext" in capsys.readouterr().err
+
+
 # --- OAuth state CSRF check (#26) ---
 
 
@@ -2734,6 +2815,59 @@ class TestStateCsrfCheck:
         assert calls[-1] == ("abc", "abc")
         assert oauth_mod.secrets.compare_digest("abc", "abd") is False
         assert calls[-1] == ("abc", "abd")
+
+
+class TestAuthorizationFlowFailurePaths:
+    """End-to-end failure paths of `_run_authorization_flow`: the callback
+    timeout and the server-returned-error branch (both clean up the server)."""
+
+    META = OAuthMetadata(
+        authorization_endpoint="https://ex.com/authorize",
+        token_endpoint="https://ex.com/token",
+    )
+
+    def test_callback_timeout_raises(self, monkeypatch):
+        """No callback ever arrives → TimeoutError after the deadline."""
+        monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", lambda _url: True)
+        client = httpx.Client()
+        with pytest.raises(TimeoutError, match="callback not received"):
+            _run_authorization_flow(
+                "https://ex.com/mcp",
+                client,
+                metadata=self.META,
+                cached=None,
+                client_id_override="cid",
+                timeout=0.3,
+            )
+
+    def test_callback_error_raises_runtime_error(self, monkeypatch):
+        """A callback carrying ?error=... → RuntimeError, no code exchange."""
+        from urllib.parse import parse_qs, urlparse
+        from urllib.request import urlopen
+
+        def fake_open(auth_url: str) -> bool:
+            redirect_uri = parse_qs(urlparse(auth_url).query)["redirect_uri"][0]
+
+            def hit() -> None:
+                try:
+                    urlopen(f"{redirect_uri}?error=access_denied", timeout=5).read()
+                except Exception:
+                    pass
+
+            threading.Thread(target=hit, daemon=True).start()
+            return True
+
+        monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", fake_open)
+        client = httpx.Client()
+        with pytest.raises(RuntimeError, match="OAuth error"):
+            _run_authorization_flow(
+                "https://ex.com/mcp",
+                client,
+                metadata=self.META,
+                cached=None,
+                client_id_override="cid",
+                timeout=5,
+            )
 
 
 # --- _parse_resource_metadata_hint ---
@@ -3118,13 +3252,9 @@ class TestDeviceAuthorizationFlow:
         self._patch_store(tmp_path, monkeypatch)
 
         intervals: list[float] = []
-        last_sleep = [0.0]
-
-        original_sleep = time.sleep
 
         def mock_sleep(secs: float) -> None:
             intervals.append(secs)
-            last_sleep[0] = secs
 
         monkeypatch.setattr(time, "sleep", mock_sleep)
 
@@ -3320,6 +3450,110 @@ class TestDeviceAuthorizationFlow:
         ]
         assert len(da_reqs) == 1
         assert b"resource=" not in da_reqs[0].content
+
+    def test_google_verification_url_fallback(
+        self, httpx_mock, tmp_path, monkeypatch, capsys
+    ):
+        """Google's device endpoint returns the non-standard ``verification_url``;
+        the flow must accept it instead of dying with a KeyError."""
+        self._patch_store(tmp_path, monkeypatch)
+        da = _da_response()
+        del da["verification_uri"]
+        da["verification_url"] = "https://www.google.com/device"
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=da)
+        httpx_mock.add_response(
+            url=TOKEN_URL, json={"access_token": "acc", "token_type": "Bearer"}
+        )
+        client = httpx.Client()
+        data = _run_device_authorization_flow(
+            MCP_URL, client, metadata=_device_meta(), cached=None
+        )
+        assert data.access_token == "acc"
+        assert "https://www.google.com/device" in capsys.readouterr().err
+
+    def test_missing_verification_uri_raises_clear_error(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """Neither verification_uri nor verification_url → a clear ValueError,
+        not a raw KeyError."""
+        self._patch_store(tmp_path, monkeypatch)
+        da = _da_response()
+        del da["verification_uri"]
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=da)
+        client = httpx.Client()
+        with pytest.raises(ValueError, match="verification_uri"):
+            _run_device_authorization_flow(
+                MCP_URL, client, metadata=_device_meta(), cached=None
+            )
+
+    def test_poll_deadline_exhaustion_raises_timeout(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """When the device code expires before the user authorizes, the poll
+        loop raises TimeoutError. A fake clock crosses the deadline
+        deterministically."""
+        self._patch_store(tmp_path, monkeypatch)
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={"error": "authorization_pending"},
+            status_code=400,
+            is_reusable=True,
+        )
+
+        clock = {"t": 0.0}
+        monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+
+        def jump_sleep(_secs: float) -> None:
+            clock["t"] += 100000  # leap past the deadline after the first poll
+
+        monkeypatch.setattr(time, "sleep", jump_sleep)
+
+        client = httpx.Client()
+        with pytest.raises(TimeoutError, match="timed out"):
+            _run_device_authorization_flow(
+                MCP_URL, client, metadata=_device_meta(), cached=None
+            )
+
+    def test_poll_network_error_is_retried(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """A transient network error during polling must not abort the flow —
+        the loop logs, sleeps, and continues to the next poll."""
+        self._patch_store(tmp_path, monkeypatch)
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_exception(httpx.ConnectError("flaky"), url=TOKEN_URL)
+        httpx_mock.add_response(
+            url=TOKEN_URL, json={"access_token": "acc", "token_type": "Bearer"}
+        )
+        monkeypatch.setattr(time, "sleep", lambda _s: None)
+        client = httpx.Client()
+        data = _run_device_authorization_flow(
+            MCP_URL, client, metadata=_device_meta(), cached=None
+        )
+        assert data.access_token == "acc"
+
+    def test_poll_unknown_error_surfaces_http_error(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """A non-spec error code (e.g. invalid_client) falls through to
+        raise_for_status and surfaces as HTTPStatusError."""
+        self._patch_store(tmp_path, monkeypatch)
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(
+            url=TOKEN_URL, json={"error": "invalid_client"}, status_code=400
+        )
+        monkeypatch.setattr(time, "sleep", lambda _s: None)
+        client = httpx.Client()
+        with pytest.raises(httpx.HTTPStatusError):
+            _run_device_authorization_flow(
+                MCP_URL, client, metadata=_device_meta(), cached=None
+            )
 
 
 class TestEnsureTokenDeviceFlow:
