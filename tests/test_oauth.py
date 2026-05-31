@@ -638,6 +638,22 @@ class TestRegisterClient:
         assert reg.client_id == "cid123"
         assert reg.client_secret is None
 
+    def test_missing_client_id_raises_clear_error(self, httpx_mock):
+        """A registration response without client_id → ValueError, not a bare
+        KeyError (RFC 7591 §3.2.1 REQUIRES client_id)."""
+        httpx_mock.add_response(
+            url="https://api.example.com/register",
+            json={"client_secret": "csec"},  # no client_id
+        )
+        meta = OAuthMetadata(
+            authorization_endpoint="https://api.example.com/authorize",
+            token_endpoint="https://api.example.com/token",
+            registration_endpoint="https://api.example.com/register",
+        )
+        client = httpx.Client()
+        with pytest.raises(ValueError, match="client_id"):
+            register_client(meta, "http://127.0.0.1:9999/callback", client)
+
     def test_no_registration_endpoint(self):
         meta = OAuthMetadata(
             authorization_endpoint="https://api.example.com/authorize",
@@ -1271,6 +1287,20 @@ class TestParseTokenResponse:
         client = httpx.Client()
         resp = client.post("https://example.com/token")
         with pytest.raises(httpx.HTTPStatusError):
+            _parse_token_response(resp)
+
+    def test_form_urlencoded_200_error_body_raises_clear_error(self, httpx_mock):
+        """GitHub legacy returns HTTP 200 + form-urlencoded error body. The
+        in-body error check must fire here too — a clear RuntimeError, not an
+        opaque downstream KeyError on access_token."""
+        httpx_mock.add_response(
+            url="https://example.com/token",
+            text="error=bad_verification_code&error_description=Code+expired",
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        )
+        client = httpx.Client()
+        resp = client.post("https://example.com/token")
+        with pytest.raises(RuntimeError, match="Code expired"):
             _parse_token_response(resp)
 
 
@@ -3484,6 +3514,37 @@ class TestDeviceAuthorizationFlow:
         httpx_mock.add_response(url=DEVICE_AUTH_URL, json=da)
         client = httpx.Client()
         with pytest.raises(ValueError, match="verification_uri"):
+            _run_device_authorization_flow(
+                MCP_URL, client, metadata=_device_meta(), cached=None
+            )
+
+    def test_unsafe_verification_uri_rejected(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """A non-http(s) / cleartext verification_uri must be rejected, not
+        presented to the user as an 'Open:' phishing target."""
+        self._patch_store(tmp_path, monkeypatch)
+        da = _da_response(verification_uri="http://phishing.example/login")
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=da)
+        client = httpx.Client()
+        with pytest.raises(ValueError, match="verification_uri"):
+            _run_device_authorization_flow(
+                MCP_URL, client, metadata=_device_meta(), cached=None
+            )
+
+    def test_missing_device_code_raises_clear_error(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """A device-auth response missing device_code/user_code → ValueError,
+        not a bare KeyError."""
+        self._patch_store(tmp_path, monkeypatch)
+        da = _da_response()
+        del da["device_code"]
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=da)
+        client = httpx.Client()
+        with pytest.raises(ValueError, match="device_code"):
             _run_device_authorization_flow(
                 MCP_URL, client, metadata=_device_meta(), cached=None
             )
