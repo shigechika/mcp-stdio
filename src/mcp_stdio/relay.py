@@ -1236,6 +1236,14 @@ def run(
                 session_id = None
                 continue
 
+            # Adopt a server-supplied session id from THIS response before the
+            # 401/403 recovery branches rebuild their retry headers, so a server
+            # that rotates/assigns Mcp-Session-Id alongside an auth challenge is
+            # honoured on the retry rather than re-sending the stale one. (The
+            # 404 branch re-establishes its own fresh session below.)
+            if result.session_id:
+                session_id = result.session_id
+
             # Token expired (401) — refresh and retry once
             if result.status_code == 401 and token_refresher:
                 log("received 401, attempting token refresh")
@@ -1651,4 +1659,10 @@ def run_sse(
                 _write_line(_error_response(str(e), req_id))
     finally:
         state.stop.set()
+        # Give the reader a moment to observe stop at a checkpoint and exit its
+        # own stream context (closing the connection from the owning thread)
+        # before we close the client out from under it. The daemon flag already
+        # guarantees process exit is never blocked; this just avoids closing an
+        # in-flight GET stream from another thread.
+        reader.join(timeout=1.0)
         client.close()
