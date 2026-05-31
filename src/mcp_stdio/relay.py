@@ -11,6 +11,7 @@ import socket
 import sys
 import threading
 import time
+from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urljoin
@@ -483,6 +484,49 @@ def _parse_www_authenticate_scope(header: str | None) -> str | None:
     return None
 
 
+def _iter_sse_events(lines: Iterable[str]) -> Iterator[tuple[str, str]]:
+    """Yield ``(event_type, data)`` pairs from SSE lines per the WHATWG spec.
+
+    Implements the WHATWG Server-Sent Events line-decoding algorithm so every
+    SSE-decoding site parses identically:
+
+    - a ``data:`` field strips at most one leading U+0020 from its value, so a
+      space-less ``data:{...}`` is valid (servers are not required to emit the
+      conventional ``data: {...}`` with a space);
+    - ``event:`` sets the event type, which defaults to ``"message"`` and resets
+      after every dispatched event;
+    - ``:``-prefixed comment lines and unrecognised fields are ignored;
+    - an event is dispatched on each blank-line boundary with its ``data:``
+      fields concatenated by LF;
+    - a final unterminated event with non-empty data is also dispatched at end
+      of input, so a response body that omits the trailing blank line is not
+      silently dropped.
+
+    Callers decide which event types to act on (``message`` for JSON-RPC
+    payloads, ``endpoint`` for the legacy SSE bootstrap).
+    """
+    event_type = "message"
+    data_lines: list[str] = []
+    for line in lines:
+        if line == "":
+            if data_lines:
+                yield event_type, "\n".join(data_lines)
+            event_type = "message"
+            data_lines = []
+            continue
+        if line.startswith(":"):
+            continue
+        field, _, value = line.partition(":")
+        if value.startswith(" "):
+            value = value[1:]
+        if field == "event":
+            event_type = value
+        elif field == "data":
+            data_lines.append(value)
+    if data_lines:
+        yield event_type, "\n".join(data_lines)
+
+
 def _post_and_stream(
     client: httpx.Client,
     url: str,
@@ -507,6 +551,13 @@ def _post_and_stream(
     """
     last_error: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
+        # Tracks whether any payload has been committed to stdout on this
+        # attempt. Once a byte is written to the client the non-idempotent
+        # POST can no longer be safely replayed, so a mid-stream transient
+        # error must surface an error instead of retrying — otherwise the
+        # server re-streams and the client sees duplicate JSON-RPC responses
+        # (and tools/call may execute twice server-side).
+        emitted = False
         try:
             with client.stream("POST", url, content=content, headers=headers) as resp:
                 session = resp.headers.get("mcp-session-id")
@@ -531,12 +582,13 @@ def _post_and_stream(
                 pv: str | None = None
                 content_type = resp.headers.get("content-type", "")
                 if "text/event-stream" in content_type:
-                    for line in resp.iter_lines():
-                        if line.startswith("data: "):
-                            payload = line[6:]
-                            if capture_init and pv is None:
-                                pv = _extract_protocol_version(payload)
-                            _emit(payload, tracker)
+                    for event_type, payload in _iter_sse_events(resp.iter_lines()):
+                        if event_type != "message":
+                            continue
+                        if capture_init and pv is None:
+                            pv = _extract_protocol_version(payload)
+                        _emit(payload, tracker)
+                        emitted = True
                 else:
                     resp.read()
                     text = resp.text.strip()
@@ -544,6 +596,7 @@ def _post_and_stream(
                         if capture_init:
                             pv = _extract_protocol_version(text)
                         _emit(text, tracker)
+                        emitted = True
 
                 return _StreamResult(session, 200, protocol_version=pv)
         except (
@@ -554,6 +607,15 @@ def _post_and_stream(
         ) as e:
             last_error = e
             log(f"attempt {attempt}/{MAX_RETRIES} failed: {e}")
+            if emitted:
+                # Response already partially delivered to the client; replaying
+                # the POST would duplicate it. Surface a stream-interrupted
+                # error (at-most-once) rather than retry.
+                log("upstream stream interrupted after partial delivery; not retrying")
+                _write_line(
+                    _error_response(f"upstream stream interrupted: {e}", req_id)
+                )
+                return None
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY * attempt)
 
@@ -602,15 +664,13 @@ def _post_parsed(
 
             content_type = resp.headers.get("content-type", "")
             if "text/event-stream" in content_type:
-                for sse_line in resp.text.splitlines():
-                    if sse_line.startswith("data: "):
-                        try:
-                            return (
-                                json.loads(sse_line[len("data: "):]),
-                                _StreamResult(session, 200),
-                            )
-                        except json.JSONDecodeError:
-                            continue
+                for event_type, payload in _iter_sse_events(resp.text.splitlines()):
+                    if event_type != "message":
+                        continue
+                    try:
+                        return json.loads(payload), _StreamResult(session, 200)
+                    except json.JSONDecodeError:
+                        continue
                 return None, _StreamResult(session, 200)
 
             text = resp.text.strip()
@@ -919,13 +979,14 @@ def check_connection(
         result_data: dict[str, Any] | None = None
 
         if "text/event-stream" in content_type:
-            for event_line in resp.text.splitlines():
-                if event_line.startswith("data: "):
-                    try:
-                        result_data = json.loads(event_line[6:])
-                        break
-                    except json.JSONDecodeError:
-                        continue
+            for event_type, payload in _iter_sse_events(resp.text.splitlines()):
+                if event_type != "message":
+                    continue
+                try:
+                    result_data = json.loads(payload)
+                    break
+                except json.JSONDecodeError:
+                    continue
         else:
             try:
                 result_data = json.loads(resp.text)
@@ -1189,49 +1250,46 @@ def _sse_reader_loop(
     headers: dict[str, str],
     state: _SseState,
     tracker: _CancelTracker | None = None,
+    headers_lock: threading.Lock | None = None,
 ) -> None:
     """Reader thread: maintain SSE GET stream and dispatch events.
 
     Parses the SSE event stream per the WHATWG Server-Sent Events
-    specification. The first ``endpoint`` event provides the POST URL
-    (which may be relative — resolved with urljoin). Subsequent
-    ``message`` events are JSON-RPC responses written to stdout.
+    specification (via the shared ``_iter_sse_events`` decoder). The first
+    ``endpoint`` event provides the POST URL (which may be relative —
+    resolved with urljoin). Subsequent ``message`` events are JSON-RPC
+    responses written to stdout.
+
+    ``headers`` is shared with the main stdin loop, which may mutate it on a
+    401/403 token refresh. ``headers_lock`` (when provided) serialises the
+    per-reconnect snapshot taken here against those mutations so the request
+    build never iterates a dict that is changing under it.
 
     Reconnects automatically on disconnect.
     """
     while not state.stop.is_set():
         try:
-            with client.stream("GET", url, headers=headers) as resp:
+            if headers_lock is not None:
+                with headers_lock:
+                    req_headers = dict(headers)
+            else:
+                req_headers = dict(headers)
+            with client.stream("GET", url, headers=req_headers) as resp:
                 if resp.status_code != 200:
                     log(f"SSE connection failed: HTTP {resp.status_code}")
                     state.ready.set()
                     return
 
-                event_type = "message"
-                data_lines: list[str] = []
-
-                for line in resp.iter_lines():
+                for event_type, data in _iter_sse_events(resp.iter_lines()):
                     if state.stop.is_set():
                         return
-
-                    if line == "":
-                        if data_lines:
-                            data = "\n".join(data_lines)
-                            if event_type == "endpoint":
-                                resolved = urljoin(url, data)
-                                state.endpoint_url = resolved
-                                state.ready.set()
-                                log(f"SSE endpoint: {resolved}")
-                            elif event_type == "message":
-                                _emit(data, tracker)
-                        event_type = "message"
-                        data_lines = []
-                    elif line.startswith(":"):
-                        continue
-                    elif line.startswith("event:"):
-                        event_type = line[len("event:") :].strip()
-                    elif line.startswith("data:"):
-                        data_lines.append(line[len("data:") :].lstrip(" "))
+                    if event_type == "endpoint":
+                        resolved = urljoin(url, data)
+                        state.endpoint_url = resolved
+                        state.ready.set()
+                        log(f"SSE endpoint: {resolved}")
+                    elif event_type == "message":
+                        _emit(data, tracker)
 
                 if state.stop.is_set():
                     return
@@ -1352,9 +1410,13 @@ def run_sse(
 
     tracker: _CancelTracker | None = _CancelTracker() if cancel_filter else None
     state = _SseState()
+    # The reader thread snapshots ``headers`` on every (re)connect while the
+    # main loop below may mutate it on a 401/403 token refresh. Serialise the
+    # two so the GET request build never iterates a dict mid-mutation.
+    headers_lock = threading.Lock()
     reader = threading.Thread(
         target=_sse_reader_loop,
-        args=(client, url, headers, state, tracker),
+        args=(client, url, headers, state, tracker, headers_lock),
         daemon=True,
     )
     reader.start()
@@ -1430,7 +1492,8 @@ def run_sse(
                     log("received 401, attempting token refresh")
                     new_headers = token_refresher()
                     if new_headers:
-                        headers.update(new_headers)
+                        with headers_lock:
+                            headers.update(new_headers)
                         resp = client.post(
                             endpoint,
                             content=line,
@@ -1458,7 +1521,8 @@ def run_sse(
                         )
                         new_headers = scope_upgrader(required_scope)
                         if new_headers:
-                            headers.update(new_headers)
+                            with headers_lock:
+                                headers.update(new_headers)
                             resp = client.post(
                                 endpoint,
                                 content=line,

@@ -15,6 +15,7 @@ from pytest_httpx import IteratorStream
 
 from mcp_stdio.relay import (
     MAX_LIST_PAGES,
+    MAX_RETRIES,
     PAGINATED_LIST_METHODS,
     _CancelTracker,
     _SseState,
@@ -26,6 +27,7 @@ from mcp_stdio.relay import (
     _extract_cancel_id,
     _extract_id,
     _handle_rate_limit,
+    _iter_sse_events,
     _make_httpx_transport,
     _normalize_null_arguments,
     _parse_retry_after,
@@ -243,6 +245,143 @@ class TestPostAndStream:
         result = _post_and_stream(client, "https://example.com/mcp", '{"id":1}', {}, 1)
         assert result is not None
         assert result.status_code == 404
+
+    def test_sse_data_without_space_is_parsed(self, httpx_mock):
+        """WHATWG SSE: ``data:`` needs no trailing space — a compliant server
+        sending ``data:{...}`` must be relayed, not silently dropped."""
+        payload = '{"jsonrpc":"2.0","result":{},"id":1}'
+        httpx_mock.add_response(
+            stream=IteratorStream([f"data:{payload}\n\n".encode()]),
+            headers={"content-type": "text/event-stream"},
+        )
+        client = httpx.Client()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            result = _post_and_stream(
+                client, "https://example.com/mcp", '{"id":1}', {}, 1
+            )
+        assert result is not None and result.status_code == 200
+        assert payload in stdout.getvalue()
+
+    def test_sse_non_message_event_not_emitted(self, httpx_mock):
+        """A ``data:``-bearing non-``message`` event (ping/keepalive) must not
+        be forwarded to stdout as if it were a JSON-RPC message."""
+        payload = '{"jsonrpc":"2.0","result":{},"id":1}'
+        body = (
+            b"event: ping\ndata: heartbeat\n\n"
+            + f"event: message\ndata: {payload}\n\n".encode()
+        )
+        httpx_mock.add_response(
+            stream=IteratorStream([body]),
+            headers={"content-type": "text/event-stream"},
+        )
+        client = httpx.Client()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            _post_and_stream(client, "https://example.com/mcp", '{"id":1}', {}, 1)
+        lines = [x for x in stdout.getvalue().strip().splitlines() if x]
+        assert lines == [payload]
+
+    def test_sse_multiline_data_joined(self, httpx_mock):
+        """Multiple ``data:`` fields of one event are joined with LF, not
+        emitted as separate (invalid) stdout lines."""
+        httpx_mock.add_response(
+            stream=IteratorStream([b"event: message\ndata: a\ndata: b\ndata: c\n\n"]),
+            headers={"content-type": "text/event-stream"},
+        )
+        client = httpx.Client()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            _post_and_stream(client, "https://example.com/mcp", '{"id":1}', {}, 1)
+        assert stdout.getvalue().strip() == "a\nb\nc"
+
+    def test_midstream_failure_does_not_retry_or_duplicate(self, httpx_mock):
+        """A transient error AFTER a payload was delivered must not replay the
+        non-idempotent POST (which would duplicate the response). Instead a
+        single stream-interrupted error is emitted and no second POST runs."""
+        delivered = '{"jsonrpc":"2.0","result":{},"id":1}'
+
+        def gen():
+            yield f"event: message\ndata: {delivered}\n\n".encode()
+            raise httpx.ReadError("connection dropped mid-stream")
+
+        httpx_mock.add_response(
+            stream=IteratorStream(gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+        client = httpx.Client()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout), patch("mcp_stdio.relay.time.sleep"):
+            result = _post_and_stream(
+                client, "https://example.com/mcp", '{"id":1}', {}, 1
+            )
+        # No retry: the POST was issued exactly once.
+        assert len(httpx_mock.get_requests()) == 1
+        # Caller sees "error already printed".
+        assert result is None
+        lines = [json.loads(x) for x in stdout.getvalue().strip().splitlines() if x]
+        # The already-delivered payload, then exactly one synthesized error
+        # for the same request id — never a duplicate of the payload.
+        assert lines[0]["result"] == {}
+        assert lines[1]["error"]["message"].startswith("upstream stream interrupted")
+        assert lines[1]["id"] == 1
+        assert len(lines) == 2
+
+    def test_preoutput_failure_still_retries(self, httpx_mock):
+        """A transient error BEFORE any output (e.g. JSON body read) is still
+        safely retriable — the response had not begun streaming."""
+        httpx_mock.add_exception(httpx.ConnectError("refused"))
+        httpx_mock.add_response(
+            json={"jsonrpc": "2.0", "result": {"ok": True}, "id": 1},
+            headers={"content-type": "application/json"},
+        )
+        client = httpx.Client()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout), patch("mcp_stdio.relay.time.sleep"):
+            result = _post_and_stream(
+                client, "https://example.com/mcp", '{"id":1}', {}, 1
+            )
+        assert result is not None and result.status_code == 200
+        assert len(httpx_mock.get_requests()) == 2  # retried after the connect error
+        emitted = json.loads(stdout.getvalue().strip())
+        assert emitted["result"] == {"ok": True}
+
+
+class TestIterSseEvents:
+    """WHATWG Server-Sent Events line decoder shared by all SSE-decode sites."""
+
+    def test_data_without_space(self):
+        assert list(_iter_sse_events(["data:hello", ""])) == [("message", "hello")]
+
+    def test_data_with_single_space_stripped(self):
+        assert list(_iter_sse_events(["data: hello", ""])) == [("message", "hello")]
+
+    def test_only_one_leading_space_stripped(self):
+        # WHATWG strips exactly one U+0020; further spaces are part of the value.
+        assert list(_iter_sse_events(["data:  hello", ""])) == [("message", " hello")]
+
+    def test_default_event_type_is_message(self):
+        assert list(_iter_sse_events(["data:x", ""])) == [("message", "x")]
+
+    def test_event_type_tracked_and_reset(self):
+        lines = ["event:ping", "data:a", "", "data:b", ""]
+        assert list(_iter_sse_events(lines)) == [("ping", "a"), ("message", "b")]
+
+    def test_multiline_data_joined_with_lf(self):
+        assert list(_iter_sse_events(["data:a", "data:b", ""])) == [("message", "a\nb")]
+
+    def test_comment_lines_ignored(self):
+        assert list(_iter_sse_events([": keepalive", "data:a", ""])) == [
+            ("message", "a")
+        ]
+
+    def test_trailing_event_without_blank_line_flushed(self):
+        # httpx may not surface a final empty line; a complete event must still
+        # be dispatched at end of input.
+        assert list(_iter_sse_events(["data:a"])) == [("message", "a")]
+
+    def test_event_without_data_not_dispatched(self):
+        assert list(_iter_sse_events(["event:message", ""])) == []
 
 
 # --- run (integration) ---
@@ -668,6 +807,31 @@ class TestProtocolVersionHeader:
     def test_sse_framed_initialize_captures_version(self, httpx_mock):
         httpx_mock.add_response(
             text='data: {"jsonrpc":"2.0","result":{"protocolVersion":"2025-03-26"},"id":1}\n\n',
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":2}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            [
+                '{"jsonrpc":"2.0","method":"initialize","id":1}',
+                '{"jsonrpc":"2.0","method":"tools/call","id":2}',
+            ]
+        )
+        reqs = httpx_mock.get_requests()
+        assert reqs[1].headers["mcp-protocol-version"] == "2025-03-26"
+
+    def test_sse_initialize_with_leading_noise_captures_version(self, httpx_mock):
+        """capture_init skips a leading comment and a non-result data line and
+        still captures protocolVersion from the InitializeResult event."""
+        body = (
+            ": keepalive\n"
+            'data: {"jsonrpc":"2.0","method":"notifications/progress"}\n\n'
+            'data: {"jsonrpc":"2.0","result":{"protocolVersion":"2025-03-26"},"id":1}\n\n'
+        )
+        httpx_mock.add_response(
+            text=body,
             headers={"content-type": "text/event-stream"},
         )
         httpx_mock.add_response(
@@ -1293,6 +1457,53 @@ class TestPagination:
         requests = httpx_mock.get_requests()
         assert requests[1].headers["authorization"] == "Bearer new-token"
 
+    def test_first_page_retry_exhaustion_emits_single_error(self, httpx_mock):
+        """When page 1 exhausts all retries (repeated ConnectError), the
+        buffered ``_post_parsed`` path writes exactly one JSON-RPC error for
+        the request id and no partial result."""
+        for _ in range(MAX_RETRIES):
+            httpx_mock.add_exception(httpx.ConnectError("refused"), url=self.URL)
+
+        with patch("mcp_stdio.relay.time.sleep"):
+            output = self._run_with_stdin(
+                httpx_mock,
+                [json.dumps({"jsonrpc": "2.0", "id": 7, "method": "tools/list"})],
+            )
+        lines = [json.loads(x) for x in output.strip().splitlines() if x]
+        assert len(lines) == 1
+        assert lines[0]["id"] == 7
+        assert "error" in lines[0]
+        assert "result" not in lines[0]
+
+    def test_sse_data_without_space_is_paginated(self, httpx_mock):
+        """Pagination's buffered SSE parse accepts space-less ``data:`` framing."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "a"}], "nextCursor": "p2"},
+        }
+        page2 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "b"}]},
+        }
+        httpx_mock.add_response(
+            url=self.URL,
+            text=f"data:{json.dumps(page1)}\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text=f"data:{json.dumps(page2)}\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())
+        assert [t["name"] for t in merged["result"]["tools"]] == ["a", "b"]
+
     def test_max_list_pages_constant_is_positive(self):
         """Sanity check on the shipped cap."""
         assert MAX_LIST_PAGES >= 1
@@ -1331,6 +1542,20 @@ class TestCheckConnection:
         """SSE response with one data: line."""
         body = (
             'data: {"jsonrpc":"2.0","id":1,"result":'
+            '{"protocolVersion":"2024-11-05","serverInfo":{"name":"sse","version":"0.1"},'
+            '"capabilities":{}}}\n\n'
+        )
+        httpx_mock.add_response(
+            text=body,
+            headers={"content-type": "text/event-stream"},
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+
+    def test_sse_data_without_space(self, httpx_mock):
+        """WHATWG SSE: ``data:`` without a trailing space is valid framing and
+        --check must still parse the initialize result."""
+        body = (
+            'data:{"jsonrpc":"2.0","id":1,"result":'
             '{"protocolVersion":"2024-11-05","serverInfo":{"name":"sse","version":"0.1"},'
             '"capabilities":{}}}\n\n'
         )
@@ -1788,6 +2013,48 @@ class TestRunSse:
                 sse_read_timeout=300,
             )
 
+    def test_post_during_reconnect_window_emits_error(self, monkeypatch):
+        """A stdin line arriving while the reader is mid-reconnect (endpoint
+        cleared) must get a clean 'SSE endpoint unavailable' error, not hang.
+
+        Deterministic: a one-shot ``endpoint_url`` reports the bootstrap URL
+        for run_sse's startup check, then ``None`` once the main loop tries to
+        POST — exactly the reconnect-window race the branch guards.
+        """
+        bootstrap_url = "https://example.com/messages"
+
+        class _OneShotEndpointState:
+            def __init__(self):
+                self._reads = 0
+                self.ready = threading.Event()
+                self.stop = threading.Event()
+
+            @property
+            def endpoint_url(self):
+                self._reads += 1
+                return bootstrap_url if self._reads == 1 else None
+
+            @endpoint_url.setter
+            def endpoint_url(self, value):
+                pass  # reader-thread writes are irrelevant to this test
+
+        def fake_reader(client, url, headers, state, tracker=None, headers_lock=None):
+            state.ready.set()
+            state.stop.wait(timeout=3)
+
+        monkeypatch.setattr("mcp_stdio.relay._SseState", _OneShotEndpointState)
+        monkeypatch.setattr("mcp_stdio.relay._sse_reader_loop", fake_reader)
+
+        stdin = StringIO('{"jsonrpc":"2.0","method":"test","id":5}\n')
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {}, timeout_read=0.05)
+
+        msgs = [json.loads(x) for x in stdout.getvalue().strip().splitlines() if x]
+        assert len(msgs) == 1
+        assert msgs[0]["id"] == 5
+        assert msgs[0]["error"]["message"] == "SSE endpoint unavailable"
+
     def test_endpoint_then_post_then_message(self, httpx_mock):
         payload = '{"jsonrpc":"2.0","result":{},"id":42}'
         post_received = threading.Event()
@@ -1847,9 +2114,11 @@ class TestRunSse:
         )
 
         call_count = {"n": 0}
+        seen_auth: list[str | None] = []
 
         def post_callback(request):
             call_count["n"] += 1
+            seen_auth.append(request.headers.get("authorization"))
             if call_count["n"] == 1:
                 return httpx.Response(status_code=401)
             post_received.set()
@@ -1877,6 +2146,8 @@ class TestRunSse:
 
         assert refresher_called["n"] == 1
         assert call_count["n"] == 2
+        # The retried POST must carry the refreshed token, not the stale one.
+        assert seen_auth[1] == "Bearer new"
 
     def test_post_403_triggers_scope_upgrader(self, httpx_mock):
         """#17: SSE transport must run step-up on 403 insufficient_scope."""
@@ -1898,9 +2169,11 @@ class TestRunSse:
         )
 
         call_count = {"n": 0}
+        seen_auth: list[str | None] = []
 
         def post_callback(request):
             call_count["n"] += 1
+            seen_auth.append(request.headers.get("authorization"))
             if call_count["n"] == 1:
                 return httpx.Response(
                     status_code=403,
@@ -1936,6 +2209,8 @@ class TestRunSse:
 
         assert seen_scopes == ["hr:read hr:write"]
         assert call_count["n"] == 2
+        # The retried POST must carry the upgraded-scope token.
+        assert seen_auth[1] == "Bearer upgraded"
 
     def test_post_403_without_insufficient_scope_emits_error(self, httpx_mock):
         """Plain 403 (no scope challenge) surfaces as error (#11 + #17)."""
@@ -2143,6 +2418,29 @@ class TestTcpKeepaliveSocketOptions:
         if hasattr(socket, "TCP_KEEPALIVE"):
             keys = [(level, opt) for (level, opt, _val) in opts]
             assert (socket.IPPROTO_TCP, socket.TCP_KEEPALIVE) in keys
+
+    def test_darwin_full_set_deterministic(self, monkeypatch):
+        """Cover the darwin idle+interval+count append path on any host OS by
+        faking a socket module that exposes all three constants — so the macOS
+        branch has deterministic coverage on the Linux CI matrix too."""
+        monkeypatch.setattr("mcp_stdio.relay.sys.platform", "darwin")
+        import mcp_stdio.relay as relay_mod
+
+        class _FakeSocket:
+            SOL_SOCKET = socket.SOL_SOCKET
+            SO_KEEPALIVE = socket.SO_KEEPALIVE
+            IPPROTO_TCP = socket.IPPROTO_TCP
+            TCP_KEEPALIVE = 0x10
+            TCP_KEEPINTVL = 0x101
+            TCP_KEEPCNT = 0x102
+
+        monkeypatch.setattr(relay_mod, "socket", _FakeSocket)
+        opts = _tcp_keepalive_socket_options()
+        keys = [(level, opt) for (level, opt, _val) in opts]
+        assert (_FakeSocket.SOL_SOCKET, _FakeSocket.SO_KEEPALIVE) in keys
+        assert (_FakeSocket.IPPROTO_TCP, _FakeSocket.TCP_KEEPALIVE) in keys
+        assert (_FakeSocket.IPPROTO_TCP, _FakeSocket.TCP_KEEPINTVL) in keys
+        assert (_FakeSocket.IPPROTO_TCP, _FakeSocket.TCP_KEEPCNT) in keys
 
     def test_windows_sets_only_so_keepalive(self, monkeypatch):
         """Windows has no per-socket idle/intvl tuning via setsockopt — we
