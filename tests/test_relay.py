@@ -1898,6 +1898,72 @@ class TestRun:
         assert reqs[5].headers.get("mcp-session-id") == "sess-new"
         assert json.loads(reqs[5].content)["method"] == "call"
 
+    def test_full_401_403_404_triple_recovery_cascade(self, httpx_mock):
+        """#L3(round29): drive the documented 4-dispatch worst case in ONE stdin
+        line — initial -> 401-refresh -> 403-step-up -> 404-reinit -> replay — so
+        the three sequential recovery branches (and the session-id hand-off
+        between them) are pinned end-to-end. A regression that cleared session_id
+        after the step-up would silently break the `and session_id`-gated 404
+        self-heal, which the 2-branch tests cannot catch."""
+        # 1: init -> sess-1
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json", "mcp-session-id": "sess-1"},
+        )
+        # 2: call -> 401 (triggers refresh)
+        httpx_mock.add_response(
+            status_code=401, text="", headers={"content-type": "application/json"}
+        )
+        # 3: refreshed retry -> 403 insufficient_scope (triggers step-up)
+        httpx_mock.add_response(
+            status_code=403,
+            text="",
+            headers={
+                "content-type": "application/json",
+                "www-authenticate": 'Bearer error="insufficient_scope", scope="extra"',
+            },
+        )
+        # 4: step-up retry -> 404 (session expired during the recovery window)
+        httpx_mock.add_response(
+            status_code=404, text="", headers={"content-type": "application/json"}
+        )
+        # 5: _reinitialize's initialize -> 200, sess-new
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"protocolVersion":"2024-11-05"},"id":0}',
+            headers={"content-type": "application/json", "mcp-session-id": "sess-new"},
+        )
+        # 6: _reinitialize's notifications/initialized -> 202
+        httpx_mock.add_response(status_code=202, text="")
+        # 7: replayed call with sess-new -> 200
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"ok":true},"id":2}',
+            headers={"content-type": "application/json"},
+        )
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","method":"init","id":1}',
+                '{"jsonrpc":"2.0","method":"call","id":2}',
+            ],
+            token_refresher=lambda: {"Authorization": "Bearer refreshed"},
+            scope_upgrader=lambda _s: {"Authorization": "Bearer broader"},
+        )
+        lines = [x for x in output.strip().splitlines() if x]
+        # Only init + the final replayed call reach stdout (no error, no leaked
+        # reinit handshake).
+        assert len(lines) == 2
+        assert json.loads(lines[1])["result"] == {"ok": True}
+
+        reqs = httpx_mock.get_requests()
+        assert len(reqs) == 7
+        # Each retry carried the right credential/session as the cascade advanced.
+        assert reqs[2].headers.get("authorization") == "Bearer refreshed"  # 401→retry
+        assert reqs[3].headers.get("authorization") == "Bearer broader"  # 403→step-up
+        assert json.loads(reqs[4].content)["method"] == "initialize"  # 404→reinit
+        assert reqs[6].headers.get("mcp-session-id") == "sess-new"  # replay
+        assert json.loads(reqs[6].content)["method"] == "call"
+
     def test_401_refresh_failure_returns_error(self, httpx_mock):
         httpx_mock.add_response(
             status_code=401,
