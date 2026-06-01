@@ -591,7 +591,21 @@ def save_token(server_url: str, data: TokenData) -> None:
         if server_url != key:
             store.pop(server_url, None)
         store[key] = asdict(data)
-        _write_store(store)
+        try:
+            _write_store(store)
+        except OSError as e:
+            # #4 (round21): a write failure (full / read-only FS, permission)
+            # must fail SOFT, mirroring the _StoreUnreadable read path above. The
+            # token is simply not cached — the caller re-auths next time — rather
+            # than the OSError propagating up the OAuth/relay path. This also fixes
+            # a worse case: a refresh whose save fails would otherwise propagate
+            # out of refresh_cached_token and make the relay emit an auth error
+            # even though the freshly refreshed token was perfectly usable.
+            print(
+                f"warning: could not write token store ({e}); token not cached, "
+                f"will re-authenticate next time",
+                file=sys.stderr,
+            )
 
 
 def delete_token(server_url: str) -> None:
@@ -615,4 +629,15 @@ def delete_token(server_url: str) -> None:
                 del store[key]
                 removed = True
         if removed:
-            _write_store(store)
+            try:
+                _write_store(store)
+            except OSError as e:
+                # Fail soft like save_token (#4 round21): a failed delete leaves
+                # the (stale) entry in place — a stale cached token at worst —
+                # rather than propagating an OSError up the caller. A later
+                # successful write reconciles it.
+                print(
+                    f"warning: could not write token store ({e}); "
+                    f"token not deleted",
+                    file=sys.stderr,
+                )
