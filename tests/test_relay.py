@@ -1466,6 +1466,64 @@ class TestRun:
         # The step-up retry (req 3) must carry the id rotated on the 401 retry.
         assert reqs[3].headers.get("mcp-session-id") == "sess-2"
 
+    def test_chained_403_stepup_then_404_reinitializes_and_replays(self, httpx_mock):
+        """#6(round21): a 403 whose step-up retry returns 404 must cascade into
+        the 404 reinitialize branch — initialize a fresh session, then replay the
+        original call with it. Proves the 403 step-up retry feeds the 404 reinit
+        (the recovery branches are sequential ifs, not elif)."""
+        # 1: init -> sess-1
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json", "mcp-session-id": "sess-1"},
+        )
+        # 2: call -> 403 insufficient_scope (triggers step-up)
+        httpx_mock.add_response(
+            status_code=403,
+            text="",
+            headers={
+                "content-type": "application/json",
+                "www-authenticate": 'Bearer error="insufficient_scope", scope="extra"',
+            },
+        )
+        # 3: step-up retry -> 404 (session expired during the step-up window)
+        httpx_mock.add_response(
+            status_code=404, text="", headers={"content-type": "application/json"}
+        )
+        # 4: _reinitialize's initialize -> 200, sess-new
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"protocolVersion":"2024-11-05"},"id":0}',
+            headers={"content-type": "application/json", "mcp-session-id": "sess-new"},
+        )
+        # 5: _reinitialize's notifications/initialized -> 202
+        httpx_mock.add_response(status_code=202, text="")
+        # 6: replayed call with sess-new -> 200
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"ok":true},"id":2}',
+            headers={"content-type": "application/json"},
+        )
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","method":"init","id":1}',
+                '{"jsonrpc":"2.0","method":"call","id":2}',
+            ],
+            token_refresher=lambda: {"Authorization": "Bearer new"},
+            scope_upgrader=lambda _s: {"Authorization": "Bearer broader"},
+        )
+        lines = [x for x in output.strip().splitlines() if x]
+        # The internal reinit handshake must not leak; only init + final call.
+        assert len(lines) == 2
+        assert json.loads(lines[1])["result"] == {"ok": True}
+
+        reqs = httpx_mock.get_requests()
+        assert len(reqs) == 6
+        # req 4 is the reinitialize's initialize (no session, initialize body)
+        assert json.loads(reqs[3].content)["method"] == "initialize"
+        # req 6 is the replayed call carrying the freshly-initialized session id
+        assert reqs[5].headers.get("mcp-session-id") == "sess-new"
+        assert json.loads(reqs[5].content)["method"] == "call"
+
     def test_401_refresh_failure_returns_error(self, httpx_mock):
         httpx_mock.add_response(
             status_code=401,
@@ -3998,6 +4056,42 @@ class TestRunSse:
             RuntimeError("boom"),
         )
         assert out.strip() == ""
+
+    def test_cross_origin_endpoint_refused_end_to_end(self, httpx_mock):
+        """#7(round21): an SSE endpoint event pointing cross-origin while an
+        Authorization header is set is refused at the reader (no credential
+        leak). With no OTHER endpoint, run_sse has no usable endpoint, fails
+        startup and exits(1) — and crucially NO POST is ever sent to the evil
+        origin. Proves the credential-leak refusal holds end-to-end."""
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: https://evil.example/steal\n\n"
+            # Keep the stream open briefly so the reader stays parked past the
+            # refusal (rather than ending and reconnecting into an unmocked GET)
+            # until run_sse observes the None endpoint and exits.
+            time.sleep(0.5)
+
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        stdin = StringIO('{"jsonrpc":"2.0","method":"tools/call","id":77}\n')
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            with pytest.raises(SystemExit) as exc:
+                run_sse(
+                    self.URL,
+                    {
+                        "Content-Type": "application/json",
+                        "Authorization": "Bearer s3cr3t",
+                    },
+                )
+        assert exc.value.code == 1
+        # The cross-origin endpoint was refused — no POST to ANY origin, so the
+        # bearer credential never went to evil.example.
+        assert not [r for r in httpx_mock.get_requests() if r.method == "POST"]
 
     def test_sse_read_timeout_default_and_disabled(self, monkeypatch):
         """#9: run_sse() passes sse_read_timeout through to httpx.Client.
