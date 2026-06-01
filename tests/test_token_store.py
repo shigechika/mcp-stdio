@@ -1,5 +1,6 @@
 """Tests for mcp_stdio.token_store module."""
 
+import errno
 import json
 import os
 import stat
@@ -489,6 +490,27 @@ class TestNormalizeKey:
         # Default port still folds out, brackets retained.
         assert _normalize_key("https://[::1]:443/mcp") == "https://[::1]/mcp"
 
+    def test_userinfo_dropped_and_warned_once(self, monkeypatch, capsys):
+        """#7(round17): embedded userinfo is dropped from the key (two URLs
+        differing only in credentials fold to one slot), and a one-time stderr
+        warning surfaces the silent token-sharing — emitted only once."""
+        monkeypatch.setattr("mcp_stdio.token_store._warned_userinfo_key", False)
+        k1 = _normalize_key("https://userA:passA@example.com/mcp")
+        k2 = _normalize_key("https://userB:passB@example.com/mcp")
+        # userinfo dropped → both fold to the same credential-free key
+        assert k1 == k2 == "https://example.com/mcp"
+        err = capsys.readouterr().err
+        assert err.count("embedded userinfo") == 1  # warned exactly once
+        # A second normalize with userinfo does not warn again.
+        _normalize_key("https://userC:passC@example.com/mcp")
+        assert "embedded userinfo" not in capsys.readouterr().err
+
+    def test_no_userinfo_no_warning(self, monkeypatch, capsys):
+        """A normal URL (no userinfo) must not emit the warning."""
+        monkeypatch.setattr("mcp_stdio.token_store._warned_userinfo_key", False)
+        _normalize_key("https://example.com/mcp")
+        assert capsys.readouterr().err == ""
+
 
 class TestKeyNormalizationInStore:
     def _patch(self, tmp_path, monkeypatch):
@@ -523,6 +545,43 @@ class TestKeyNormalizationInStore:
         delete_token("https://x.com/mcp/")
         assert load_token("https://x.com/mcp") is None
         assert load_token("https://x.com/mcp/") is None
+
+    def test_write_store_output_is_key_sorted(self, tmp_path, monkeypatch):
+        """#8(round17): on-disk tokens.json keys are sorted for stable,
+        diff-friendly output regardless of save order."""
+        store_file = self._patch(tmp_path, monkeypatch)
+        save_token("https://zebra.com/mcp", TokenData(access_token="z"))
+        save_token("https://alpha.com/mcp", TokenData(access_token="a"))
+        save_token("https://middle.com/mcp", TokenData(access_token="m"))
+        keys = list(json.loads(store_file.read_text()).keys())
+        assert keys == sorted(keys)
+
+    def test_write_path_enoent_treated_as_absent_not_unreadable(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """#9(round17): if the store vanishes in the TOCTOU window between
+        exists() and os.open on the WRITE path, treat it as absent (the save
+        proceeds from {}) rather than _StoreUnreadable (which would abort the
+        save with a misleading 'could not be read' warning)."""
+        store_file = self._patch(tmp_path, monkeypatch)
+        save_token("https://a.com/mcp", TokenData(access_token="a"))  # store exists
+
+        real_open = os.open
+
+        def vanishing_read_open(path, flags, *a, **k):
+            # Simulate ENOENT only on the read-open of the store file (no O_CREAT);
+            # the temp-file write-open (O_CREAT) and dir fsync proceed normally.
+            if os.fspath(path) == str(store_file) and not (flags & os.O_CREAT):
+                raise OSError(errno.ENOENT, "No such file or directory")
+            return real_open(path, flags, *a, **k)
+
+        monkeypatch.setattr("mcp_stdio.token_store.os.open", vanishing_read_open)
+        save_token("https://b.com/mcp", TokenData(access_token="b"))  # must NOT abort
+        monkeypatch.setattr("mcp_stdio.token_store.os.open", real_open)
+
+        # The save proceeded (treated the vanished store as absent), so b persisted.
+        assert load_token("https://b.com/mcp").access_token == "b"
+        assert "could not be read" not in capsys.readouterr().err
 
 
 class TestLegacyMigration:
