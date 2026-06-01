@@ -73,6 +73,28 @@ class TestAuthorizationBaseUrl:
             == "https://api.example.com"
         )
 
+    def test_strips_embedded_userinfo(self):
+        """#9: userinfo must be dropped so the synthesised default /authorize
+        and /token endpoints never carry credentials (bypassing the #13
+        endpoint-userinfo rejection)."""
+        assert (
+            _authorization_base_url("https://user:pass@api.example.com/v1/mcp")
+            == "https://api.example.com"
+        )
+
+    def test_strips_userinfo_keeps_port(self):
+        assert (
+            _authorization_base_url("https://user:pass@api.example.com:8443/mcp")
+            == "https://api.example.com:8443"
+        )
+
+    def test_ipv6_host_rebracketed(self):
+        """An IPv6 literal host must keep its brackets after userinfo stripping."""
+        assert (
+            _authorization_base_url("https://user@[2001:db8::1]:9000/mcp")
+            == "https://[2001:db8::1]:9000"
+        )
+
 
 # --- PKCE ---
 
@@ -1072,6 +1094,41 @@ class TestRefreshCachedToken:
         req = httpx_mock.get_requests()[0]
         assert b"resource=https%3A%2F%2Fapi.example.com%2Fmcp" in req.content
 
+    def test_refresh_preserves_persisted_issuer(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """#6/#8: a refresh must not wipe the persisted AS issuer — otherwise the
+        RFC 9207 iss check would silently go dark after the first refresh."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        from mcp_stdio.token_store import load_token, save_token
+
+        save_token(
+            "https://api.example.com/mcp",
+            TokenData(
+                access_token="old_at",
+                refresh_token="rt123",
+                expires_at=time.time() - 10,
+                client_id="cid",
+                token_endpoint="https://auth.example.com/token",
+                authorization_endpoint="https://auth.example.com/authorize",
+                issuer="https://auth.example.com",
+            ),
+        )
+        httpx_mock.add_response(
+            url="https://auth.example.com/token",
+            json={"access_token": "new_at", "expires_in": 3600},
+        )
+        client = httpx.Client()
+        data = refresh_cached_token("https://api.example.com/mcp", client)
+        assert data is not None and data.issuer == "https://auth.example.com"
+        # And it survives the round-trip back to disk.
+        assert load_token("https://api.example.com/mcp").issuer == (
+            "https://auth.example.com"
+        )
+
     def test_returns_none_when_no_cached_token(self, tmp_path, monkeypatch):
         store_file = tmp_path / "tokens.json"
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
@@ -1211,6 +1268,18 @@ class TestTokenResponseToData:
         data = _token_response_to_data(raw, meta, "cid", None)
         assert data.access_token == "at"
         assert data.expires_at is None  # no expiry known
+
+    def test_persists_issuer_for_rfc9207(self):
+        """#6/#8: the AS issuer is persisted so the RFC 9207 iss mix-up check
+        survives a step-up that reconstructs metadata from the cached token."""
+        raw = {"access_token": "at", "expires_in": 3600}
+        meta = OAuthMetadata(
+            authorization_endpoint="https://ex.com/auth",
+            token_endpoint="https://ex.com/token",
+            issuer="https://ex.com",
+        )
+        data = _token_response_to_data(raw, meta, "cid", None)
+        assert data.issuer == "https://ex.com"
 
     def test_no_refresh_token(self):
         """FastMCP #1356: no refresh_token in response."""
@@ -3440,6 +3509,30 @@ class TestDeviceAuthorizationFlow:
         assert data.access_token == "acc"
         assert data.refresh_token == "ref"
         assert data.client_id == "cid"
+
+    def test_expires_in_clamped_to_max_lifetime(
+        self, httpx_mock, tmp_path, monkeypatch, capsys
+    ):
+        """#7: an inflated expires_in is clamped to the max device-flow lifetime
+        so the poll loop cannot stay alive for years."""
+        from mcp_stdio.oauth import _DEVICE_FLOW_MAX_LIFETIME_SECS
+
+        self._patch_store(tmp_path, monkeypatch)
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(
+            url=DEVICE_AUTH_URL, json=_da_response(expires_in=999999999)
+        )
+        httpx_mock.add_response(
+            url=TOKEN_URL, json={"access_token": "acc", "token_type": "Bearer"}
+        )
+
+        client = httpx.Client()
+        _run_device_authorization_flow(
+            MCP_URL, client, metadata=_device_meta(), cached=None
+        )
+        err = capsys.readouterr().err
+        assert f"expires in {_DEVICE_FLOW_MAX_LIFETIME_SECS}s" in err
+        assert "999999999" not in err
 
     def test_verification_uri_complete_printed(self, httpx_mock, tmp_path, monkeypatch, capsys):
         """verification_uri_complete is shown when present."""

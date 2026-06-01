@@ -99,6 +99,10 @@ class TokenData:
     token_endpoint: str = ""
     authorization_endpoint: str = ""
     registration_endpoint: str | None = None
+    # RFC 8414 issuer identifier of the authorization server. Persisted so the
+    # RFC 9207 `iss` mix-up check survives across invocations (e.g. a step-up
+    # that reconstructs OAuthMetadata from this cached entry).
+    issuer: str | None = None
     # Token endpoint authentication method (RFC 6749 §2.3 / RFC 8414)
     token_endpoint_auth_method: str = "none"
     # Suppress RFC 8707 resource parameter (for AS that reject it, e.g. Entra ID v2)

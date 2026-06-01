@@ -32,6 +32,14 @@ from .token_store import TokenData, delete_token, load_token, save_token
 # a single sleep cannot block for hours, mirroring relay.py's Retry-After cap.
 _DEVICE_POLL_CAP_SECS = 60
 
+# Upper bound on the whole device-flow lifetime. ``expires_in`` from the AS
+# drives the poll loop's deadline; the per-sleep interval is already capped, but
+# without a ceiling on the total an AS returning ``expires_in: 999999999`` would
+# keep the process polling the token endpoint for years. RFC 8628 device codes
+# are typically ~1800 s; 3600 s is a generous bound that still kills the
+# pathological case.
+_DEVICE_FLOW_MAX_LIFETIME_SECS = 3600
+
 
 def _safe_int(value: Any, default: int) -> int:
     """Coerce an AS-supplied JSON value to int, falling back on bad input."""
@@ -64,9 +72,25 @@ def _authorization_base_url(server_url: str) -> str:
     """Derive authorization base URL by stripping the path component.
 
     Per MCP spec: https://api.example.com/v1/mcp -> https://api.example.com
+
+    Any embedded userinfo (``user:pass@``) is dropped. ``_validate_endpoint_url``
+    rejects AS-declared endpoints carrying userinfo as a parser-confusion /
+    exfiltration vector (#13); the default ``/authorize`` and ``/token``
+    endpoints synthesised from this base must not reintroduce it, or a
+    ``https://user:pass@host/mcp`` server URL would cause credentials and
+    authorization codes to be POSTed to ``https://user:pass@host/token``.
     """
     parsed = urlparse(server_url)
-    return f"{parsed.scheme}://{parsed.netloc}"
+    host = parsed.hostname or ""
+    # urlparse strips the brackets from an IPv6 literal host — restore them.
+    if ":" in host:
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    netloc = f"{host}:{port}" if port is not None else host
+    return f"{parsed.scheme}://{netloc}"
 
 
 # Default ports used when normalising a parsed URL into a RFC 6454 origin
@@ -846,6 +870,7 @@ def _token_response_to_data(
         token_endpoint=metadata.token_endpoint,
         authorization_endpoint=metadata.authorization_endpoint,
         registration_endpoint=metadata.registration_endpoint,
+        issuer=metadata.issuer,
         token_endpoint_auth_method=auth_method,
         no_resource_indicator=no_resource_indicator,
     )
@@ -894,6 +919,9 @@ def refresh_cached_token(
         authorization_endpoint=cached.authorization_endpoint,
         token_endpoint=cached.token_endpoint,
         registration_endpoint=cached.registration_endpoint,
+        # Carry the persisted issuer through so a refresh does not wipe it
+        # (_token_response_to_data now writes metadata.issuer into TokenData).
+        issuer=cached.issuer,
     )
     data = _token_response_to_data(
         raw,
@@ -1175,8 +1203,12 @@ def _run_device_authorization_flow(
     )
     # Coerce defensively: a JSON float-as-string or non-numeric value from a
     # malformed/hostile AS must fall back to the default, not raise ValueError
-    # out of the flow.
-    expires_in = _safe_int(da.get("expires_in"), 1800)
+    # out of the flow. Clamp to a max lifetime so an inflated expires_in cannot
+    # keep the poll loop (and the process) alive indefinitely — the per-sleep
+    # interval cap above does not bound the overall deadline on its own.
+    expires_in = max(
+        1, min(_safe_int(da.get("expires_in"), 1800), _DEVICE_FLOW_MAX_LIFETIME_SECS)
+    )
     # Clamp the AS-supplied polling interval to a sane window so a hostile or
     # misconfigured AS cannot make a single time.sleep block for hours (or
     # raise on a negative value), mirroring the cap-gated Retry-After sleep in
@@ -1405,6 +1437,11 @@ def step_up_authorize(
             authorization_endpoint=cached.authorization_endpoint,
             token_endpoint=cached.token_endpoint,
             registration_endpoint=cached.registration_endpoint,
+            # Rehydrate the persisted issuer so the RFC 9207 `iss` mix-up check
+            # in _run_authorization_flow stays active on this cache-hit path —
+            # step-up runs a full browser+callback flow, the case most exposed
+            # to AS mix-up, so the defence must not silently no-op here.
+            issuer=cached.issuer,
         )
     else:
         metadata = discover_oauth_metadata(server_url, client)
