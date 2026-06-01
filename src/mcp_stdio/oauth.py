@@ -947,7 +947,13 @@ def _run_authorization_flow(
             auth_method = cached.token_endpoint_auth_method
         else:
             log("registering OAuth client")
-            reg = register_client(metadata, redirect_uri, client)
+            # DCR runs before the callback server is closed on the success path
+            # below; close it on failure so the listening socket does not leak.
+            try:
+                reg = register_client(metadata, redirect_uri, client)
+            except BaseException:
+                callback_server.server_close()
+                raise
             cid = reg.client_id
             csecret = reg.client_secret
             cse_at = reg.client_secret_expires_at
