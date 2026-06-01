@@ -162,6 +162,19 @@ def _validate_auth_server_url(auth_server_url: str, mcp_server_url: str) -> bool
         )
         return False
 
+    if parsed.username is not None or parsed.password is not None:
+        # Mirror _validate_endpoint_url: an authorization_server carrying
+        # userinfo would survive into the synthesized default token endpoint
+        # (which is NOT re-validated), routing the credential exchange — code +
+        # client_secret + PKCE verifier — through a userinfo authority. Refuse
+        # it. See #13.
+        log(
+            f"warning: authorization_server URL {auth_server_url!r} embeds "
+            f"userinfo (user:pass@); refusing as a credential-exfiltration / "
+            f"parser-confusion vector. See #13."
+        )
+        return False
+
     if parsed.scheme == "http" and not _is_loopback(parsed.hostname or ""):
         log(
             f"warning: refusing to follow non-loopback HTTP "
@@ -311,7 +324,21 @@ def _build_well_known_url(
     path = parsed.path.rstrip("/")
     well_known_path = f"/.well-known/{suffix}{path}"
     query = parsed.query if keep_query else ""
-    return urlunsplit((parsed.scheme, parsed.netloc, well_known_path, query, ""))
+    # Drop any embedded userinfo so credentials in a ``user:pass@host`` server
+    # URL are not sent as HTTP Basic auth on the discovery GET — consistent with
+    # the userinfo stripping in _authorization_base_url and the #13 validators.
+    host = parsed.hostname or ""
+    if host:
+        if ":" in host:
+            host = f"[{host}]"  # re-bracket an IPv6 literal
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        netloc = f"{host}:{port}" if port is not None else host
+    else:
+        netloc = parsed.netloc  # no parseable host — preserve verbatim
+    return urlunsplit((parsed.scheme, netloc, well_known_path, query, ""))
 
 
 def _fetch_authorization_server_metadata(
@@ -1116,6 +1143,12 @@ def _run_authorization_flow(
         metadata,
         cid,
         csecret,
+        # RFC 6749 §5.1 lets the AS omit `scope` when it equals the requested
+        # scope — exactly what a step-up does (requested == merged union). Fall
+        # back to the requested `scope` so the stored TokenData.scope is not
+        # wiped to None, which would shrink the union on the NEXT step-up. On
+        # initial auth `scope` is None, which is the correct fallback there too.
+        previous_scope=scope,
         client_secret_expires_at=cse_at,
         auth_method=auth_method,
         no_resource_indicator=not resource_indicator,
