@@ -1100,6 +1100,36 @@ class TestProtocolVersionHeader:
         assert reqs[4].headers["mcp-protocol-version"] == "2024-11-05"
         assert reqs[5].headers["mcp-protocol-version"] == "2024-11-05"
 
+    def test_reinitialize_recaptures_version_from_sse_framed_response(self, httpx_mock):
+        """The 404-recovery re-initialize response may itself be SSE-framed —
+        the protocol version must still be re-captured and injected."""
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"protocolVersion":"2025-06-18"},"id":1}',
+            headers={"content-type": "application/json", "mcp-session-id": "sess-1"},
+        )
+        httpx_mock.add_response(
+            status_code=404, text="", headers={"content-type": "application/json"}
+        )
+        # reinit initialize -> SSE-framed, renegotiates 2025-03-26
+        httpx_mock.add_response(
+            text='data: {"jsonrpc":"2.0","result":{"protocolVersion":"2025-03-26"},"id":0}\n\n',
+            headers={"content-type": "text/event-stream", "mcp-session-id": "sess-2"},
+        )
+        httpx_mock.add_response(status_code=202, text="")  # reinit initialized
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":2}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            [
+                '{"jsonrpc":"2.0","method":"initialize","id":1}',
+                '{"jsonrpc":"2.0","method":"tools/call","id":2}',
+            ]
+        )
+        reqs = httpx_mock.get_requests()
+        assert reqs[3].headers["mcp-protocol-version"] == "2025-03-26"  # initialized
+        assert reqs[4].headers["mcp-protocol-version"] == "2025-03-26"  # retry
+
 
 # --- step-up authorization (anthropics/claude-code#44652) ---
 
@@ -1754,6 +1784,29 @@ class TestPagination:
             [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
         )
         assert output.strip() == "{not valid json"
+        assert len(httpx_mock.get_requests()) == 2
+
+    def test_page1_sse_with_no_parseable_message_falls_back(self, httpx_mock):
+        """Page-1 SSE whose only message event has a non-JSON data line (server
+        bug) yields parsed=None in _post_parsed, so pagination falls back to a
+        _post_and_stream re-POST and forwards the body."""
+        # Page-1 buffered SSE parse finds no JSON message, then the fallback
+        # re-POSTs and the streaming path emits the (now valid) body.
+        httpx_mock.add_response(
+            url=self.URL,
+            text="event: message\ndata: not-json\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text='event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"tools":[]}}\n\n',
+            headers={"content-type": "text/event-stream"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        assert json.loads(output.strip())["result"]["tools"] == []
         assert len(httpx_mock.get_requests()) == 2
 
     def test_page2_non_dict_result_flushes_partial(self, httpx_mock):
@@ -2415,7 +2468,9 @@ class TestRunSse:
                     def __exit__(self_, *a):
                         return False
 
-                    def iter_lines(self_):
+                    def iter_text(self_):
+                        # Matches the production call site; never iterated here
+                        # because the 404 status returns early.
                         return iter([])
 
                 return _CM()

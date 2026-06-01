@@ -596,6 +596,9 @@ def _iter_sse_events(lines: Iterable[str]) -> Iterator[tuple[str, str]]:
     - ``event:`` sets the event type, which defaults to ``"message"`` and resets
       after every dispatched event;
     - ``:``-prefixed comment lines and unrecognised fields are ignored;
+    - the ``id:`` and ``retry:`` fields are intentionally ignored: mcp-stdio
+      does not implement SSE resumption (no ``Last-Event-ID`` replay on
+      reconnect) or server-driven reconnect timing for the legacy GET stream;
     - an event is dispatched on each blank-line boundary with its ``data:``
       fields concatenated by LF;
     - a final unterminated event with non-empty data is also dispatched at end
