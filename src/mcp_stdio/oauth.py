@@ -131,6 +131,35 @@ def _authorization_base_url(server_url: str) -> str:
     return f"{parsed.scheme}://{netloc}"
 
 
+def _resource_indicator(server_url: str) -> str:
+    """Return the RFC 8707 ``resource`` value for ``server_url``.
+
+    Strips embedded userinfo (``user:pass@``) — RFC 8707 §2 defines the resource
+    as a target-service URI and the credentials are not part of that identity;
+    leaving them in would send them verbatim in the token/authorize form body,
+    the authorize URL (and the browser address bar), and the AS's request logs.
+    Mirrors the userinfo-strip discipline of ``_authorization_base_url`` /
+    ``_build_well_known_url``. Keeps the path and query (they distinguish
+    resources) but drops any fragment (RFC 8707 §2 MUST NOT). Returns the input
+    unchanged if it does not parse as an http(s) URL with a host (#L1 round37).
+    """
+    try:
+        parsed = urlparse(server_url)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return server_url
+    if not parsed.scheme or not host:
+        return server_url
+    if ":" in host:  # re-bracket an IPv6 literal host (urlparse strips brackets)
+        host = f"[{host}]"
+    netloc = f"{host}:{port}" if port is not None else host
+    resource = f"{parsed.scheme}://{netloc}{parsed.path}"
+    if parsed.query:
+        resource += f"?{parsed.query}"
+    return resource
+
+
 # Default ports used when normalising a parsed URL into a RFC 6454 origin
 # tuple for comparison. Any scheme outside this table falls through as None,
 # which is fine — we only reach the cross-origin check after scheme has
@@ -1255,7 +1284,7 @@ def refresh_cached_token(
             cached.client_secret,
             cached.refresh_token,
             client,
-            resource=None if no_resource_indicator else server_url,
+            resource=None if no_resource_indicator else _resource_indicator(server_url),
             auth_method=auth_method,
         )
     except Exception as e:
@@ -1279,17 +1308,29 @@ def refresh_cached_token(
         # keeps the cached flag intact for the next step-up.
         iss_parameter_supported=cached.iss_parameter_supported,
     )
-    data = _token_response_to_data(
-        raw,
-        metadata,
-        cached.client_id,
-        cached.client_secret,
-        previous_refresh_token=cached.refresh_token,
-        previous_scope=cached.scope,
-        client_secret_expires_at=cached.client_secret_expires_at,
-        auth_method=auth_method,
-        no_resource_indicator=no_resource_indicator,
-    )
+    try:
+        data = _token_response_to_data(
+            raw,
+            metadata,
+            cached.client_id,
+            cached.client_secret,
+            previous_refresh_token=cached.refresh_token,
+            previous_scope=cached.scope,
+            client_secret_expires_at=cached.client_secret_expires_at,
+            auth_method=auth_method,
+            no_resource_indicator=no_resource_indicator,
+        )
+    except Exception as e:
+        # #M2 (round37): a non-compliant 200 token response MISSING access_token
+        # (e.g. {"token_type":"Bearer"} with no `error`) slips past
+        # _parse_token_response and makes _token_response_to_data raise. This
+        # call was outside the try above, so the RuntimeError propagated out of
+        # refresh_cached_token — violating its "returns None on failure" contract
+        # and, worse, aborting ensure_token's recovery (it expects None to clear
+        # the stale token and re-auth, but the RuntimeError reached cli.py and
+        # exited 1). Degrade to None like every other refresh failure.
+        log(f"token refresh failed: {_sanitize_oauth_error(e)}")
+        return None
     save_token(server_url, data)
     log("token refreshed successfully")
     return data
@@ -1377,7 +1418,7 @@ def _run_authorization_flow(
             "code_challenge_method": "S256",
         }
         if resource_indicator:
-            params["resource"] = server_url
+            params["resource"] = _resource_indicator(server_url)
         if scope:
             params["scope"] = scope
 
@@ -1446,6 +1487,13 @@ def _run_authorization_flow(
     # false-mismatch and block a legitimate flow. A genuine mix-up always differs
     # by HOST, which rstrip does not mask, so the defence is preserved.
     #
+    # Honest deviation note (#N1 round37): RFC 9207 §2.4 specifies a SIMPLE
+    # STRING comparison (RFC 3986 §6.2.1), i.e. byte-exact. The rstrip("/")
+    # tolerance is a deliberate, security-preserving relaxation of that letter
+    # (same spirit as the RFC 9728 §3.3 / RFC 8414 §3.3 warn-and-continue
+    # relaxations) — it only collapses a trailing slash, never a host/scheme/port
+    # difference, so no mix-up the strict comparison would catch slips through.
+    #
     # §2.4 has a SECOND MUST: a client MUST reject a response that OMITS `iss`
     # from an AS that advertises iss support (the RFC 9207 §3 metadata flag) —
     # otherwise a mix-up attacker could simply strip `iss` to silence the compare
@@ -1480,7 +1528,7 @@ def _run_authorization_flow(
         code_verifier,
         redirect_uri,
         client,
-        resource=server_url if resource_indicator else None,
+        resource=_resource_indicator(server_url) if resource_indicator else None,
         auth_method=auth_method,
     )
     data = _token_response_to_data(
@@ -1555,7 +1603,7 @@ def _run_device_authorization_flow(
     # Step 1: Device Authorization Request (RFC 8628 §3.1)
     da_params: dict[str, str] = {}
     if resource_indicator:
-        da_params["resource"] = server_url
+        da_params["resource"] = _resource_indicator(server_url)
     if scope:
         da_params["scope"] = scope
     da_headers: dict[str, str] = {
