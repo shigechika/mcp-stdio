@@ -1396,6 +1396,15 @@ def _check_connection_sse(
         if holder["post_error"] is not None:
             stream = holder["resp"]
             if stream is not None:
+                # #2 (round24): this closes the GET stream from the POST helper
+                # thread while the MAIN thread may be mid-iter_text(). It is the
+                # intended fast-fail (don't block the read until timeout for a
+                # reply that will never come), confined to the one-shot --check
+                # path — never the relay loop. A cross-thread close during an
+                # active read can surface as an exception rather than a clean
+                # StopIteration on some httpx/httpcore versions; that is caught by
+                # the outer `except Exception` and the verdict stays False, so it
+                # is best-effort by design.
                 try:
                     stream.close()
                 except Exception:  # noqa: BLE001
@@ -1805,9 +1814,22 @@ def run(
                             continue
                         # Re-adopt a session id the server rotated alongside this 401
                         # retry's response, so a chained 403 step-up below rebuilds
-                        # its retry headers from the fresh id, not the stale one
-                        # (mirrors the once-adoption above the recovery branches).
-                        if result.session_id:
+                        # its retry headers from the fresh id, not the stale one.
+                        # Gate it like the pre-recovery adoption (#1 round24): adopt
+                        # only when the retry SUCCEEDED, or returned a 403 that the
+                        # step-up branch below will actually consume. A TERMINAL
+                        # status (bare 500/400, or a 403 with no scope_upgrader) that
+                        # merely echoes a session id must NOT poison session_id for
+                        # the next stdin line — that id was just rejected. (A 404 is
+                        # excluded: its branch reinitializes from scratch, ignoring
+                        # any rotated id, and a cold 404 must stay a terminal error.)
+                        if result.session_id and (
+                            result.status_code < 400
+                            or (
+                                result.status_code == 403
+                                and scope_upgrader is not None
+                            )
+                        ):
                             session_id = result.session_id
                     else:
                         log("token refresh failed, returning error")
@@ -1836,9 +1858,12 @@ def run(
                                 # None handling.
                                 continue
                             # Re-adopt a session id rotated alongside this step-up
-                            # retry's response so a chained 404 sees the fresh id
-                            # (mirrors the 401-branch re-adoption above).
-                            if result.session_id:
+                            # retry's response. Gate it like the 401 branch (#1
+                            # round24): adopt only on SUCCESS. After the step-up the
+                            # only downstream branch is 404, which reinitializes from
+                            # scratch (ignoring any rotated id), so a terminal status
+                            # echoing a session id must not poison the next line.
+                            if result.session_id and result.status_code < 400:
                                 session_id = result.session_id
                         else:
                             log("step-up authorization failed, returning error")
