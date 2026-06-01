@@ -1083,6 +1083,45 @@ class TestRun:
         assert err["error"]["code"] == -32000
         assert "session lost" in err["error"]["message"]
 
+    def test_reinitialize_notifications_initialized_transport_error_returns_error(
+        self, httpx_mock
+    ):
+        """#13(round23): if the initialize succeeds but the
+        notifications/initialized POST RAISES a transport error (not just a
+        non-200), _reinitialize's except httpx.HTTPError branch must still treat
+        the re-init as failed and surface 'session lost' — exercising the
+        raise-path, distinct from the non-200-status path above."""
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "sess-old",
+            },
+        )
+        httpx_mock.add_response(status_code=404, text="")
+        # Initialize succeeds — server assigns sess-new
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":0}',
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "sess-new",
+            },
+        )
+        # notifications/initialized POST raises a transport error.
+        httpx_mock.add_exception(httpx.ConnectError("connection reset"))
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","method":"init","id":1}',
+                '{"jsonrpc":"2.0","method":"call","id":2}',
+            ],
+        )
+        lines = [x for x in output.strip().splitlines() if x]
+        err = json.loads(lines[-1])
+        assert err["id"] == 2
+        assert "session lost" in err["error"]["message"]
+
     def test_reinitialize_missing_session_id_returns_error(self, httpx_mock):
         """#12: a re-initialize that returns 200 with a valid InitializeResult
         but NO mcp-session-id header (a plausible broken-server bug) must
@@ -2892,10 +2931,12 @@ class TestPagination:
         assert merged["result"]["_meta"] == {"total": 2}  # late field kept
         assert "nextCursor" not in merged["result"]
 
-    def test_page_sse_skips_interleaved_notification(self, httpx_mock):
-        """#1: a server may interleave a notification on the POST's SSE stream
-        BEFORE the list result. _post_parsed must skip it and return the real
-        response, not mistake the notification for the page result."""
+    def test_page_sse_forwards_interleaved_notification(self, httpx_mock):
+        """#5(round23): a server may interleave a notification on the POST's SSE
+        stream BEFORE the list result. _post_parsed must FORWARD it to stdout
+        (like the streaming path _post_and_stream) AND still return the real
+        response — not mistake the notification for the page result, nor drop it
+        only on the paginated methods."""
         notif = '{"jsonrpc":"2.0","method":"notifications/message","params":{}}'
         result = '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}]}}'
         body = (
@@ -2911,10 +2952,13 @@ class TestPagination:
             httpx_mock,
             [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
         )
-        merged = json.loads(output.strip())
+        lines = [json.loads(x) for x in output.strip().splitlines() if x]
+        # The interleaved notification was DELIVERED (not dropped, not mistaken
+        # for the result).
+        assert any(d.get("method") == "notifications/message" for d in lines)
+        # The real list result is still parsed correctly.
+        merged = next(d for d in lines if "result" in d)
         assert [t["name"] for t in merged["result"]["tools"]] == ["a"]
-        # The interleaved notification must not have been forwarded as the result.
-        assert "notifications/message" not in output
 
 
 # --- check_connection ---
