@@ -156,18 +156,30 @@ class TestEnforceLfStdio:
         assert calls == [{"newline": ""}, {"newline": ""}]
 
     def test_windows_without_reconfigure_is_tolerated(self):
-        """Some redirected streams lack reconfigure(); must not raise."""
+        """Some redirected streams lack reconfigure(); must not raise — AND the
+        win32 branch must actually run the hasattr guard (#C-1 round34). The
+        stream records the `reconfigure` lookup, so `checked` is True only if the
+        win32 path was taken; on a non-win32 early-return it would stay False."""
 
-        class BareStream:
-            # Intentionally no reconfigure attribute
-            pass
+        class TrackingStream:
+            def __init__(self):
+                self.checked = False
 
+            def __getattr__(self, name):
+                # Only `reconfigure` is missing; hasattr() probes it here.
+                if name == "reconfigure":
+                    self.checked = True
+                raise AttributeError(name)
+
+        stdin_stream, stdout_stream = TrackingStream(), TrackingStream()
         with (
             patch("mcp_stdio.relay.sys.platform", "win32"),
-            patch("mcp_stdio.relay.sys.stdin", BareStream()),
-            patch("mcp_stdio.relay.sys.stdout", BareStream()),
+            patch("mcp_stdio.relay.sys.stdin", stdin_stream),
+            patch("mcp_stdio.relay.sys.stdout", stdout_stream),
         ):
-            _enforce_lf_stdio()  # should not raise
+            _enforce_lf_stdio()  # must not raise
+        # The win32 branch ran the hasattr guard on both streams.
+        assert stdin_stream.checked and stdout_stream.checked
 
 
 # --- _extract_id ---
