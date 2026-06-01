@@ -2156,6 +2156,57 @@ class TestEnsureToken:
         data = ensure_token("https://example.com/mcp", client)
         assert data.access_token == "cached_at"
 
+    def test_expired_cached_token_without_refresh_token_skips_refresh(
+        self, tmp_path, monkeypatch
+    ):
+        """#F-3(round28): an EXPIRED cached token lacking a refresh_token must
+        skip the refresh branch (its gate needs refresh_token AND token_endpoint
+        AND client_id) and fall straight to the full authorization flow —
+        refresh_cached_token must not even be called."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        from mcp_stdio.token_store import save_token
+
+        save_token(
+            "https://example.com/mcp",
+            TokenData(
+                access_token="expired_at",
+                expires_at=time.time() - 10,  # already expired
+                refresh_token=None,  # no refresh path available
+                token_endpoint="https://example.com/token",
+                authorization_endpoint="https://example.com/authorize",
+            ),
+        )
+
+        called = {"refresh": False}
+
+        def spy_refresh(*a, **k):
+            called["refresh"] = True
+            return None
+
+        sentinel = TokenData(access_token="fresh_from_full_flow")
+        monkeypatch.setattr("mcp_stdio.oauth.refresh_cached_token", spy_refresh)
+        monkeypatch.setattr(
+            "mcp_stdio.oauth._probe_www_authenticate", lambda *a, **k: None
+        )
+        monkeypatch.setattr(
+            "mcp_stdio.oauth.discover_oauth_metadata",
+            lambda *a, **k: OAuthMetadata(
+                authorization_endpoint="https://example.com/authorize",
+                token_endpoint="https://example.com/token",
+            ),
+        )
+        monkeypatch.setattr(
+            "mcp_stdio.oauth._run_authorization_flow", lambda *a, **k: sentinel
+        )
+
+        client = httpx.Client()
+        data = ensure_token("https://example.com/mcp", client)
+        assert data is sentinel
+        assert called["refresh"] is False
+
     def test_refresh_leeway_zero_uses_actual_expiry(self, tmp_path, monkeypatch):
         """#56: refresh_leeway=0 disables proactive refresh — token valid until literal expiry.
 
@@ -4495,6 +4546,37 @@ class TestDeviceAuthorizationFlow:
             _run_device_authorization_flow(
                 MCP_URL, client, metadata=_device_meta(), cached=None
             )
+
+    def test_poll_2xx_non_json_body_sleeps_and_continues(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """#F-4(round28): a non-200 2xx poll response (e.g. 202) with a non-JSON
+        body does not raise — raise_for_status only fires on 4xx/5xx, and .json()
+        raises but is caught — so the loop sleeps-and-continues rather than
+        crashing. A subsequent 200 then succeeds. Complements the 400 non-JSON
+        test (which exercises the raise side)."""
+        self._patch_store(tmp_path, monkeypatch)
+        monkeypatch.setattr(time, "sleep", lambda _s: None)
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        # Poll #1: 202 (2xx but not 200) with a non-JSON body. json() raises,
+        # raise_for_status() does not (2xx) → sleep-and-continue.
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            status_code=202,
+            headers={"content-type": "text/html"},
+            text="<html>processing</html>",
+        )
+        # Poll #2: 200 success.
+        httpx_mock.add_response(
+            url=TOKEN_URL, json={"access_token": "acc", "token_type": "Bearer"}
+        )
+
+        client = httpx.Client()
+        data = _run_device_authorization_flow(
+            MCP_URL, client, metadata=_device_meta(), cached=None
+        )
+        assert data.access_token == "acc"
 
     def test_explicit_client_id_skips_dcr(self, httpx_mock, tmp_path, monkeypatch):
         """#7(round14): with an explicit --client-id (client_id_override) the

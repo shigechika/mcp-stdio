@@ -1577,7 +1577,12 @@ def _run_device_authorization_flow(
                 headers=poll_headers,
             )
         except Exception as exc:
-            log(f"device flow poll error: {exc}")
+            # Sanitise like the refresh path (#B-2 round28): today's reachable
+            # exception is an httpx transport error whose str() carries only the
+            # operator-trusted token-endpoint URL (no AS body), but bounding it
+            # keeps any future exception type that embeds resp.text from writing
+            # raw AS-controlled bytes to the log.
+            log(f"device flow poll error: {_sanitize_oauth_error(exc)}")
             _poll_sleep()
             continue
 
