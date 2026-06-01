@@ -25,7 +25,7 @@ pytest tests/test_relay.py::TestSendRequest -v
 pip install build && python -m build
 ```
 
-Uses **hatch** as the build backend. Version is defined in `src/mcp_stdio/__init__.py` (`__version__`).
+Uses **hatchling** as the build backend (`build-backend = "hatchling.build"` in `pyproject.toml`). Version is defined in `src/mcp_stdio/__init__.py` (`__version__`).
 
 ## Architecture
 
