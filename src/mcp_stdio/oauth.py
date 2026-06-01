@@ -49,8 +49,10 @@ def _safe_int(value: Any, default: int) -> int:
         return default
 
 
-# RFC 6749 §4.1.2.1 / §5.2 error / error_description grammar: printable ASCII
-# excluding double-quote (0x22) and backslash (0x5C). Anything outside it is
+# RFC 6749 error / error_description grammar (NQSCHAR): printable ASCII
+# excluding double-quote (0x22) and backslash (0x5C). The ABNF is defined in
+# Appendix A.7 (`error = 1*NQSCHAR`) and A.8 (`error-description = 1*NQSCHAR`);
+# §4.1.2.1 / §5.2 are where those parameters are used. Anything outside it is
 # stripped from an AS-supplied error before it reaches a log / exception, so a
 # hostile AS cannot inject control characters or megabytes of text into the
 # operator's logs. See #12.
@@ -1488,10 +1490,16 @@ def _run_device_authorization_flow(
         )
     # RFC 8628 §3.2 mandates ``verification_uri``; Google's device endpoint
     # historically returns the non-standard ``verification_url``. Accept either
-    # so the advertised --oauth-device flow works against Google. Validate the
-    # scheme/origin (the URL is presented to the user as an actionable "Open:"
-    # instruction) so a hostile AS cannot phish via a cleartext / non-http(s)
-    # verification URL — mirroring the AS-endpoint validation. See #13.
+    # so the advertised --oauth-device flow works against Google. The URL is
+    # presented to the user as an actionable "Open:" instruction, so
+    # ``_validate_endpoint_url`` enforces the SCHEME guard (rejects non-http(s),
+    # userinfo, and non-loopback cleartext) — a hostile AS cannot point the user
+    # at a plaintext / parser-confusing URL. It is NOT origin-pinned to the
+    # discovered AS: RFC 8628 verification URIs legitimately live on a separate
+    # user-facing host (e.g. google.com/device vs oauth2.googleapis.com), so an
+    # origin check would break compliant flows. The §3.3.1/§5.4 user_code
+    # confirmation below is the anti-phishing / device-disambiguation mitigation.
+    # See #13.
     verification_uri = _validate_endpoint_url(
         da.get("verification_uri") or da.get("verification_url"),
         label="verification_uri",
