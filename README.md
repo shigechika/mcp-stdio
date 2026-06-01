@@ -209,6 +209,8 @@ Options:
   -h, --help             Show help
 ```
 
+Run `mcp-stdio --help` for the full per-flag detail (platform notes and issue references are more verbose than this table).
+
 ## Workarounds
 
 See [WORKAROUNDS.md](WORKAROUNDS.md) for known issues in Claude Code, mcp-remote, and Windows that mcp-stdio addresses.

@@ -366,10 +366,10 @@ def _error_response(message: str, req_id: Any = None) -> str:
 def _parse_retry_after(value: str | None) -> float | None:
     """Parse an HTTP ``Retry-After`` header value.
 
-    Per RFC 7231 §7.1.3, ``Retry-After`` is either a non-negative integer
-    number of seconds (delta-seconds) or an HTTP-date. Returns the number
-    of seconds to wait, or ``None`` if the header is absent or
-    unparseable. A past HTTP-date returns ``0`` (retry immediately).
+    Per RFC 9110 §10.2.3 (formerly RFC 7231 §7.1.3), ``Retry-After`` is either
+    a non-negative integer number of seconds (delta-seconds) or an HTTP-date.
+    Returns the number of seconds to wait, or ``None`` if the header is absent
+    or unparseable. A past HTTP-date returns ``0`` (retry immediately).
     """
     if not value:
         return None
@@ -385,8 +385,8 @@ def _parse_retry_after(value: str | None) -> float | None:
         if math.isnan(secs) or math.isinf(secs):
             return None
         return max(0.0, secs)
-    # Fall back to HTTP-date (RFC 7231 §7.1.1.1 — IMF-fixdate, obsolete
-    # RFC 850, or ANSI C's asctime()).
+    # Fall back to HTTP-date (RFC 9110 §5.6.7, formerly RFC 7231 §7.1.1.1 —
+    # IMF-fixdate, obsolete RFC 850, or ANSI C's asctime()).
     try:
         dt = email.utils.parsedate_to_datetime(stripped)
     except (TypeError, ValueError):
