@@ -259,7 +259,7 @@ def main() -> None:
             "expire (default: 60, or MCP_OAUTH_REFRESH_LEEWAY env var). "
             "Increase for ASes with significant clock skew; decrease for "
             "deployments where short-lived tokens make a 60 s window "
-            "exceed token TTL"
+            "exceed token TTL. Only used with --oauth / --oauth-device"
         ),
     )
     parser.add_argument(
@@ -403,9 +403,16 @@ def main() -> None:
     )
 
     # Warn if OAuth-only options are explicitly set without an OAuth flow — they
-    # are silently ignored otherwise.
+    # are silently ignored otherwise. client_id is presence-based (`is not None`)
+    # so an explicit `--client-id ''` trips it too, matching the --bearer-token
+    # discipline (#13 round22). oauth_scope's default is "" (not None), so an
+    # explicit empty value is indistinguishable from the default and stays on the
+    # truthiness check. --oauth-refresh-leeway is also OAuth-only but always has a
+    # default, so it cannot be presence-detected here — its help text says so.
     if not (args.oauth or args.oauth_device) and (
-        args.client_id or args.oauth_scope or args.no_resource_indicator
+        args.client_id is not None
+        or args.oauth_scope
+        or args.no_resource_indicator
     ):
         print(
             "warning: --client-id / --oauth-scope / --no-resource-indicator are "
