@@ -361,6 +361,43 @@ class TestMain:
         assert auth_keys == ["Authorization"]
         assert headers["Authorization"] == "Bearer oauth-tok"
 
+    def test_warns_when_oauth_only_flags_set_without_oauth(self, capsys):
+        """OAuth-only flags without --oauth/--oauth-device are silently ignored;
+        emit a warning so the user notices."""
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--oauth-scope",
+                    "hr:read",
+                    "https://example.com/mcp",
+                ],
+            ),
+            patch("mcp_stdio.cli.run"),
+        ):
+            main()
+        assert "ignored without --oauth" in capsys.readouterr().err
+
+    def test_no_warning_when_oauth_flags_with_oauth(self, capsys):
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--oauth",
+                    "--oauth-scope",
+                    "hr:read",
+                    "https://example.com/mcp",
+                ],
+            ),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        assert "ignored without --oauth" not in capsys.readouterr().err
+
     def test_dash_h_overrides_default_content_type_case_insensitively(self):
         with (
             patch(

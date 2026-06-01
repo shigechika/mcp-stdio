@@ -333,6 +333,18 @@ def main() -> None:
         )
         sys.exit(1)
 
+    # Warn if OAuth-only options are set without an OAuth flow — they are
+    # silently ignored otherwise. --client-id / --oauth-scope also accept env
+    # defaults, so only treat them as "set" when non-empty.
+    if not (args.oauth or args.oauth_device) and (
+        args.client_id or args.oauth_scope or args.no_resource_indicator
+    ):
+        print(
+            "warning: --client-id / --oauth-scope / --no-resource-indicator are "
+            "ignored without --oauth or --oauth-device",
+            file=sys.stderr,
+        )
+
     # When an OAuth flow is selected, ignore any ambient env bearer token —
     # the flow below sets the Authorization header itself.
     if args.oauth or args.oauth_device:
