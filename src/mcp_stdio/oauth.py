@@ -250,6 +250,17 @@ def _validate_prm_hint_url(hint_url: str, server_url: str) -> bool:
         log(f"warning: unsupported scheme in resource_metadata hint {hint_url!r}, ignoring")
         return False
 
+    if parsed.username is not None or parsed.password is not None:
+        # Parity with the sibling #13 validators (_validate_auth_server_url,
+        # _validate_endpoint_url): refuse embedded userinfo so this attacker-
+        # influenced hint cannot send HTTP Basic credentials to a userinfo
+        # authority on the discovery GET.
+        log(
+            f"warning: resource_metadata hint {hint_url!r} embeds userinfo "
+            f"(user:pass@); refusing. See #13."
+        )
+        return False
+
     if parsed.scheme == "http" and not _is_loopback(parsed.hostname or ""):
         log(
             f"warning: refusing resource_metadata hint {hint_url!r} "
@@ -1070,57 +1081,63 @@ def _run_authorization_flow(
     if cid is None:  # -O-safe invariant (every branch above sets cid)
         raise RuntimeError("no client_id available for authorization")
 
-    code_verifier, code_challenge = generate_pkce()
-
-    # Authorization URL params; RFC 8707 resource indicator included by default
-    state = secrets.token_urlsafe(32)
-    params: dict[str, str] = {
-        "client_id": cid,
-        "response_type": "code",
-        "redirect_uri": redirect_uri,
-        "state": state,
-        "code_challenge": code_challenge,
-        "code_challenge_method": "S256",
-    }
-    if resource_indicator:
-        params["resource"] = server_url
-    if scope:
-        params["scope"] = scope
-
-    auth_url = f"{metadata.authorization_endpoint}?{urlencode(params)}"
-    # Log a STATE-REDACTED URL. The user still needs a clickable URL when the
-    # browser does not auto-open, but the single-use CSRF ``state`` nonce does
-    # not need to land in stderr — MCP host logs (Claude Desktop/Code) persist
-    # to files that may be shared in bug reports. The browser receives the full
-    # URL below; the PKCE secret (``code_verifier``) is never in the URL and the
-    # S256 ``code_challenge`` is public, so only ``state`` is worth redacting.
-    log_url = f"{metadata.authorization_endpoint}?{urlencode({**params, 'state': '<redacted>'})}"
-    log(f"authorize URL (open in browser if not auto-opened):\n{log_url}")
-
-    webbrowser.open(auth_url)
-
+    # From here the callback server is listening. Any failure between now and
+    # the close below (generate_pkce, webbrowser.open, thread.start, timeout)
+    # must still close it, or the loopback listening socket leaks for the
+    # process lifetime — so the whole window is guarded and closed on any exit.
     done = threading.Event()
+    try:
+        code_verifier, code_challenge = generate_pkce()
 
-    def serve() -> None:
-        while not done.is_set():
-            callback_server.handle_request()
+        # Authorization URL params; RFC 8707 resource indicator on by default
+        state = secrets.token_urlsafe(32)
+        params: dict[str, str] = {
+            "client_id": cid,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        }
+        if resource_indicator:
+            params["resource"] = server_url
+        if scope:
+            params["scope"] = scope
 
-    thread = threading.Thread(target=serve, daemon=True)
-    thread.start()
+        auth_url = f"{metadata.authorization_endpoint}?{urlencode(params)}"
+        # Log a STATE-REDACTED URL. The user still needs a clickable URL when the
+        # browser does not auto-open, but the single-use CSRF ``state`` nonce
+        # does not need to land in stderr — MCP host logs (Claude Desktop/Code)
+        # persist to files that may be shared in bug reports. The browser
+        # receives the full URL below; the PKCE secret (``code_verifier``) is
+        # never in the URL and the S256 ``code_challenge`` is public, so only
+        # ``state`` is worth redacting.
+        log_url = (
+            f"{metadata.authorization_endpoint}"
+            f"?{urlencode({**params, 'state': '<redacted>'})}"
+        )
+        log(f"authorize URL (open in browser if not auto-opened):\n{log_url}")
 
-    deadline = time.monotonic() + timeout
-    while not (cb_result.auth_code or cb_result.error):
-        if time.monotonic() > deadline:
-            done.set()
-            callback_server.server_close()
-            raise TimeoutError(
-                "OAuth callback not received within timeout. "
-                "Please restart and try again."
-            )
-        time.sleep(0.2)
+        webbrowser.open(auth_url)
 
-    done.set()
-    callback_server.server_close()
+        def serve() -> None:
+            while not done.is_set():
+                callback_server.handle_request()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+
+        deadline = time.monotonic() + timeout
+        while not (cb_result.auth_code or cb_result.error):
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    "OAuth callback not received within timeout. "
+                    "Please restart and try again."
+                )
+            time.sleep(0.2)
+    finally:
+        done.set()
+        callback_server.server_close()
 
     if cb_result.error:
         raise RuntimeError(f"OAuth error: {cb_result.error}")
