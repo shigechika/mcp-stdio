@@ -102,6 +102,14 @@ def _build_token_refresher(
             new_headers = dict(headers)
             new_headers["Authorization"] = f"Bearer {data.access_token}"
             return new_headers
+        except Exception as e:
+            # Mirror upgrader(): a refresh failure beyond the network call
+            # (e.g. save_token re-raising OSError on a full/read-only disk)
+            # must degrade to None so the relay's 401 handler emits a JSON-RPC
+            # auth error and keeps the session alive, instead of an uncaught
+            # crash that drops the stdio connection mid-session (#11 contract).
+            print(f"error: token refresh failed: {e}", file=sys.stderr)
+            return None
         finally:
             client.close()
 
@@ -209,7 +217,11 @@ def main() -> None:
         # Pass as string so argparse re-applies _non_negative_float to the
         # default — invalid env var values (negative, non-numeric) surface
         # as argparse errors instead of a raw Python ValueError on startup.
-        default=os.environ.get("MCP_OAUTH_REFRESH_LEEWAY", "60"),
+        # `or "60"` treats an exported-but-EMPTY env var (a common CI artifact
+        # of `export VAR=$MAYBE_UNSET`) as unset rather than aborting startup
+        # with "invalid float value: ''"; a genuinely malformed value still
+        # errors.
+        default=(os.environ.get("MCP_OAUTH_REFRESH_LEEWAY") or "60"),
         metavar="SECONDS",
         help=(
             "Proactively refresh access tokens this many seconds before they "

@@ -185,6 +185,22 @@ class TestMain:
             main()
         assert mock_ensure.call_args.kwargs["refresh_leeway"] == 120.0
 
+    def test_oauth_refresh_leeway_empty_env_var_falls_back_to_default(
+        self, monkeypatch
+    ):
+        """An exported-but-EMPTY MCP_OAUTH_REFRESH_LEEWAY (a common CI artifact
+        of `export VAR=$MAYBE_UNSET`) must fall back to the 60 s default, not
+        abort startup with an argparse 'invalid float value' error."""
+        monkeypatch.setenv("MCP_OAUTH_REFRESH_LEEWAY", "")
+        with (
+            patch("sys.argv", ["mcp-stdio", "--oauth", "https://example.com/mcp"]),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        assert mock_ensure.call_args.kwargs["refresh_leeway"] == 60.0
+
     def test_oauth_refresh_leeway_negative_rejected(self, capsys):
         """#56: negative leeway values are rejected at parse time."""
         with patch(
@@ -732,10 +748,26 @@ class TestBuildTokenRefresher:
         assert refresher() is None
         assert _SpyClient.instances[-1].closed
 
+    def test_returns_none_when_refresh_raises_and_closes(self, monkeypatch, capsys):
+        """A refresh that RAISES (e.g. save_token re-raising OSError on a
+        read-only disk) must degrade to None — not crash the relay mid-session
+        — and still close the client. Symmetric with the upgrader."""
+        _SpyClient.instances.clear()
+        monkeypatch.setattr("mcp_stdio.cli.httpx.Client", _SpyClient)
+
+        def boom(url, client):
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr("mcp_stdio.oauth.refresh_cached_token", boom)
+        refresher = _build_token_refresher("https://example.com/mcp", {}, 10, 120)
+        assert refresher() is None
+        assert _SpyClient.instances[-1].closed
+        assert "token refresh failed" in capsys.readouterr().err
+
 
 class TestBuildScopeUpgrader:
     """The upgrader closure runs RFC 9470 step-up and returns broader-scope
-    headers, catching exceptions (unlike the refresher)."""
+    headers; like the refresher, it catches exceptions and degrades to None."""
 
     def test_returns_bearer_headers_and_closes_client(self, monkeypatch):
         _SpyClient.instances.clear()
