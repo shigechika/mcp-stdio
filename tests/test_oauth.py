@@ -144,6 +144,29 @@ class TestDiscoverMetadata:
         assert meta.token_endpoint == "https://api.example.com/tok"
         assert meta.registration_endpoint == "https://api.example.com/reg"
 
+    def test_default_endpoints_no_double_slash_for_trailing_slash_as(
+        self, httpx_mock
+    ):
+        """An AS advertised with a trailing slash whose metadata omits the
+        endpoints must yield single-slash default endpoints, not '//authorize'."""
+        server_url = "https://mcp.example.com/mcp"
+        httpx_mock.add_response(
+            url="https://mcp.example.com/.well-known/oauth-protected-resource/mcp",
+            json={
+                "resource": server_url,
+                "authorization_servers": ["https://as.example.com/"],
+            },
+        )
+        httpx_mock.add_response(
+            url="https://as.example.com/.well-known/oauth-authorization-server",
+            json={"issuer": "https://as.example.com/"},  # no endpoints declared
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata(server_url, client)
+        assert meta.authorization_endpoint == "https://as.example.com/authorize"
+        assert meta.token_endpoint == "https://as.example.com/token"
+        assert "//authorize" not in meta.authorization_endpoint
+
     def test_fallback_on_404(self, httpx_mock):
         self._mock_no_prm(httpx_mock)
         httpx_mock.add_response(
@@ -2938,6 +2961,97 @@ class TestAuthorizationFlowFailurePaths:
                 client_id_override="cid",
                 timeout=5,
             )
+
+
+class TestRfc9207IssValidation:
+    """RFC 9207: validate the authorization-response `iss` parameter against the
+    discovered issuer (AS mix-up defence)."""
+
+    META = OAuthMetadata(
+        authorization_endpoint="https://ex.com/authorize",
+        token_endpoint="https://ex.com/token",
+        issuer="https://ex.com",
+    )
+
+    def _driver(self, extra_query: str):
+        from urllib.parse import parse_qs, urlparse
+        from urllib.request import urlopen
+
+        def fake_open(auth_url: str) -> bool:
+            q = parse_qs(urlparse(auth_url).query)
+            redirect_uri = q["redirect_uri"][0]
+            state = q["state"][0]
+            cb = f"{redirect_uri}?code=c&state={state}"
+            if extra_query:
+                cb += f"&{extra_query}"
+
+            def hit() -> None:
+                try:
+                    urlopen(cb, timeout=5).read()
+                except Exception:
+                    pass
+
+            threading.Thread(target=hit, daemon=True).start()
+            return True
+
+        return fake_open
+
+    def test_iss_mismatch_raises(self, monkeypatch):
+        monkeypatch.setattr(
+            "mcp_stdio.oauth.webbrowser.open", self._driver("iss=https://evil.example")
+        )
+        client = httpx.Client()
+        with pytest.raises(RuntimeError, match="issuer mismatch"):
+            _run_authorization_flow(
+                "https://ex.com/mcp",
+                client,
+                metadata=self.META,
+                cached=None,
+                client_id_override="cid",
+                timeout=5,
+            )
+
+    def test_iss_match_proceeds(self, httpx_mock, tmp_path, monkeypatch):
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+        httpx_mock.add_response(
+            url="https://ex.com/token",
+            json={"access_token": "at", "token_type": "Bearer"},
+        )
+        monkeypatch.setattr(
+            "mcp_stdio.oauth.webbrowser.open", self._driver("iss=https://ex.com")
+        )
+        client = httpx.Client()
+        data = _run_authorization_flow(
+            "https://ex.com/mcp",
+            client,
+            metadata=self.META,
+            cached=None,
+            client_id_override="cid",
+            timeout=5,
+        )
+        assert data.access_token == "at"
+
+    def test_no_iss_skips_validation(self, httpx_mock, tmp_path, monkeypatch):
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+        httpx_mock.add_response(
+            url="https://ex.com/token",
+            json={"access_token": "at", "token_type": "Bearer"},
+        )
+        monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", self._driver(""))
+        client = httpx.Client()
+        data = _run_authorization_flow(
+            "https://ex.com/mcp",
+            client,
+            metadata=self.META,
+            cached=None,
+            client_id_override="cid",
+            timeout=5,
+        )
+        assert data.access_token == "at"
 
 
 # --- _parse_resource_metadata_hint ---
