@@ -128,6 +128,10 @@ class TokenData:
     token_endpoint_auth_method: str = "none"
     # Suppress RFC 8707 resource parameter (for AS that reject it, e.g. Entra ID v2)
     no_resource_indicator: bool = False
+    # RFC 9207 §3 authorization_response_iss_parameter_supported. Persisted so a
+    # step-up that reconstructs OAuthMetadata from this cached entry can keep the
+    # §2.4 missing-iss MUST-reject active instead of silently defaulting to off.
+    iss_parameter_supported: bool = False
 
 
 # Set once if we ever fail to tighten the store dir to 0o700 and detect it is
