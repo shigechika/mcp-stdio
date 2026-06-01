@@ -105,6 +105,34 @@ class TestLoadSaveDelete:
         sys.platform == "win32",
         reason="POSIX mode bits don't model the NTFS ACL Windows uses",
     )
+    def test_newly_created_parent_dirs_are_tightened(self, tmp_path, monkeypatch):
+        """#L2(round29): mkdir(mode=) only tightens the final component, so an
+        intermediate dir parents=True creates (e.g. ~/.config on a fresh home)
+        would otherwise be left at the umask. Each ancestor WE create must be
+        0o700. A pre-existing ancestor (tmp_path) is untouched."""
+        # Store nested two levels deep so an intermediate parent is created.
+        store_dir = tmp_path / "config" / "mcp-stdio"
+        store_file = store_dir / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", store_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        old_umask = os.umask(0o000)  # loosest umask → intermediate would be 0o777
+        try:
+            save_token("https://example.com/mcp", TokenData(access_token="tok"))
+        finally:
+            os.umask(old_umask)
+
+        # The intermediate dir we created is 0o700, not umask-loose.
+        intermediate_mode = stat.S_IMODE(os.stat(tmp_path / "config").st_mode)
+        assert intermediate_mode & (stat.S_IRWXG | stat.S_IRWXO) == 0
+        assert stat.S_IMODE(os.stat(store_dir).st_mode) & (
+            stat.S_IRWXG | stat.S_IRWXO
+        ) == 0
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX mode bits don't model the NTFS ACL Windows uses",
+    )
     def test_lock_file_retightened_to_0600(self, tmp_path, monkeypatch):
         """#9(round19): a PRE-EXISTING loose-mode lock file is re-tightened to
         0o600 via fchmod when _store_lock opens it — the O_CREAT mode only

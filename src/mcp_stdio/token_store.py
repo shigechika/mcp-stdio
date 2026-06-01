@@ -156,10 +156,24 @@ def _ensure_store_dir() -> None:
 
     ``mkdir``'s ``mode`` only applies on creation, so re-assert 0o700 in case
     the directory pre-existed with looser permissions (created earlier by
-    another tool, or under a permissive umask).
+    another tool, or under a permissive umask). ``mkdir(mode=)`` also tightens
+    only the FINAL component; any intermediate dir ``parents=True`` creates
+    (e.g. ``~/.config`` on a fresh home) uses the umask, so each ancestor WE
+    create is 0o700'd too — but a pre-existing ancestor (the user's shared
+    ``~/.config``) is left untouched.
     """
     global _warned_loose_store_dir
+    # #L2 (round29): the ancestors that do not yet exist are exactly the ones
+    # mkdir(parents=True) is about to create. Capture them BEFORE mkdir so we can
+    # tighten only those — never re-mode a directory we did not create. The list
+    # stops naturally at the first existing ancestor (home is always present).
+    new_ancestors = [p for p in _STORE_DIR.parents if not p.exists()]
     _STORE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for ancestor in new_ancestors:
+        try:
+            os.chmod(ancestor, stat.S_IRWXU)  # 0o700, only dirs we just created
+        except OSError:
+            pass  # best-effort; the 0o600 token file is the primary guard
     try:
         os.chmod(_STORE_DIR, stat.S_IRWXU)  # 0o700
     except OSError:
