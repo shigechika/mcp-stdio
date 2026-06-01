@@ -421,14 +421,30 @@ def _fetch_authorization_server_metadata(
         if resp.status_code == 200:
             data = resp.json()
             # RFC 8414 §3.3: the issuer in the response MUST be identical to the
-            # URL used for discovery. We log a warning on mismatch but continue
-            # (the spec says reject) — real servers may be slightly misconfigured
-            # (trailing slash, etc.) and rejecting would be too strict.
+            # URL used for discovery. We split the spec's MUST-reject by ORIGIN:
+            #   - A cross-ORIGIN issuer (different scheme/host/port) is a mix-up /
+            #     AS-spoofing signal — REJECT (return None) so this metadata is
+            #     never used. Otherwise it would anchor the RFC 9207 `iss` check
+            #     (see issuer= below) on a FOREIGN origin: an adversarial AS that
+            #     returns a different issuer AND echoes that same `iss` on the
+            #     callback would self-satisfy the mix-up defence.
+            #   - A SAME-origin mismatch (trailing slash, path, case) is the kind
+            #     of slight misconfiguration real servers ship, so warn and
+            #     continue — rejecting on a cosmetic difference is too strict.
             issuer = data.get("issuer")
+            if issuer and _origin(urlparse(issuer)) != _origin(
+                urlparse(auth_server_base)
+            ):
+                log(
+                    f"warning: RFC 8414 §3.3 issuer ORIGIN mismatch — expected "
+                    f"the origin of {auth_server_base!r}, got {issuer!r}; "
+                    f"refusing this authorization-server metadata (mix-up guard)"
+                )
+                return None
             if issuer and issuer.rstrip("/") != auth_server_base.rstrip("/"):
                 log(
-                    f"warning: RFC 8414 §3.3 issuer mismatch — "
-                    f"expected {auth_server_base!r}, got {issuer!r}"
+                    f"warning: RFC 8414 §3.3 issuer mismatch (same origin) — "
+                    f"expected {auth_server_base!r}, got {issuer!r}; continuing"
                 )
             methods = data.get("token_endpoint_auth_methods_supported")
             # Strip a trailing slash before building default endpoints so an AS
@@ -1151,7 +1167,12 @@ def refresh_cached_token(
             auth_method=auth_method,
         )
     except Exception as e:
-        log(f"token refresh failed: {e}")
+        # Sanitise the interpolated exception text: today's reachable exceptions
+        # (httpx.HTTPStatusError, _raise_for_body_error's RuntimeError) carry no
+        # token or raw AS body, but a future exception type embedding resp.text
+        # would otherwise leak AS-controlled bytes into the log. Bound it
+        # defensively so no exception type can write an unbounded/raw log line.
+        log(f"token refresh failed: {_sanitize_oauth_error(e)}")
         return None
     metadata = OAuthMetadata(
         authorization_endpoint=cached.authorization_endpoint,
