@@ -1551,6 +1551,14 @@ def _run_device_authorization_flow(
         time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
 
     while time.monotonic() < deadline:
+        # No RFC 8707 ``resource`` is sent on the poll, unlike exchange_code /
+        # refresh_access_token. The Device Authorization Request already carried
+        # it (see the device-authorization POST above), so the AS has bound the
+        # audience to this ``device_code``; RFC 8707 §2.2 phrases the token-request
+        # ``resource`` as optional ("the client CAN indicate ... by way of the
+        # resource parameter") and lets the AS scope to the original grant — it
+        # does not require resending it on the device_code exchange. The omission
+        # is therefore intentional, mirroring the auth-method divergence below.
         poll_data: dict[str, str] = {
             "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
             "device_code": device_code,
