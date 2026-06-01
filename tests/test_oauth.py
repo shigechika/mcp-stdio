@@ -1628,11 +1628,42 @@ class TestTokenResponseToData:
         )
         assert data.token_type == "Bearer"
 
+    @pytest.mark.parametrize("bad", [0, -100, "0", "-5"])
+    def test_non_positive_expires_in_treated_as_no_expiry(self, bad, capsys):
+        """#9(round22): expires_in of 0 or negative must NOT yield an
+        immediately-expired token (which would force an instant re-refresh) —
+        treat it as no advertised expiry (expires_at=None) and warn."""
+        data = _token_response_to_data(
+            {"access_token": "at", "expires_in": bad}, self.META, "cid", None
+        )
+        assert data.expires_at is None
+        assert "non-positive expires_in" in capsys.readouterr().err
+
+    def test_positive_expires_in_still_computes_expiry(self):
+        data = _token_response_to_data(
+            {"access_token": "at", "expires_in": 3600}, self.META, "cid", None
+        )
+        assert data.expires_at is not None and data.expires_at > 0
+
 
 # --- _parse_token_response ---
 
 
 class TestParseTokenResponse:
+    def test_non_json_non_form_body_raises_clear_error(self, httpx_mock):
+        """#8(round22): a 200 with a non-JSON, non-form body (e.g. a text/html
+        maintenance page) must raise a clear RuntimeError naming the
+        content-type, not a raw JSONDecodeError that surfaces opaquely."""
+        httpx_mock.add_response(
+            url="https://example.com/token",
+            text="<html>maintenance</html>",
+            headers={"content-type": "text/html"},
+        )
+        client = httpx.Client()
+        resp = client.post("https://example.com/token")
+        with pytest.raises(RuntimeError, match="non-JSON"):
+            _parse_token_response(resp)
+
     def test_json_response(self, httpx_mock):
         httpx_mock.add_response(
             url="https://example.com/token",

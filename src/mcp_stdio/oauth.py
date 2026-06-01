@@ -890,7 +890,20 @@ def _parse_token_response(resp: httpx.Response) -> dict[str, Any]:
         _raise_for_body_error(result)
         return result
 
-    result = resp.json()
+    # #8 (round22): a 200 with any other content-type (text/plain, text/html, or
+    # a missing content-type over a non-JSON body) would otherwise raise a raw
+    # json.JSONDecodeError out of resp.json() — fine on the refresh path (caught,
+    # degrades to None) but it propagates as an opaque error on the auth-code
+    # path. Raise a clear RuntimeError naming the unexpected content-type instead,
+    # matching the explicit-error style of the missing-access_token guard below.
+    try:
+        result = resp.json()
+    except ValueError as exc:  # json.JSONDecodeError is a ValueError subclass
+        ct = resp.headers.get("content-type", "<none>")
+        raise RuntimeError(
+            f"token endpoint returned a non-JSON, non-form-urlencoded body "
+            f"(content-type {ct!r})"
+        ) from exc
     _raise_for_body_error(result)
     return result
 
@@ -1036,9 +1049,21 @@ def _token_response_to_data(
         # form-urlencoded ones (GitHub-legacy path via _parse_token_response).
         # Coerce defensively so a string value cannot crash the whole flow.
         try:
-            expires_at = time.time() + float(raw["expires_in"])
+            expires_in = float(raw["expires_in"])
         except (TypeError, ValueError):
-            expires_at = None
+            expires_in = None
+        # #9 (round22): a non-positive expires_in (0 or negative — malformed or
+        # hostile) would make expires_at <= now, so ensure_token would treat the
+        # FRESHLY obtained token as already expired and immediately re-refresh /
+        # re-run the whole flow instead of using it once. Treat it as "no expiry
+        # advertised" (expires_at = None) and warn, rather than burning the token.
+        if expires_in is not None and expires_in > 0:
+            expires_at = time.time() + expires_in
+        elif expires_in is not None:
+            log(
+                f"warning: ignoring non-positive expires_in ({expires_in!r}); "
+                f"treating the token as having no advertised expiry"
+            )
 
     # `.get(default)` only substitutes when the key is ABSENT; a provider that
     # returns an explicit `"token_type": null` (or a non-string) would otherwise
