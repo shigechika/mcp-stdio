@@ -259,7 +259,10 @@ def main() -> None:
             "expire (default: 60, or MCP_OAUTH_REFRESH_LEEWAY env var). "
             "Increase for ASes with significant clock skew; decrease for "
             "deployments where short-lived tokens make a 60 s window "
-            "exceed token TTL. Only used with --oauth / --oauth-device"
+            "exceed token TTL. Only used with --oauth / --oauth-device. Note: a "
+            "malformed MCP_OAUTH_REFRESH_LEEWAY value aborts startup at argument "
+            "parsing even on a non-OAuth run (the env default is validated eagerly "
+            "so a bad value surfaces clearly rather than silently)"
         ),
     )
     parser.add_argument(
