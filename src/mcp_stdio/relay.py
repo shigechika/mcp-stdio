@@ -654,6 +654,7 @@ def _post_and_stream(
     tracker: _CancelTracker | None = None,
     *,
     capture_init: bool = False,
+    has_id: bool = True,
 ) -> _StreamResult | None:
     """Send a POST and stream the response to stdout with retry.
 
@@ -666,6 +667,12 @@ def _post_and_stream(
     version from an InitializeResult), surfaced via
     ``_StreamResult.protocol_version``. Parsing is read-only and never
     affects what is written to stdout.
+
+    ``has_id`` mirrors the run() loop's notification policy one frame
+    deeper: a notification (no JSON-RPC id) must never receive a
+    synthesized error response, so the retry-exhausted / stream-interrupted
+    error writes below are suppressed when ``has_id`` is False (the failure
+    is still logged to stderr), matching the ``req_has_id`` gating in run().
     """
     last_error: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -731,15 +738,17 @@ def _post_and_stream(
                 # the POST would duplicate it. Surface a stream-interrupted
                 # error (at-most-once) rather than retry.
                 log("upstream stream interrupted after partial delivery; not retrying")
-                _write_line(
-                    _error_response(f"upstream stream interrupted: {e}", req_id)
-                )
+                if has_id:
+                    _write_line(
+                        _error_response(f"upstream stream interrupted: {e}", req_id)
+                    )
                 return None
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY * attempt)
 
     log(f"request failed after retries: {last_error}")
-    _write_line(_error_response(str(last_error), req_id))
+    if has_id:
+        _write_line(_error_response(str(last_error), req_id))
     return None
 
 
@@ -749,6 +758,8 @@ def _post_parsed(
     content: str,
     headers: dict[str, str],
     req_id: Any,
+    *,
+    has_id: bool = True,
 ) -> tuple[dict[str, Any] | None, _StreamResult | None]:
     """Send a POST and return the parsed JSON-RPC response.
 
@@ -761,6 +772,9 @@ def _post_parsed(
     decoded response dict on success, or ``None`` on non-200 / parse
     failure. ``stream_result`` is ``None`` only when all retries are
     exhausted (and the error was already printed to stdout).
+
+    ``has_id`` suppresses the retry-exhausted error write for a
+    notification, matching ``_post_and_stream`` and the run() loop.
     """
     last_error: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -812,7 +826,8 @@ def _post_parsed(
                 time.sleep(RETRY_DELAY * attempt)
 
     log(f"request failed after retries: {last_error}")
-    _write_line(_error_response(str(last_error), req_id))
+    if has_id:
+        _write_line(_error_response(str(last_error), req_id))
     return None, None
 
 
@@ -882,6 +897,8 @@ def _paginate_and_stream(
     req_id: Any,
     result_key: str,
     tracker: _CancelTracker | None = None,
+    *,
+    has_id: bool = True,
 ) -> _StreamResult | None:
     """Transparently follow ``result.nextCursor`` and emit one merged response.
 
@@ -898,7 +915,9 @@ def _paginate_and_stream(
     try:
         request = json.loads(line)
     except json.JSONDecodeError:
-        return _post_and_stream(client, url, line, headers, req_id, tracker)
+        return _post_and_stream(
+            client, url, line, headers, req_id, tracker, has_id=has_id
+        )
 
     base_params = request.get("params")
     params: dict[str, Any] = dict(base_params) if isinstance(base_params, dict) else {}
@@ -911,7 +930,9 @@ def _paginate_and_stream(
         page_request["params"] = params
         page_content = json.dumps(page_request)
 
-        parsed, stream = _post_parsed(client, url, page_content, headers, req_id)
+        parsed, stream = _post_parsed(
+            client, url, page_content, headers, req_id, has_id=has_id
+        )
         if stream is None:
             if page == 1:
                 return None  # error already printed
@@ -935,7 +956,9 @@ def _paginate_and_stream(
 
         if parsed is None:
             if page == 1:
-                return _post_and_stream(client, url, line, headers, req_id, tracker)
+                return _post_and_stream(
+                    client, url, line, headers, req_id, tracker, has_id=has_id
+                )
             log(
                 f"pagination: page {page} response not parseable, "
                 f"returning partial result"
@@ -1011,6 +1034,14 @@ def _reinitialize(
     Returns ``(new_session_id, negotiated_protocol_version)``. The session id
     is ``None`` on failure; the protocol version falls back to the passed-in
     ``protocol_version`` when the response omits ``result.protocolVersion``.
+
+    The initialize request advertises the previously-negotiated
+    ``protocol_version`` when known, rather than the 2024-11-05 floor: this
+    is a *recovery* handshake, so a higher version was already in force and
+    volunteering the floor would invite a silent downgrade. A first-contact
+    probe (``check_connection``) legitimately requests the floor; recovery
+    must not. The re-capture below still adopts whatever the server actually
+    returns, so a server that genuinely dropped support degrades gracefully.
     """
     initialize_msg = json.dumps(
         {
@@ -1018,7 +1049,7 @@ def _reinitialize(
             "method": "initialize",
             "id": 0,
             "params": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": protocol_version or "2024-11-05",
                 "capabilities": {},
                 "clientInfo": {"name": "mcp-stdio", "version": __version__},
             },
@@ -1429,7 +1460,8 @@ def run(
                     # PAGINATED_LIST_METHODS, so an initialize request can never
                     # take this branch — keep that invariant if the table grows.
                     return _paginate_and_stream(
-                        client, url, content, h, req_id, detected[1], tracker
+                        client, url, content, h, req_id, detected[1], tracker,
+                        has_id=req_has_id,
                     )
                 # Capture-once semantics: we only learn the version from the
                 # first initialize. A later client-driven re-initialize that
@@ -1443,7 +1475,8 @@ def run(
                 # omits it and enforces the header would be self-contradictory.
                 capture_init = protocol_version is None and _looks_like_initialize(content)
                 result = _post_and_stream(
-                    client, url, content, h, req_id, tracker, capture_init=capture_init
+                    client, url, content, h, req_id, tracker,
+                    capture_init=capture_init, has_id=req_has_id,
                 )
                 if (
                     result is not None
