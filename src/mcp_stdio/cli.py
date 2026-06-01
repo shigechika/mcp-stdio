@@ -446,8 +446,9 @@ def main() -> None:
     # so an explicit `--client-id ''` trips it too, matching the --bearer-token
     # discipline (#13 round22). oauth_scope's default is "" (not None), so an
     # explicit empty value is indistinguishable from the default and stays on the
-    # truthiness check. --oauth-refresh-leeway is also OAuth-only but always has a
-    # default, so it cannot be presence-detected here — its help text says so.
+    # truthiness check. --oauth-refresh-leeway and --oauth-timeout are also
+    # OAuth-only but always carry a non-None default, so they cannot be
+    # presence-detected here — their help text flags them as OAuth-only instead.
     if not (args.oauth or args.oauth_device) and (
         args.client_id is not None
         or args.oauth_scope
@@ -505,6 +506,23 @@ def main() -> None:
         # the built-in default (e.g. -H 'authorization: ...' replaces the
         # bearer Authorization) instead of sending two same-named headers.
         for existing in [k for k in headers if k.lower() == key.lower()]:
+            # #N5 (round29): when a -H 'Authorization' displaces an EXPLICIT
+            # --bearer-token, warn instead of silently dropping it — mirroring
+            # the OAuth path's override warning. Gated on bearer_from_flag (so
+            # an ambient env token does not trip it) and on the displaced value
+            # still being the bearer's, so a second -H Authorization does not
+            # re-warn.
+            if (
+                key.lower() == "authorization"
+                and bearer_from_flag
+                and bearer_token
+                and headers.get(existing) == _bearer_header_value(bearer_token)
+            ):
+                print(
+                    "warning: explicit -H 'Authorization' header overrides "
+                    "--bearer-token",
+                    file=sys.stderr,
+                )
             del headers[existing]
         headers[key] = value
 

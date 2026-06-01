@@ -519,6 +519,53 @@ class TestMain:
             assert auth_keys == ["authorization"]
             assert headers["authorization"] == "Bearer override"
 
+    def test_dash_h_authorization_overriding_bearer_warns(self, monkeypatch, capsys):
+        """#N5(round29): a -H 'Authorization' that displaces an EXPLICIT
+        --bearer-token warns (mirroring the OAuth override warning) instead of
+        silently dropping the flag's value."""
+        monkeypatch.delenv("MCP_BEARER_TOKEN", raising=False)
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "https://example.com/mcp",
+                    "--bearer-token",
+                    "tok123",
+                    "-H",
+                    "Authorization: Bearer override",
+                ],
+            ),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+        headers = mock_run.call_args.kwargs["headers"]
+        assert headers["Authorization"] == "Bearer override"  # -H wins
+        assert "overrides --bearer-token" in capsys.readouterr().err
+
+    def test_dash_h_authorization_without_bearer_flag_does_not_warn(
+        self, monkeypatch, capsys
+    ):
+        """An ambient env MCP_BEARER_TOKEN displaced by -H must NOT warn — the
+        warning is gated on an EXPLICIT --bearer-token (bearer_from_flag)."""
+        monkeypatch.setenv("MCP_BEARER_TOKEN", "env-tok")
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "https://example.com/mcp",
+                    "-H",
+                    "Authorization: Bearer override",
+                ],
+            ),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+        headers = mock_run.call_args.kwargs["headers"]
+        assert headers["Authorization"] == "Bearer override"
+        assert "overrides --bearer-token" not in capsys.readouterr().err
+
     def test_oauth_authorization_dedups_case_variant_dash_h(self, monkeypatch):
         """--oauth together with a differently-cased -H authorization must not
         send two Authorization headers — the OAuth token is the only one."""
