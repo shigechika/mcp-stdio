@@ -124,8 +124,16 @@ def _migrate_legacy_store() -> None:
     if not _LEGACY_STORE_FILE.exists():
         return
     if _STORE_FILE.exists():
-        # New file already exists — just remove legacy
-        _LEGACY_STORE_FILE.unlink()
+        # New file already exists — best-effort removal of the now-redundant
+        # legacy file. This runs UNLOCKED from load_token, so the unlink can
+        # lose a TOCTOU race against a concurrent migration (ENOENT) or hit a
+        # read-only / permission-locked legacy FS. Neither must be allowed to
+        # crash a read of the already-migrated store, so guard it like every
+        # other filesystem op in this function.
+        try:
+            _LEGACY_STORE_FILE.unlink()
+        except OSError:
+            pass
     else:
         _ensure_store_dir()
         # Tighten the legacy file's mode BEFORE moving it, so the secrets never
@@ -137,7 +145,6 @@ def _migrate_legacy_store() -> None:
             pass
         try:
             _LEGACY_STORE_FILE.rename(_STORE_FILE)
-            os.chmod(_STORE_FILE, stat.S_IRUSR | stat.S_IWUSR)
         except OSError:
             # rename() can fail for two reasons:
             #  - EXDEV: the legacy and XDG paths are on different filesystems.
@@ -163,6 +170,16 @@ def _migrate_legacy_store() -> None:
                         _LEGACY_STORE_FILE.unlink()
                     except OSError:
                         pass
+        else:
+            # rename() succeeded — re-assert 0o600 on the moved inode as a
+            # belt-and-suspenders step (the line-143 pre-tighten already set
+            # it). This is in its OWN guard, not the rename try, so a chmod
+            # failure here is not misread as a rename/EXDEV failure and routed
+            # into the copy-through recovery above.
+            try:
+                os.chmod(_STORE_FILE, stat.S_IRUSR | stat.S_IWUSR)
+            except OSError:
+                pass
     # Remove legacy directory if empty
     try:
         _LEGACY_STORE_DIR.rmdir()
