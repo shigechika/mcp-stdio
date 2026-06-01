@@ -269,9 +269,14 @@ def _migrate_legacy_store() -> None:
                             _LEGACY_STORE_FILE.unlink()
                         except OSError:
                             pass
-                except OSError:
+                except Exception:
                     # Unlocked read path: a failed stat/write must never crash
                     # the read — leave the legacy file for a later run to retry.
+                    # Catch Exception, not just OSError (#C-3 round28): _write_store
+                    # runs json.dumps before its inner try, mirroring the widened
+                    # save_token/delete_token contract. `data` is json.loads output
+                    # so a non-OSError is unreachable today, but the symmetry keeps
+                    # a future caller's non-serializable value from crashing a read.
                     pass
     else:
         _ensure_store_dir()
@@ -355,11 +360,13 @@ def _migrate_legacy_store() -> None:
                     try:
                         _write_store(data)
                         written = True
-                    except OSError:
+                    except Exception:
                         # This copy-through runs UNLOCKED from load_token. A
                         # failed write (disk full, read-only FS, permission) must
                         # NOT propagate out and crash the read — leave the legacy
                         # file intact for a later run to retry the migration.
+                        # Catch Exception, not just OSError (#C-3 round28), to match
+                        # the widened save_token/delete_token soft-fail contract.
                         pass
                     if written:
                         try:
