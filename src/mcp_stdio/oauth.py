@@ -1093,6 +1093,13 @@ def _run_authorization_flow(
     handler_cls = _make_callback_handler(cb_result)
 
     callback_server = HTTPServer(("127.0.0.1", 0), handler_cls)
+    # #4 (round18): bound handle_request()'s block so the serve() daemon below
+    # re-checks ``done`` between requests instead of parking forever in
+    # select(None) after the single callback. Without this the thread stays
+    # alive for the whole (long-lived) relay process — one leaked thread + a
+    # half-closed selector per interactive auth / step-up. handle_timeout() is a
+    # no-op, so a short timeout just loops back to the ``while not done`` guard.
+    callback_server.timeout = 0.5
     port = callback_server.server_address[1]
     redirect_uri = f"http://127.0.0.1:{port}/callback"
 
@@ -1370,7 +1377,12 @@ def _run_device_authorization_flow(
         print(f"  Open: {verification_uri_complete}", file=sys.stderr)
     else:
         print(f"  Open: {verification_uri}", file=sys.stderr)
-        print(f"  Enter code: {user_code}", file=sys.stderr)
+    # RFC 8628 §3.3.1: clients MUST STILL display the user_code even when a
+    # verification_uri_complete (which embeds it) is used — the AS asks the user
+    # to confirm the code matches, as a device-disambiguation / remote-phishing
+    # mitigation (§5.4). So show it unconditionally, not only on the no-complete
+    # branch. See #5 (round18).
+    print(f"  Code (verify it matches): {user_code}", file=sys.stderr)
     print(f"\nWaiting for authorization (expires in {expires_in}s)...", file=sys.stderr)
 
     # Step 2: Poll token endpoint (RFC 8628 §3.4 request / §3.5 response)
