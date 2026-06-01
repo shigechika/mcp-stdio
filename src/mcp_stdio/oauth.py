@@ -1647,12 +1647,18 @@ def _run_device_authorization_flow(
     client_id_override: str | None = None,
     scope: str | None = None,
     resource_indicator: bool = True,
+    timeout: float | None = None,
 ) -> TokenData:
     """Run RFC 8628 Device Authorization Grant flow.
 
     Displays a ``verification_uri`` + ``user_code`` on stderr so the user can
     authorize on a separate device, then polls the token endpoint until the
     device code expires or the user grants access.
+
+    ``timeout`` (when not ``None``) is the operator's ``--oauth-timeout`` and
+    bounds how long this waits for the user to confirm the device code — the
+    effective poll lifetime is ``min(timeout, server-advertised expires_in)``.
+    A direct caller passing ``None`` keeps the full RFC 8628 server lifetime.
     """
     if not metadata.device_authorization_endpoint:
         raise ValueError(
@@ -1767,6 +1773,17 @@ def _run_device_authorization_flow(
     expires_in = max(
         1, min(_safe_int(da.get("expires_in"), 1800), _DEVICE_FLOW_MAX_LIFETIME_SECS)
     )
+    # Honour the operator's --oauth-timeout as an UPPER bound on the human wait
+    # (#L9 round39). The CLI help promises --oauth-timeout covers "device-code
+    # confirmation", but it was never plumbed here, so the device flow silently
+    # ran on the server-advertised lifetime alone. Clamp the effective poll
+    # lifetime to min(timeout, expires_in) so the documented contract holds; a
+    # longer device window simply needs a larger --oauth-timeout. timeout=None
+    # (a direct caller) keeps the full RFC 8628 lifetime. floor at 1 s so a tiny
+    # timeout still allows the immediate first poll.
+    effective_lifetime = expires_in
+    if timeout is not None:
+        effective_lifetime = max(1, min(expires_in, int(timeout)))
     # Clamp the AS-supplied polling interval to a sane window so a hostile or
     # misconfigured AS cannot make a single time.sleep block for hours (or
     # raise on a negative value), mirroring the cap-gated Retry-After sleep in
@@ -1785,11 +1802,14 @@ def _run_device_authorization_flow(
     # mitigation (§5.4). So show it unconditionally, not only on the no-complete
     # branch. See #5 (round18).
     print(f"  Code (verify it matches): {user_code}", file=sys.stderr)
-    print(f"\nWaiting for authorization (expires in {expires_in}s)...", file=sys.stderr)
+    print(
+        f"\nWaiting for authorization (giving up in {effective_lifetime}s)...",
+        file=sys.stderr,
+    )
 
     # Step 2: Poll token endpoint (RFC 8628 §3.4 request / §3.5 response)
     # Sleep is at the end of each iteration so the first poll is immediate.
-    deadline = time.monotonic() + expires_in
+    deadline = time.monotonic() + effective_lifetime
 
     def _poll_sleep() -> None:
         # Never sleep past the deadline — a slow_down-inflated interval must not
@@ -1982,6 +2002,9 @@ def ensure_token(
             client_id_override=client_id,
             scope=scope,
             resource_indicator=resource_indicator,
+            # #L9 round39: honour --oauth-timeout for the device-code wait too,
+            # matching the auth-code branch below and the CLI help text.
+            timeout=timeout,
         )
     return _run_authorization_flow(
         server_url,
