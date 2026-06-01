@@ -214,7 +214,7 @@ Run `mcp-stdio --help` for the full per-flag detail (platform notes and issue re
 
 ## Workarounds
 
-See [WORKAROUNDS.md](WORKAROUNDS.md) for known issues in Claude Code, mcp-remote, and Windows that mcp-stdio addresses.
+See [WORKAROUNDS.md](WORKAROUNDS.md) for known issues in Claude Code, mcp-remote, the MCP SDKs, and Windows that mcp-stdio addresses.
 
 ## How It Works
 
