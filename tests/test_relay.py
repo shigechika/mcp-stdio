@@ -724,6 +724,92 @@ class TestRun:
         # The final request must not carry the (possibly stale) session id.
         assert "mcp-session-id" not in reqs[-1].headers
 
+    def test_403_stepup_retry_exhaustion_resets_session_id(self, httpx_mock):
+        """#13: when a 403 step-up retry exhausts all retries, session_id is
+        reset (symmetric with the 401 path) so the next request does not
+        re-send a maybe-stale Mcp-Session-Id."""
+        # 1: init -> sess-1
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json", "mcp-session-id": "sess-1"},
+        )
+        # 2: call -> 403 insufficient_scope (triggers step-up)
+        httpx_mock.add_response(
+            status_code=403,
+            text="",
+            headers={
+                "content-type": "application/json",
+                "www-authenticate": 'Bearer error="insufficient_scope", scope="extra"',
+            },
+        )
+        # 3-5: the upgraded retry exhausts all retries with connection errors
+        for _ in range(MAX_RETRIES):
+            httpx_mock.add_exception(httpx.ConnectError("dead"))
+        # 6: a later call -> 200 (must carry NO session header)
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":3}',
+            headers={"content-type": "application/json"},
+        )
+
+        def upgrader(_scope):
+            return {"Authorization": "Bearer broader"}
+
+        with patch("mcp_stdio.relay.time.sleep"):
+            self._run_with_stdin(
+                httpx_mock,
+                [
+                    '{"jsonrpc":"2.0","method":"init","id":1}',
+                    '{"jsonrpc":"2.0","method":"call","id":2}',
+                    '{"jsonrpc":"2.0","method":"call","id":3}',
+                ],
+                scope_upgrader=upgrader,
+            )
+
+        reqs = httpx_mock.get_requests()
+        assert "mcp-session-id" not in reqs[-1].headers
+
+    def test_404_reinit_replay_retry_exhaustion_emits_error(self, httpx_mock):
+        """#13: after a successful 404 re-initialize, if the replayed request
+        itself exhausts retries, the client still gets a single JSON-RPC error
+        (no hang) — the recovered session does not swallow the failure."""
+        # 1: init -> sess-old
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "sess-old",
+            },
+        )
+        # 2: call -> 404 (session expired)
+        httpx_mock.add_response(status_code=404, text="")
+        # 3: re-initialize -> sess-new
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":0}',
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "sess-new",
+            },
+        )
+        # 4: notifications/initialized -> 202
+        httpx_mock.add_response(status_code=202, text="")
+        # 5-7: the replayed call exhausts all retries with connection errors
+        for _ in range(MAX_RETRIES):
+            httpx_mock.add_exception(httpx.ConnectError("dead"))
+
+        with patch("mcp_stdio.relay.time.sleep"):
+            output = self._run_with_stdin(
+                httpx_mock,
+                [
+                    '{"jsonrpc":"2.0","method":"init","id":1}',
+                    '{"jsonrpc":"2.0","method":"call","id":2}',
+                ],
+            )
+        lines = [x for x in output.strip().splitlines() if x]
+        # init response + one error for the replayed call that never recovered.
+        assert len(lines) == 2
+        err = json.loads(lines[1])
+        assert err["id"] == 2 and "error" in err
+
     def test_reinitialize_failure_returns_error(self, httpx_mock):
         """If the post-404 re-initialize fails, we surface a JSON-RPC error
         instead of silently dropping the original request."""
@@ -791,6 +877,65 @@ class TestRun:
         err = json.loads(lines[1])
         assert err["id"] == 2
         assert err["error"]["code"] == -32000
+        assert "session lost" in err["error"]["message"]
+
+    def test_reinitialize_missing_session_id_returns_error(self, httpx_mock):
+        """#12: a re-initialize that returns 200 with a valid InitializeResult
+        but NO mcp-session-id header (a plausible broken-server bug) must
+        surface 'session lost', not silently continue without a session."""
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "sess-old",
+            },
+        )
+        httpx_mock.add_response(status_code=404, text="")
+        # Re-initialize: 200 OK + valid result but the session header is missing.
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":0}',
+            headers={"content-type": "application/json"},
+        )
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","method":"init","id":1}',
+                '{"jsonrpc":"2.0","method":"call","id":2}',
+            ],
+        )
+        lines = [x for x in output.strip().splitlines() if x]
+        assert len(lines) == 2
+        err = json.loads(lines[1])
+        assert err["id"] == 2
+        assert "session lost" in err["error"]["message"]
+
+    def test_reinitialize_transport_error_returns_error(self, httpx_mock):
+        """#12: a transport error on the re-initialize POST must surface
+        'session lost' rather than crash the gateway."""
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "sess-old",
+            },
+        )
+        httpx_mock.add_response(status_code=404, text="")
+        # Re-initialize POST itself raises a transport error.
+        httpx_mock.add_exception(httpx.ConnectError("reinit dead"))
+
+        with patch("mcp_stdio.relay.time.sleep"):
+            output = self._run_with_stdin(
+                httpx_mock,
+                [
+                    '{"jsonrpc":"2.0","method":"init","id":1}',
+                    '{"jsonrpc":"2.0","method":"call","id":2}',
+                ],
+            )
+        lines = [x for x in output.strip().splitlines() if x]
+        assert len(lines) == 2
+        err = json.loads(lines[1])
+        assert err["id"] == 2
         assert "session lost" in err["error"]["message"]
 
     def test_request_failure_returns_error(self, httpx_mock):
@@ -1842,6 +1987,59 @@ class TestPagination:
             url=self.URL,
             status_code=500,
             text="",
+            headers={"content-type": "application/json"},
+        )
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())
+        assert [t["name"] for t in merged["result"]["tools"]] == ["ok1"]
+        assert "nextCursor" not in merged["result"]
+
+    def test_page2_retry_exhaustion_returns_partial_result(self, httpx_mock):
+        """#11: page 2 exhausting all retries (repeated transport error) must
+        flush the page-1 items already collected, not lose them."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "ok1"}], "nextCursor": "p2"},
+        }
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(page1),
+            headers={"content-type": "application/json"},
+        )
+        for _ in range(MAX_RETRIES):
+            httpx_mock.add_exception(httpx.ConnectError("refused"), url=self.URL)
+
+        with patch("mcp_stdio.relay.time.sleep"):
+            output = self._run_with_stdin(
+                httpx_mock,
+                [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+            )
+        merged = json.loads(output.strip())
+        assert [t["name"] for t in merged["result"]["tools"]] == ["ok1"]
+        assert "nextCursor" not in merged["result"]
+
+    def test_page2_unparseable_body_returns_partial_result(self, httpx_mock):
+        """#11: page 2 returning an unparseable 200 body must flush the page-1
+        items, not drop the whole response."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "ok1"}], "nextCursor": "p2"},
+        }
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(page1),
+            headers={"content-type": "application/json"},
+        )
+        # page 2: HTTP 200 but the body is not valid JSON.
+        httpx_mock.add_response(
+            url=self.URL,
+            text="{not json",
             headers={"content-type": "application/json"},
         )
 
@@ -3052,6 +3250,91 @@ class TestRunSse:
         assert call_count["n"] == 2
         # The retried POST must carry the refreshed token, not the stale one.
         assert seen_auth[1] == "Bearer new"
+        # #18: the post-refresh upstream response must actually reach stdout —
+        # pin the end-to-end happy path (refresh -> retry -> response delivered),
+        # not just the header plumbing.
+        assert '"id":1' in stdout.getvalue()
+
+    def test_post_401_refresh_failure_returns_error(self, httpx_mock):
+        """#10: when the POST 401 refresher returns None, run_sse must emit a
+        single 'authentication failed' error for a request-with-id — symmetric
+        with run()'s test_401_refresh_failure_returns_error."""
+        release_stdin = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=xyz\n\n"
+            release_stdin.wait(timeout=3)
+
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        def post_callback(request):
+            # Refresh fails, so there is no retry — release stdin and 401.
+            release_stdin.set()
+            return httpx.Response(status_code=401)
+
+        httpx_mock.add_callback(
+            post_callback,
+            url="https://example.com/messages?sessionId=xyz",
+            method="POST",
+            is_reusable=True,
+        )
+
+        def token_refresher():
+            return None  # user aborted re-auth / refresh token expired
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"test","id":7}\n', release_stdin
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {}, token_refresher=token_refresher)
+
+        msgs = [json.loads(x) for x in stdout.getvalue().strip().splitlines() if x]
+        assert len(msgs) == 1
+        assert msgs[0]["id"] == 7
+        assert msgs[0]["error"]["message"] == "authentication failed"
+
+    def test_post_401_refresh_failure_notification_gets_no_error(self, httpx_mock):
+        """#10/req_has_id gate: a notification (no id) whose POST draws a 401
+        with a failing refresher must NOT receive a synthesized id:null error."""
+        release_stdin = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=xyz\n\n"
+            release_stdin.wait(timeout=3)
+
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        def post_callback(request):
+            release_stdin.set()
+            return httpx.Response(status_code=401)
+
+        httpx_mock.add_callback(
+            post_callback,
+            url="https://example.com/messages?sessionId=xyz",
+            method="POST",
+            is_reusable=True,
+        )
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"notifications/progress","params":{}}\n',
+            release_stdin,
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {}, token_refresher=lambda: None)
+
+        assert stdout.getvalue().strip() == ""
 
     def test_post_403_triggers_scope_upgrader(self, httpx_mock):
         """#17: SSE transport must run step-up on 403 insufficient_scope."""

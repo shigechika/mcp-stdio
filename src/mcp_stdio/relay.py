@@ -760,6 +760,7 @@ def _post_parsed(
     req_id: Any,
     *,
     has_id: bool = True,
+    emit_error_on_failure: bool = True,
 ) -> tuple[dict[str, Any] | None, _StreamResult | None]:
     """Send a POST and return the parsed JSON-RPC response.
 
@@ -771,10 +772,16 @@ def _post_parsed(
     Returns a tuple of ``(parsed, stream_result)``. ``parsed`` is the
     decoded response dict on success, or ``None`` on non-200 / parse
     failure. ``stream_result`` is ``None`` only when all retries are
-    exhausted (and the error was already printed to stdout).
+    exhausted.
 
     ``has_id`` suppresses the retry-exhausted error write for a
     notification, matching ``_post_and_stream`` and the run() loop.
+
+    ``emit_error_on_failure`` lets the pagination caller suppress the
+    exhaustion error for page>=2: there the caller flushes the partial
+    result it already collected, so writing an error too would emit a
+    SECOND JSON-RPC response for the same id. Page 1 keeps it True (no
+    partial exists, so the error is the only response).
     """
     last_error: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -826,7 +833,7 @@ def _post_parsed(
                 time.sleep(RETRY_DELAY * attempt)
 
     log(f"request failed after retries: {last_error}")
-    if has_id:
+    if has_id and emit_error_on_failure:
         _write_line(_error_response(str(last_error), req_id))
     return None, None
 
@@ -931,7 +938,16 @@ def _paginate_and_stream(
         page_content = json.dumps(page_request)
 
         parsed, stream = _post_parsed(
-            client, url, page_content, headers, req_id, has_id=has_id
+            client,
+            url,
+            page_content,
+            headers,
+            req_id,
+            has_id=has_id,
+            # Page 1 has no partial to flush, so its exhaustion error IS the
+            # response. Page>=2 flushes the partial below, so suppress the error
+            # here to avoid a duplicate JSON-RPC response for the same id.
+            emit_error_on_failure=(page == 1),
         )
         if stream is None:
             if page == 1:
