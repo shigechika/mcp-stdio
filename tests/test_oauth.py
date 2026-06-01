@@ -1711,6 +1711,40 @@ class TestCallbackServer:
         assert cb_result.error == "access_denied"
         assert cb_result.auth_code is None
 
+    def test_error_html_escaped_against_reflected_xss(self):
+        """#7(round18): the OAuth error is reflected into the callback HTML page
+        (do_GET serves it back), so it MUST be html.escaped — a regression that
+        dropped the escape would reintroduce a reflected XSS on the loopback
+        page. Pin the escaping with an HTML-metacharacter payload."""
+        cb_result = CallbackResult()
+        handler_cls = _make_callback_handler(cb_result)
+
+        from http.server import HTTPServer
+
+        server = HTTPServer(("127.0.0.1", 0), handler_cls)
+        port = server.server_address[1]
+        done = threading.Event()
+
+        def serve():
+            while not done.is_set():
+                server.handle_request()
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        time.sleep(0.3)
+
+        resp = httpx.get(
+            f"http://127.0.0.1:{port}/callback",
+            params={"error": "<script>alert(1)</script>"},
+        )
+        done.set()
+        server.server_close()
+
+        assert resp.status_code == 200
+        # The raw script tag must NOT appear; only its escaped form may.
+        assert "<script>alert(1)</script>" not in resp.text
+        assert "&lt;script&gt;" in resp.text
+
     def test_callback_is_single_shot(self):
         """#6(round11): once the first authorization response is captured, a
         second /callback hit (refresh / prefetch / double-submit) must NOT
@@ -3274,6 +3308,72 @@ class TestStateCsrfCheck:
         ]
         assert token_calls == []
 
+    def test_absent_state_raises_csrf_error(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """#8(round18): a callback delivering ?code= with NO state parameter must
+        still raise 'state mismatch' (not crash compare_digest with None). Pins
+        the `cb_result.state or ''` defensive coalesce."""
+        from urllib.parse import parse_qs, urlparse
+        from urllib.request import urlopen
+
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        httpx_mock.add_response(url="https://example.com/mcp", status_code=401)
+        httpx_mock.add_response(
+            url=(
+                "https://example.com/.well-known/"
+                "oauth-protected-resource/mcp"
+            ),
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://example.com/authorize",
+                "token_endpoint": "https://example.com/token",
+                "registration_endpoint": "https://example.com/register",
+            },
+        )
+        httpx_mock.add_response(
+            url="https://example.com/register",
+            json={"client_id": "cid"},
+        )
+
+        def fake_open(auth_url: str) -> bool:
+            q = parse_qs(urlparse(auth_url).query)
+            redirect_uri = q["redirect_uri"][0]
+
+            def hit_callback() -> None:
+                # Code present, state entirely absent → cb_result.state is None.
+                cb_url = f"{redirect_uri}?code=some_code"
+                try:
+                    urlopen(cb_url, timeout=5).read()
+                except Exception:
+                    pass
+
+            threading.Thread(target=hit_callback, daemon=True).start()
+            return True
+
+        monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", fake_open)
+
+        client = httpx.Client()
+        with pytest.raises(RuntimeError, match="state mismatch"):
+            ensure_token(self.SERVER_URL, client, timeout=5)
+
+        token_calls = [
+            r
+            for r in httpx_mock.get_requests()
+            if str(r.url) == "https://example.com/token"
+        ]
+        assert token_calls == []
+
     def test_uses_constant_time_comparison(self, monkeypatch):
         """The comparison goes through secrets.compare_digest, not ==.
 
@@ -4011,7 +4111,9 @@ class TestDeviceAuthorizationFlow:
         assert "999999999" not in err
 
     def test_verification_uri_complete_printed(self, httpx_mock, tmp_path, monkeypatch, capsys):
-        """verification_uri_complete is shown when present."""
+        """verification_uri_complete is shown when present — AND the user_code is
+        STILL displayed for the user to confirm it matches (RFC 8628 §3.3.1 MUST,
+        anti-phishing / device disambiguation). See #5 (round18)."""
         self._patch_store(tmp_path, monkeypatch)
 
         httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
@@ -4030,8 +4132,9 @@ class TestDeviceAuthorizationFlow:
         _run_device_authorization_flow(MCP_URL, client, metadata=_device_meta(), cached=None)
         err = capsys.readouterr().err
         assert "https://example.com/activate?code=ABCD-1234" in err
-        # user_code not printed separately when verification_uri_complete is present
-        assert "Enter code:" not in err
+        # RFC 8628 §3.3.1: the user_code MUST still be shown even with the
+        # complete URI, so the user can verify it against the authorizing page.
+        assert "ABCD-1234" in err
 
     def test_user_code_printed_without_complete_uri(self, httpx_mock, tmp_path, monkeypatch, capsys):
         """When verification_uri_complete is absent, user_code is shown separately."""
