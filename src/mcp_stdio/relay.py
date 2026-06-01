@@ -1626,6 +1626,12 @@ def run(
                         # never a 4xx). Keep session_id — see the top-level None
                         # handling: a transient blip must not defeat 404 recovery.
                         continue
+                    # Re-adopt a session id the server rotated alongside this 401
+                    # retry's response, so a chained 403 step-up below rebuilds
+                    # its retry headers from the fresh id, not the stale one
+                    # (mirrors the once-adoption above the recovery branches).
+                    if result.session_id:
+                        session_id = result.session_id
                 else:
                     log("token refresh failed, returning error")
                     if req_has_id:
@@ -1652,6 +1658,11 @@ def run(
                             # is never a 4xx). Keep session_id — see the top-level
                             # None handling.
                             continue
+                        # Re-adopt a session id rotated alongside this step-up
+                        # retry's response so a chained 404 sees the fresh id
+                        # (mirrors the 401-branch re-adoption above).
+                        if result.session_id:
+                            session_id = result.session_id
                     else:
                         log("step-up authorization failed, returning error")
                         if req_has_id:
@@ -2026,6 +2037,12 @@ def run_sse(
                     if new_headers:
                         with headers_lock:
                             headers.update(new_headers)
+                        # Re-read the endpoint: if the reader thread reconnected
+                        # between the first POST and this retry it may have
+                        # published a fresh endpoint; honour it rather than the
+                        # stale capture (fall back to the captured one if the
+                        # reader has it momentarily nulled mid-reconnect).
+                        endpoint = state.endpoint_url or endpoint
                         resp = client.post(
                             endpoint,
                             content=line,
@@ -2056,6 +2073,9 @@ def run_sse(
                         if new_headers:
                             with headers_lock:
                                 headers.update(new_headers)
+                            # Honour a fresh endpoint if the reader reconnected
+                            # since the first POST (see the 401 retry above).
+                            endpoint = state.endpoint_url or endpoint
                             resp = client.post(
                                 endpoint,
                                 content=line,

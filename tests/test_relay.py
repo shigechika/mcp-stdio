@@ -1231,6 +1231,49 @@ class TestRun:
         # The refreshed retry (req 2) must carry the rotated session id.
         assert reqs[2].headers.get("mcp-session-id") == "sess-2"
 
+    def test_chained_401_then_403_adopts_rotated_session_id(self, httpx_mock):
+        """#1(round12): a 401 whose refreshed retry returns 403 + a ROTATED
+        session id must have the step-up retry carry that rotated id — the
+        session adoption must repeat across chained recovery branches, not only
+        on the original response."""
+        # 1: init -> sess-1
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json", "mcp-session-id": "sess-1"},
+        )
+        # 2: call -> 401 (triggers refresh)
+        httpx_mock.add_response(
+            status_code=401, text="", headers={"content-type": "application/json"}
+        )
+        # 3: refreshed retry -> 403 insufficient_scope AND rotates to sess-2
+        httpx_mock.add_response(
+            status_code=403,
+            text="",
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "sess-2",
+                "www-authenticate": 'Bearer error="insufficient_scope", scope="extra"',
+            },
+        )
+        # 4: step-up retry -> 200
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"ok":true},"id":2}',
+            headers={"content-type": "application/json"},
+        )
+
+        self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","method":"init","id":1}',
+                '{"jsonrpc":"2.0","method":"call","id":2}',
+            ],
+            token_refresher=lambda: {"Authorization": "Bearer new"},
+            scope_upgrader=lambda _s: {"Authorization": "Bearer broader"},
+        )
+        reqs = httpx_mock.get_requests()
+        # The step-up retry (req 3) must carry the id rotated on the 401 retry.
+        assert reqs[3].headers.get("mcp-session-id") == "sess-2"
+
     def test_401_refresh_failure_returns_error(self, httpx_mock):
         httpx_mock.add_response(
             status_code=401,
@@ -1859,6 +1902,24 @@ class TestNormalizeNullArguments:
 
     def test_malformed_json_passed_through(self):
         line = '{"method":"tools/call","arguments":null'  # truncated
+        assert _normalize_null_arguments(line) == line
+
+    def test_null_params_with_arguments_elsewhere_passed_through(self):
+        """#10(round12): the regex matches an "arguments":null nested elsewhere,
+        but params itself is null (not an object). The non-dict-params branch
+        must leave the line unchanged — only params.arguments is ever rewritten."""
+        line = (
+            '{"jsonrpc":"2.0","method":"tools/call","id":1,'
+            '"params":null,"_meta":{"arguments":null}}'
+        )
+        assert _normalize_null_arguments(line) == line
+
+    def test_array_params_with_arguments_elsewhere_passed_through(self):
+        """params as a positional array (non-dict) likewise passes through."""
+        line = (
+            '{"jsonrpc":"2.0","method":"tools/call","id":1,'
+            '"params":[1,2],"_meta":{"arguments":null}}'
+        )
         assert _normalize_null_arguments(line) == line
 
 
@@ -4482,6 +4543,19 @@ class TestEmit:
         line = '[{"jsonrpc":"2.0","result":{},"id":1}]'
         _emit(line, t)
         assert capsys.readouterr().out.strip() == line
+
+    def test_drops_merged_paginated_result(self, capsys):
+        """#2(round12): a merged paginated list result (the shape
+        _paginate_and_stream flushes via _emit) is dropped when its id was
+        cancelled — closing the cancel-filter × pagination coverage gap."""
+        t = _CancelTracker()
+        t.add(1)
+        merged = (
+            '{"jsonrpc":"2.0","id":1,'
+            '"result":{"tools":[{"name":"a"},{"name":"b"}]}}'
+        )
+        _emit(merged, t)
+        assert capsys.readouterr().out.strip() == ""  # cancelled → dropped
 
 
 class TestRunCancelFilter:
