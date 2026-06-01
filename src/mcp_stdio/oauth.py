@@ -1316,6 +1316,10 @@ def _run_authorization_flow(
     cb_result = CallbackResult()
     handler_cls = _make_callback_handler(cb_result)
 
+    # Bind 127.0.0.1 (NOT "" / "0.0.0.0"): the callback carries the auth code and
+    # state, so only the LOCAL browser may reach /callback. This loopback-only
+    # bind is the premise the single-shot + state-binding CSRF model rests on —
+    # do not widen it. The ephemeral port (0) further narrows the attack window.
     callback_server = HTTPServer(("127.0.0.1", 0), handler_cls)
     # #4 (round18): bound handle_request()'s block so the serve() daemon below
     # re-checks ``done`` between requests instead of parking forever in
@@ -1721,9 +1725,15 @@ def _run_device_authorization_flow(
         try:
             err = tok_resp.json().get("error", "")
         except Exception:
+            # Non-JSON body. raise_for_status fails a 4xx/5xx; a non-compliant
+            # 2xx-non-200 / 3xx (which raise_for_status would NOT catch, being
+            # <400) would otherwise spin to the device-code deadline — fast-fail
+            # it by name instead of wasting the code's whole lifetime (#2 round36).
             tok_resp.raise_for_status()
-            _poll_sleep()
-            continue
+            raise RuntimeError(
+                f"Device flow failed: unexpected non-JSON HTTP "
+                f"{tok_resp.status_code} from the token endpoint"
+            )
 
         if err == "authorization_pending":
             pass
@@ -1733,7 +1743,29 @@ def _run_device_authorization_flow(
         elif err in ("expired_token", "access_denied"):
             raise RuntimeError(f"Device flow failed: {err}")
         else:
-            tok_resp.raise_for_status()
+            # An unknown error code, or a non-200 status with no recognized
+            # error. FAST-FAIL with an actionable message — never spin to the
+            # device-code deadline on a status retrying cannot resolve (RFC 8628
+            # §3.5 mandates 200 or 400+error; a non-compliant 2xx-non-200 / 3xx
+            # would otherwise no-op raise_for_status and loop) (#2 round36).
+            # Surface the AS error_description when present, mirroring the
+            # _parse_token_response extraction the auth-code / refresh paths use.
+            desc = ""
+            try:
+                body = tok_resp.json()
+                if isinstance(body, dict):
+                    desc = body.get("error_description") or body.get("error") or ""
+            except Exception:
+                pass
+            if desc:
+                raise RuntimeError(
+                    f"Device flow failed: {_sanitize_oauth_error(desc)}"
+                )
+            tok_resp.raise_for_status()  # 4xx/5xx with no body → honest HTTP error
+            raise RuntimeError(
+                f"Device flow failed: unexpected HTTP {tok_resp.status_code} "
+                f"from the token endpoint"
+            )
 
         _poll_sleep()
 

@@ -4744,36 +4744,49 @@ class TestDeviceAuthorizationFlow:
                 MCP_URL, client, metadata=_device_meta(), cached=None
             )
 
-    def test_poll_2xx_non_json_body_sleeps_and_continues(
+    def test_poll_2xx_non_json_body_fast_fails(
         self, httpx_mock, tmp_path, monkeypatch
     ):
-        """#F-4(round28): a non-200 2xx poll response (e.g. 202) with a non-JSON
-        body does not raise — raise_for_status only fires on 4xx/5xx, and .json()
-        raises but is caught — so the loop sleeps-and-continues rather than
-        crashing. A subsequent 200 then succeeds. Complements the 400 non-JSON
-        test (which exercises the raise side)."""
+        """#2(round36): a non-200 2xx poll response (e.g. 202) with a non-JSON
+        body is non-compliant (RFC 8628 §3.5 mandates 200 or 400+error) and
+        retrying it never resolves — so the loop FAST-FAILS by name instead of
+        spinning to the device-code deadline (the prior round28 behavior was to
+        sleep-and-continue, which wasted the whole code lifetime)."""
         self._patch_store(tmp_path, monkeypatch)
         monkeypatch.setattr(time, "sleep", lambda _s: None)
         httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
         httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
-        # Poll #1: 202 (2xx but not 200) with a non-JSON body. json() raises,
-        # raise_for_status() does not (2xx) → sleep-and-continue.
+        # Poll: 202 (2xx but not 200) with a non-JSON body → fast-fail, not retry.
         httpx_mock.add_response(
             url=TOKEN_URL,
             status_code=202,
             headers={"content-type": "text/html"},
             text="<html>processing</html>",
         )
-        # Poll #2: 200 success.
-        httpx_mock.add_response(
-            url=TOKEN_URL, json={"access_token": "acc", "token_type": "Bearer"}
-        )
 
         client = httpx.Client()
-        data = _run_device_authorization_flow(
-            MCP_URL, client, metadata=_device_meta(), cached=None
-        )
-        assert data.access_token == "acc"
+        with pytest.raises(RuntimeError, match="unexpected non-JSON HTTP 202"):
+            _run_device_authorization_flow(
+                MCP_URL, client, metadata=_device_meta(), cached=None
+            )
+
+    def test_poll_2xx_valid_json_no_error_fast_fails(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """#2(round36): a non-200 2xx with VALID JSON but no `error` key is the
+        other spin path raise_for_status would no-op — it must also fast-fail by
+        status, not loop to the deadline."""
+        self._patch_store(tmp_path, monkeypatch)
+        monkeypatch.setattr(time, "sleep", lambda _s: None)
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(url=TOKEN_URL, status_code=202, json={})
+
+        client = httpx.Client()
+        with pytest.raises(RuntimeError, match="unexpected HTTP 202"):
+            _run_device_authorization_flow(
+                MCP_URL, client, metadata=_device_meta(), cached=None
+            )
 
     def test_explicit_client_id_skips_dcr(self, httpx_mock, tmp_path, monkeypatch):
         """#7(round14): with an explicit --client-id (client_id_override) the
@@ -5275,20 +5288,27 @@ class TestDeviceAuthorizationFlow:
         )
         assert data.access_token == "acc"
 
-    def test_poll_unknown_error_surfaces_http_error(
+    def test_poll_unknown_error_surfaces_actionable_runtime_error(
         self, httpx_mock, tmp_path, monkeypatch
     ):
-        """A non-spec error code (e.g. invalid_client) falls through to
-        raise_for_status and surfaces as HTTPStatusError."""
+        """#2(round36): a non-spec error code (e.g. invalid_client) now fast-fails
+        with an actionable RuntimeError that names the AS error, instead of an
+        opaque HTTPStatusError that drops the body — mirroring the
+        error_description extraction the auth-code / refresh paths use."""
         self._patch_store(tmp_path, monkeypatch)
         httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
         httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
         httpx_mock.add_response(
-            url=TOKEN_URL, json={"error": "invalid_client"}, status_code=400
+            url=TOKEN_URL,
+            json={
+                "error": "invalid_client",
+                "error_description": "client authentication failed",
+            },
+            status_code=400,
         )
         monkeypatch.setattr(time, "sleep", lambda _s: None)
         client = httpx.Client()
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(RuntimeError, match="client authentication failed"):
             _run_device_authorization_flow(
                 MCP_URL, client, metadata=_device_meta(), cached=None
             )
