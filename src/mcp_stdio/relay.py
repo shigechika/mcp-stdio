@@ -266,11 +266,13 @@ class _CancelTracker:
     exactly once — a later request that legitimately *reuses* the same id
     (permitted by JSON-RPC once the prior call is done) is then forwarded
     normally instead of being dropped for the whole TTL window. Entries
-    expire after ``ttl`` seconds (monotonic clock — immune to NTP jumps),
-    and the internal map is opportunistically garbage-collected when it
-    grows past ``_CANCEL_GC_THRESHOLD`` entries so an adversarial peer cannot
-    leak memory. Both transports share one instance; the SSE reader thread
-    in ``run_sse`` reads concurrently with the main loop, hence the lock.
+    expire after ``ttl`` seconds (monotonic clock — immune to NTP jumps), and
+    once the map grows past ``_CANCEL_GC_THRESHOLD`` every ``add`` sweeps out
+    the TTL-aged entries. The GC reclaims only entries older than ``ttl``, so
+    it is not a hard size cap: the bound against an adversarial peer is "one
+    TTL window of distinct-cancel throughput", which then self-expires — never
+    an unbounded leak. Both transports share one instance; the SSE reader
+    thread in ``run_sse`` reads concurrently with the main loop, hence the lock.
     """
 
     __slots__ = ("_seen", "_lock", "_ttl", "_now")
@@ -804,13 +806,24 @@ def _post_parsed(
 
             content_type = resp.headers.get("content-type", "")
             if "text/event-stream" in content_type:
+                # A spec-compliant server MAY interleave server-initiated
+                # requests and notifications on the POST's SSE stream BEFORE the
+                # actual JSON-RPC response. Return only the response object (one
+                # carrying ``result``/``error``); a bare notification has
+                # neither, and returning it would make the pagination merge treat
+                # it as the page result and drop the real list. Mirrors the
+                # keep-reading gate in _check_connection_sse.
                 for event_type, payload in _iter_sse_events(_split_sse_text(resp.text)):
                     if event_type != "message":
                         continue
                     try:
-                        return json.loads(payload), _StreamResult(session, 200)
+                        parsed = json.loads(payload)
                     except json.JSONDecodeError:
                         continue
+                    if isinstance(parsed, dict) and (
+                        "result" in parsed or "error" in parsed
+                    ):
+                        return parsed, _StreamResult(session, 200)
                 return None, _StreamResult(session, 200)
 
             text = resp.text.strip()
@@ -1508,6 +1521,18 @@ def run(
                 # header is sent rather than guessing — a server that both
                 # omits it and enforces the header would be self-contradictory.
                 capture_init = _looks_like_initialize(content)
+                if capture_init:
+                    # An initialize request IS the (re)negotiation and predates a
+                    # known version, so it must not advertise the prior one
+                    # (2025-06-18: the header carries the negotiated version and
+                    # applies to requests AFTER initialization). Strip it from
+                    # this POST, matching _reinitialize which omits it on its own
+                    # initialize POST. Mcp-Session-Id is left untouched.
+                    h = {
+                        k: v
+                        for k, v in h.items()
+                        if k.lower() != "mcp-protocol-version"
+                    }
                 result = _post_and_stream(
                     client, url, content, h, req_id, tracker,
                     capture_init=capture_init, has_id=req_has_id,
