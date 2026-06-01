@@ -775,6 +775,43 @@ class TestRun:
         req2 = httpx_mock.get_requests()[1]
         assert req2.headers["mcp-session-id"] == "sess-123"
 
+    def test_error_response_session_id_not_adopted(self, httpx_mock):
+        """#1(round19): a session id echoed on a 4xx/5xx error response must NOT
+        be carried into the next request — the relay would otherwise send an id
+        the server just rejected. Only a non-error response rotates session_id."""
+        # Line 1: 200 establishes session "good".
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json", "mcp-session-id": "good"},
+        )
+        # Line 2: 500 echoes a DIFFERENT session id — must be ignored (the relay
+        # synthesizes an error and does not adopt the rejected id).
+        httpx_mock.add_response(
+            status_code=500,
+            text="",
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "bad-rotated",
+            },
+        )
+        # Line 3: 200 — must still carry "good", not "bad-rotated".
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":3}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","method":"init","id":1}',
+                '{"jsonrpc":"2.0","method":"call","id":2}',
+                '{"jsonrpc":"2.0","method":"call","id":3}',
+            ],
+        )
+        reqs = httpx_mock.get_requests()
+        assert reqs[1].headers.get("mcp-session-id") == "good"
+        # The 500's "bad-rotated" was NOT adopted — request 3 still sends "good".
+        assert reqs[2].headers.get("mcp-session-id") == "good"
+
     def test_session_expired_triggers_reinitialize_then_retry(self, httpx_mock):
         """Reproduces the 404 -> 400 hang from FastMCP StreamableHTTP.
 
@@ -4867,6 +4904,45 @@ class TestCancelTracker:
         assert not errors, f"threads raised: {errors!r}"
         for i in range(800):
             assert t.contains(i)
+
+    def test_consume_under_contention_is_exactly_once(self):
+        """#12(round19): consume() must return True EXACTLY once per id even when
+        many threads race on the SAME ids — the lock makes pop-and-check atomic.
+        A broken/removed lock could let two threads both pop-and-return-True for
+        one id (a double drop). Unlike test_thread_safety (disjoint ranges, which
+        passes even without the lock), this contends on shared ids and asserts an
+        invariant only a correct lock preserves: total True count == id count."""
+        t = _CancelTracker()
+        n_ids = 500
+        for i in range(n_ids):
+            t.add(i)
+
+        true_counts: list[int] = []
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(8)
+
+        def worker() -> None:
+            try:
+                barrier.wait()  # release all threads together for max contention
+                local = sum(1 for i in range(n_ids) if t.consume(i))
+                true_counts.append(local)
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+
+        assert not errors, f"threads raised: {errors!r}"
+        # Every id consumed by exactly one thread → the True counts sum to n_ids.
+        assert sum(true_counts) == n_ids, (
+            f"expected exactly {n_ids} successful consumes (one per id), "
+            f"got {sum(true_counts)} across {true_counts!r}"
+        )
+        # And every id is gone afterwards.
+        assert all(not t.contains(i) for i in range(n_ids))
 
 
 class TestExtractCancelId:
