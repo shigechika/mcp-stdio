@@ -249,8 +249,35 @@ def _looks_like_initialize(line: str) -> bool:
     A cheap pre-filter so the relay only attempts to capture the negotiated
     protocol version from initialize responses. The trailing quote in the
     pattern means ``notifications/initialized`` does not match.
+
+    Pre-filter ONLY: this is a substring regex, so a ``tools/call`` whose nested
+    ``arguments`` merely contains a ``"method":"initialize"`` key also matches.
+    That is fine for the response-capture use (over-triggering it is harmless —
+    a non-initialize response carries no ``result.protocolVersion``), but a
+    request-header MUTATION must NOT key off this; use ``_is_initialize_request``.
     """
     return bool(_INITIALIZE_METHOD_RE.search(line))
+
+
+def _is_initialize_request(line: str) -> bool:
+    """Authoritatively confirm ``line`` is a JSON-RPC ``initialize`` REQUEST.
+
+    Parses the line and checks the TOP-LEVEL ``method``, mirroring
+    ``_normalize_null_arguments`` / ``_detect_paginated_list``. Unlike the
+    ``_looks_like_initialize`` regex pre-filter, a ``tools/call`` whose nested
+    ``arguments`` contains a ``"method":"initialize"`` substring does NOT
+    false-positive here — so this is safe to gate the request-header strip on,
+    where a false positive would wrongly drop MCP-Protocol-Version from a real
+    tool call and break it against a strict 2025-06-18 server. The cheap regex
+    still short-circuits the parse for the common non-matching line.
+    """
+    if not _INITIALIZE_METHOD_RE.search(line):
+        return False
+    try:
+        msg = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(msg, dict) and msg.get("method") == "initialize"
 
 
 def _extract_protocol_version(payload: str) -> str | None:
@@ -1645,7 +1672,9 @@ def run(
                     # header is sent rather than guessing — a server that both
                     # omits it and enforces the header would be self-contradictory.
                     capture_init = _looks_like_initialize(content)
-                    if capture_init and protocol_version is not None:
+                    if protocol_version is not None and _is_initialize_request(
+                        content
+                    ):
                         # An initialize request IS the (re)negotiation and predates a
                         # known version, so it must not advertise the prior one
                         # (2025-06-18: the header carries the negotiated version and
@@ -1654,7 +1683,10 @@ def run(
                         # on ``protocol_version is not None`` means we only drop the
                         # relay's OWN injected header — on a cold-start initialize
                         # (no version yet) a user-pinned ``-H MCP-Protocol-Version``
-                        # is left intact. Mcp-Session-Id is untouched.
+                        # is left intact. Mcp-Session-Id is untouched. The strip is
+                        # gated on the PARSE-authoritative check (not the regex
+                        # capture_init) so a tools/call whose arguments contains a
+                        # "method":"initialize" key keeps its header. See #3 (round18).
                         h = {
                             k: v
                             for k, v in h.items()

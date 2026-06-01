@@ -1690,6 +1690,35 @@ class TestProtocolVersionHeader:
         # (b) the next request carries the relay-injected negotiated version
         assert reqs[1].headers["mcp-protocol-version"] == "2025-06-18"
 
+    def test_tools_call_with_nested_method_initialize_keeps_header(self, httpx_mock):
+        """#3(round18): a tools/call whose nested ``arguments`` contains a
+        ``"method":"initialize"`` key must NOT be misread as an initialize
+        request — the substring matches the cheap regex, but the header strip is
+        gated on a parse-authoritative top-level method check, so the negotiated
+        MCP-Protocol-Version is PRESERVED on the tool call (a regression would
+        strip it and break the call against a strict 2025-06-18 server)."""
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"protocolVersion":"2025-06-18"},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":2}',
+            headers={"content-type": "application/json"},
+        )
+        # The tool call's arguments legitimately carry a "method" key whose value
+        # is "initialize" (e.g. an HTTP/API-wrapper tool) — top-level method is
+        # tools/call, so the header must survive.
+        self._run_with_stdin(
+            [
+                '{"jsonrpc":"2.0","method":"initialize","id":1}',
+                '{"jsonrpc":"2.0","method":"tools/call","id":2,"params":'
+                '{"name":"http","arguments":{"method":"initialize","url":"https://x"}}}',
+            ]
+        )
+        reqs = httpx_mock.get_requests()
+        # The tools/call is a post-init request → carries the negotiated header.
+        assert reqs[1].headers["mcp-protocol-version"] == "2025-06-18"
+
     def test_initialized_notification_carries_header(self, httpx_mock):
         """notifications/initialized is the first subsequent request — must carry it."""
         httpx_mock.add_response(
