@@ -1127,6 +1127,79 @@ class TestRegisterClient:
         with pytest.raises(ValueError, match=match):
             register_client(meta, "http://127.0.0.1:9999/callback", client)
 
+    def test_honours_as_assigned_auth_method(self, httpx_mock):
+        """#L4(round39): RFC 7591 §3.2.1 — the AS MAY replace the requested
+        token_endpoint_auth_method and MUST return the registered value. When the
+        AS assigns a method we support that differs from the one we requested, the
+        returned ClientRegistration adopts the AS-assigned value so the later
+        token exchange frames credentials the way the AS expects."""
+        httpx_mock.add_response(
+            url="https://api.example.com/register",
+            json={
+                "client_id": "cid",
+                "client_secret": "sec",
+                "token_endpoint_auth_method": "client_secret_post",  # AS-assigned
+            },
+        )
+        meta = OAuthMetadata(
+            authorization_endpoint="https://api.example.com/authorize",
+            token_endpoint="https://api.example.com/token",
+            registration_endpoint="https://api.example.com/register",
+            # We request client_secret_basic (first supported match)...
+            token_endpoint_auth_methods_supported=["client_secret_basic"],
+        )
+        client = httpx.Client()
+        reg = register_client(meta, "http://127.0.0.1:9999/callback", client)
+        # ...but the AS recorded client_secret_post — that value wins.
+        assert reg.auth_method == "client_secret_post"
+        body = json.loads(httpx_mock.get_requests()[0].content)
+        assert body["token_endpoint_auth_method"] == "client_secret_basic"
+
+    def test_unsupported_as_assigned_auth_method_keeps_requested(
+        self, httpx_mock, capsys
+    ):
+        """#L4(round39): if the AS assigns a method mcp-stdio does not implement
+        (e.g. private_key_jwt), keep the requested method as the best-effort
+        fallback and warn so the ensuing exchange failure is not opaque."""
+        httpx_mock.add_response(
+            url="https://api.example.com/register",
+            json={
+                "client_id": "cid",
+                "client_secret": "sec",
+                "token_endpoint_auth_method": "private_key_jwt",  # unsupported here
+            },
+        )
+        meta = OAuthMetadata(
+            authorization_endpoint="https://api.example.com/authorize",
+            token_endpoint="https://api.example.com/token",
+            registration_endpoint="https://api.example.com/register",
+            token_endpoint_auth_methods_supported=["client_secret_basic"],
+        )
+        client = httpx.Client()
+        reg = register_client(meta, "http://127.0.0.1:9999/callback", client)
+        assert reg.auth_method == "client_secret_basic"  # requested, unchanged
+        assert "unsupported token_endpoint_auth_method" in capsys.readouterr().err
+
+    def test_non_string_as_assigned_auth_method_ignored(self, httpx_mock):
+        """A non-string token_endpoint_auth_method in the registration response is
+        ignored (isinstance guard) — the requested method is kept, no crash."""
+        httpx_mock.add_response(
+            url="https://api.example.com/register",
+            json={
+                "client_id": "cid",
+                "token_endpoint_auth_method": 123,  # non-string
+            },
+        )
+        meta = OAuthMetadata(
+            authorization_endpoint="https://api.example.com/authorize",
+            token_endpoint="https://api.example.com/token",
+            registration_endpoint="https://api.example.com/register",
+            token_endpoint_auth_methods_supported=["client_secret_post"],
+        )
+        client = httpx.Client()
+        reg = register_client(meta, "http://127.0.0.1:9999/callback", client)
+        assert reg.auth_method == "client_secret_post"
+
     def test_no_registration_endpoint(self):
         meta = OAuthMetadata(
             authorization_endpoint="https://api.example.com/authorize",
@@ -5839,6 +5912,34 @@ class TestExchangeCodeBasicAuth:
         assert b"client_id=cid" in req.content
         assert b"client_secret=csec" in req.content
         assert "authorization" not in req.headers
+
+    def test_basic_auth_without_secret_warns_and_falls_back_to_body(
+        self, httpx_mock, capsys
+    ):
+        """#L5(round39): client_secret_basic selected but no client_secret present
+        (a confidential client that lost its secret / a registration race). The
+        code degrades safely to body auth (client_id only) but now logs an
+        actionable warning so the operator sees WHY the AS rejects it, instead of
+        an opaque 401."""
+        httpx_mock.add_response(
+            url="https://as.example.com/token",
+            json={"access_token": "at"},
+        )
+        client = httpx.Client()
+        exchange_code(
+            self.META,
+            "cid",
+            None,  # no secret despite client_secret_basic
+            "code",
+            "v",
+            "http://127.0.0.1:9/cb",
+            client,
+            auth_method="client_secret_basic",
+        )
+        req = httpx_mock.get_requests()[0]
+        assert "authorization" not in req.headers  # no Basic header without a secret
+        assert b"client_id=cid" in req.content  # fell back to body
+        assert "client_secret_basic" in capsys.readouterr().err
 
 
 # --- client_secret_basic in refresh_access_token ---

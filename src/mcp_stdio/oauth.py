@@ -772,6 +772,24 @@ def _pick_token_endpoint_auth_method(supported: list[str] | None) -> str:
     return "none"
 
 
+def _warn_if_basic_auth_lacks_secret(
+    auth_method: str, client_secret: str | None
+) -> None:
+    """Warn when client_secret_basic is selected but no client_secret is present.
+
+    The callers then fall back to sending only client_id in the request body,
+    which an AS expecting HTTP Basic credentials for a confidential client
+    rejects. Surfacing the inconsistency turns an opaque AS 401 into an
+    actionable message (#L5 round39).
+    """
+    if auth_method == "client_secret_basic" and not client_secret:
+        log(
+            "warning: token_endpoint_auth_method is 'client_secret_basic' but no "
+            "client_secret is available — sending client_id only; the AS will "
+            "likely reject this. Re-registration (RFC 7591) may be needed."
+        )
+
+
 @dataclass
 class ClientRegistration:
     """Result of dynamic client registration."""
@@ -869,6 +887,34 @@ def register_client(
             "Client registration response client_secret is not a string "
             "(RFC 7591 §3.2.1)."
         )
+    # RFC 7591 §3.2.1: "The authorization server MAY reject or replace any of the
+    # client's requested metadata values ... and substitute them with suitable
+    # values", and MUST return all registered metadata about the client. So the
+    # token_endpoint_auth_method the AS records in the registration RESPONSE is
+    # authoritative and may differ from the one we requested (L812). Honour the
+    # AS-assigned value when we implement it, so the subsequent token exchange
+    # frames credentials the way the AS expects (Basic header vs request body)
+    # instead of the way we asked — otherwise the exchange fails with an opaque
+    # AS rejection. (#L4 round39)
+    assigned_method = data.get("token_endpoint_auth_method")
+    if isinstance(assigned_method, str) and assigned_method != auth_method:
+        if assigned_method in _SUPPORTED_AUTH_METHODS:
+            log(
+                f"AS assigned token_endpoint_auth_method {assigned_method!r} "
+                f"(requested {auth_method!r}); using the AS-assigned value per "
+                f"RFC 7591 §3.2.1"
+            )
+            auth_method = assigned_method
+        else:
+            # The AS recorded a method we do not implement (e.g. private_key_jwt).
+            # We cannot frame credentials that way, so keep our requested method
+            # as the best-effort fallback but surface the mismatch — otherwise the
+            # ensuing exchange failure looks like a generic auth error.
+            log(
+                f"warning: AS assigned unsupported token_endpoint_auth_method "
+                f"{assigned_method!r} (requested {auth_method!r}); mcp-stdio "
+                f"cannot honour it and the token exchange may fail"
+            )
     return ClientRegistration(
         client_id=client_id,
         client_secret=client_secret,
@@ -1119,6 +1165,7 @@ def exchange_code(
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
     }
+    _warn_if_basic_auth_lacks_secret(auth_method, client_secret)
     if auth_method == "client_secret_basic" and client_secret:
         # URL-encode client_id and client_secret before base64-encoding for HTTP
         # Basic auth. RFC 6749 §2.3.1 specifies the form-urlencoded algorithm
@@ -1169,6 +1216,7 @@ def refresh_access_token(
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
     }
+    _warn_if_basic_auth_lacks_secret(auth_method, client_secret)
     if auth_method == "client_secret_basic" and client_secret:
         creds = base64.b64encode(
             f"{quote(client_id, safe='')}:{quote(client_secret, safe='')}".encode()
@@ -1649,6 +1697,9 @@ def _run_device_authorization_flow(
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
     }
+    # Covers both this device-authorization request and the token poll below:
+    # both reuse this auth_method/csecret, so one warning here suffices.
+    _warn_if_basic_auth_lacks_secret(auth_method, csecret)
     if auth_method == "client_secret_basic" and csecret:
         creds = base64.b64encode(
             f"{quote(cid, safe='')}:{quote(csecret, safe='')}".encode()
