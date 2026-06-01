@@ -180,6 +180,27 @@ class TestLoadSaveDelete:
         assert mode & stat.S_IRWXG == 0
         assert mode & stat.S_IRWXO == 0
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX symlink semantics; NTFS differs",
+    )
+    def test_read_does_not_chmod_through_a_symlink(self, tmp_path, monkeypatch):
+        """A symlinked tokens.json must NOT have its target's mode altered on
+        read — guards against a symlink-swap chmod of an attacker-chosen file."""
+        target = tmp_path / "real.json"
+        target.write_text('{"https://example.com/mcp": {"access_token": "t"}}')
+        os.chmod(target, 0o644)
+        link = tmp_path / "tokens.json"
+        link.symlink_to(target)
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", link)
+
+        loaded = load_token("https://example.com/mcp")
+        assert loaded is not None and loaded.access_token == "t"
+        # The symlink target's mode must be untouched (chmod skipped on symlink).
+        assert os.stat(target).st_mode & stat.S_IRWXO == stat.S_IROTH
+
     def test_concurrent_saves_of_distinct_keys_both_persist(
         self, tmp_path, monkeypatch
     ):
@@ -261,8 +282,15 @@ class TestNormalizeKey:
     def test_keeps_non_default_port(self):
         assert _normalize_key("https://x.com:8443/mcp") == "https://x.com:8443/mcp"
 
-    def test_strips_single_trailing_slash(self):
+    def test_strips_trailing_slashes(self):
         assert _normalize_key("https://x.com/mcp/") == "https://x.com/mcp"
+        # rstrip removes all trailing slashes, matching the docstring.
+        assert _normalize_key("https://x.com/mcp///") == "https://x.com/mcp"
+
+    def test_query_is_preserved_in_key(self):
+        assert (
+            _normalize_key("https://x.com/mcp?t=1") == "https://x.com/mcp?t=1"
+        )
 
     def test_non_http_returned_unchanged(self):
         assert _normalize_key("not a url") == "not a url"
