@@ -2111,6 +2111,14 @@ def _sse_reader_loop(
     window where a server keeps the GET alive on an expired token would be
     over-engineering for no observed failure mode.
 
+    The cross-origin credential guard on the endpoint event (#D-1 round34)
+    evaluates ``has_auth`` against this SAME per-connect snapshot, so it is only
+    as fresh as the current GET connection — acceptable because Authorization is
+    established at startup, not introduced mid-session: a refresh that ADDED an
+    Authorization header where none existed would not reach an already-open
+    stream's snapshot until reconnect, but that flow does not occur (auth is set
+    once at startup), so the guard never evaluates a stale has_auth=False.
+
     Reconnects automatically on disconnect.
     """
     # Whether a usable endpoint was EVER established. A non-200 on the very
