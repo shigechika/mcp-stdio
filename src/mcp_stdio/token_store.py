@@ -11,6 +11,7 @@ possible (acquisition failures are non-fatal by design).
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import stat
@@ -38,6 +39,10 @@ _DEFAULT_PORTS = {"https": 443, "http": 80}
 # of secrets to an attacker-chosen target. 0 on platforms without it (Windows),
 # where the parent dir's 0o700 mode is the primary guard anyway.
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+# Set once if a server URL carrying embedded userinfo is normalized into a key,
+# so the credential-sharing warning is emitted only once per process.
+_warned_userinfo_key = False
 
 
 def _normalize_key(server_url: str) -> str:
@@ -70,6 +75,21 @@ def _normalize_key(server_url: str) -> str:
         port = parsed.port
     except ValueError:
         return server_url
+    # #7 (round17): userinfo is dropped from the key, so two URLs differing ONLY
+    # in embedded credentials (user:pass@) fold to the same slot and silently
+    # share / overwrite one cached token. MCP endpoints normally carry no
+    # userinfo, so this stays a deliberate fold — but warn ONCE so an operator
+    # using embedded credentials is not surprised by the token sharing.
+    if parsed.username or parsed.password:
+        global _warned_userinfo_key
+        if not _warned_userinfo_key:
+            print(
+                "mcp-stdio: warning: server URL contains embedded userinfo "
+                "(user:pass@host); it is dropped from the token-store key, so "
+                "URLs differing only in credentials share one cached token slot.",
+                file=sys.stderr,
+            )
+            _warned_userinfo_key = True
     # ``hostname`` strips the brackets from an IPv6 literal; re-add them so the
     # rebuilt netloc is a valid, re-parsable URL and ``[::1]:8443`` cannot
     # collide with another address whose final hextet equals a port.
@@ -340,7 +360,14 @@ def _read_store(*, for_write: bool = False) -> dict[str, Any]:
         # in — refused), EACCES, or a transient I/O error. On the write path
         # this must NOT degrade to {} (which a save would then clobber over the
         # unread store); raise so the caller aborts.
-        if for_write:
+        #
+        # ENOENT is the exception (#9 round17): the file vanished in the TOCTOU
+        # window between the exists() check above and this open (a concurrent
+        # migration unlink, or an external tool). A vanished file is semantically
+        # ABSENT, not unreadable — return {} so the write proceeds from a clean
+        # slate, instead of aborting the save with a misleading "could not be
+        # read" warning. There is nothing to clobber.
+        if for_write and e.errno != errno.ENOENT:
             raise _StoreUnreadable(str(e)) from e
         return {}
     try:
@@ -376,7 +403,10 @@ def _write_store(data: dict[str, Any]) -> None:
     loss (the file data fsync alone does not guarantee the rename survives).
     """
     _ensure_store_dir()
-    payload = json.dumps(data, indent=2).encode("utf-8")
+    # sort_keys for stable, diff-friendly on-disk output (#8 round17): without it
+    # the per-server key order follows dict-insertion order and churns across the
+    # read-modify-write saves, complicating inspection/diffing for no benefit.
+    payload = json.dumps(data, indent=2, sort_keys=True).encode("utf-8")
     # Per-write unique temp name. PID alone is not enough: when the advisory
     # lock degrades to a no-op (lock fs unavailable), two THREADS in one process
     # share the PID and would otherwise pick the same temp path and clobber each
