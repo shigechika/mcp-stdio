@@ -330,6 +330,54 @@ class TestMain:
                 main()
             assert exc_info.value.code == 1
 
+    def test_empty_bearer_flag_still_conflicts_with_oauth(self, monkeypatch):
+        """#17: `--bearer-token '' --oauth` must error like a non-empty token —
+        an explicit (even empty) bearer flag is a contradictory auth choice and
+        must not slip past the mutual-exclusion check on a falsiness technicality."""
+        monkeypatch.delenv("MCP_BEARER_TOKEN", raising=False)
+        with patch(
+            "sys.argv",
+            [
+                "mcp-stdio",
+                "https://example.com/mcp",
+                "--oauth",
+                "--bearer-token",
+                "",
+            ],
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 1
+
+    def test_explicit_authorization_header_with_oauth_warns(
+        self, monkeypatch, capsys
+    ):
+        """#18: an explicit -H 'Authorization: ...' overridden by the OAuth token
+        emits a stderr warning instead of silently discarding it."""
+        monkeypatch.delenv("MCP_BEARER_TOKEN", raising=False)
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--oauth",
+                    "-H",
+                    "Authorization: Bearer mine",
+                    "https://example.com/mcp",
+                ],
+            ),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run") as mock_run,
+            patch("mcp_stdio.cli._build_token_refresher"),
+            patch("mcp_stdio.cli._build_scope_upgrader"),
+        ):
+            mock_ensure.return_value.access_token = "oauth-tok"
+            main()
+        # The OAuth token wins and the override is announced.
+        headers = mock_run.call_args.kwargs["headers"]
+        assert headers["Authorization"] == "Bearer oauth-tok"
+        assert "overridden by the OAuth-acquired token" in capsys.readouterr().err
+
     def test_dash_h_overrides_bearer_authorization_case_insensitively(self):
         """A -H differing only in case from a built-in header replaces it,
         rather than sending two same-named headers (RFC 7230 §3.2)."""
