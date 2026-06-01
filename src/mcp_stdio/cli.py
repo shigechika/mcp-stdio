@@ -291,7 +291,8 @@ def main() -> None:
         help=(
             "Disable TCP keepalive on the HTTP socket. TCP keepalive is "
             "on by default (60s idle + 4 probes × 15s ≈ 120s half-open "
-            "detection on Linux/macOS/BSD; SO_KEEPALIVE-only on Windows). "
+            "detection on Linux/macOS/FreeBSD/NetBSD; SO_KEEPALIVE-only on "
+            "Windows and other platforms). "
             "Opt out for proxy/NAT paths that strip keepalive packets. "
             "See #9."
         ),
@@ -465,12 +466,16 @@ def main() -> None:
             for existing in overridden:
                 del headers[existing]
             headers["Authorization"] = f"Bearer {token_data.access_token}"
-            token_refresher = _build_token_refresher(
-                args.url, headers, args.timeout_connect, args.timeout_read
-            )
-            scope_upgrader = _build_scope_upgrader(
-                args.url, headers, args.timeout_connect, args.timeout_read
-            )
+            # The relay-loop 401/403 recovery callbacks are unused by the
+            # one-shot --check / --test probe (check_connection never refreshes
+            # or steps up), so only build them on the real relay path. See #15.
+            if not (args.check or args.test):
+                token_refresher = _build_token_refresher(
+                    args.url, headers, args.timeout_connect, args.timeout_read
+                )
+                scope_upgrader = _build_scope_upgrader(
+                    args.url, headers, args.timeout_connect, args.timeout_read
+                )
         except Exception as e:
             print(f"error: OAuth authentication failed: {e}", file=sys.stderr)
             sys.exit(1)
