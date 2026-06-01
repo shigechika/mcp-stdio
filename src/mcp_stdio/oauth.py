@@ -81,7 +81,16 @@ def _authorization_base_url(server_url: str) -> str:
     authorization codes to be POSTed to ``https://user:pass@host/token``.
     """
     parsed = urlparse(server_url)
-    host = parsed.hostname or ""
+    if not parsed.scheme or not parsed.hostname:
+        # A schemeless / hostless input (e.g. "example.com/mcp") otherwise
+        # produces a malformed base like "://example.com/mcp" that flows
+        # silently into the synthesized default endpoints. Fail clearly at the
+        # source — OAuth needs an absolute http(s) URL with a host.
+        raise ValueError(
+            f"server URL must be an absolute http(s) URL with a host, "
+            f"got {server_url!r}"
+        )
+    host = parsed.hostname
     # urlparse strips the brackets from an IPv6 literal host — restore them.
     if ":" in host:
         host = f"[{host}]"

@@ -95,6 +95,15 @@ class TestAuthorizationBaseUrl:
             == "https://[2001:db8::1]:9000"
         )
 
+    @pytest.mark.parametrize(
+        "bad", ["example.com/mcp", "/just/a/path", "ftp:///nohost", ""]
+    )
+    def test_schemeless_or_hostless_raises(self, bad):
+        """#7(round12): a URL missing scheme or host must fail clearly instead of
+        producing a malformed '://...' base that flows into default endpoints."""
+        with pytest.raises(ValueError, match="absolute http"):
+            _authorization_base_url(bad)
+
 
 # --- PKCE ---
 
