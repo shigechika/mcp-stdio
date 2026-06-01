@@ -198,7 +198,9 @@ def _write_store(data: dict[str, Any]) -> None:
 
     Uses a temp file created with 0o600 from the start (no umask window),
     then atomically renames it over the target file so a crash mid-write
-    cannot corrupt existing tokens.
+    cannot corrupt existing tokens. After the rename the parent directory is
+    fsynced so the directory entry change is itself durable across a power
+    loss (the file data fsync alone does not guarantee the rename survives).
     """
     _ensure_store_dir()
     payload = json.dumps(data, indent=2).encode("utf-8")
@@ -217,6 +219,17 @@ def _write_store(data: dict[str, Any]) -> None:
         except OSError:
             pass
         raise
+    # Make the rename durable. Best-effort: some platforms/filesystems reject a
+    # directory fsync, and opening a directory fails on Windows — neither should
+    # fail the write.
+    try:
+        dir_fd = os.open(str(_STORE_DIR), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 @contextlib.contextmanager

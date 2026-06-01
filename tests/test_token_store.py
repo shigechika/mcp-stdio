@@ -119,6 +119,26 @@ class TestLoadSaveDelete:
         store_file.write_text("not json")
         assert load_token("https://example.com/mcp") is None
 
+    def test_save_survives_unavailable_dir_fsync(self, tmp_path, monkeypatch):
+        """The post-rename parent-dir fsync is best-effort — a platform that
+        rejects it (e.g. Windows) must not fail the save."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        real_open = os.open
+
+        def open_no_dir_fsync(path, flags, *a, **k):
+            # Reject opening the directory (the dir-fsync path), allow the rest.
+            if os.path.isdir(path):
+                raise OSError("directory fsync unsupported")
+            return real_open(path, flags, *a, **k)
+
+        monkeypatch.setattr("mcp_stdio.token_store.os.open", open_no_dir_fsync)
+        save_token("https://example.com/mcp", TokenData(access_token="t"))
+        monkeypatch.setattr("mcp_stdio.token_store.os.open", real_open)
+        assert load_token("https://example.com/mcp").access_token == "t"
+
     def test_load_unknown_future_field_returns_none(self, tmp_path, monkeypatch):
         """Forward-compat: an entry written by a newer version carrying a field
         this version doesn't know must degrade to None, not raise."""
