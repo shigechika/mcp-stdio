@@ -228,6 +228,36 @@ class TestDiscoverMetadata:
         assert meta.authorization_endpoint == "https://as.example.com/auth"
         assert meta.token_endpoint == "https://as.example.com/tok"
 
+    def test_phase3_defaults_target_discovered_as_origin(self, httpx_mock):
+        """#3(round14): when a cross-origin AS is discovered via PRM but ALL its
+        RFC 8414 metadata fetches 404, the phase-3 default endpoints must target
+        the DISCOVERED AS origin — not the MCP host (which would POST the
+        credential exchange to the wrong origin)."""
+        server_url = "https://mcp.example.com/mcp"
+        # Path-aware PRM advertises a cross-origin AS (found → loop breaks).
+        httpx_mock.add_response(
+            url="https://mcp.example.com/.well-known/oauth-protected-resource/mcp",
+            json={
+                "resource": server_url,
+                "authorization_servers": ["https://as.example.com"],
+            },
+        )
+        # Every RFC 8414 metadata fetch 404s: the discovered AS, the host base,
+        # and the path-scoped server URL.
+        for url in (
+            "https://as.example.com/.well-known/oauth-authorization-server",
+            "https://mcp.example.com/.well-known/oauth-authorization-server",
+            "https://mcp.example.com/.well-known/oauth-authorization-server/mcp",
+        ):
+            httpx_mock.add_response(url=url, status_code=404)
+
+        client = httpx.Client()
+        meta = discover_oauth_metadata(server_url, client)
+        # Defaults point at the AS origin, not the MCP host.
+        assert meta.authorization_endpoint == "https://as.example.com/authorize"
+        assert meta.token_endpoint == "https://as.example.com/token"
+        assert meta.issuer == "https://as.example.com"
+
     def test_fallback_on_404(self, httpx_mock):
         self._mock_no_prm(httpx_mock)
         httpx_mock.add_response(
