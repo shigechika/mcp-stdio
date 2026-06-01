@@ -463,6 +463,7 @@ def discover_oauth_metadata(
                 f"expected {server_url!r}, got {prm_resource!r}"
             )
         auth_servers = prm_data.get("authorization_servers")
+        found = False
         if auth_servers and isinstance(auth_servers, list):
             # Walk the list and pick the first entry that passes validation.
             # A malicious or misconfigured MCP server might otherwise send
@@ -474,8 +475,13 @@ def discover_oauth_metadata(
                 ):
                     auth_server_url = candidate
                     log(f"discovered authorization server: {auth_server_url}")
+                    found = True
                     break
-        break
+        if found:
+            break
+        # A 200 PRM doc that yielded no usable authorization_servers (missing /
+        # empty / all entries rejected) must NOT end discovery — fall through to
+        # the next candidate (e.g. the host-root PRM) instead of giving up here.
 
     # Phase 2: RFC 8414 Authorization Server Metadata
     meta = _fetch_authorization_server_metadata(auth_server_url, client)
@@ -686,6 +692,19 @@ def _make_callback_handler(
                 return
 
             params = parse_qs(parsed.query)
+
+            # Single-shot capture: once the first authorization response is
+            # recorded, ignore any subsequent /callback hit (browser refresh,
+            # link prefetch, double-submit) so it cannot overwrite the captured
+            # code/error in the race window before the main loop consumes it.
+            if result.auth_code is not None or result.error is not None:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(
+                    b"<h1>Already received</h1><p>You can close this tab.</p>"
+                )
+                return
 
             if "error" in params:
                 result.error = params["error"][0]
