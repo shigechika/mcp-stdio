@@ -2981,6 +2981,37 @@ class TestAuthorizationFlowFailurePaths:
                 timeout=5,
             )
 
+    def test_dcr_failure_closes_callback_server(self, monkeypatch):
+        """If DCR raises before the success-path close, the localhost callback
+        server is still closed so its listening socket is not leaked."""
+        import mcp_stdio.oauth as oauth_mod
+
+        closed: list[bool] = []
+        real_server_close = oauth_mod.HTTPServer.server_close
+
+        def spying_close(self) -> None:
+            closed.append(True)
+            real_server_close(self)
+
+        monkeypatch.setattr(oauth_mod.HTTPServer, "server_close", spying_close)
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("registration refused")
+
+        monkeypatch.setattr("mcp_stdio.oauth.register_client", boom)
+        # No client_id_override and no cached client → DCR path is taken.
+        client = httpx.Client()
+        with pytest.raises(RuntimeError, match="registration refused"):
+            _run_authorization_flow(
+                "https://ex.com/mcp",
+                client,
+                metadata=self.META,
+                cached=None,
+                client_id_override=None,
+                timeout=5,
+            )
+        assert closed, "callback server was not closed on the DCR error path"
+
 
 class TestRfc9207IssValidation:
     """RFC 9207: validate the authorization-response `iss` parameter against the
