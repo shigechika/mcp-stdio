@@ -725,6 +725,13 @@ def _post_and_stream(
                         _emit(text, tracker)
                         emitted = True
 
+                if not emitted and has_id:
+                    # A 200 that delivered NO JSON-RPC payload (empty body, or
+                    # only non-message SSE events) would leave a request-with-id
+                    # waiting forever. Synthesize an error so the client is not
+                    # left hanging, mirroring the >=400 fall-through in run().
+                    # Notifications (has_id False) stay silent.
+                    _write_line(_error_response("empty response from server", req_id))
                 return _StreamResult(session, 200, protocol_version=pv)
         except httpx.TransportError as e:
             # TransportError is the supertype of every transient network/timeout/
@@ -944,6 +951,10 @@ def _paginate_and_stream(
     merged_result: dict[str, Any] | None = None
     last_session: str | None = None
     truncated = False
+    # The cursor for the page we could NOT fetch (set on a mid-pagination
+    # failure or the page-cap). Re-exposed as ``nextCursor`` on the merged
+    # result so a truncated list is resumable instead of silently complete.
+    pending_cursor: str | None = None
 
     for page in range(1, MAX_LIST_PAGES + 1):
         page_request = dict(request)
@@ -969,6 +980,8 @@ def _paginate_and_stream(
                 f"pagination: page {page} exhausted retries, "
                 f"returning partial result"
             )
+            truncated = True
+            pending_cursor = params.get("cursor")
             break
 
         if stream.session_id:
@@ -981,6 +994,8 @@ def _paginate_and_stream(
                 f"pagination: page {page} returned HTTP {stream.status_code}, "
                 f"returning partial result"
             )
+            truncated = True
+            pending_cursor = params.get("cursor")
             break
 
         if parsed is None:
@@ -999,6 +1014,8 @@ def _paginate_and_stream(
                 f"pagination: page {page} response not parseable, "
                 f"returning partial result"
             )
+            truncated = True
+            pending_cursor = params.get("cursor")
             break
 
         page_result = parsed.get("result")
@@ -1008,6 +1025,8 @@ def _paginate_and_stream(
             if page == 1:
                 _emit(json.dumps(parsed), tracker)
                 return stream
+            truncated = True
+            pending_cursor = params.get("cursor")
             break
 
         if merged_result is None:
@@ -1031,6 +1050,7 @@ def _paginate_and_stream(
         params["cursor"] = next_cursor
     else:
         truncated = True
+        pending_cursor = params.get("cursor")
         log(
             f"pagination: reached MAX_LIST_PAGES={MAX_LIST_PAGES}, "
             f"truncating results"
@@ -1039,13 +1059,18 @@ def _paginate_and_stream(
     if merged_result is None:
         merged_result = {result_key: []}
 
+    # A truncated list (a later page failed, or the page cap was hit) must NOT be
+    # reported as complete: re-expose the cursor for the unfetched page so the
+    # client can RESUME pagination itself instead of silently losing the tail.
+    if truncated and pending_cursor:
+        merged_result["nextCursor"] = pending_cursor
+
     merged_response: dict[str, Any] = {
         "jsonrpc": request.get("jsonrpc", "2.0"),
         "id": request.get("id"),
         "result": merged_result,
     }
     _emit(json.dumps(merged_response), tracker)
-    _ = truncated  # kept for future _meta annotation
     return _StreamResult(last_session, 200)
 
 
@@ -1521,13 +1546,16 @@ def run(
                 # header is sent rather than guessing — a server that both
                 # omits it and enforces the header would be self-contradictory.
                 capture_init = _looks_like_initialize(content)
-                if capture_init:
+                if capture_init and protocol_version is not None:
                     # An initialize request IS the (re)negotiation and predates a
                     # known version, so it must not advertise the prior one
                     # (2025-06-18: the header carries the negotiated version and
-                    # applies to requests AFTER initialization). Strip it from
-                    # this POST, matching _reinitialize which omits it on its own
-                    # initialize POST. Mcp-Session-Id is left untouched.
+                    # applies to requests AFTER initialization). Strip the value
+                    # _prepare_headers injected, matching _reinitialize. The gate
+                    # on ``protocol_version is not None`` means we only drop the
+                    # relay's OWN injected header — on a cold-start initialize
+                    # (no version yet) a user-pinned ``-H MCP-Protocol-Version``
+                    # is left intact. Mcp-Session-Id is untouched.
                     h = {
                         k: v
                         for k, v in h.items()
@@ -1548,8 +1576,14 @@ def run(
 
             result = _dispatch(line, req_headers)
             if result is None:
-                # All retries exhausted — error already printed
-                session_id = None
+                # All retries exhausted on a TRANSPORT error (the error was
+                # already printed). ``None`` is never a 4xx — every non-200
+                # status returns a _StreamResult — so the server-side session was
+                # NOT invalidated; only the network blipped. KEEP session_id so
+                # the next request still carries it and can trigger 404 self-heal
+                # if the session truly expired. Clearing it here would instead
+                # defeat that recovery on a mere blip (the next 404 could not
+                # fire its recovery branch, which is gated on session_id).
                 continue
 
             # Adopt a server-supplied session id from THIS response before the
@@ -1588,9 +1622,9 @@ def run(
                     req_headers = _prepare_headers()
                     result = _dispatch(line, req_headers)
                     if result is None:
-                        # Retries exhausted ⇒ the session may be stale too;
-                        # reset for symmetry with the top-level None handling.
-                        session_id = None
+                        # Transport exhaustion on the refreshed retry (None is
+                        # never a 4xx). Keep session_id — see the top-level None
+                        # handling: a transient blip must not defeat 404 recovery.
                         continue
                 else:
                     log("token refresh failed, returning error")
@@ -1614,9 +1648,9 @@ def run(
                         req_headers = _prepare_headers()
                         result = _dispatch(line, req_headers)
                         if result is None:
-                            # Retries exhausted ⇒ assume the session is stale,
-                            # for symmetry with the top-level None handling.
-                            session_id = None
+                            # Transport exhaustion on the stepped-up retry (None
+                            # is never a 4xx). Keep session_id — see the top-level
+                            # None handling.
                             continue
                     else:
                         log("step-up authorization failed, returning error")
@@ -1707,6 +1741,12 @@ def _sse_reader_loop(
 
     Reconnects automatically on disconnect.
     """
+    # Whether a usable endpoint was EVER established. A non-200 on the very
+    # first connect is fatal (the server is unusable — fail startup fast); a
+    # non-200 on a later RECONNECT is treated as a transient outage and retried,
+    # so a momentary 5xx/redirect during a reconnect does not leave the reader
+    # dead and the gateway unable to ever recover.
+    established = False
     while not state.stop.is_set():
         try:
             if headers_lock is not None:
@@ -1717,8 +1757,17 @@ def _sse_reader_loop(
             with client.stream("GET", url, headers=req_headers) as resp:
                 if resp.status_code != 200:
                     log(f"SSE connection failed: HTTP {resp.status_code}")
-                    state.ready.set()
-                    return
+                    if not established:
+                        # First connect never succeeded — unblock startup
+                        # (endpoint stays None so run_sse exits) and stop.
+                        state.ready.set()
+                        return
+                    # Reconnect failure: keep trying rather than dying.
+                    state.ready.clear()
+                    state.endpoint_url = None
+                    if state.stop.wait(RETRY_DELAY):
+                        return
+                    continue
 
                 for event_type, data in _iter_sse_events(_iter_sse_lines(resp.iter_text())):
                     if state.stop.is_set():
@@ -1742,6 +1791,7 @@ def _sse_reader_loop(
                             continue
                         state.endpoint_url = resolved
                         state.ready.set()
+                        established = True
                         log(f"SSE endpoint: {resolved}")
                     elif event_type == "message":
                         _emit(data, tracker)
