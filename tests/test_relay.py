@@ -2185,6 +2185,92 @@ class TestSseReaderLoop:
         # Both GETs were issued (the first one raised, the second succeeded)
         assert len(httpx_mock.get_requests()) == 2
 
+    def test_clean_stream_end_triggers_reconnect(self, httpx_mock):
+        """A GET stream that ends *normally* (server closed it, no exception)
+        must reconnect — exercising the graceful-EOF reconnect branch, not the
+        HTTPError one."""
+        state = _SseState()
+
+        # First GET ends cleanly (generator returns without setting stop).
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream([b"event: endpoint\ndata: /first\n\n"]),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        # Second GET re-resolves a new endpoint, then ends the test.
+        def healthy_gen():
+            yield b"event: endpoint\ndata: /second\n\n"
+            state.stop.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream(healthy_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        client = httpx.Client()
+        try:
+            with (
+                patch("sys.stdout", StringIO()),
+                patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            ):
+                _sse_reader_loop(client, self.URL, {}, state)
+        finally:
+            client.close()
+
+        # The graceful EOF on GET #1 must have triggered GET #2.
+        assert state.endpoint_url == "https://example.com/second"
+        assert len(httpx_mock.get_requests()) == 2
+
+    def test_reconnect_resnapshot_uses_refreshed_headers(self, httpx_mock):
+        """When headers are mutated (as a 401 refresh would) between connects,
+        the reader's per-reconnect locked snapshot picks up the new value — the
+        reconnected GET carries the refreshed Authorization, not the stale one."""
+        state = _SseState()
+        headers = {"Authorization": "Bearer old"}
+        headers_lock = threading.Lock()
+        seen_auth: list[str | None] = []
+
+        def first_gen():
+            # End cleanly; simulate a mid-session token refresh by mutating the
+            # shared headers under the lock before the reader re-snapshots.
+            yield b"event: endpoint\ndata: /first\n\n"
+            with headers_lock:
+                headers["Authorization"] = "Bearer new"
+
+        def second_gen():
+            yield b"event: endpoint\ndata: /second\n\n"
+            state.stop.set()
+
+        def get_callback(request):
+            seen_auth.append(request.headers.get("authorization"))
+            gen = first_gen if len(seen_auth) == 1 else second_gen
+            return httpx.Response(
+                200,
+                stream=IteratorStream(gen()),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        httpx_mock.add_callback(get_callback, url=self.URL, method="GET", is_reusable=True)
+
+        client = httpx.Client()
+        try:
+            with (
+                patch("sys.stdout", StringIO()),
+                patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            ):
+                _sse_reader_loop(
+                    client, self.URL, headers, state, headers_lock=headers_lock
+                )
+        finally:
+            client.close()
+
+        assert seen_auth[0] == "Bearer old"
+        assert seen_auth[1] == "Bearer new"  # reconnect re-snapshotted the update
+
 
 class _BlockingStdin:
     """Stdin iterator that yields one line then blocks until released.
@@ -2974,6 +3060,26 @@ class TestCancelTracker:
         clock.advance(31)  # past 60 s
         assert not t.contains(5)
 
+    def test_consume_drops_once_then_id_reuse_passes(self):
+        """consume() removes the entry on first match, so a cancelled id's late
+        response is dropped exactly once; a reused id within the TTL passes."""
+        t = _CancelTracker()
+        t.add(7)
+        assert t.consume(7) is True  # the cancelled request's late response
+        assert t.consume(7) is False  # a reused id=7 now passes through
+
+    def test_consume_expired_returns_false_and_removes(self):
+        clock = _FakeClock()
+        t = _CancelTracker(ttl=60.0, now=clock)
+        t.add(5)
+        clock.advance(61)
+        assert t.consume(5) is False
+        # entry removed even though expired
+        assert t.consume(5) is False
+
+    def test_consume_none(self):
+        assert _CancelTracker().consume(None) is False
+
     def test_gc_bounds_memory(self):
         clock = _FakeClock()
         t = _CancelTracker(ttl=10.0, now=clock)
@@ -3222,13 +3328,16 @@ class TestRunCancelFilter:
         )
         assert '"ok":true' in output
 
-    def test_subsequent_response_for_cancelled_id_is_dropped(self, httpx_mock):
-        # Emits the cancel FIRST, then sends a subsequent request whose
-        # id collides with the cancelled one. The late response should
-        # be dropped.
-        httpx_mock.add_response(status_code=202, text="")  # cancel
+    def test_reused_id_after_cancel_is_forwarded(self, httpx_mock):
+        # A request that reuses a previously-cancelled id is a brand-new call;
+        # its response must be FORWARDED, not dropped (JSON-RPC permits id reuse
+        # once the prior call is done). Forwarding the new request untracks the
+        # cancel for that id. (The genuine "late response for an in-flight
+        # cancelled request is dropped" case is async-only — see
+        # TestRunSseCancelFilter.)
+        httpx_mock.add_response(status_code=202, text="")  # cancel ACK
         httpx_mock.add_response(
-            text='{"jsonrpc":"2.0","result":{"should":"drop"},"id":7}',
+            text='{"jsonrpc":"2.0","result":{"keep":true},"id":7}',
             headers={"content-type": "application/json"},
         )
         output = self._run_with_stdin(
@@ -3241,7 +3350,7 @@ class TestRunCancelFilter:
                 '{"jsonrpc":"2.0","method":"tools/call","id":7}',
             ],
         )
-        assert "drop" not in output
+        assert '"keep":true' in output
 
     def test_cancel_is_forwarded_upstream(self, httpx_mock):
         httpx_mock.add_response(status_code=202, text="")
