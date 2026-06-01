@@ -192,8 +192,21 @@ def _read_legacy_data() -> dict[str, Any] | None:
     an attacker-redirected symlink target) over the XDG store.
     """
     try:
-        fd = os.open(_LEGACY_STORE_FILE, os.O_RDONLY | _O_NOFOLLOW)
+        fd = os.open(_LEGACY_STORE_FILE, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK)
     except OSError:
+        return None
+    # Refuse a non-regular legacy file the same way _read_store does (#2
+    # round27): O_NOFOLLOW blocks a symlink, but an O_RDONLY read of a
+    # writer-less FIFO planted at the legacy path would block forever and hang
+    # every token load / relay startup. O_NONBLOCK makes the open return at
+    # once (a no-op for the regular file we expect); fstat then rejects the
+    # special file before f.read() can hang on it.
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None
+    except OSError:
+        os.close(fd)
         return None
     try:
         with os.fdopen(fd, "r", encoding="utf-8") as f:
@@ -272,13 +285,50 @@ def _migrate_legacy_store() -> None:
             os.chmod(_LEGACY_STORE_DIR, stat.S_IRWXU)  # 0o700
         except OSError:
             pass
-        # Tighten the legacy file's mode BEFORE moving it, so the secrets never
-        # sit at the new XDG path with a looser (pre-0o600) mode, even briefly:
-        # rename() preserves the source inode's permission bits.
+        # #1 (round27): before moving the legacy file into the TRUSTED XDG store
+        # path, confirm it is a REGULAR file via an O_NOFOLLOW-anchored fd.
+        # Path.rename moves a SYMLINK itself, so a symlink planted at the legacy
+        # path (a dotfile manager like GNU Stow, a backup/restore — not
+        # necessarily an attacker) would otherwise land at
+        # ~/.config/mcp-stdio/tokens.json, after which every O_NOFOLLOW read
+        # ELOOPs and save/delete abort forever — a permanent token-cache DoS.
+        # Open with O_NOFOLLOW (refuses a symlink: ELOOP) + O_NONBLOCK (so a FIFO
+        # cannot block the open), fstat for S_ISREG, and fchmod through that fd
+        # (a path-based chmod would FOLLOW a symlink and 0o600 an attacker /
+        # user-chosen target). A non-regular / symlinked legacy file is left
+        # untouched — never followed into the store. The residual TOCTOU between
+        # this check and the path-based rename below is bounded by the legacy
+        # dir's 0o700 mode (re-asserted just above), so only the owning user
+        # could swap the inode, which is the self-induced dotfile-manager case.
+        legacy_is_regular = False
         try:
-            os.chmod(_LEGACY_STORE_FILE, stat.S_IRUSR | stat.S_IWUSR)
+            _lfd = os.open(
+                _LEGACY_STORE_FILE, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK
+            )
         except OSError:
-            pass
+            _lfd = -1
+        if _lfd >= 0:
+            try:
+                legacy_is_regular = stat.S_ISREG(os.fstat(_lfd).st_mode)
+            except OSError:
+                legacy_is_regular = False
+            if legacy_is_regular:
+                # Tighten the mode BEFORE moving it, so the secrets never sit at
+                # the new XDG path with a looser (pre-0o600) mode even briefly:
+                # rename() preserves the source inode's permission bits. fchmod
+                # is anchored to the fd, so it cannot follow a swapped-in symlink.
+                _fchmod = getattr(os, "fchmod", None)
+                if _fchmod is not None:
+                    try:
+                        _fchmod(_lfd, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
+                    except OSError:
+                        pass
+            os.close(_lfd)
+        if not legacy_is_regular:
+            # Symlink / FIFO / device / vanished legacy file — do not rename or
+            # copy it into the trusted store. Leave it in place; the XDG store
+            # stays absent so load_token returns None (a clean re-auth).
+            return
         try:
             _LEGACY_STORE_FILE.rename(_STORE_FILE)
         except OSError:
