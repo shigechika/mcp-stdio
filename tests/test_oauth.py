@@ -46,7 +46,7 @@ from mcp_stdio.token_store import TokenData
 
 
 class TestSafeInt:
-    """#M1(round38): _safe_int coerces an AS-supplied JSON value to int and falls
+    """: _safe_int coerces an AS-supplied JSON value to int and falls
     back on bad input. json.loads parses the non-standard literals Infinity /
     -Infinity / NaN by default, so an AS can put a float('inf') into expires_in /
     interval — and int(float('inf')) raises OverflowError (NOT ValueError), which
@@ -80,7 +80,7 @@ class TestSafeInt:
 
 
 class TestResourceIndicator:
-    """#L1(round37): the RFC 8707 resource value strips userinfo (it is not part
+    """: the RFC 8707 resource value strips userinfo (it is not part
     of the resource identity and would otherwise reach the AS / its logs / the
     browser address bar) while keeping path+query and dropping any fragment."""
 
@@ -163,14 +163,14 @@ class TestAuthorizationBaseUrl:
         "bad", ["example.com/mcp", "/just/a/path", "ftp:///nohost", ""]
     )
     def test_schemeless_or_hostless_raises(self, bad):
-        """#7(round12): a URL missing scheme or host must fail clearly instead of
+        """: a URL missing scheme or host must fail clearly instead of
         producing a malformed '://...' base that flows into default endpoints."""
         with pytest.raises(ValueError, match="absolute http"):
             _authorization_base_url(bad)
 
 
 class TestSanitizeOAuthError:
-    """#12(round14): AS-supplied error strings are sanitised to the RFC 6749
+    """: AS-supplied error strings are sanitised to the RFC 6749
     grammar and length-bounded before reaching logs / exceptions."""
 
     def test_plain_error_code_passes(self):
@@ -232,7 +232,7 @@ class TestPKCE:
 
 
 class TestFetchAuthServerMetadataIssuer:
-    """#7(round23): the issuer comparison and synthesized defaults must use the
+    """: the issuer comparison and synthesized defaults must use the
     query-stripped base — the path-scoped fallback passes the full server_url."""
 
     def test_query_in_url_no_spurious_mismatch_and_clean_defaults(
@@ -320,7 +320,7 @@ class TestDiscoverMetadata:
         assert "//authorize" not in meta.authorization_endpoint
 
     def test_path_prm_without_as_falls_through_to_host_root(self, httpx_mock):
-        """#7(round11): a path-aware PRM that returns 200 but yields no usable
+        """: a path-aware PRM that returns 200 but yields no usable
         authorization_servers must NOT end discovery — fall through to the
         host-root PRM candidate instead of giving up."""
         server_url = "https://api.example.com/mcp"
@@ -350,7 +350,7 @@ class TestDiscoverMetadata:
         assert meta.token_endpoint == "https://as.example.com/tok"
 
     def test_phase3_defaults_target_discovered_as_origin(self, httpx_mock):
-        """#3(round14): when a cross-origin AS is discovered via PRM but ALL its
+        """: when a cross-origin AS is discovered via PRM but ALL its
         RFC 8414 metadata fetches 404, the phase-3 default endpoints must target
         the DISCOVERED AS origin — not the MCP host (which would POST the
         credential exchange to the wrong origin)."""
@@ -432,7 +432,7 @@ class TestDiscoverMetadata:
         assert meta.registration_endpoint is None  # not in response
 
     def test_iss_parameter_supported_parsed(self, httpx_mock):
-        """#4(round19): the RFC 9207 §3 flag is parsed into OAuthMetadata so the
+        """: the RFC 9207 §3 flag is parsed into OAuthMetadata so the
         §2.4 missing-iss rejection can fire; a non-true value stays False."""
         self._mock_no_prm(httpx_mock)
         httpx_mock.add_response(
@@ -573,7 +573,7 @@ class TestDiscoverMetadata:
         assert meta.token_endpoint == "https://api.example.com/token"
 
     def test_rfc9728_non_json_200_falls_through(self, httpx_mock):
-        """#15(round23): a PRM candidate returning HTTP 200 with a NON-JSON body
+        """: a PRM candidate returning HTTP 200 with a NON-JSON body
         must be skipped (continue to the next candidate / defaults), not crash on
         the json() parse — closes the 200-non-JSON branch (the test above only
         covers the 404-non-JSON case)."""
@@ -810,7 +810,7 @@ class TestDiscoverMetadata:
         )
 
     def test_rfc8414_cross_origin_issuer_rejected(self, httpx_mock):
-        """#8(round26): RFC 8414 §3.3 — a CROSS-ORIGIN issuer (different host)
+        """: RFC 8414 §3.3 — a CROSS-ORIGIN issuer (different host)
         is a mix-up / AS-spoofing signal, so the metadata is REJECTED rather
         than used. Discovery falls back to the synthesized defaults on the
         discovery origin, so the spoofed endpoints never receive a credential."""
@@ -827,7 +827,7 @@ class TestDiscoverMetadata:
         # path-scoped RFC 8414 §3.1 fetch before Phase 3 — mock it as 404 so no
         # unexpected request escapes. pytest_httpx strict mode flags it at
         # TEARDOWN, where _fetch_authorization_server_metadata's broad except
-        # cannot swallow it (a local run passed without this; see #151 round21).
+        # cannot swallow it (a local run passed without this; see).
         httpx_mock.add_response(
             url=(
                 "https://api.example.com/.well-known/"
@@ -844,7 +844,7 @@ class TestDiscoverMetadata:
     def test_rfc8414_same_origin_issuer_trailing_slash_warns_but_continues(
         self, httpx_mock
     ):
-        """#8(round26): a SAME-origin issuer mismatch (trailing slash / path /
+        """: a SAME-origin issuer mismatch (trailing slash / path /
         case) is the slight misconfiguration real servers ship — warn, but still
         use the metadata. Only a cross-origin issuer is rejected."""
         self._mock_no_prm(httpx_mock)
@@ -862,12 +862,12 @@ class TestDiscoverMetadata:
         assert meta.authorization_endpoint == "https://api.example.com/auth"
 
     def test_phase3_refuses_cleartext_synthesized_endpoints(self, httpx_mock):
-        """#15(round26): when discovery falls to Phase 3 (no PRM, no RFC 8414
+        """: when discovery falls to Phase 3 (no PRM, no RFC 8414
         metadata) and the only base is a cleartext non-loopback http:// origin,
         synthesizing default /authorize + /token would POST the code +
         client_secret in plaintext. _validate_endpoint_url rejects them and
         discover_oauth_metadata HARD-FAILS with ValueError rather than returning
-        unsafe endpoints. Drives the integration path of the #5(round19) guard."""
+        unsafe endpoints. Drives the integration path of the guard."""
         base = "http://evil.example.com"
         self._mock_no_prm(httpx_mock, base=base, path="/mcp")
         # RFC 8414 metadata absent on both the base and the path-scoped issuer.
@@ -941,7 +941,7 @@ class TestDiscoverMetadata:
     def test_rfc9728_resource_match_ignores_userinfo_in_server_url(
         self, httpx_mock, capsys
     ):
-        """#4(round43): the §3.3 resource comparison uses the userinfo-STRIPPED
+        """: the §3.3 resource comparison uses the userinfo-STRIPPED
         identifier (the form the rest of the flow uses), so an operator server_url
         carrying user:pass@ does NOT trip a spurious mismatch warning against a
         compliant PRM resource that (correctly) omits userinfo."""
@@ -970,7 +970,7 @@ class TestDiscoverMetadata:
 
     @pytest.mark.parametrize("body", [[], ["https://evil"], 42, "a string"])
     def test_non_object_prm_body_skipped(self, httpx_mock, body):
-        """#L2(round38): a PRM document whose body is not an OBJECT (a bare array
+        """: a PRM document whose body is not an OBJECT (a bare array
         or scalar — the PRM is fully MCP-server-controlled) would make
         prm_data.get(...) raise AttributeError and abort discovery. It must be
         skipped so the host-root PRM candidate (and Phase 2/3) still run."""
@@ -1000,7 +1000,7 @@ class TestDiscoverMetadata:
         assert meta.authorization_endpoint == "https://auth.example.com/authorize"
 
     def test_non_string_prm_resource_does_not_crash(self, httpx_mock):
-        """#L2(round38): a non-string PRM `resource` (e.g. an integer) must not
+        """: a non-string PRM `resource` (e.g. an integer) must not
         crash the §3.3 mismatch check on `.rstrip` — the isinstance(str) guard
         skips the warning and discovery proceeds using authorization_servers."""
         httpx_mock.add_response(
@@ -1142,7 +1142,7 @@ class TestRegisterClient:
     def test_non_string_dcr_credentials_raise_clear_error(
         self, httpx_mock, reg, match
     ):
-        """#A-1(round34): a non-conformant AS returning a non-string client_id /
+        """: a non-conformant AS returning a non-string client_id /
         client_secret must raise an actionable RFC 7591 ValueError here, not an
         opaque TypeError deep in quote() during HTTP Basic auth (or a silently
         str-coerced client_id in the authorize URL)."""
@@ -1159,7 +1159,7 @@ class TestRegisterClient:
             register_client(meta, "http://127.0.0.1:9999/callback", client)
 
     def test_honours_as_assigned_auth_method(self, httpx_mock):
-        """#L4(round39): RFC 7591 §3.2.1 — the AS MAY replace the requested
+        """: RFC 7591 §3.2.1 — the AS MAY replace the requested
         token_endpoint_auth_method and MUST return the registered value. When the
         AS assigns a method we support that differs from the one we requested, the
         returned ClientRegistration adopts the AS-assigned value so the later
@@ -1189,7 +1189,7 @@ class TestRegisterClient:
     def test_unsupported_as_assigned_auth_method_keeps_requested(
         self, httpx_mock, capsys
     ):
-        """#L4(round39): if the AS assigns a method mcp-stdio does not implement
+        """: if the AS assigns a method mcp-stdio does not implement
         (e.g. private_key_jwt), keep the requested method as the best-effort
         fallback and warn so the ensuing exchange failure is not opaque."""
         httpx_mock.add_response(
@@ -1318,7 +1318,7 @@ class TestRegisterClient:
         assert reg.client_secret_expires_at is None
 
     def test_client_secret_expires_at_garbage_coerced_to_none(self, httpx_mock):
-        """#15(round23): a non-numeric client_secret_expires_at (e.g. 'never')
+        """: a non-numeric client_secret_expires_at (e.g. 'never')
         that fails float() must coerce to None (no expiry), not crash DCR — closes
         the uncovered garbage-value branch alongside the 0 / '0' / missing cases."""
         httpx_mock.add_response(
@@ -1490,7 +1490,7 @@ class TestExchangeCode:
         assert b"resource=https" in req.content
 
     def test_token_exchange_failure(self, httpx_mock):
-        """#1(round34): a standard RFC 6749 §5.2 token error (4xx + error /
+        """: a standard RFC 6749 §5.2 token error (4xx + error /
         error_description) surfaces the actionable error_description as a
         RuntimeError, not an opaque HTTPStatusError that drops the body."""
         httpx_mock.add_response(
@@ -1585,7 +1585,7 @@ class TestRefreshToken:
     def test_invalid_grant(self, httpx_mock):
         """Refresh token expired or revoked — an RFC 6749 §5.2 error body (here
         with no error_description) surfaces the `error` code as a RuntimeError
-        (#1 round34). On the refresh path refresh_cached_token catches it and
+. On the refresh path refresh_cached_token catches it and
         degrades to None, exactly as it did for the prior HTTPStatusError."""
         httpx_mock.add_response(
             url="https://api.example.com/token",
@@ -1685,7 +1685,7 @@ class TestRefreshCachedToken:
     def test_refresh_200_missing_access_token_returns_none(
         self, tmp_path, monkeypatch, httpx_mock
     ):
-        """#M2(round37): a non-compliant 200 token response with NO access_token
+        """: a non-compliant 200 token response with NO access_token
         (and no `error`) makes _token_response_to_data raise. refresh_cached_token
         must degrade to None per its contract — not propagate a RuntimeError that
         aborts ensure_token's clear-and-re-auth recovery (and exits cli.py with
@@ -1717,7 +1717,7 @@ class TestRefreshCachedToken:
     def test_unsafe_cached_token_endpoint_aborts_refresh(
         self, tmp_path, monkeypatch, httpx_mock
     ):
-        """#L4(round38): defence-in-depth. A cached token_endpoint that fails the
+        """: defence-in-depth. A cached token_endpoint that fails the
         #13 policy (here a non-loopback cleartext HTTP URL) must be re-validated
         before the refresh re-POSTs credentials to it. refresh_cached_token must
         abort (return None → re-auth) and make NO request to the unsafe URL."""
@@ -1948,7 +1948,7 @@ class TestTokenResponseToData:
             _token_response_to_data({"token_type": "Bearer"}, self.META, "cid", None)
 
     def test_persists_iss_parameter_supported_from_metadata(self):
-        """#3(round20): the RFC 9207 §3 flag from the discovered metadata is
+        """: the RFC 9207 §3 flag from the discovered metadata is
         written into TokenData so a later step-up can rehydrate it. A round-trip
         through save/load preserves it."""
         meta = OAuthMetadata(
@@ -2079,7 +2079,7 @@ class TestTokenResponseToData:
         "bad", [float("inf"), float("-inf"), float("nan"), "Infinity", "NaN"]
     )
     def test_non_finite_expires_in_degrades_to_none(self, bad):
-        """#6(round42): a non-finite expires_in (json.loads parses Infinity/NaN by
+        """: a non-finite expires_in (json.loads parses Infinity/NaN by
         default) must be treated as 'no expiry advertised', NOT set expires_at to
         inf/nan. float('inf') > 0 is True, so without the isfinite guard a hostile
         AS could pin a token as eternally fresh and suppress every future refresh."""
@@ -2126,7 +2126,7 @@ class TestTokenResponseToData:
 
     @pytest.mark.parametrize("bad", [0, -100, "0", "-5"])
     def test_non_positive_expires_in_treated_as_no_expiry(self, bad, capsys):
-        """#9(round22): expires_in of 0 or negative must NOT yield an
+        """: expires_in of 0 or negative must NOT yield an
         immediately-expired token (which would force an instant re-refresh) —
         treat it as no advertised expiry (expires_at=None) and warn."""
         data = _token_response_to_data(
@@ -2147,7 +2147,7 @@ class TestTokenResponseToData:
 
 class TestParseTokenResponse:
     def test_non_json_non_form_body_raises_clear_error(self, httpx_mock):
-        """#8(round22): a 200 with a non-JSON, non-form body (e.g. a text/html
+        """: a 200 with a non-JSON, non-form body (e.g. a text/html
         maintenance page) must raise a clear RuntimeError naming the
         content-type, not a raw JSONDecodeError that surfaces opaquely."""
         httpx_mock.add_response(
@@ -2172,7 +2172,7 @@ class TestParseTokenResponse:
 
     @pytest.mark.parametrize("body", [[], [1, 2], "a string", 42, True])
     def test_non_object_json_body_raises_clear_error(self, httpx_mock, body):
-        """#L3(round38): a 200 whose JSON body is not an OBJECT (a bare array,
+        """: a 200 whose JSON body is not an OBJECT (a bare array,
         scalar, bool) is non-compliant (RFC 6749 §5.1 mandates a JSON object).
         Surface a clear RuntimeError naming the type, not the opaque TypeError
         that _raise_for_body_error's `"error" in result` raises on a non-iterable
@@ -2198,7 +2198,7 @@ class TestParseTokenResponse:
         assert result["scope"] == "repo"
 
     def test_form_urlencoded_duplicate_key_collapses_to_first(self, httpx_mock):
-        """#8(round19): a non-conformant duplicated form field must collapse to
+        """: a non-conformant duplicated form field must collapse to
         its first value (a string), never leave a LIST that would flow into
         TokenData.access_token or be str()-ed by the error sanitiser."""
         httpx_mock.add_response(
@@ -2227,7 +2227,7 @@ class TestParseTokenResponse:
             _parse_token_response(resp)
 
     def test_http_400_with_error_body_raises_runtime_error(self, httpx_mock):
-        """#1(round34): a 4xx whose body is an RFC 6749 §5.2 error surfaces the
+        """: a 4xx whose body is an RFC 6749 §5.2 error surfaces the
         `error` code as a RuntimeError (actionable), not the opaque
         HTTPStatusError that drops the body."""
         httpx_mock.add_response(
@@ -2268,7 +2268,7 @@ class TestParseTokenResponse:
             _parse_token_response(resp)
 
     def test_form_urlencoded_4xx_error_body_raises_clear_error(self, httpx_mock):
-        """#L5(round37): a 4xx with a form-urlencoded RFC 6749 §5.2 error body
+        """: a 4xx with a form-urlencoded RFC 6749 §5.2 error body
         surfaces the error as a RuntimeError before raise_for_status — the
         form-urlencoded 4xx branch, sibling of the JSON 4xx and form-urlencoded
         200-error cases that were already covered."""
@@ -2320,7 +2320,7 @@ class TestCallbackServer:
         assert cb_result.state == "test_state"
 
     def test_callback_response_has_security_headers(self):
-        """#6(round32): the callback page sets Cache-Control: no-store and
+        """: the callback page sets Cache-Control: no-store and
         Referrer-Policy: no-referrer — defense-in-depth, since the callback URL
         carries the auth code/state."""
         cb_result = CallbackResult()
@@ -2349,7 +2349,7 @@ class TestCallbackServer:
         assert resp.headers.get("referrer-policy") == "no-referrer"
 
     def test_bare_callback_hit_does_not_render_success(self):
-        """#2(round21): a /callback hit carrying neither code nor error (a
+        """: a /callback hit carrying neither code nor error (a
         browser prefetch, a manual GET) captured nothing — the page must NOT say
         'Authorization successful' (which could mislead a phishing victim), and
         auth_code/error stay None so the main loop keeps waiting."""
@@ -2411,7 +2411,7 @@ class TestCallbackServer:
         assert cb_result.auth_code is None
 
     def test_error_html_escaped_against_reflected_xss(self):
-        """#7(round18): the OAuth error is reflected into the callback HTML page
+        """: the OAuth error is reflected into the callback HTML page
         (do_GET serves it back), so it MUST be html.escaped — a regression that
         dropped the escape would reintroduce a reflected XSS on the loopback
         page. Pin the escaping with an HTML-metacharacter payload."""
@@ -2445,7 +2445,7 @@ class TestCallbackServer:
         assert "&lt;script&gt;" in resp.text
 
     def test_callback_is_single_shot(self):
-        """#6(round11): once the first authorization response is captured, a
+        """: once the first authorization response is captured, a
         second /callback hit (refresh / prefetch / double-submit) must NOT
         overwrite it."""
         cb_result = CallbackResult()
@@ -2526,7 +2526,7 @@ class TestCallbackServer:
         assert cb_result.state == "good_state"
 
     def test_rejects_non_loopback_host_header(self):
-        """#5(round42): a request carrying a non-loopback Host header (a DNS-
+        """: a request carrying a non-loopback Host header (a DNS-
         rebinding attempt) is rejected 404 and captures nothing, even though it
         reaches the loopback-bound server with a valid-looking code+state."""
         cb_result = CallbackResult()
@@ -2566,7 +2566,7 @@ class TestCallbackServer:
         assert cb_result.auth_code == "good"
 
     def test_callback_sets_csrf_fields_before_gating_auth_code(self):
-        """#4(round42): the handler must assign the CSRF fields (state/iss) BEFORE
+        """: the handler must assign the CSRF fields (state/iss) BEFORE
         the gating auth_code so the lock-free main loop never observes auth_code
         set while state is still None — which would spuriously fail the constant-
         time state compare. Verified by recording attribute-assignment order."""
@@ -2674,7 +2674,7 @@ class TestEnsureToken:
     def test_expired_cached_token_without_refresh_token_skips_refresh(
         self, tmp_path, monkeypatch
     ):
-        """#F-3(round28): an EXPIRED cached token lacking a refresh_token must
+        """: an EXPIRED cached token lacking a refresh_token must
         skip the refresh branch (its gate needs refresh_token AND token_endpoint
         AND client_id) and fall straight to the full authorization flow —
         refresh_cached_token must not even be called."""
@@ -3538,7 +3538,7 @@ class TestStepUpAuthorize:
     def test_cache_hit_rehydrates_iss_support_and_rejects_missing_iss(
         self, tmp_path, monkeypatch
     ):
-        """#3(round20): when the cached token records iss_parameter_supported,
+        """: when the cached token records iss_parameter_supported,
         the step-up cache-hit path rehydrates the RFC 9207 §3 flag so the §2.4
         missing-iss MUST-reject fires. The callback omits iss, so step-up must
         abort with 'issuer missing' rather than silently accepting it."""
@@ -3673,7 +3673,7 @@ class TestStepUpAuthorize:
     def test_rediscovery_probes_www_authenticate_for_prm_hint(
         self, tmp_path, monkeypatch
     ):
-        """#6(round16): when the cached token lacks endpoints, step_up's
+        """: when the cached token lacks endpoints, step_up's
         re-discovery probes WWW-Authenticate for an RFC 9728 PRM hint FIRST and
         threads it into discovery — mirroring ensure_token — so a server
         publishing PRM at a non-standard URL is discoverable on this path too,
@@ -3774,7 +3774,7 @@ class TestStepUpAuthorize:
         monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
         self._drive_callback(monkeypatch)
 
-        # Step-up re-discovery now probes WWW-Authenticate first (#6 round16).
+        # Step-up re-discovery now probes WWW-Authenticate first.
         # A 401 with no PRM hint makes the probe a no-op so discovery falls
         # through to the .well-known URLs below — but the request must be mocked
         # or pytest_httpx's strict assert_all_requests_were_expected fails.
@@ -3816,7 +3816,7 @@ class TestStepUpAuthorize:
     def test_unsafe_cached_endpoint_falls_through_to_discovery(
         self, tmp_path, monkeypatch, httpx_mock
     ):
-        """#L4(round38): defence-in-depth. If the cached token_endpoint fails the
+        """: defence-in-depth. If the cached token_endpoint fails the
         #13 policy (here a non-loopback cleartext HTTP URL), the step-up cache-hit
         branch must be skipped and fresh discovery run instead — so the credential
         flow goes to the freshly DISCOVERED safe endpoint, never the unsafe cached
@@ -3879,7 +3879,7 @@ class TestStepUpAuthorize:
 class TestOrigin:
     """_origin folds case / default ports / userinfo to one comparable tuple and
     returns a string sentinel for a malformed port so it never spuriously matches
-    a valid origin (#8 round44 pins the otherwise-uncovered sentinel branch)."""
+    a valid origin ( pins the otherwise-uncovered sentinel branch)."""
 
     def test_malformed_port_returns_string_sentinel(self):
         from urllib.parse import urlparse
@@ -4059,7 +4059,7 @@ class TestValidateAuthServerUrl:
         "bad", ["https://host:999999/as", "https://host:notaport/as"]
     )
     def test_malformed_port_rejected_not_raised(self, bad):
-        """#1(round31): an out-of-range / non-numeric port makes urllib raise on
+        """: an out-of-range / non-numeric port makes urllib raise on
         lazy .port access — the validator must REJECT (False), not let the
         ValueError escape and abort the discovery walk."""
         assert _validate_auth_server_url(bad, self.SERVER_URL) is False
@@ -4124,7 +4124,7 @@ class TestValidateAuthServerUrl:
         assert meta.authorization_endpoint == "https://auth.example.com/authorize"
 
     def test_discover_skips_malformed_port_auth_server(self, httpx_mock):
-        """#1(round31): a malformed-port AS candidate must be SKIPPED, not crash
+        """: a malformed-port AS candidate must be SKIPPED, not crash
         the discovery walk. urllib parses the port lazily and raises ValueError
         on .port access, which previously propagated out of the whole OAuth flow
         — a single bad authorization_servers entry would DoS discovery."""
@@ -4192,7 +4192,7 @@ class TestValidateEndpointUrl:
         "bad", ["https://evil:999999/token", "https://evil:notaport/token"]
     )
     def test_malformed_port_returns_none(self, bad, capsys):
-        """#2(round31): a malformed port must be dropped (None), not returned as
+        """: a malformed port must be dropped (None), not returned as
         a 'valid' endpoint that later receives a credential POST and surfaces an
         opaque httpx error deep in exchange_code / refresh."""
         assert _validate_endpoint_url(bad, label="token_endpoint") is None
@@ -4313,7 +4313,7 @@ class TestStateCsrfCheck:
     def test_absent_state_raises_csrf_error(
         self, tmp_path, monkeypatch, httpx_mock
     ):
-        """#8(round18): a callback delivering ?code= with NO state parameter must
+        """: a callback delivering ?code= with NO state parameter must
         still raise 'state mismatch' (not crash compare_digest with None). Pins
         the `cb_result.state or ''` defensive coalesce."""
         from urllib.parse import parse_qs, urlparse
@@ -4379,7 +4379,7 @@ class TestStateCsrfCheck:
     def test_uses_constant_time_comparison(
         self, tmp_path, monkeypatch, httpx_mock
     ):
-        """#14(round26): the CSRF state check goes through secrets.compare_digest
+        """: the CSRF state check goes through secrets.compare_digest
         on the PRODUCTION path, not ==.
 
         The previous version called compare_digest itself in the test body, so it
@@ -4512,7 +4512,7 @@ class TestAuthorizationFlowFailurePaths:
         self, monkeypatch
     ):
         """A LEGITIMATE error callback echoes `state` (RFC 6749 §4.1.2.1) →
-        surfaces the OAuth error, no code exchange. (#1 round35: state is now
+        surfaces the OAuth error, no code exchange. (: state is now
         validated before the error is acted on.)"""
         from urllib.parse import parse_qs, urlparse
         from urllib.request import urlopen
@@ -4547,7 +4547,7 @@ class TestAuthorizationFlowFailurePaths:
             )
 
     def test_callback_error_without_state_rejected_as_csrf(self, monkeypatch):
-        """#1(round35): an error callback that does NOT carry the matching state
+        """: an error callback that does NOT carry the matching state
         is an unauthenticated abort attempt (a local process / port-guessing page
         hitting /callback?error=... during the auth window), not a real AS error.
         State is validated first, so it is rejected as a CSRF mismatch — it
@@ -4612,7 +4612,7 @@ class TestAuthorizationFlowFailurePaths:
         assert closed, "callback server was not closed on the DCR error path"
 
     def test_webbrowser_open_failure_closes_callback_server(self, monkeypatch):
-        """#4(round13): a failure AFTER the callback server is bound but before
+        """: a failure AFTER the callback server is bound but before
         the success-path close (here webbrowser.open raising) must still close
         the server — the try/finally covers the whole listening window, not just
         DCR."""
@@ -4717,7 +4717,7 @@ class TestRfc9207IssValidation:
     def test_trailing_slash_iss_does_not_false_mismatch(
         self, httpx_mock, tmp_path, monkeypatch
     ):
-        """#7(round25): the iss compare is trailing-slash tolerant, so a Phase-3
+        """: the iss compare is trailing-slash tolerant, so a Phase-3
         synthesized issuer ('https://ex.com', no slash) does NOT false-mismatch an
         AS whose real iss is 'https://ex.com/' — the flow proceeds. A genuine
         mix-up (different host) is still caught (test_iss_mismatch_raises)."""
@@ -4775,7 +4775,7 @@ class TestRfc9207IssValidation:
     def test_stepup_preserves_cached_refresh_token_when_response_omits_it(
         self, httpx_mock, tmp_path, monkeypatch
     ):
-        """#L2(round41): a step-up token response that OMITS refresh_token (RFC
+        """: a step-up token response that OMITS refresh_token (RFC
         6749 §5.1, OPTIONAL) must keep the CACHED refresh_token in the stored
         TokenData — not overwrite it with None, which would break every future
         silent refresh until the next interactive flow. Mirrors the scope
@@ -4835,7 +4835,7 @@ class TestRfc9207IssValidation:
         assert data.access_token == "at"
 
     # RFC 9207 §2.4 second MUST: reject a missing iss from an AS that advertises
-    # support (authorization_response_iss_parameter_supported). #4/#7 (round19).
+    # support (authorization_response_iss_parameter_supported). #4/.
     META_ISS_SUPPORTED = OAuthMetadata(
         authorization_endpoint="https://ex.com/authorize",
         token_endpoint="https://ex.com/token",
@@ -4964,7 +4964,7 @@ class TestValidatePrmHintUrl:
         assert _validate_prm_hint_url("not a url !!!", self.SERVER) is False
 
     def test_userinfo_rejected(self, capsys):
-        """#3(round13): an embedded userinfo hint is refused, parity with the
+        """: an embedded userinfo hint is refused, parity with the
         sibling #13 validators (so HTTP Basic creds aren't sent on the GET)."""
         assert (
             _validate_prm_hint_url(
@@ -5238,7 +5238,7 @@ class TestDeviceAuthorizationFlow:
     def test_non_object_device_auth_body_raises(
         self, httpx_mock, tmp_path, monkeypatch, body
     ):
-        """#L3(round38): a non-object device-authorization body (a bare array /
+        """: a non-object device-authorization body (a bare array /
         scalar) would make da.get('device_code') raise AttributeError. Surface a
         clear RuntimeError naming the type instead."""
         self._patch_store(tmp_path, monkeypatch)
@@ -5253,7 +5253,7 @@ class TestDeviceAuthorizationFlow:
     def test_infinity_expires_in_does_not_crash(
         self, httpx_mock, tmp_path, monkeypatch
     ):
-        """#M1(round38): the client's json.loads parses the non-standard literal
+        """: the client's json.loads parses the non-standard literal
         `Infinity` into float('inf') (parse_constant defaults to it). A device-
         authorization response carrying expires_in=Infinity must NOT crash the
         flow — _safe_int catches the int(inf) OverflowError and clamps to the
@@ -5288,7 +5288,7 @@ class TestDeviceAuthorizationFlow:
     def test_preserves_requested_scope_when_omitted(
         self, httpx_mock, tmp_path, monkeypatch
     ):
-        """#4(round15): a device-flow token response that OMITS scope (RFC 6749
+        """: a device-flow token response that OMITS scope (RFC 6749
         §5.1) must keep the requested scope in the stored TokenData — mirrors the
         auth-code / refresh paths."""
         self._patch_store(tmp_path, monkeypatch)
@@ -5312,7 +5312,7 @@ class TestDeviceAuthorizationFlow:
     def test_poll_non_json_error_body_raises_http_error(
         self, httpx_mock, tmp_path, monkeypatch
     ):
-        """#7(round15): a poll response with a non-JSON error body must surface a
+        """: a poll response with a non-JSON error body must surface a
         clean HTTP error via raise_for_status, not crash on .json()."""
         self._patch_store(tmp_path, monkeypatch)
         httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
@@ -5333,10 +5333,10 @@ class TestDeviceAuthorizationFlow:
     def test_poll_2xx_non_json_body_fast_fails(
         self, httpx_mock, tmp_path, monkeypatch
     ):
-        """#2(round36): a non-200 2xx poll response (e.g. 202) with a non-JSON
+        """: a non-200 2xx poll response (e.g. 202) with a non-JSON
         body is non-compliant (RFC 8628 §3.5 mandates 200 or 400+error) and
         retrying it never resolves — so the loop FAST-FAILS by name instead of
-        spinning to the device-code deadline (the prior round28 behavior was to
+        spinning to the device-code deadline (the prior behavior was to
         sleep-and-continue, which wasted the whole code lifetime)."""
         self._patch_store(tmp_path, monkeypatch)
         monkeypatch.setattr(time, "sleep", lambda _s: None)
@@ -5359,7 +5359,7 @@ class TestDeviceAuthorizationFlow:
     def test_poll_2xx_valid_json_no_error_fast_fails(
         self, httpx_mock, tmp_path, monkeypatch
     ):
-        """#2(round36): a non-200 2xx with VALID JSON but no `error` key is the
+        """: a non-200 2xx with VALID JSON but no `error` key is the
         other spin path raise_for_status would no-op — it must also fast-fail by
         status, not loop to the deadline."""
         self._patch_store(tmp_path, monkeypatch)
@@ -5375,7 +5375,7 @@ class TestDeviceAuthorizationFlow:
             )
 
     def test_explicit_client_id_skips_dcr(self, httpx_mock, tmp_path, monkeypatch):
-        """#7(round14): with an explicit --client-id (client_id_override) the
+        """: with an explicit --client-id (client_id_override) the
         device flow uses it directly — no DCR /register POST — and the
         device-authorization POST carries that client_id."""
         self._patch_store(tmp_path, monkeypatch)
@@ -5421,14 +5421,14 @@ class TestDeviceAuthorizationFlow:
         )
         err = capsys.readouterr().err
         # No --oauth-timeout here, so the effective wait equals the clamped
-        # server lifetime (#L9 round39 reworded the message to "giving up in").
+        # server lifetime ( reworded the message to "giving up in").
         assert f"giving up in {_DEVICE_FLOW_MAX_LIFETIME_SECS}s" in err
         assert "999999999" not in err
 
     def test_verification_uri_complete_printed(self, httpx_mock, tmp_path, monkeypatch, capsys):
         """verification_uri_complete is shown when present — AND the user_code is
         STILL displayed for the user to confirm it matches (RFC 8628 §3.3.1 MUST,
-        anti-phishing / device disambiguation). See #5 (round18)."""
+        anti-phishing / device disambiguation)."""
         self._patch_store(tmp_path, monkeypatch)
 
         httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
@@ -5839,7 +5839,7 @@ class TestDeviceAuthorizationFlow:
     def test_oauth_timeout_clamps_device_poll_lifetime(
         self, httpx_mock, tmp_path, monkeypatch
     ):
-        """#L9(round39): --oauth-timeout bounds the device-code wait. With a
+        """: --oauth-timeout bounds the device-code wait. With a
         timeout (5s) far below the server-advertised expires_in (1800s), the poll
         deadline is clamped to the timeout: a clock jump of 6s — past the 5s
         timeout but nowhere near the 1800s server lifetime — ends the flow with
@@ -5873,7 +5873,7 @@ class TestDeviceAuthorizationFlow:
     def test_oauth_timeout_does_not_extend_beyond_server_lifetime(
         self, httpx_mock, tmp_path, monkeypatch
     ):
-        """#L9(round39): the clamp is min(timeout, expires_in) — a timeout LARGER
+        """: the clamp is min(timeout, expires_in) — a timeout LARGER
         than the server lifetime must not extend the wait. expires_in=10, a huge
         timeout, and a 11s clock jump (past expires_in, below timeout) still ends
         with TimeoutError: the deadline stayed at the 10s server lifetime."""
@@ -5942,7 +5942,7 @@ class TestDeviceAuthorizationFlow:
     def test_poll_unknown_error_surfaces_actionable_runtime_error(
         self, httpx_mock, tmp_path, monkeypatch
     ):
-        """#2(round36): a non-spec error code (e.g. invalid_client) now fast-fails
+        """: a non-spec error code (e.g. invalid_client) now fast-fails
         with an actionable RuntimeError that names the AS error, instead of an
         opaque HTTPStatusError that drops the body — mirroring the
         error_description extraction the auth-code / refresh paths use."""
@@ -6176,7 +6176,7 @@ class TestExchangeCodeBasicAuth:
     def test_basic_auth_without_secret_warns_and_falls_back_to_body(
         self, httpx_mock, capsys
     ):
-        """#L5(round39): client_secret_basic selected but no client_secret present
+        """: client_secret_basic selected but no client_secret present
         (a confidential client that lost its secret / a registration race). The
         code degrades safely to body auth (client_id only) but now logs an
         actionable warning so the operator sees WHY the AS rejects it, instead of

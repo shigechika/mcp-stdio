@@ -15,7 +15,7 @@ from mcp_stdio.token_store import TokenData
 
 
 class TestBearerHeaderValue:
-    """#5(round21): an OAuth AS-supplied token gets the same CR/LF/NUL ban as
+    """: an OAuth AS-supplied token gets the same CR/LF/NUL ban as
     -H values and --bearer-token, so it cannot inject/split request headers."""
 
     def test_clean_token_builds_header(self):
@@ -159,7 +159,7 @@ class TestMain:
             assert kwargs.kwargs["timeout_read"] == 60.0
 
     def test_default_timeouts_are_floats(self):
-        """#6(round18): with the timeout flags omitted the defaults must be
+        """: with the timeout flags omitted the defaults must be
         floats — argparse applies ``type`` only to argv strings, not to the
         default object, so an int default would leak through. Keep the attribute
         type consistent with the _positive_float validator."""
@@ -207,7 +207,7 @@ class TestMain:
         assert mock_ensure.call_args.kwargs["refresh_leeway"] == 300.0
 
     def test_oauth_timeout_default_and_flag(self):
-        """#13(round25): the interactive-OAuth wait is configurable via
+        """: the interactive-OAuth wait is configurable via
         --oauth-timeout (default 120) and propagated to ensure_token(timeout=)."""
         # Default.
         with (
@@ -307,7 +307,7 @@ class TestMain:
     )
     @pytest.mark.parametrize("value", ["nan", "inf", "Infinity"])
     def test_non_finite_floats_rejected(self, flag, value, capsys):
-        """#4(round27): float() parses nan/inf, which slip past the < 0 / == 0
+        """: float() parses nan/inf, which slip past the < 0 / == 0
         comparisons and defeat the validators (a nan/inf timeout never fires →
         silent hang). Every float flag must reject non-finite values at parse
         time. (-inf is omitted: argparse intercepts a leading '-' as an option
@@ -450,7 +450,7 @@ class TestMain:
             assert exc_info.value.code == 1
 
     def test_empty_bearer_flag_alone_warns_no_auth(self, monkeypatch, capsys):
-        """#C-1(round28): `--bearer-token ''` alone (no OAuth) is counted as an
+        """: `--bearer-token ''` alone (no OAuth) is counted as an
         auth choice by the mutual-exclusion check but attaches NO Authorization
         header — silently unauthenticated. Surface a stderr warning, and confirm
         no Authorization header is built."""
@@ -520,7 +520,7 @@ class TestMain:
             assert headers["authorization"] == "Bearer override"
 
     def test_dash_h_authorization_overriding_bearer_warns(self, monkeypatch, capsys):
-        """#N5(round29): a -H 'Authorization' that displaces an EXPLICIT
+        """: a -H 'Authorization' that displaces an EXPLICIT
         --bearer-token warns (mirroring the OAuth override warning) instead of
         silently dropping the flag's value."""
         monkeypatch.delenv("MCP_BEARER_TOKEN", raising=False)
@@ -639,7 +639,7 @@ class TestMain:
         assert "ignored without --oauth" not in capsys.readouterr().err
 
     def test_check_with_oauth_skips_relay_callbacks(self, monkeypatch):
-        """#15(round13): on the one-shot --check probe the relay 401/403
+        """: on the one-shot --check probe the relay 401/403
         recovery callbacks are not built (check_connection never uses them)."""
         with (
             patch(
@@ -672,7 +672,7 @@ class TestMain:
     def test_explicit_empty_client_id_without_oauth_warns(
         self, monkeypatch, capsys
     ):
-        """#13(round22): an explicit `--client-id ''` (falsy) without an OAuth
+        """: an explicit `--client-id ''` (falsy) without an OAuth
         flow now trips the OAuth-only warning — the gate is presence-based
         (`is not None`), matching the --bearer-token discipline."""
         monkeypatch.delenv("MCP_OAUTH_CLIENT_ID", raising=False)
@@ -701,7 +701,7 @@ class TestMain:
         assert "forbidden control character" in capsys.readouterr().err
 
     def test_oauth_token_with_control_char_exits(self, monkeypatch, capsys):
-        """#12(round23): an OAuth-acquired access_token carrying CR/LF/NUL (a
+        """: an OAuth-acquired access_token carrying CR/LF/NUL (a
         compromised/malicious AS smuggling control chars) must fail startup
         (exit 1), not split request headers on the wire. Covers the initial-flow
         header-build guard, distinct from the --bearer-token and refresher paths."""
@@ -1005,7 +1005,7 @@ class TestBuildTokenRefresher:
     def test_refresh_token_with_control_char_degrades_to_none(
         self, monkeypatch, capsys
     ):
-        """#5(round21): a refreshed token carrying CR/LF/NUL must NOT reach the
+        """: a refreshed token carrying CR/LF/NUL must NOT reach the
         wire — the refresher degrades to None (relay emits an auth error) rather
         than building an injectable Authorization header."""
         _SpyClient.instances.clear()
@@ -1032,7 +1032,7 @@ class TestBuildTokenRefresher:
         assert _SpyClient.instances[-1].closed
 
     def test_does_not_alias_live_headers_dict(self, monkeypatch):
-        """#L3(round39): the callback layers Authorization onto a build-time
+        """: the callback layers Authorization onto a build-time
         FROZEN copy of the base headers, not the live shared dict the SSE reader
         thread also holds. Mutating the caller's dict after build must not affect
         the callback's output — proving the live object is never iterated
@@ -1093,18 +1093,18 @@ class TestBuildScopeUpgrader:
         assert out["Authorization"] == "Bearer upgraded"
         assert out["X-Base"] == "1"
         assert _SpyClient.instances[-1].closed
-        # #13(round26): --oauth-timeout must reach the mid-session step-up too,
+        # --oauth-timeout must reach the mid-session step-up too,
         # not just the cold-start ensure_token — otherwise a step-up silently
         # falls back to step_up_authorize's hardcoded 120 s default.
         assert captured["timeout"] == 90
-        # #11(round19): the RFC 9470 step-up path carries the same credential-leak
+        # the RFC 9470 step-up path carries the same credential-leak
         # exposure as refresh, so its client must pin follow_redirects=False too
         # (an AS-controlled token endpoint could otherwise 302 the credential POST
         # to a cleartext / cross-origin host). Symmetric with the refresher test.
         assert _SpyClient.instances[-1].kwargs.get("follow_redirects") is False
 
     def test_does_not_alias_live_headers_dict(self, monkeypatch):
-        """#L3(round39): like the refresher, the upgrader layers Authorization
+        """: like the refresher, the upgrader layers Authorization
         onto a build-time frozen copy of the base headers, not the live shared
         dict. Mutating the caller's dict after build must not affect output."""
         _SpyClient.instances.clear()
@@ -1152,7 +1152,7 @@ class TestOAuthFailureExit:
         assert "OAuth authentication failed" in capsys.readouterr().err
 
     def test_keyboard_interrupt_during_oauth_exits_130(self, capsys):
-        """#2(round35): Ctrl-C during the pre-relay OAuth flow (before run()
+        """: Ctrl-C during the pre-relay OAuth flow (before run()
         installs signal handlers) exits cleanly with 130, not a raw
         KeyboardInterrupt traceback. KeyboardInterrupt is a BaseException, so the
         OAuth block's `except Exception` does not catch it — main()'s top-level

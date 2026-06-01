@@ -29,7 +29,7 @@ _STORE_DIR = Path.home() / ".config" / "mcp-stdio"
 # _STORE_FILE is FROZEN at import (derived once from _STORE_DIR), while
 # _store_lock re-derives its lock path LIVE from _STORE_DIR. Production never
 # mutates _STORE_DIR after import, so the two always agree; tests that redirect
-# the store must monkeypatch BOTH _STORE_DIR and _STORE_FILE (see #8 round36).
+# the store must monkeypatch BOTH _STORE_DIR and _STORE_FILE (see).
 _STORE_FILE = _STORE_DIR / "tokens.json"
 
 # Legacy path (v0.3.0 and earlier)
@@ -95,7 +95,7 @@ def _normalize_key(server_url: str) -> str:
         port = parsed.port
     except ValueError:
         return server_url
-    # #7 (round17): userinfo is dropped from the key, so two URLs differing ONLY
+    # userinfo is dropped from the key, so two URLs differing ONLY
     # in embedded credentials (user:pass@) fold to the same slot and silently
     # share / overwrite one cached token. MCP endpoints normally carry no
     # userinfo, so this stays a deliberate fold — but warn ONCE so an operator
@@ -169,14 +169,15 @@ def _ensure_store_dir() -> None:
     ``mkdir(parents=True)``, which 0o700's only the leaf and leaves intermediates
     at the umask mode, then path-chmods them — there is no umask-mode window and
     no path-based chmod on a just-created ancestor to be redirected by a symlink
-    swap (#3 round36). A pre-existing ancestor (the user's shared ``~/.config``)
+    swap. A pre-existing ancestor (the user's shared ``~/.config``)
     is left untouched; only directories WE create are tightened.
     """
     global _warned_loose_store_dir
-    # Create missing ancestors top-down (parent before child) AT 0o700. #L2
-    # round29 tightened them post-hoc; creating them at 0o700 closes the window
-    # entirely. reversed(parents) yields root-ward → leaf-ward, so each parent
-    # exists before its child; the leaf is created just below.
+    # Create missing ancestors top-down (parent before child) AT 0o700 — creating
+    # them tight from the start closes the umask window that tightening them
+    # post-hoc would otherwise leave open. reversed(parents) yields root-ward →
+    # leaf-ward, so each parent exists before its child; the leaf is created just
+    # below.
     for ancestor in reversed(_STORE_DIR.parents):
         if not ancestor.exists():
             try:
@@ -195,7 +196,7 @@ def _ensure_store_dir() -> None:
     try:
         os.chmod(_STORE_DIR, stat.S_IRWXU)  # 0o700 — re-assert for a pre-existing leaf
     except OSError:
-        # #10 (round16): the chmod can genuinely fail (a dir owned by another
+        # the chmod can genuinely fail (a dir owned by another
         # uid after a botched restore, some network mounts). The token file is
         # still written 0o600 so the secret bytes stay protected, but a loose
         # store DIR widens the listing/symlink-swap surface. Fail closed but
@@ -229,7 +230,7 @@ def _read_json_object_file(path: Path) -> dict[str, Any] | None:
         fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK)
     except OSError:
         return None
-    # Refuse a non-regular file the same way _read_store does (#2 round27):
+    # Refuse a non-regular file the same way _read_store does:
     # O_NOFOLLOW blocks a symlink, but an O_RDONLY read of a writer-less FIFO
     # planted at the path would block forever and hang every token load / relay
     # startup. O_NONBLOCK makes the open return at once (a no-op for the regular
@@ -242,7 +243,7 @@ def _read_json_object_file(path: Path) -> dict[str, Any] | None:
     except OSError:
         os.close(fd)
         return None
-    # Close the bare fd if os.fdopen itself raises (#5 round44): under resource
+    # Close the bare fd if os.fdopen itself raises: under resource
     # pressure fdopen can raise OSError, and since the `with` never engages the
     # file object that would close `fd` is never created — the broad except below
     # would then swallow the error and leak the raw fd. Wrap fdopen separately so
@@ -293,7 +294,7 @@ def _migrate_legacy_store() -> None:
         # left an empty placeholder) is NOT proof the migration completed;
         # unlinking the legacy file then would silently lose still-real tokens.
         #
-        # Probe the CONTENT, not the byte size (#L7 round39): an empty-dict store
+        # Probe the CONTENT, not the byte size: an empty-dict store
         # (`{}`, 2 bytes — all tokens were deleted) has st_size > 0 yet holds NO
         # tokens, so the old size test wrongly treated it as "migration complete"
         # and unlinked still-real legacy tokens. Mirror the empty-placeholder
@@ -321,9 +322,9 @@ def _migrate_legacy_store() -> None:
             except OSError:
                 pass
         else:
-            # #8 (round16): the XDG store is an EMPTY placeholder (a stray
+            # the XDG store is an EMPTY placeholder (a stray
             # `touch`, an interrupted external write, a backup restore) OR an
-            # empty-dict `{}` store with all tokens deleted (#L7 round39) — both
+            # empty-dict `{}` store with all tokens deleted — both
             # otherwise shadow still-valid legacy tokens forever (_read_store
             # would read {} and load_token would force a needless re-auth). Copy
             # the legacy data through into the placeholder instead of stranding
@@ -343,7 +344,7 @@ def _migrate_legacy_store() -> None:
                 except Exception:
                     # Unlocked read path: a failed stat/write must never crash
                     # the read — leave the legacy file for a later run to retry.
-                    # Catch Exception, not just OSError (#C-3 round28): _write_store
+                    # Catch Exception, not just OSError: _write_store
                     # runs json.dumps before its inner try, mirroring the widened
                     # save_token/delete_token contract. `data` is json.loads output
                     # so a non-OSError is unreachable today, but the symmetry keeps
@@ -351,7 +352,7 @@ def _migrate_legacy_store() -> None:
                     pass
     else:
         _ensure_store_dir()
-        # #9 (round16): re-assert 0o700 on the legacy DIR before exposing the
+        # re-assert 0o700 on the legacy DIR before exposing the
         # secrets to a rename/copy-through, mirroring _ensure_store_dir's
         # defensive re-chmod of the XDG dir. An older version (or permissive
         # umask) may have created ~/.mcp-stdio/ group/other-readable; if the
@@ -361,7 +362,7 @@ def _migrate_legacy_store() -> None:
             os.chmod(_LEGACY_STORE_DIR, stat.S_IRWXU)  # 0o700
         except OSError:
             pass
-        # #1 (round27): before moving the legacy file into the TRUSTED XDG store
+        # before moving the legacy file into the TRUSTED XDG store
         # path, confirm it is a REGULAR file via an O_NOFOLLOW-anchored fd.
         # Path.rename moves a SYMLINK itself, so a symlink planted at the legacy
         # path (a dotfile manager like GNU Stow, a backup/restore — not
@@ -436,7 +437,7 @@ def _migrate_legacy_store() -> None:
                         # failed write (disk full, read-only FS, permission) must
                         # NOT propagate out and crash the read — leave the legacy
                         # file intact for a later run to retry the migration.
-                        # Catch Exception, not just OSError (#C-3 round28), to match
+                        # Catch Exception, not just OSError, to match
                         # the widened save_token/delete_token soft-fail contract.
                         pass
                     if written:
@@ -476,8 +477,7 @@ def _warn_unusable_store_once(detail: str) -> None:
     Covers both genuinely corrupt JSON and a valid-but-non-object top level
     (e.g. ``[]`` / ``42`` / ``null``) — both are equally unusable as a token
     store and overwrite-safe (the next save replaces them), so they must surface
-    the SAME operator signal instead of one silently degrading to ``{}`` (#L3
-    round40). The ``_warned_corrupt_store`` flag keeps it to one line per process
+    the SAME operator signal instead of one silently degrading to ``{}``. The ``_warned_corrupt_store`` flag keeps it to one line per process
     across repeated reads; ``detail`` names the specific cause.
     """
     global _warned_corrupt_store
@@ -502,7 +502,7 @@ def _read_store(*, for_write: bool = False) -> dict[str, Any]:
     race would otherwise let the next save persist ONLY its one key and wipe
     every other server's cached token. A corrupt-JSON store stays overwrite-safe
     (``{}``) — its bytes are already unrecoverable — but the WRITE path warns once
-    so the replacement is visible to the operator (#L2 round37).
+    so the replacement is visible to the operator.
     """
     _migrate_legacy_store()
     if not _STORE_FILE.exists():
@@ -527,7 +527,7 @@ def _read_store(*, for_write: bool = False) -> dict[str, Any]:
         # this must NOT degrade to {} (which a save would then clobber over the
         # unread store); raise so the caller aborts.
         #
-        # ENOENT is the exception (#9 round17): the file vanished in the TOCTOU
+        # ENOENT is the exception: the file vanished in the TOCTOU
         # window between the exists() check above and this open (a concurrent
         # migration unlink, or an external tool). A vanished file is semantically
         # ABSENT, not unreadable — return {} so the write proceeds from a clean
@@ -536,7 +536,7 @@ def _read_store(*, for_write: bool = False) -> dict[str, Any]:
         if for_write and e.errno != errno.ENOENT:
             raise _StoreUnreadable(str(e)) from e
         return {}
-    # #10 (round25): O_NOFOLLOW refuses a SYMLINK but not a FIFO / device node /
+    # O_NOFOLLOW refuses a SYMLINK but not a FIFO / device node /
     # other special file pre-planted at the store path. A named pipe would make
     # the f.read() below BLOCK forever (no writer), hanging every load/save and
     # the relay startup. Refuse a non-regular file via the fd we already hold:
@@ -578,9 +578,9 @@ def _read_store(*, for_write: bool = False) -> dict[str, Any]:
         # paths therefore treat it as an empty store. But the silent replacement
         # previously hid a real event from the operator (a 3rd-party tool / disk
         # corrupting tokens.json), so warn ONCE that the store is corrupt —
-        # visibility without changing the recovery behaviour (#L2 round37).
+        # visibility without changing the recovery behaviour.
         #
-        # Fire on BOTH paths now (#L8 round39): a read-only invocation
+        # Fire on BOTH paths now: a read-only invocation
         # (load_token -> _read_store with for_write=False) otherwise gives the
         # operator zero signal — just an unexplained re-auth — until some later
         # save happens to reach the write path.
@@ -591,8 +591,8 @@ def _read_store(*, for_write: bool = False) -> dict[str, Any]:
         # null) is just as unusable as a token store as corrupt JSON, and the
         # next save clobbers it the same overwrite-safe way — so surface it with
         # the SAME one-shot warning instead of the silent {} that left the
-        # operator with only an unexplained re-auth (#L3 round40, completing the
-        # read-path visibility of #L8 round39).
+        # operator with only an unexplained re-auth (, completing the
+        # read-path visibility of).
         _warn_unusable_store_once(
             f"holds a non-object JSON top level ({type(data).__name__})"
         )
@@ -609,7 +609,7 @@ def _write_store(data: dict[str, Any]) -> None:
     fsynced so the directory entry change is itself durable across a power
     loss (the file data fsync alone does not guarantee the rename survives).
 
-    Note (#11 round22): a HARD kill (SIGKILL / power loss / OOM) between the temp
+    Note: a HARD kill (SIGKILL / power loss / OOM) between the temp
     file's creation and the os.replace leaves an orphaned ``tokens.json.tmp.*``
     sibling (0o600) that is never swept. This is accepted as harmless: the real
     store is untouched (os.replace is atomic), the unique random suffix prevents
@@ -618,10 +618,10 @@ def _write_store(data: dict[str, Any]) -> None:
     hot path for a leak that only a hard crash can produce.
     """
     _ensure_store_dir()
-    # sort_keys for stable, diff-friendly on-disk output (#8 round17): without it
+    # sort_keys for stable, diff-friendly on-disk output: without it
     # the per-server key order follows dict-insertion order and churns across the
     # read-modify-write saves, complicating inspection/diffing for no benefit.
-    # allow_nan=False (#7 round31): Python's default would serialise a non-finite
+    # allow_nan=False: Python's default would serialise a non-finite
     # expires_at (inf/nan) as the non-standard literal `Infinity`/`NaN`, which a
     # strict JSON parser rejects and which only the load-side math.isfinite guard
     # catches. Raise ValueError instead so the bad value never reaches disk —
@@ -640,7 +640,7 @@ def _write_store(data: dict[str, Any]) -> None:
         # serialise (they are already unusable on the read side) and retry, so one
         # foreign bad entry cannot block all future writes. The entry being saved
         # is always finite (_token_response_to_data's isfinite guard), so it
-        # survives. (#6 round44)
+        # survives.
         clean = {}
         dropped = 0
         for key, value in data.items():
@@ -691,7 +691,7 @@ def _write_store(data: dict[str, Any]) -> None:
     # fail the write.
     try:
         # _O_NONBLOCK for consistency with every other os.open in this file
-        # (#5 round33). Harmless on a directory (a dir open never blocks), but
+        #. Harmless on a directory (a dir open never blocks), but
         # it keeps the defensive open discipline uniform so a future copy of
         # this pattern does not omit it where it DOES matter (FIFO at a path).
         dir_fd = os.open(str(_STORE_DIR), os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK)
@@ -717,7 +717,7 @@ def _store_lock() -> Iterator[None]:
     processes AND concurrent threads in one process: each call opens a fresh
     ``os.open`` fd, and ``flock`` locks the open file description, so two
     threads with their own fds block each other exactly like two processes
-    (#B-2 round34). The unique temp-file suffix in ``_write_store`` is only the
+. The unique temp-file suffix in ``_write_store`` is only the
     backstop for the degraded no-lock path, NOT the in-process serialiser — do
     not refactor this to a POSIX record lock (``lockf``/``fcntl.lockf``), which
     is per-process and would silently stop serialising sibling threads.
@@ -727,7 +727,7 @@ def _store_lock() -> Iterator[None]:
     # so test monkeypatching of _STORE_DIR redirects the lock file too.
     lock_path = _STORE_DIR / "tokens.json.lock"
     try:
-        # _O_NONBLOCK (#1 round32): without it, an O_WRONLY open of a writer-less
+        # _O_NONBLOCK: without it, an O_WRONLY open of a writer-less
         # FIFO planted at the lock path BLOCKS forever, hanging every
         # save_token/delete_token instead of degrading to an unlocked write.
         # Matches every other os.open in this file (read / legacy / migration),
@@ -759,7 +759,7 @@ def _store_lock() -> Iterator[None]:
                 )
         yield
         return
-    # #9 (round19): the 0o600 mode above applies only on CREATION. Re-tighten a
+    # the 0o600 mode above applies only on CREATION. Re-tighten a
     # pre-existing lock file via the fd (fchmod, anchored to this inode like
     # _read_store) so a lock file left group/other-writable — e.g. pre-planted by
     # a local user once the dir-tightening already failed — cannot become the
@@ -808,7 +808,7 @@ def load_token(server_url: str) -> TokenData | None:
     now passes canonically is missed by both lookups and triggers one
     re-authentication. That is benign and self-healing: the next ``save_token``
     rewrites under the normalised key, and a wrong-token return is structurally
-    impossible (#B-1 round34).
+    impossible.
     """
     store = _read_store()
     entry = store.get(_normalize_key(server_url))
@@ -830,11 +830,11 @@ def load_token(server_url: str) -> TokenData | None:
     # degrade to None rather than propagate a TypeError up the OAuth path.
     if not isinstance(td.access_token, str) or not td.access_token:
         return None
-    # #9 (round23): bool is an int SUBCLASS in Python, so a corrupted
+    # bool is an int SUBCLASS in Python, so a corrupted
     # ``true``/``false`` in the JSON would pass an isinstance(..., (int, float))
     # check and reach ensure_token as 1/0 — a nonsensical 1970-epoch expiry.
     # Reject bool explicitly so it degrades to re-auth instead of a bogus expiry.
-    # #11 (round25): json.loads parses the literals NaN / Infinity / -Infinity by
+    # json.loads parses the literals NaN / Infinity / -Infinity by
     # default, which pass isinstance(..., float) but poison the `expires_at >
     # time.time()` comparison — inf reads as never-expiring (the token is trusted
     # forever and refresh never fires), NaN as always-expired. Reject non-finite
@@ -873,7 +873,7 @@ def load_token(server_url: str) -> TokenData | None:
             return None
     if not isinstance(td.no_resource_indicator, bool):
         return None
-    # #10 (round22): iss_parameter_supported is SECURITY-load-bearing — it gates
+    # iss_parameter_supported is SECURITY-load-bearing — it gates
     # the RFC 9207 §2.4 missing-iss MUST-reject on the step-up cache-hit path. A
     # corrupted store flipping it to a non-bool (or a truthy string that reads as
     # enabled, or a 0 that reads as disabled) must degrade to None / re-auth, not
@@ -911,18 +911,18 @@ def save_token(server_url: str, data: TokenData) -> None:
             # fails loudly. This is deliberately separate from _write_store's
             # drop-and-retry, which only sanitises FOREIGN pre-existing entries so
             # one of them cannot wedge this save — our own bad input is a caller
-            # error and must not be silently dropped to {} on disk. (#6 round44)
+            # error and must not be silently dropped to {} on disk.
             json.dumps(store[key], allow_nan=False)
             _write_store(store)
         except Exception as e:
-            # #4 (round21): a write failure (full / read-only FS, permission)
+            # a write failure (full / read-only FS, permission)
             # must fail SOFT, mirroring the _StoreUnreadable read path above. The
             # token is simply not cached — the caller re-auths next time — rather
             # than the OSError propagating up the OAuth/relay path. This also fixes
             # a worse case: a refresh whose save fails would otherwise propagate
             # out of refresh_cached_token and make the relay emit an auth error
             # even though the freshly refreshed token was perfectly usable.
-            # #12 (round26): catch Exception, not just OSError — _write_store's
+            # catch Exception, not just OSError — _write_store's
             # json.dumps runs before its inner try, so a non-serializable value
             # injected upstream raises ValueError/TypeError that would otherwise
             # bypass this soft-fail contract and crash the relay mid-session.
@@ -957,7 +957,7 @@ def delete_token(server_url: str) -> None:
             try:
                 _write_store(store)
             except Exception as e:
-                # Fail soft like save_token (#4 round21, #12 round26): a failed
+                # Fail soft like save_token (,): a failed
                 # delete leaves the (stale) entry in place — a stale cached token
                 # at worst — rather than propagating up the caller. Catch
                 # Exception so a non-OSError from _write_store's pre-try

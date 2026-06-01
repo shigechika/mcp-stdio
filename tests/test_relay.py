@@ -159,7 +159,7 @@ class TestEnforceLfStdio:
 
     def test_windows_without_reconfigure_is_tolerated(self):
         """Some redirected streams lack reconfigure(); must not raise — AND the
-        win32 branch must actually run the hasattr guard (#C-1 round34). The
+        win32 branch must actually run the hasattr guard. The
         stream records the `reconfigure` lookup, so `checked` is True only if the
         win32 path was taken; on a non-win32 early-return it would stay False."""
 
@@ -404,7 +404,7 @@ class TestPostAndStream:
             )
         # No retry: the POST was issued exactly once.
         assert len(httpx_mock.get_requests()) == 1
-        # #1(round25): the interrupt now returns a 200 result (carrying any
+        # the interrupt now returns a 200 result (carrying any
         # captured protocol_version) rather than None — the payload was already
         # delivered, so its negotiated state must not be discarded.
         assert result is not None and result.status_code == 200
@@ -436,7 +436,7 @@ class TestPostAndStream:
         assert emitted["result"] == {"ok": True}
 
     def test_decoding_error_is_caught_not_crashed(self, httpx_mock):
-        """#1(round15) HIGH: a 200 whose body fails to decode (bad
+        """ HIGH: a 200 whose body fails to decode (bad
         Content-Encoding) raises httpx.DecodingError — a SIBLING of
         TransportError, not a subclass. It must be caught (now via HTTPError) and
         retried/surfaced, never propagate out and crash the gateway."""
@@ -468,7 +468,7 @@ class TestPostAndStream:
         assert err["id"] == 1 and "error" in err
 
     def test_recovery_write_brokenpipe_does_not_crash(self, httpx_mock):
-        """#3(round31): when the client has closed stdout, _write_line raises
+        """: when the client has closed stdout, _write_line raises
         BrokenPipeError. The outer run() handler's own recovery write would then
         re-raise it and crash out of the loop — breaking the documented
         keep-the-session-alive guarantee. The recovery write must swallow a
@@ -551,7 +551,7 @@ class TestPostAndStream:
                 None,
                 has_id=False,
             )
-        # #1(round25): the emitted-interrupt branch now returns a 200 result
+        # the emitted-interrupt branch now returns a 200 result
         # (carrying any captured protocol_version) rather than None, so the
         # already-delivered payload's negotiated state is not discarded.
         assert result is not None and result.status_code == 200
@@ -560,7 +560,7 @@ class TestPostAndStream:
         assert lines == [delivered]
 
     def test_initialize_interrupt_preserves_protocol_version(self, httpx_mock):
-        """#1(round25): an initialize SSE stream that emits the InitializeResult
+        """: an initialize SSE stream that emits the InitializeResult
         and THEN errors must still surface the captured protocolVersion (a 200
         result), so the relay keeps injecting MCP-Protocol-Version on subsequent
         requests instead of losing the negotiated version to a None return."""
@@ -593,7 +593,7 @@ class TestPostAndStream:
         assert result.protocol_version == "2025-06-18"
 
     def test_sse_only_ping_event_synthesizes_error_for_request(self, httpx_mock):
-        """#14(round25): a 200 text/event-stream body with ONLY a non-message
+        """: a 200 text/event-stream body with ONLY a non-message
         (ping) event delivers no JSON-RPC payload, so a request-with-id must get
         a synthesized 'empty response' error — the SSE arm of the empty-200
         guard, previously covered only on the JSON arm."""
@@ -637,7 +637,7 @@ class TestPostAndStream:
         assert stdout.getvalue().strip() == ""
 
     def test_empty_200_body_to_request_synthesizes_error(self, httpx_mock):
-        """#4(round11): a 200 with NO JSON-RPC payload would leave a
+        """: a 200 with NO JSON-RPC payload would leave a
         request-with-id hanging; synthesize an error so the client recovers."""
         httpx_mock.add_response(
             status_code=200, text="", headers={"content-type": "application/json"}
@@ -694,7 +694,7 @@ class TestSameOrigin:
         assert not _same_origin("https://h.example:8443/x", "https://h.example/x")
 
     def test_malformed_url_returns_not_same_origin(self):
-        """#4(round32): a malformed URL (urlsplit/.port raises ValueError, e.g. a
+        """: a malformed URL (urlsplit/.port raises ValueError, e.g. a
         non-numeric port) must be treated as NOT same-origin — the conservative,
         fail-closed answer for the SSE cross-origin credential guard."""
         assert not _same_origin(
@@ -744,7 +744,7 @@ class TestExtractProtocolVersion:
         ],
     )
     def test_malformed_protocol_version_rejected(self, pv):
-        """#M1(round37): protocolVersion comes from the JSON body and is injected
+        """: protocolVersion comes from the JSON body and is injected
         as the MCP-Protocol-Version request header, so a value carrying CR/LF/NUL
         (or any non-visible-ASCII) must be rejected to None — otherwise it poisons
         the header and httpx's send-time LocalProtocolError bricks the session."""
@@ -777,7 +777,7 @@ class TestIsInitializeRequest:
         assert _is_initialize_request(line) is False  # but parse says no
 
     def test_malformed_json_after_regex_match_is_false(self):
-        """#9(round43): the regex pre-filter matches but the line is not valid
+        """: the regex pre-filter matches but the line is not valid
         JSON — the json.loads-failure branch must return False, not raise. (The
         only protocol-version gate path that previously had no direct test.)"""
         line = '{"method":"initialize" broken json'
@@ -818,7 +818,7 @@ class TestIterSseEvents:
         ]
 
     def test_id_and_retry_fields_ignored(self):
-        """#10(round17): relay deliberately forgoes Last-Event-ID resumption and
+        """: relay deliberately forgoes Last-Event-ID resumption and
         server-driven retry timing, so the WHATWG decoder must ignore `id:` and
         `retry:` lines (fall through the field dispatch) without disturbing the
         surrounding event — pins the documented ignore-and-continue behaviour."""
@@ -829,7 +829,7 @@ class TestIterSseEvents:
         assert list(_iter_sse_events(lines)) == [("message", "a\nb")]
 
     def test_empty_event_field_defaults_to_message(self):
-        """#4(round25): WHATWG 'dispatch the event' uses the default type
+        """: WHATWG 'dispatch the event' uses the default type
         'message' when the event-type buffer is the empty string, so an
         explicitly-empty `event:` must NOT yield a ('', data) event that the
         message-only consumers then drop."""
@@ -851,7 +851,7 @@ class TestIterSseEvents:
         assert list(_iter_sse_events(["event:message", ""])) == []
 
     def test_empty_data_value_not_dispatched(self):
-        """#2(round14): WHATWG suppresses dispatch when the data buffer is the
+        """: WHATWG suppresses dispatch when the data buffer is the
         empty string — a bare `data:` must not yield a ('message', '') event."""
         assert list(_iter_sse_events(["data:", ""])) == []
         # event type set but only an empty data line → still suppressed.
@@ -864,7 +864,7 @@ class TestIterSseEvents:
         assert list(_iter_sse_events(["data:", "data:x", ""])) == [("message", "\nx")]
 
     def test_leading_bom_stripped(self):
-        """#2(round13): WHATWG SSE stream-decode removes ONE leading U+FEFF BOM.
+        """: WHATWG SSE stream-decode removes ONE leading U+FEFF BOM.
         A BOM-prefixed first line must still parse as its real field, so the
         critical first `endpoint` event is recognised, not misclassified.
         (BOM written as the "\\ufeff" escape — never a raw byte in source.)"""
@@ -997,7 +997,7 @@ class TestRun:
         assert req2.headers["mcp-session-id"] == "sess-123"
 
     def test_error_response_session_id_not_adopted(self, httpx_mock):
-        """#1(round19): a session id echoed on a 4xx/5xx error response must NOT
+        """: a session id echoed on a 4xx/5xx error response must NOT
         be carried into the next request — the relay would otherwise send an id
         the server just rejected. Only a non-error response rotates session_id."""
         # Line 1: 200 establishes session "good".
@@ -1034,7 +1034,7 @@ class TestRun:
         assert reqs[2].headers.get("mcp-session-id") == "good"
 
     def test_202_to_request_session_id_not_adopted(self, httpx_mock):
-        """#1(round33): a 202 returned to a request-WITH-id is synthesized into a
+        """: a 202 returned to a request-WITH-id is synthesized into a
         JSON-RPC error (a non-compliant server can't ack a request), so its echoed
         (rotated) session id must NOT be adopted — exactly like a 4xx/5xx. The
         pre-recovery `< 400` gate previously admitted 202; the next request must
@@ -1074,7 +1074,7 @@ class TestRun:
     def test_unparseable_403_session_id_not_adopted_with_scope_upgrader(
         self, httpx_mock
     ):
-        """#1(round26): the pre-recovery 403 adoption gate must require a PARSEABLE
+        """: the pre-recovery 403 adoption gate must require a PARSEABLE
         insufficient_scope challenge. A generic 403 (no scope param) that echoes a
         rotated session id, while a scope_upgrader exists, must NOT adopt that id —
         the step-up branch will not consume it, so adopting would poison the next
@@ -1116,7 +1116,7 @@ class TestRun:
     def test_post_refresh_retry_terminal_error_session_id_not_adopted(
         self, httpx_mock
     ):
-        """#1(round24): the INLINE 401-retry session-id adoption must be gated
+        """: the INLINE 401-retry session-id adoption must be gated
         too — a refreshed retry that returns a TERMINAL error (500) while echoing
         a rotated mcp-session-id must NOT carry that rejected id into the next
         stdin line (the downstream gate declines it, but the inline write must
@@ -1160,7 +1160,7 @@ class TestRun:
     def test_inline_401_retry_unparseable_403_session_id_not_adopted(
         self, httpx_mock
     ):
-        """#1(round28): the INLINE 401-retry re-adoption must require a PARSEABLE
+        """: the INLINE 401-retry re-adoption must require a PARSEABLE
         insufficient_scope challenge on a 403, mirroring the top-level
         feeds_recovery gate. A 401 retry that returns a 403 with a generic
         (unparseable) WWW-Authenticate AND a rotated session id, while a
@@ -1283,7 +1283,7 @@ class TestRun:
         assert replay_body["id"] == 2
 
     def test_401_retry_exhaustion_preserves_session_id(self, httpx_mock):
-        """#1(round11): a 401-refresh retry exhausted by a TRANSPORT error must
+        """: a 401-refresh retry exhausted by a TRANSPORT error must
         PRESERVE the session id — the blip did not invalidate the session, so the
         next request still carries it (and could trigger 404 self-heal). Clearing
         it would defeat that recovery."""
@@ -1324,7 +1324,7 @@ class TestRun:
         assert reqs[-1].headers.get("mcp-session-id") == "sess-1"
 
     def test_403_stepup_retry_exhaustion_preserves_session_id(self, httpx_mock):
-        """#1(round11): a 403 step-up retry exhausted by a TRANSPORT error
+        """: a 403 step-up retry exhausted by a TRANSPORT error
         PRESERVES the session id (symmetric with the 401 path) so the next
         request still carries it and 404 self-heal stays possible."""
         # 1: init -> sess-1
@@ -1412,7 +1412,7 @@ class TestRun:
     def test_reinitialize_strips_pinned_protocol_version_from_initialize(
         self, httpx_mock
     ):
-        """#3(round26): an operator-pinned `-H MCP-Protocol-Version` must NOT ride
+        """: an operator-pinned `-H MCP-Protocol-Version` must NOT ride
         the re-initialize's initialize POST (initialize IS the renegotiation),
         mirroring the dispatch path's strip. The post-initialize
         notifications/initialized DOES carry the freshly negotiated version."""
@@ -1523,7 +1523,7 @@ class TestRun:
     def test_reinitialize_notifications_initialized_transport_error_returns_error(
         self, httpx_mock
     ):
-        """#13(round23): if the initialize succeeds but the
+        """: if the initialize succeeds but the
         notifications/initialized POST RAISES a transport error (not just a
         non-200), _reinitialize's except httpx.HTTPError branch must still treat
         the re-init as failed and surface 'session lost' — exercising the
@@ -1671,7 +1671,7 @@ class TestRun:
         assert output.strip() == ""
 
     def test_decoding_error_does_not_crash_loop(self, httpx_mock):
-        """#1(round15) HIGH end-to-end: a request whose body fails to decode
+        """ HIGH end-to-end: a request whose body fails to decode
         (bad Content-Encoding) must NOT crash run() — the client gets an error
         and the loop survives to process the next stdin line."""
         for _ in range(MAX_RETRIES):  # bad-gzip request 1 → DecodingError ×3
@@ -1703,7 +1703,7 @@ class TestRun:
         assert any(m.get("id") == 2 and "result" in m for m in lines)
 
     def test_notification_404_reinit_failure_gets_no_response(self, httpx_mock):
-        """#5(round14): a notification whose POST 404s (with a prior session) and
+        """: a notification whose POST 404s (with a prior session) and
         whose _reinitialize then fails must produce NO id:null 'session lost'
         error — the req_has_id gate covers the 404 recovery branch."""
         # init -> sess-1
@@ -1728,7 +1728,7 @@ class TestRun:
         assert json.loads(lines[0])["id"] == 1
 
     def test_notification_403_stepup_failure_gets_no_response(self, httpx_mock):
-        """#5(round14): a notification whose POST 403s insufficient_scope and
+        """: a notification whose POST 403s insufficient_scope and
         whose scope_upgrader returns None must produce no id:null error."""
         httpx_mock.add_response(
             status_code=403,
@@ -1900,7 +1900,7 @@ class TestRun:
         assert reqs[2].headers.get("mcp-session-id") == "sess-2"
 
     def test_chained_401_then_403_adopts_rotated_session_id(self, httpx_mock):
-        """#1(round12): a 401 whose refreshed retry returns 403 + a ROTATED
+        """: a 401 whose refreshed retry returns 403 + a ROTATED
         session id must have the step-up retry carry that rotated id — the
         session adoption must repeat across chained recovery branches, not only
         on the original response."""
@@ -1943,7 +1943,7 @@ class TestRun:
         assert reqs[3].headers.get("mcp-session-id") == "sess-2"
 
     def test_successful_403_stepup_adopts_rotated_session_id(self, httpx_mock):
-        """#7(round27): a 403 step-up retry that SUCCEEDS (200) while rotating the
+        """: a 403 step-up retry that SUCCEEDS (200) while rotating the
         mcp-session-id must adopt that rotated id for the next stdin line —
         symmetric with the 401 branch. Pins the post-step-up adoption at
         relay.py ~1904 (`if result.session_id and result.status_code < 400`),
@@ -1991,7 +1991,7 @@ class TestRun:
         assert reqs[3].headers.get("mcp-session-id") == "sess-rotated"
 
     def test_chained_403_stepup_then_404_reinitializes_and_replays(self, httpx_mock):
-        """#6(round21): a 403 whose step-up retry returns 404 must cascade into
+        """: a 403 whose step-up retry returns 404 must cascade into
         the 404 reinitialize branch — initialize a fresh session, then replay the
         original call with it. Proves the 403 step-up retry feeds the 404 reinit
         (the recovery branches are sequential ifs, not elif)."""
@@ -2049,7 +2049,7 @@ class TestRun:
         assert json.loads(reqs[5].content)["method"] == "call"
 
     def test_full_401_403_404_triple_recovery_cascade(self, httpx_mock):
-        """#L3(round29): drive the documented 4-dispatch worst case in ONE stdin
+        """: drive the documented 4-dispatch worst case in ONE stdin
         line — initial -> 401-refresh -> 403-step-up -> 404-reinit -> replay — so
         the three sequential recovery branches (and the session-id hand-off
         between them) are pinned end-to-end. A regression that cleared session_id
@@ -2205,7 +2205,7 @@ class TestRun:
         assert output.strip() == ""
 
     def test_202_to_request_with_id_synthesizes_error(self, httpx_mock):
-        """#4(round16): a non-compliant 202 to a REQUEST (with id) on Streamable
+        """: a non-compliant 202 to a REQUEST (with id) on Streamable
         HTTP delivers no body and no async reply, so the relay must synthesize a
         JSON-RPC error instead of leaving the client hanging — unlike the silent
         202-to-notification case above."""
@@ -2225,7 +2225,7 @@ class TestRun:
     def test_unexpected_exception_degrades_to_error_not_crash(
         self, httpx_mock, monkeypatch
     ):
-        """#1(round17): an unexpected non-httpx exception escaping dispatch must
+        """: an unexpected non-httpx exception escaping dispatch must
         degrade THIS request to a JSON-RPC error and keep the stdin loop alive —
         the 'never crash the gateway' contract is structural, not per-helper."""
         import mcp_stdio.relay as relay_mod
@@ -2267,7 +2267,7 @@ class TestRun:
     def test_unexpected_exception_on_notification_stays_silent(
         self, httpx_mock, monkeypatch
     ):
-        """#1(round17): the same guard must NOT synthesize an id:null response
+        """: the same guard must NOT synthesize an id:null response
         for a notification (no id) that triggers an unexpected error — it logs
         and continues silently."""
         monkeypatch.setattr(
@@ -2298,7 +2298,7 @@ class TestRun:
     def test_explicit_null_id_request_error_is_emitted_not_suppressed(
         self, httpx_mock
     ):
-        """#L4(round40): a request with an EXPLICIT "id": null is a request, not a
+        """: a request with an EXPLICIT "id": null is a request, not a
         notification, so an unhandled non-2xx must still synthesize an error
         echoing "id": null — never silently drop it as if it were a notification.
         The contract was asserted only at the helper level (TestErrorResponse),
@@ -2366,7 +2366,7 @@ class TestProtocolVersionHeader:
         assert reqs[1].headers["mcp-protocol-version"] == "2025-06-18"
 
     def test_user_pinned_header_survives_cold_start_initialize(self, httpx_mock):
-        """#12(round16): on a cold-start initialize (version not yet negotiated)
+        """: on a cold-start initialize (version not yet negotiated)
         a user-supplied -H MCP-Protocol-Version is deliberately preserved on the
         initialize POST (relay.py only strips its OWN injected header once a
         version is captured). The next request then carries the relay-injected
@@ -2400,7 +2400,7 @@ class TestProtocolVersionHeader:
         assert reqs[1].headers["mcp-protocol-version"] == "2025-06-18"
 
     def test_tools_call_with_nested_method_initialize_keeps_header(self, httpx_mock):
-        """#3(round18): a tools/call whose nested ``arguments`` contains a
+        """: a tools/call whose nested ``arguments`` contains a
         ``"method":"initialize"`` key must NOT be misread as an initialize
         request — the substring matches the cheap regex, but the header strip is
         gated on a parse-authoritative top-level method check, so the negotiated
@@ -2431,7 +2431,7 @@ class TestProtocolVersionHeader:
     def test_tools_call_with_nested_method_initialize_does_not_capture_version(
         self, httpx_mock
     ):
-        """#3(round42): the CAPTURE counterpart of the strip test above. A
+        """: the CAPTURE counterpart of the strip test above. A
         tools/call whose nested ``arguments`` contains a ``"method":"initialize"``
         key must NOT capture ``result.protocolVersion`` from its tool response —
         capture is now gated on the parse-authoritative check, not the substring
@@ -2907,7 +2907,7 @@ class TestNormalizeNullArguments:
         assert out["params"]["arguments"] == {}
 
     def test_rewrites_null_arguments_with_whitespace_around_colon(self):
-        """#15(round25): the cheap pre-gate regex tolerates whitespace around the
+        """: the cheap pre-gate regex tolerates whitespace around the
         `arguments` colon, but every other test uses the compact form — pin the
         whitespace variant so a server emitting `"arguments" : null` is rewritten."""
         line = (
@@ -2924,7 +2924,7 @@ class TestNormalizeNullArguments:
         assert "arguments" not in out["params"]
 
     def test_rewrites_null_arguments_with_id_zero(self):
-        """#11(round17): the id-0 falsy-id regression class is pinned at every
+        """: the id-0 falsy-id regression class is pinned at every
         other transform layer (_emit, run, _CancelTracker); complete the symmetry
         here. Normalization keys off method/params, never the id, so id:0 must
         rewrite arguments to {} and preserve id:0 exactly."""
@@ -2970,7 +2970,7 @@ class TestNormalizeNullArguments:
         assert _normalize_null_arguments(line) == line
 
     def test_null_params_with_arguments_elsewhere_passed_through(self):
-        """#10(round12): the regex matches an "arguments":null nested elsewhere,
+        """: the regex matches an "arguments":null nested elsewhere,
         but params itself is null (not an object). The non-dict-params branch
         must leave the line unchanged — only params.arguments is ever rewritten."""
         line = (
@@ -3080,7 +3080,7 @@ class TestPagination:
         return stdout.getvalue()
 
     def test_page1_nonlist_result_key_coerced_to_empty(self, httpx_mock):
-        """#11(round24): a page-1 result that has a nextCursor but whose
+        """: a page-1 result that has a nextCursor but whose
         result_key (here 'tools') is MISSING/not-a-list (a server bug) must be
         coerced to [] so the merge starts from an empty list, then page 2's items
         append normally. Exercises the defensive coercion branch in
@@ -3108,7 +3108,7 @@ class TestPagination:
         assert merged["result"]["tools"] == [{"name": "a"}]
 
     def test_paginated_notification_no_id_produces_no_response(self, httpx_mock):
-        """#1(round44): a list method sent as a NOTIFICATION (no id key) must get
+        """: a list method sent as a NOTIFICATION (no id key) must get
         NO response — the merged-response emit is gated on has_id, mirroring every
         other synthesized-write path. Otherwise a spurious {"id":null,...} frame
         would be delivered for a notification (a JSON-RPC violation)."""
@@ -3303,7 +3303,7 @@ class TestPagination:
         names = [t["name"] for t in merged["result"]["tools"]]
         assert names == ["t1", "t2", "t3"]  # exactly MAX_LIST_PAGES pages
         assert len(httpx_mock.get_requests()) == 3
-        # #14(round22): page 3 still advertised nextCursor 'p4', so the cap path
+        # page 3 still advertised nextCursor 'p4', so the cap path
         # MUST re-expose it on the merged result for the client to resume past
         # the cap — pinning resumability like the sibling truncation tests.
         assert merged["result"]["nextCursor"] == "p4"
@@ -3333,7 +3333,7 @@ class TestPagination:
         )
         merged = json.loads(output.strip())
         assert [t["name"] for t in merged["result"]["tools"]] == ["ok1"]
-        # #2(round11): a truncated list keeps the pending cursor so the client
+        # a truncated list keeps the pending cursor so the client
         # can RESUME, rather than being told the list is complete.
         assert merged["result"]["nextCursor"] == "p2"
 
@@ -3360,7 +3360,7 @@ class TestPagination:
             )
         merged = json.loads(output.strip())
         assert [t["name"] for t in merged["result"]["tools"]] == ["ok1"]
-        # Truncated → pending cursor preserved for resumption (#2 round11).
+        # Truncated → pending cursor preserved for resumption.
         assert merged["result"]["nextCursor"] == "p2"
 
     def test_page2_unparseable_body_returns_partial_result(self, httpx_mock):
@@ -3389,7 +3389,7 @@ class TestPagination:
         )
         merged = json.loads(output.strip())
         assert [t["name"] for t in merged["result"]["tools"]] == ["ok1"]
-        # Truncated → pending cursor preserved for resumption (#2 round11).
+        # Truncated → pending cursor preserved for resumption.
         assert merged["result"]["nextCursor"] == "p2"
 
     def test_first_page_401_triggers_token_refresh(self, httpx_mock):
@@ -3432,7 +3432,7 @@ class TestPagination:
     def test_page1_404_reinitializes_then_replays_through_pagination(
         self, httpx_mock
     ):
-        """#2(round33): a page-1 404 on a paginated method must cascade through the
+        """: a page-1 404 on a paginated method must cascade through the
         run() 404 branch — reinitialize, then RE-ENTER _paginate_and_stream with
         the fresh session and replay the full paginated fetch. Pins the
         pagination-path re-entry (recovered session adopted, no double-emit) the
@@ -3508,7 +3508,7 @@ class TestPagination:
         assert json.loads(reqs[5].content)["method"] == "tools/list"
 
     def test_page2_401_does_not_trigger_recovery_returns_partial(self, httpx_mock):
-        """#L(round30): a 401 on page>=2 must NOT reach run()'s token-refresh
+        """#L: a 401 on page>=2 must NOT reach run()'s token-refresh
         recovery — _paginate_and_stream flushes the accumulated partial (status
         coerced to 200) and re-exposes the cursor so the client can resume. The
         refresher is never called and exactly one response is emitted. Pins the
@@ -3550,7 +3550,7 @@ class TestPagination:
         assert called["refresh"] is False  # page-2 401 stayed inside pagination
 
     def test_pagination_adopts_last_page_session_id(self, httpx_mock):
-        """#1142(round30): when the server rotates Mcp-Session-Id across pages,
+        """: when the server rotates Mcp-Session-Id across pages,
         the LAST page's session is adopted (last-write-wins), so the NEXT stdin
         request carries it — preserving session continuity for the 404
         self-heal."""
@@ -3729,7 +3729,7 @@ class TestPagination:
         assert [t["name"] for t in merged["result"]["tools"]] == ["a"]
 
     def test_empty_string_next_cursor_is_terminal(self, httpx_mock):
-        """#2(round32): an empty-string nextCursor is treated as terminal (like
+        """: an empty-string nextCursor is treated as terminal (like
         null / absent) — an empty cursor cannot be round-tripped, so it is a
         degenerate end, not another page. Exactly one upstream POST, and the
         merged result carries no nextCursor. Pins the documented `if not
@@ -3754,7 +3754,7 @@ class TestPagination:
         assert len(httpx_mock.get_requests()) == 1  # no second-page fetch
 
     def test_non_string_next_cursor_is_threaded_without_crashing(self, httpx_mock):
-        """#6(round33): a non-compliant server may return a non-string (e.g.
+        """: a non-compliant server may return a non-string (e.g.
         numeric) nextCursor. It is threaded back into params.cursor verbatim
         (json-serializable, so json.dumps cannot raise) and the merge stays
         well-formed — opaque-token handling, zero blast radius."""
@@ -3785,7 +3785,7 @@ class TestPagination:
     def test_page2_nonlist_result_key_keeps_page1_and_merges_late_field(
         self, httpx_mock
     ):
-        """#F-2(round28): a page-2 dict whose result_key is present but NOT a list
+        """: a page-2 dict whose result_key is present but NOT a list
         (e.g. tools:"oops") must not crash or discard page-1 items — the
         non-list value is skipped (isinstance(items, list) is False) while the
         late top-level field still merges. Complements the page-1 non-list and
@@ -3845,7 +3845,7 @@ class TestPagination:
         assert "nextCursor" not in merged["result"]
 
     def test_page_sse_forwards_interleaved_notification(self, httpx_mock):
-        """#5(round23): a server may interleave a notification on the POST's SSE
+        """: a server may interleave a notification on the POST's SSE
         stream BEFORE the list result. _post_parsed must FORWARD it to stdout
         (like the streaming path _post_and_stream) AND still return the real
         response — not mistake the notification for the page result, nor drop it
@@ -3874,7 +3874,7 @@ class TestPagination:
         assert [t["name"] for t in merged["result"]["tools"]] == ["a"]
 
     def test_page_sse_skips_non_message_event(self, httpx_mock):
-        """#4(round31): a non-`message` SSE event (e.g. event: ping) on the
+        """: a non-`message` SSE event (e.g. event: ping) on the
         paginated POST stream is skipped and the following event: message result
         is still parsed — pins the buffered-path non-message skip branch (the
         streaming path covers the equivalent case, the buffered path did not)."""
@@ -3893,7 +3893,7 @@ class TestPagination:
         assert [t["name"] for t in merged["result"]["tools"]] == ["a"]
 
     def test_page1_empty_body_falls_back_to_streamed_post(self, httpx_mock):
-        """#4(round31): a page-1 200 with an EMPTY body yields (None, 200), which
+        """: a page-1 200 with an EMPTY body yields (None, 200), which
         must trigger the plain-streamed-POST fallback (re-POST) so the client
         still gets a response — not a silent empty emit. Pins the buffered-path
         empty-body branch."""
@@ -4004,7 +4004,7 @@ class TestCheckConnection:
     def test_sse_skips_leading_notification_and_captures_result(
         self, httpx_mock, capsys
     ):
-        """#1(round36): a compliant server MAY interleave a notification on the
+        """: a compliant server MAY interleave a notification on the
         POST's SSE stream BEFORE the initialize result. --check must keep reading
         until a message carries result/error, not break on the first message —
         otherwise it mis-reports a valid server as 'could not parse initialize
@@ -4207,7 +4207,7 @@ class TestCheckConnectionSse:
         assert "tools=yes" in err
 
     def test_sse_malformed_message_after_endpoint_is_skipped(self, httpx_mock):
-        """#6(round20): a non-JSON message arriving AFTER the endpoint event must
+        """: a non-JSON message arriving AFTER the endpoint event must
         be skipped (the json.JSONDecodeError continue) and the probe keeps reading
         until the real initialize result — still returns True."""
         httpx_mock.add_response(
@@ -4233,7 +4233,7 @@ class TestCheckConnectionSse:
     def test_sse_generic_exception_in_stream_returns_false(
         self, httpx_mock, monkeypatch
     ):
-        """#6(round20): an unexpected exception raised inside the GET stream loop
+        """: an unexpected exception raised inside the GET stream loop
         hits the outer generic-exception safety net and returns False without
         crashing (mirrors the reader-loop safety-net test)."""
         httpx_mock.add_response(
@@ -4318,7 +4318,7 @@ class TestCheckConnectionSse:
         )
 
     def test_sse_post_non_2xx_reports_post_failure(self, httpx_mock, capsys):
-        """#6(round15): the endpoint POST returning a non-2xx sets post_error,
+        """: the endpoint POST returning a non-2xx sets post_error,
         the helper closes the stream, and the probe reports the POST failure
         (not a generic 'stream ended') and returns False."""
         post_attempted = threading.Event()
@@ -4354,7 +4354,7 @@ class TestCheckConnectionSse:
         assert "HTTP 500" in err
 
     def test_sse_post_raises_reports_post_failure(self, httpx_mock, capsys):
-        """#6(round15): the endpoint POST raising a transport error is caught in
+        """: the endpoint POST raising a transport error is caught in
         the helper (str(e) → post_error) and surfaced as a POST failure → False."""
         post_attempted = threading.Event()
 
@@ -4427,7 +4427,7 @@ class TestCheckConnectionSse:
         )
 
     def test_sse_message_before_endpoint_is_skipped(self, httpx_mock):
-        """#15(round14): a message event arriving BEFORE the endpoint event must
+        """: a message event arriving BEFORE the endpoint event must
         be ignored (no POST can target an unknown endpoint yet); the probe POSTs
         only after the endpoint and still completes on the real result."""
         early = '{"jsonrpc":"2.0","method":"notifications/message","params":{}}'
@@ -4621,7 +4621,7 @@ class TestSseReaderLoop:
         so `established` is False) must hit the catch-all's fail-fast branch: set
         ready and return — so run_sse's startup wait() unblocks instead of hanging
         to the connect timeout. (The established-mid-session branch reconnects
-        instead; see TestRunSseReaderRecovery. #1 round16.)"""
+        instead; see TestRunSseReaderRecovery..)"""
         httpx_mock.add_response(
             url=self.URL,
             method="GET",
@@ -4823,7 +4823,7 @@ class TestSseReaderLoop:
         assert len(httpx_mock.get_requests()) == 2
 
     def test_stop_during_reconnect_wait_returns_httperror_branch(self, httpx_mock):
-        """#7(round44): when stop is signaled during the post-disconnect
+        """: when stop is signaled during the post-disconnect
         RETRY_DELAY wait, the HTTPError reconnect branch returns promptly instead
         of issuing another GET. (Covers the otherwise-untested stop-early-return.)"""
         state = _SseState()
@@ -4839,7 +4839,7 @@ class TestSseReaderLoop:
         assert len(httpx_mock.get_requests()) == 1  # no second GET after stop
 
     def test_stop_during_reconnect_wait_returns_graceful_eof_branch(self, httpx_mock):
-        """#7(round44): the graceful-EOF reconnect path likewise returns promptly
+        """: the graceful-EOF reconnect path likewise returns promptly
         when stop is signaled during the RETRY_DELAY wait."""
         state = _SseState()
         httpx_mock.add_response(
@@ -4904,7 +4904,7 @@ class TestSseReaderLoop:
         assert seen_auth[1] == "Bearer new"  # reconnect re-snapshotted the update
 
     def test_non200_reconnect_after_establish_keeps_retrying(self, httpx_mock):
-        """#3(round11): a non-200 on RECONNECT (after an endpoint was once
+        """: a non-200 on RECONNECT (after an endpoint was once
         established) must retry, not kill the reader. Before the fix the reader
         died after the first reconnect 500 (2 GETs); now it keeps reconnecting."""
         state = _SseState()
@@ -4989,7 +4989,7 @@ class _BlockingStdin:
 
 
 class TestRunSseReaderRecovery:
-    """#1(round16): an unexpected (non-HTTPError) exception in the SSE reader
+    """: an unexpected (non-HTTPError) exception in the SSE reader
     must not permanently kill it. The reader nulls endpoint_url and reconnects,
     so async reply delivery recovers instead of every later request-with-id
     hanging forever on a dead stream."""
@@ -5107,7 +5107,7 @@ class TestRunSse:
     def test_main_loop_unexpected_exception_degrades_request_to_error(
         self, httpx_mock
     ):
-        """#5(round20): an unexpected NON-httpx exception escaping the run_sse
+        """: an unexpected NON-httpx exception escaping the run_sse
         POST path must degrade the request-with-id to an 'internal relay error'
         JSON-RPC response and keep the loop alive — the SSE-main-loop analogue of
         the run() structural #11 guard (and it did not crash the process)."""
@@ -5134,7 +5134,7 @@ class TestRunSse:
         assert out.strip() == ""
 
     def test_recovery_write_brokenpipe_does_not_crash(self, httpx_mock):
-        """#L4(round37): when the client closed stdout, the recovery write in
+        """: when the client closed stdout, the recovery write in
         run_sse's outer handler raises BrokenPipeError too. It must be swallowed
         (mirroring run()'s guard) so the SSE loop exits cleanly instead of
         crashing the gateway — the SSE analogue of the run() BrokenPipe test."""
@@ -5152,7 +5152,7 @@ class TestRunSse:
         # Reaching here = run_sse returned without propagating the BrokenPipeError.
 
     def test_cross_origin_endpoint_refused_end_to_end(self, httpx_mock):
-        """#7(round21): an SSE endpoint event pointing cross-origin while an
+        """: an SSE endpoint event pointing cross-origin while an
         Authorization header is set is refused at the reader (no credential
         leak). With no OTHER endpoint, run_sse has no usable endpoint, fails
         startup and exits(1) — and crucially NO POST is ever sent to the evil
@@ -6126,7 +6126,7 @@ class TestCancelTracker:
         assert not t.contains(5)
 
     def test_default_ttl_constant_is_60s_and_wired(self):
-        """#15(round22): pin the production TTL constant AND that the DEFAULT
+        """: pin the production TTL constant AND that the DEFAULT
         tracker (the one run()/run_sse() build) uses it, so an accidental change
         to _CANCEL_TTL_SECS — or a default-arg that stops referencing it — is
         caught rather than silently widening/shrinking the cancel window."""
@@ -6162,7 +6162,7 @@ class TestCancelTracker:
         assert _CancelTracker().consume(None) is False
 
     def test_discard_untracks_so_later_response_is_delivered(self):
-        """#14(round11): discard() removes a tracked id (used when a request
+        """: discard() removes a tracked id (used when a request
         REUSES a cancelled id), so the id's response is then delivered, not
         dropped. discard(None) and discarding an absent id are safe no-ops."""
         t = _CancelTracker()
@@ -6177,7 +6177,7 @@ class TestCancelTracker:
         assert not t.contains(None)
 
     def test_gc_bounds_memory(self):
-        """#5(round36): pin the production GC bound AND prove GC actually prunes
+        """: pin the production GC bound AND prove GC actually prunes
         the internal map. The old version hardcoded 200/256/300 and asserted only
         via contains() (which lazy-expires), so it passed even if the threshold
         were widened. Derive counts from _CANCEL_GC_THRESHOLD and assert the
@@ -6223,7 +6223,7 @@ class TestCancelTracker:
             assert t.contains(i)
 
     def test_consume_under_contention_is_exactly_once(self):
-        """#12(round19): consume() must return True EXACTLY once per id even when
+        """: consume() must return True EXACTLY once per id even when
         many threads race on the SAME ids — the lock makes pop-and-check atomic.
         A broken/removed lock could let two threads both pop-and-return-True for
         one id (a double drop). Unlike test_thread_safety (disjoint ranges, which
@@ -6278,7 +6278,7 @@ class TestExtractCancelId:
         assert _extract_cancel_id(line) == "req-42"
 
     def test_ignores_batched_cancel(self):
-        """#6(round36): a notifications/cancelled buried in a JSON-RPC BATCH array
+        """: a notifications/cancelled buried in a JSON-RPC BATCH array
         is intentionally NOT extracted (the regex pre-check matches the substring,
         but the isinstance(msg, dict) gate fails on a list → None). Pins the
         documented batch exclusion so a future refactor that iterates batch
@@ -6329,7 +6329,7 @@ class TestExtractCancelId:
     def test_non_scalar_request_id_returns_none_not_unhashable_crash(
         self, request_id
     ):
-        """#9(round42): a non-scalar requestId (object/array) is malformed AND
+        """: a non-scalar requestId (object/array) is malformed AND
         unhashable, so returning it verbatim would make the caller's
         tracker.add(rid) raise TypeError on the stdin hot path. _extract_cancel_id
         must drop it (return None) so a malformed cancellation is a clean no-op.
@@ -6472,7 +6472,7 @@ class TestEmit:
         assert capsys.readouterr().out.strip() == line
 
     def test_forwards_malformed_message_with_method_and_result(self, capsys):
-        # #1(round30): a malformed peer message carrying BOTH `method` and
+        # a malformed peer message carrying BOTH `method` and
         # `result` under a cancelled id is a request by JSON-RPC definition
         # (method present), not a response — the filter must pass it through,
         # not eat a server-initiated request on a torn-frame technicality.
@@ -6499,7 +6499,7 @@ class TestEmit:
         assert capsys.readouterr().out.strip() == line
 
     def test_drops_merged_paginated_result(self, capsys):
-        """#2(round12): a merged paginated list result (the shape
+        """: a merged paginated list result (the shape
         _paginate_and_stream flushes via _emit) is dropped when its id was
         cancelled — closing the cancel-filter × pagination coverage gap."""
         t = _CancelTracker()
@@ -6579,7 +6579,7 @@ class TestRunCancelFilter:
     def test_cancel_then_paginated_request_merged_result_is_forwarded(
         self, httpx_mock
     ):
-        """#9(round35): closes the cancel x pagination coverage matrix end-to-end.
+        """: closes the cancel x pagination coverage matrix end-to-end.
         A cancelled id reused by a paginated tools/list is a brand-new call: the
         request discards the tracked cancel before dispatch, so the MERGED
         multi-page result is FORWARDED, not dropped. (The drop case is not
@@ -6739,7 +6739,7 @@ class TestRunSseCancelFilter:
     def test_cancel_ttl_expired_then_sse_message_is_delivered(
         self, httpx_mock, monkeypatch
     ):
-        """#16(round22): the cancel-drop is TTL-bounded END-TO-END. With the
+        """: the cancel-drop is TTL-bounded END-TO-END. With the
         tracker's TTL already elapsed, a cancelled id's late SSE response is
         DELIVERED, not dropped — the integration analogue of the unit
         consume-expired test. (Patch the tracker run_sse builds to a negative TTL
@@ -6791,7 +6791,7 @@ class TestRunSseCancelFilter:
         assert "late" in stdout.getvalue()
 
     def test_no_cancel_filter_lets_sse_response_through(self, httpx_mock):
-        """#F-1(round28): run_sse(..., cancel_filter=False) builds no tracker, so
+        """: run_sse(..., cancel_filter=False) builds no tracker, so
         the SSE reader's None-tracker branch is taken and a late response for a
         cancelled id is DELIVERED, not dropped. The opt-out is the cancel
         filter's reason to exist, and the late-drop only reproduces on the SSE
@@ -6876,7 +6876,7 @@ class TestRunSseCancelFilter:
         assert "kept" in stdout.getvalue()
 
     def test_sse_reader_escapes_raw_line_separators_end_to_end(self, httpx_mock):
-        """#13(round15): a message event whose JSON payload contains a RAW
+        """: a message event whose JSON payload contains a RAW
         U+2028/U+2029 must reach stdout in escaped \\uXXXX form. Proves the
         reader-thread reply path runs through _emit's escape, not just the
         unit-tested _emit — a client framing on these chars can't mis-split."""
@@ -7105,7 +7105,7 @@ class TestRun429Retry:
         assert 2.0 in slept, f"expected a 2.0-second sleep, got {slept!r}"
 
     def test_429_http_date_retry_after_then_200(self, httpx_mock, monkeypatch):
-        """#5(round32): an HTTP-date Retry-After flows end-to-end through
+        """: an HTTP-date Retry-After flows end-to-end through
         _handle_rate_limit into the run() retry sleep — the integration analogue
         of the parser unit test. The date->delta conversion is exercised on the
         real path, not just in isolation."""
@@ -7179,7 +7179,7 @@ class TestRun429Retry:
     def test_429_over_cap_surfaces_retry_after_in_error_data(
         self, httpx_mock, monkeypatch
     ):
-        """#8(round14): a 429 whose wait exceeds the cap surfaces the server's
+        """: a 429 whose wait exceeds the cap surfaces the server's
         Retry-After as error.data.retryAfter so a client can back off."""
         monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: None)
         httpx_mock.add_response(
@@ -7235,7 +7235,7 @@ class TestRun503Retry:
         return stdout.getvalue()
 
     def test_503_with_retry_after_then_200(self, httpx_mock, monkeypatch):
-        """#2(round15): a 503 with Retry-After sleeps that long, then the
+        """: a 503 with Retry-After sleeps that long, then the
         retried POST's 200 is delivered normally."""
         slept: list[float] = []
         monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
@@ -7452,7 +7452,7 @@ class TestRunSse429Retry:
 
 
 class TestRunSse503Retry:
-    """The legacy SSE POST path treats 503 like 429 too (#2 round15)."""
+    """The legacy SSE POST path treats 503 like 429 too."""
 
     URL = "https://example.com/sse"
 
@@ -7611,7 +7611,7 @@ class TestPaginate429Retry:
     def test_paginated_list_429_over_cap_surfaces_error_data(
         self, httpx_mock, monkeypatch
     ):
-        """#12(round15): a page-1 429 whose Retry-After exceeds the cap gives
+        """: a page-1 429 whose Retry-After exceeds the cap gives
         up in _post_parsed and the pagination caller surfaces one JSON-RPC
         error carrying error.data.retryAfter (the over-cap give-up branch)."""
         slept: list[float] = []
@@ -7630,7 +7630,7 @@ class TestPaginate429Retry:
         assert len(httpx_mock.get_requests()) == 1
 
     def test_paginated_list_503_then_200(self, httpx_mock, monkeypatch):
-        """The pagination path honours 503 Retry-After too (#2 round15)."""
+        """The pagination path honours 503 Retry-After too."""
         slept: list[float] = []
         monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
 

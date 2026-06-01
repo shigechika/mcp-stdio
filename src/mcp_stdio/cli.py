@@ -20,7 +20,7 @@ def _non_negative_float(value: str) -> float:
         f = float(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid float value: {value!r}") from exc
-    # #4 (round27): float() parses "nan" / "inf" / "-inf", which silently slip
+    # float() parses "nan" / "inf" / "-inf", which silently slip
     # past the `f < 0` / `f == 0` comparisons (every comparison with nan is
     # False) and defeat the very failure mode these validators guard against — a
     # nan/inf timeout makes httpx's elapsed-vs-deadline check always False, so a
@@ -67,7 +67,7 @@ def _bearer_header_value(token: str) -> str:
     AS-supplied access token gets the same control-character ban as ``-H``
     values and ``--bearer-token`` (#14): a token carrying CR/LF could otherwise
     inject / split request headers on the wire. Raises ValueError on a forbidden
-    character so the caller can fail the relevant flow. See #5 (round21).
+    character so the caller can fail the relevant flow.
     """
     if any(c in token for c in _HEADER_VALUE_FORBIDDEN):
         raise ValueError(
@@ -122,7 +122,7 @@ def _build_token_refresher(
     and returns updated headers on success, or None on failure.
     """
     # Freeze a private copy of the operator-supplied base headers at build time
-    # (#L3 round39). The relay passes the SAME live `headers` dict to both this
+    #. The relay passes the SAME live `headers` dict to both this
     # callback and the SSE reader thread; closing over the live object and
     # iterating it via dict(headers) would read it UNLOCKED, racing any future
     # reader-thread mutation (today none exists, so it is safe, but the relay's
@@ -183,7 +183,7 @@ def _build_scope_upgrader(
     cold-start ``ensure_token`` does, so ``--oauth-timeout`` applies to a
     mid-session step-up too, not just the initial authorization.
     """
-    # Freeze the operator-supplied base headers at build time (#L3 round39); see
+    # Freeze the operator-supplied base headers at build time; see
     # _build_token_refresher for why the live shared dict is not closed over.
     base_headers = dict(headers)
 
@@ -297,7 +297,7 @@ def _main() -> None:
     parser.add_argument(
         "--oauth-timeout",
         type=_positive_float,
-        # #13 (round25): how long the interactive OAuth flow waits for the user —
+        # how long the interactive OAuth flow waits for the user —
         # the browser-callback redirect (auth-code flow) or the device-code
         # confirmation. Was a hardcoded 120 s; expose it so a user who needs
         # longer (slow device-code entry) is not cut off. Distinct from the HTTP
@@ -328,7 +328,7 @@ def _main() -> None:
     parser.add_argument(
         "--timeout-connect",
         type=_positive_float,
-        # Float defaults (#6 round18): argparse applies ``type`` only to argv
+        # Float defaults: argparse applies ``type`` only to argv
         # strings, never to the default object, so an int default would leave
         # args.timeout_connect an int when the flag is omitted. httpx tolerates
         # both, but keep the attribute's type consistent with the validator.
@@ -344,7 +344,7 @@ def _main() -> None:
     parser.add_argument(
         "--sse-read-timeout",
         type=_non_negative_float,
-        # Float default (#11 round23): argparse applies ``type`` only to argv
+        # Float default: argparse applies ``type`` only to argv
         # strings, never to the default object, so an int default would leave the
         # attribute an int when the flag is omitted — keep it consistent with the
         # _non_negative_float validator and the --timeout-* float defaults.
@@ -457,7 +457,7 @@ def _main() -> None:
     # Warn if OAuth-only options are explicitly set without an OAuth flow — they
     # are silently ignored otherwise. client_id is presence-based (`is not None`)
     # so an explicit `--client-id ''` trips it too, matching the --bearer-token
-    # discipline (#13 round22). oauth_scope's default is "" (not None), so an
+    # discipline. oauth_scope's default is "" (not None), so an
     # explicit empty value is indistinguishable from the default and stays on the
     # truthiness check. --oauth-refresh-leeway and --oauth-timeout are also
     # OAuth-only but always carry a non-None default, so they cannot be
@@ -478,7 +478,7 @@ def _main() -> None:
     # build below (`if bearer_token`) would attach NO Authorization header —
     # silently unauthenticated. Surface that asymmetry so an operator whose
     # shell expansion produced '' is not misled into thinking the request is
-    # authenticated. (#C-1 round28)
+    # authenticated.
     if bearer_from_flag and not bearer_token:
         print(
             "warning: --bearer-token is empty; sending no Authorization header",
@@ -508,7 +508,7 @@ def _main() -> None:
     }
     if bearer_token:
         # Route through _bearer_header_value so the "Bearer " literal and the
-        # CR/LF/NUL ban live in one place (#C-2 round28). The control-char check
+        # CR/LF/NUL ban live in one place. The control-char check
         # above already guarantees this cannot raise, but keeping a single
         # builder avoids the contract drifting between the two call sites.
         headers["Authorization"] = _bearer_header_value(bearer_token)
@@ -519,7 +519,7 @@ def _main() -> None:
         # the built-in default (e.g. -H 'authorization: ...' replaces the
         # bearer Authorization) instead of sending two same-named headers.
         for existing in [k for k in headers if k.lower() == key.lower()]:
-            # #N5 (round29): when a -H 'Authorization' displaces an EXPLICIT
+            # when a -H 'Authorization' displaces an EXPLICIT
             # --bearer-token, warn instead of silently dropping it — mirroring
             # the OAuth path's override warning. Gated on bearer_from_flag (so
             # an ambient env token does not trip it) and on the displaced value
@@ -543,7 +543,7 @@ def _main() -> None:
     token_refresher: Callable[[], dict[str, str] | None] | None = None
     scope_upgrader: Callable[[str], dict[str, str] | None] | None = None
     if args.oauth or args.oauth_device:
-        # NOTE (#10 round19): this runs BEFORE the --check branch below, and
+        # NOTE: this runs BEFORE the --check branch below, and
         # ensure_token only short-circuits on a valid cached/refreshable token.
         # So `--oauth --check` on a COLD cache performs the full interactive auth
         # (browser / device code, blocking up to the flow timeout) — by design,
@@ -597,7 +597,7 @@ def _main() -> None:
                 )
             except ValueError as e:
                 # The AS handed us a token with CR/LF/NUL — fail startup clearly
-                # rather than splitting headers on the wire (#5 round21).
+                # rather than splitting headers on the wire.
                 print(f"error: {e}", file=sys.stderr)
                 sys.exit(1)
             # The relay-loop 401/403 recovery callbacks are unused by the
@@ -674,7 +674,7 @@ def _main() -> None:
 def main() -> None:
     """Entry point for mcp-stdio CLI.
 
-    #2 (round35): run() / run_sse() install their own SIGINT/SIGTERM handlers,
+    run() / run_sse() install their own SIGINT/SIGTERM handlers,
     but the pre-relay work — argument parsing and especially the blocking
     interactive OAuth flow (browser callback / device-code wait, up to
     --oauth-timeout) — runs before that. A Ctrl-C there would otherwise dump a
