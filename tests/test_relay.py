@@ -3125,6 +3125,52 @@ class TestCheckConnectionSse:
         assert "sse-demo" in err
         assert "tools=yes" in err
 
+    def test_sse_malformed_message_after_endpoint_is_skipped(self, httpx_mock):
+        """#6(round20): a non-JSON message arriving AFTER the endpoint event must
+        be skipped (the json.JSONDecodeError continue) and the probe keeps reading
+        until the real initialize result — still returns True."""
+        httpx_mock.add_response(
+            url=self.SSE_URL,
+            method="GET",
+            stream=IteratorStream(
+                [
+                    b"event: endpoint\ndata: /messages\n\n",
+                    b"event: message\ndata: not-json-at-all\n\n",
+                    f"event: message\ndata: {self._INIT_RESULT}\n\n".encode(),
+                ]
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url="https://example.com/messages", method="POST", status_code=202
+        )
+        assert (
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
+            is True
+        )
+
+    def test_sse_generic_exception_in_stream_returns_false(
+        self, httpx_mock, monkeypatch
+    ):
+        """#6(round20): an unexpected exception raised inside the GET stream loop
+        hits the outer generic-exception safety net and returns False without
+        crashing (mirrors the reader-loop safety-net test)."""
+        httpx_mock.add_response(
+            url=self.SSE_URL,
+            method="GET",
+            stream=IteratorStream([b"event: endpoint\ndata: /messages\n\n"]),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        def boom(_lines):
+            raise RuntimeError("unexpected decode bug")
+
+        monkeypatch.setattr("mcp_stdio.relay._iter_sse_events", boom)
+        assert (
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
+            is False
+        )
+
     def test_sse_get_non_200_returns_false(self, httpx_mock):
         """The GET stream itself failing (e.g. 401) → False, no POST attempted."""
         httpx_mock.add_response(url=self.SSE_URL, method="GET", status_code=401)
@@ -3890,6 +3936,68 @@ class TestRunSse:
     """End-to-end tests for run_sse driven from the main thread."""
 
     URL = "https://example.com/sse"
+
+    def _sse_post_raises(self, httpx_mock, method_line, exc):
+        """Drive run_sse with one stdin line whose endpoint POST raises ``exc``
+        (a non-httpx exception), returning the captured stdout."""
+        release_stdin = threading.Event()
+        post_seen = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sid=abc\n\n"
+            post_seen.wait(timeout=3)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        def on_post(request: httpx.Request) -> httpx.Response:
+            post_seen.set()
+            raise exc
+
+        httpx_mock.add_callback(
+            on_post,
+            url="https://example.com/messages?sid=abc",
+            is_reusable=True,
+        )
+
+        stdin = _BlockingStdin(method_line, release_stdin)
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {"Content-Type": "application/json"})
+        return stdout.getvalue()
+
+    def test_main_loop_unexpected_exception_degrades_request_to_error(
+        self, httpx_mock
+    ):
+        """#5(round20): an unexpected NON-httpx exception escaping the run_sse
+        POST path must degrade the request-with-id to an 'internal relay error'
+        JSON-RPC response and keep the loop alive — the SSE-main-loop analogue of
+        the run() structural #11 guard (and it did not crash the process)."""
+        out = self._sse_post_raises(
+            httpx_mock,
+            '{"jsonrpc":"2.0","method":"tools/call","id":55}',
+            RuntimeError("simulated unexpected bug in the POST path"),
+        )
+        decoded = [json.loads(x) for x in out.splitlines() if x]
+        match = [d for d in decoded if d.get("id") == 55 and "error" in d]
+        assert match, f"expected an error response for id 55, got {decoded!r}"
+        assert "internal relay error" in match[0]["error"]["message"]
+
+    def test_main_loop_unexpected_exception_on_notification_stays_silent(
+        self, httpx_mock
+    ):
+        """The same guard must NOT synthesize an id:null response for a
+        notification (no id) — it logs and continues silently."""
+        out = self._sse_post_raises(
+            httpx_mock,
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}',
+            RuntimeError("boom"),
+        )
+        assert out.strip() == ""
 
     def test_sse_read_timeout_default_and_disabled(self, monkeypatch):
         """#9: run_sse() passes sse_read_timeout through to httpx.Client.
