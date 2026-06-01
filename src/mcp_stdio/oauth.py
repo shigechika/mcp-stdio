@@ -33,6 +33,14 @@ from .token_store import TokenData, delete_token, load_token, save_token
 _DEVICE_POLL_CAP_SECS = 60
 
 
+def _safe_int(value: Any, default: int) -> int:
+    """Coerce an AS-supplied JSON value to int, falling back on bad input."""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class OAuthMetadata:
     """Authorization server metadata (RFC 8414)."""
@@ -801,7 +809,13 @@ def _token_response_to_data(
         except (TypeError, ValueError):
             expires_at = None
 
-    token_type = raw.get("token_type", "Bearer")
+    # `.get(default)` only substitutes when the key is ABSENT; a provider that
+    # returns an explicit `"token_type": null` (or a non-string) would otherwise
+    # crash `.lower()` below. Treat null / empty / non-string as the Bearer
+    # default (RFC 6749 §5.1 makes token_type REQUIRED, so this is non-conformant
+    # input we tolerate rather than abort the whole flow on).
+    tt = raw.get("token_type")
+    token_type = tt if isinstance(tt, str) and tt else "Bearer"
     if token_type.lower() != "bearer":
         # mcp-stdio always sends the access token as an Authorization: Bearer
         # credential, so a non-Bearer token_type (e.g. DPoP / mac, RFC 9449)
@@ -997,15 +1011,17 @@ def _run_authorization_flow(
         raise RuntimeError("OAuth state mismatch — possible CSRF attack")
 
     # RFC 9207 §2.4: if the authorization response carries an `iss` parameter,
-    # the client MUST validate it equals the issuer the metadata was fetched
-    # from. This is the AS mix-up defence — it stops a code issued by AS-A from
-    # being exchanged at AS-B. Only checked when both the AS advertised an
-    # issuer and the callback returned `iss`; PKCE + state already cover the
-    # common attacks, so this is defence-in-depth.
+    # the client MUST validate it with a simple string comparison against the
+    # issuer the metadata was fetched from. This is the AS mix-up defence — it
+    # stops a code issued by AS-A from being exchanged at AS-B. Both values come
+    # from the same AS (its metadata `issuer` and its callback `iss`) so they are
+    # byte-identical; an exact compare (per §2.4, no normalisation) is correct.
+    # Only checked when both are present; PKCE + state already cover the common
+    # attacks, so this is defence-in-depth.
     if (
         cb_result.iss is not None
         and metadata.issuer
-        and cb_result.iss.rstrip("/") != metadata.issuer.rstrip("/")
+        and cb_result.iss != metadata.issuer
     ):
         raise RuntimeError(
             "OAuth issuer mismatch (RFC 9207) — possible AS mix-up attack"
@@ -1144,12 +1160,15 @@ def _run_device_authorization_flow(
         da.get("verification_uri_complete") or da.get("verification_url_complete"),
         label="verification_uri_complete",
     )
-    expires_in = int(da.get("expires_in", 1800))
+    # Coerce defensively: a JSON float-as-string or non-numeric value from a
+    # malformed/hostile AS must fall back to the default, not raise ValueError
+    # out of the flow.
+    expires_in = _safe_int(da.get("expires_in"), 1800)
     # Clamp the AS-supplied polling interval to a sane window so a hostile or
     # misconfigured AS cannot make a single time.sleep block for hours (or
     # raise on a negative value), mirroring the cap-gated Retry-After sleep in
     # relay.py. RFC 8628 §3.5 only mandates the +5 s slow_down bump (also capped).
-    poll_interval = max(1, min(int(da.get("interval", 5)), _DEVICE_POLL_CAP_SECS))
+    poll_interval = max(1, min(_safe_int(da.get("interval"), 5), _DEVICE_POLL_CAP_SECS))
 
     # Display instructions on stderr (visible even when stdout is piped to MCP client)
     print("\nDevice authorization required:", file=sys.stderr)

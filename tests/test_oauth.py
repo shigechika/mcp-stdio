@@ -1298,6 +1298,18 @@ class TestTokenResponseToData:
         _token_response_to_data(raw, meta, "cid", None)
         assert "non-Bearer" not in capsys.readouterr().err
 
+    def test_null_token_type_defaults_to_bearer(self):
+        """An explicit `"token_type": null` must not crash `.lower()` — it is
+        treated as the Bearer default."""
+        meta = OAuthMetadata(
+            authorization_endpoint="https://ex.com/auth",
+            token_endpoint="https://ex.com/token",
+        )
+        data = _token_response_to_data(
+            {"access_token": "at", "token_type": None}, meta, "cid", None
+        )
+        assert data.token_type == "Bearer"
+
 
 # --- _parse_token_response ---
 
@@ -3767,6 +3779,27 @@ class TestDeviceAuthorizationFlow:
         httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
         httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
         httpx_mock.add_exception(httpx.ConnectError("flaky"), url=TOKEN_URL)
+        httpx_mock.add_response(
+            url=TOKEN_URL, json={"access_token": "acc", "token_type": "Bearer"}
+        )
+        monkeypatch.setattr(time, "sleep", lambda _s: None)
+        client = httpx.Client()
+        data = _run_device_authorization_flow(
+            MCP_URL, client, metadata=_device_meta(), cached=None
+        )
+        assert data.access_token == "acc"
+
+    def test_non_numeric_interval_and_expires_in_coerced(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """A float-as-string interval / expires_in from a malformed AS must be
+        coerced to the default, not raise ValueError out of the flow."""
+        self._patch_store(tmp_path, monkeypatch)
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(
+            url=DEVICE_AUTH_URL,
+            json=_da_response(interval="5.5", expires_in="not-a-number"),
+        )
         httpx_mock.add_response(
             url=TOKEN_URL, json={"access_token": "acc", "token_type": "Bearer"}
         )
