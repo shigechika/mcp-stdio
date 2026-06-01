@@ -136,6 +136,10 @@ Check connectivity before use:
 
 ```bash
 mcp-stdio --check https://your-server.example.com:8080/mcp
+
+# For an SSE server, pass --transport sse so --check runs the legacy
+# GET/endpoint/POST handshake instead of a Streamable HTTP probe:
+mcp-stdio --check --transport sse https://your-server.example.com:8080/sse
 ```
 
 ## Claude Desktop Configuration
