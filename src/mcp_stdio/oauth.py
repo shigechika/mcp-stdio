@@ -42,6 +42,9 @@ class OAuthMetadata:
     registration_endpoint: str | None = None
     device_authorization_endpoint: str | None = None
     token_endpoint_auth_methods_supported: list[str] | None = None
+    # RFC 8414 issuer identifier — used to validate the RFC 9207 ``iss``
+    # parameter on the authorization response (AS mix-up defence).
+    issuer: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +299,9 @@ def _fetch_authorization_server_metadata(
                     f"expected {auth_server_url!r}, got {issuer!r}"
                 )
             methods = data.get("token_endpoint_auth_methods_supported")
+            # Strip a trailing slash before building default endpoints so an AS
+            # URL like "https://as/" does not yield "https://as//authorize".
+            base = auth_server_url.rstrip("/")
             # Validate every endpoint the metadata declares against the #13
             # cleartext-leak policy before it can receive a secret. An unsafe
             # authorization/token endpoint falls back to the default path on
@@ -305,11 +311,11 @@ def _fetch_authorization_server_metadata(
                 authorization_endpoint=_validate_endpoint_url(
                     data.get("authorization_endpoint"), label="authorization_endpoint"
                 )
-                or f"{auth_server_url}/authorize",
+                or f"{base}/authorize",
                 token_endpoint=_validate_endpoint_url(
                     data.get("token_endpoint"), label="token_endpoint"
                 )
-                or f"{auth_server_url}/token",
+                or f"{base}/token",
                 registration_endpoint=_validate_endpoint_url(
                     data.get("registration_endpoint"), label="registration_endpoint"
                 ),
@@ -318,6 +324,7 @@ def _fetch_authorization_server_metadata(
                     label="device_authorization_endpoint",
                 ),
                 token_endpoint_auth_methods_supported=methods if isinstance(methods, list) else None,
+                issuer=issuer or auth_server_url,
             )
     except Exception:
         pass
@@ -574,6 +581,7 @@ class CallbackResult:
     auth_code: str | None = None
     state: str | None = None
     error: str | None = None
+    iss: str | None = None  # RFC 9207 issuer identifier, if the AS returned it
 
 
 def _make_callback_handler(
@@ -605,6 +613,7 @@ def _make_callback_handler(
             elif "code" in params:
                 result.auth_code = params["code"][0]
                 result.state = params.get("state", [None])[0]
+                result.iss = params.get("iss", [None])[0]
 
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -986,6 +995,21 @@ def _run_authorization_flow(
     # we want it to hold up to scrutiny without caveats. See #26.
     if not secrets.compare_digest(cb_result.state or "", state):
         raise RuntimeError("OAuth state mismatch — possible CSRF attack")
+
+    # RFC 9207 §2.4: if the authorization response carries an `iss` parameter,
+    # the client MUST validate it equals the issuer the metadata was fetched
+    # from. This is the AS mix-up defence — it stops a code issued by AS-A from
+    # being exchanged at AS-B. Only checked when both the AS advertised an
+    # issuer and the callback returned `iss`; PKCE + state already cover the
+    # common attacks, so this is defence-in-depth.
+    if (
+        cb_result.iss is not None
+        and metadata.issuer
+        and cb_result.iss.rstrip("/") != metadata.issuer.rstrip("/")
+    ):
+        raise RuntimeError(
+            "OAuth issuer mismatch (RFC 9207) — possible AS mix-up attack"
+        )
 
     code = cb_result.auth_code
     assert code is not None
