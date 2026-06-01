@@ -1311,11 +1311,16 @@ def _run_authorization_flow(
         raise RuntimeError("OAuth state mismatch — possible CSRF attack")
 
     # RFC 9207 §2.4: if the authorization response carries an `iss` parameter,
-    # the client MUST validate it with a simple string comparison against the
-    # issuer the metadata was fetched from. This is the AS mix-up defence — it
-    # stops a code issued by AS-A from being exchanged at AS-B. Both values come
-    # from the same AS (its metadata `issuer` and its callback `iss`) so they are
-    # byte-identical; an exact compare (per §2.4, no normalisation) is correct.
+    # the client MUST validate it against the issuer the metadata was fetched
+    # from. This is the AS mix-up defence — it stops a code issued by AS-A from
+    # being exchanged at AS-B. On the metadata path both values come from the
+    # same AS (its metadata `issuer` and its callback `iss`) so they are
+    # byte-identical and the comparison is exact. The trailing-slash tolerance
+    # below (#7 round25) is a no-op there, but matters on the PHASE-3 fallback
+    # where `metadata.issuer` is a SYNTHESIZED guess (`as_base`, an origin with
+    # no path/slash): a real AS whose issuer is `https://as/` would otherwise
+    # false-mismatch and block a legitimate flow. A genuine mix-up always differs
+    # by HOST, which rstrip does not mask, so the defence is preserved.
     #
     # §2.4 has a SECOND MUST: a client MUST reject a response that OMITS `iss`
     # from an AS that advertises iss support (the RFC 9207 §3 metadata flag) —
@@ -1332,7 +1337,7 @@ def _run_authorization_flow(
     if (
         cb_result.iss is not None
         and metadata.issuer
-        and cb_result.iss != metadata.issuer
+        and cb_result.iss.rstrip("/") != metadata.issuer.rstrip("/")
     ):
         raise RuntimeError(
             "OAuth issuer mismatch (RFC 9207) — possible AS mix-up attack"
