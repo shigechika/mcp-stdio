@@ -449,6 +449,24 @@ class TestMain:
                 main()
             assert exc_info.value.code == 1
 
+    def test_empty_bearer_flag_alone_warns_no_auth(self, monkeypatch, capsys):
+        """#C-1(round28): `--bearer-token ''` alone (no OAuth) is counted as an
+        auth choice by the mutual-exclusion check but attaches NO Authorization
+        header — silently unauthenticated. Surface a stderr warning, and confirm
+        no Authorization header is built."""
+        monkeypatch.delenv("MCP_BEARER_TOKEN", raising=False)
+        with (
+            patch(
+                "sys.argv",
+                ["mcp-stdio", "https://example.com/mcp", "--bearer-token", ""],
+            ),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+        assert "--bearer-token is empty" in capsys.readouterr().err
+        headers = mock_run.call_args.kwargs["headers"]
+        assert "Authorization" not in headers
+
     def test_explicit_authorization_header_with_oauth_warns(
         self, monkeypatch, capsys
     ):

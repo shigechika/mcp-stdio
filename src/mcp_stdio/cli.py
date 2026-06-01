@@ -459,6 +459,18 @@ def main() -> None:
             file=sys.stderr,
         )
 
+    # An explicit but EMPTY --bearer-token counts as an auth choice for the
+    # mutual-exclusion check above (presence, not truthiness), yet the header
+    # build below (`if bearer_token`) would attach NO Authorization header —
+    # silently unauthenticated. Surface that asymmetry so an operator whose
+    # shell expansion produced '' is not misled into thinking the request is
+    # authenticated. (#C-1 round28)
+    if bearer_from_flag and not bearer_token:
+        print(
+            "warning: --bearer-token is empty; sending no Authorization header",
+            file=sys.stderr,
+        )
+
     # When an OAuth flow is selected, ignore any ambient env bearer token —
     # the flow below sets the Authorization header itself.
     if args.oauth or args.oauth_device:
@@ -481,7 +493,11 @@ def main() -> None:
         "Accept": "application/json, text/event-stream",
     }
     if bearer_token:
-        headers["Authorization"] = f"Bearer {bearer_token}"
+        # Route through _bearer_header_value so the "Bearer " literal and the
+        # CR/LF/NUL ban live in one place (#C-2 round28). The control-char check
+        # above already guarantees this cannot raise, but keeping a single
+        # builder avoids the contract drifting between the two call sites.
+        headers["Authorization"] = _bearer_header_value(bearer_token)
     for h in args.headers:
         key, value = _parse_header(h)
         # HTTP header names are case-insensitive (RFC 7230 §3.2). Drop any
