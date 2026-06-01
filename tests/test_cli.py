@@ -1031,6 +1031,30 @@ class TestBuildTokenRefresher:
         assert refresher() is None
         assert _SpyClient.instances[-1].closed
 
+    def test_does_not_alias_live_headers_dict(self, monkeypatch):
+        """#L3(round39): the callback layers Authorization onto a build-time
+        FROZEN copy of the base headers, not the live shared dict the SSE reader
+        thread also holds. Mutating the caller's dict after build must not affect
+        the callback's output — proving the live object is never iterated
+        unlocked from the callback (no cross-thread aliasing)."""
+        _SpyClient.instances.clear()
+        monkeypatch.setattr("mcp_stdio.cli.httpx.Client", _SpyClient)
+        monkeypatch.setattr(
+            "mcp_stdio.oauth.refresh_cached_token",
+            lambda url, client: TokenData(access_token="fresh"),
+        )
+        live = {"X-Base": "1"}
+        refresher = _build_token_refresher("https://example.com/mcp", live, 10, 120)
+        # Mutate the live dict AFTER build, as the relay main loop's
+        # headers.update would (concurrently with the reader thread).
+        live["X-Base"] = "MUTATED"
+        live["X-New"] = "added"
+        out = refresher()
+        # Output reflects the frozen build-time snapshot, not the mutation.
+        assert out["X-Base"] == "1"
+        assert "X-New" not in out
+        assert out["Authorization"] == "Bearer fresh"
+
     def test_returns_none_when_refresh_raises_and_closes(self, monkeypatch, capsys):
         """A refresh that RAISES (e.g. save_token re-raising OSError on a
         read-only disk) must degrade to None — not crash the relay mid-session
@@ -1078,6 +1102,25 @@ class TestBuildScopeUpgrader:
         # (an AS-controlled token endpoint could otherwise 302 the credential POST
         # to a cleartext / cross-origin host). Symmetric with the refresher test.
         assert _SpyClient.instances[-1].kwargs.get("follow_redirects") is False
+
+    def test_does_not_alias_live_headers_dict(self, monkeypatch):
+        """#L3(round39): like the refresher, the upgrader layers Authorization
+        onto a build-time frozen copy of the base headers, not the live shared
+        dict. Mutating the caller's dict after build must not affect output."""
+        _SpyClient.instances.clear()
+        monkeypatch.setattr("mcp_stdio.cli.httpx.Client", _SpyClient)
+        monkeypatch.setattr(
+            "mcp_stdio.oauth.step_up_authorize",
+            lambda url, client, scope, *, timeout: TokenData(access_token="upgraded"),
+        )
+        live = {"X-Base": "1"}
+        upgrader = _build_scope_upgrader("https://example.com/mcp", live, 10, 120, 90)
+        live["X-Base"] = "MUTATED"
+        live["X-New"] = "added"
+        out = upgrader("hr:read")
+        assert out["X-Base"] == "1"
+        assert "X-New" not in out
+        assert out["Authorization"] == "Bearer upgraded"
 
     def test_returns_none_when_step_up_raises_and_closes(self, monkeypatch, capsys):
         _SpyClient.instances.clear()

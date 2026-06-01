@@ -821,6 +821,14 @@ def _post_and_stream(
                             continue
                         if capture_init and pv is None:
                             pv = _extract_protocol_version(payload)
+                        # _emit -> _write_line can raise BrokenPipeError (an
+                        # OSError, not an httpx.HTTPError) mid-stream if the
+                        # downstream reader closed stdout. That intentionally
+                        # bypasses the httpx.HTTPError handler below and unwinds
+                        # to run()/run_sse()'s outer `except Exception` safety
+                        # net, which swallows the re-raised write error: a dead
+                        # reader cannot observe the truncated body anyway (#L2
+                        # round39).
                         _emit(payload, tracker)
                         emitted = True
                 else:
@@ -2370,8 +2378,12 @@ def run_sse(
         """Take a consistent copy of ``headers`` under the lock for a POST.
 
         Symmetric with the reader thread's snapshot and the 401/403 mutations
-        so every cross-thread access to ``headers`` is serialised — no POST
-        ever iterates the dict while a refresh is updating it.
+        so every cross-thread access to the shared ``headers`` object is
+        serialised — no POST ever iterates the dict while a refresh is updating
+        it. The token_refresher / scope_upgrader callbacks do NOT count as a
+        cross-thread access: they layer a fresh Authorization onto a build-time
+        frozen copy of the base headers (see cli.py _build_token_refresher),
+        never touching this live object, so the serialisation claim holds.
         """
         with headers_lock:
             return dict(headers)

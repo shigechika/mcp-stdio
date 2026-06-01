@@ -121,6 +121,16 @@ def _build_token_refresher(
     Returns a callable that attempts to refresh the OAuth token
     and returns updated headers on success, or None on failure.
     """
+    # Freeze a private copy of the operator-supplied base headers at build time
+    # (#L3 round39). The relay passes the SAME live `headers` dict to both this
+    # callback and the SSE reader thread; closing over the live object and
+    # iterating it via dict(headers) would read it UNLOCKED, racing any future
+    # reader-thread mutation (today none exists, so it is safe, but the relay's
+    # own comment claims every cross-thread access is serialised). The callbacks
+    # only ever layer a fresh Authorization onto the static base headers, so a
+    # frozen snapshot is behaviourally identical AND removes the shared-object
+    # aliasing entirely — no lock needed, no fragile invariant to preserve.
+    base_headers = dict(headers)
 
     def refresher() -> dict[str, str] | None:
         from .oauth import refresh_cached_token
@@ -140,7 +150,7 @@ def _build_token_refresher(
             data = refresh_cached_token(server_url, client)
             if data is None:
                 return None
-            new_headers = dict(headers)
+            new_headers = dict(base_headers)
             new_headers["Authorization"] = _bearer_header_value(data.access_token)
             return new_headers
         except Exception as e:
@@ -173,6 +183,9 @@ def _build_scope_upgrader(
     cold-start ``ensure_token`` does, so ``--oauth-timeout`` applies to a
     mid-session step-up too, not just the initial authorization.
     """
+    # Freeze the operator-supplied base headers at build time (#L3 round39); see
+    # _build_token_refresher for why the live shared dict is not closed over.
+    base_headers = dict(headers)
 
     def upgrader(required_scope: str) -> dict[str, str] | None:
         from .oauth import step_up_authorize
@@ -192,7 +205,7 @@ def _build_scope_upgrader(
             data = step_up_authorize(
                 server_url, client, required_scope, timeout=oauth_timeout
             )
-            new_headers = dict(headers)
+            new_headers = dict(base_headers)
             new_headers["Authorization"] = _bearer_header_value(data.access_token)
         except Exception as e:
             print(f"error: step-up authorization failed: {e}", file=sys.stderr)
