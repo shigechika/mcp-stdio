@@ -3585,16 +3585,34 @@ class TestCheckConnectionSse:
         )
 
     def test_sse_stream_ends_before_response_returns_false(self, httpx_mock):
-        """endpoint arrives but no initialize response before EOF → False."""
+        """endpoint arrives but no initialize response before EOF → False.
+
+        The stream is held open until the endpoint POST has been observed, so
+        the mocked POST is deterministically requested. Without this, the reader
+        thread's EOF could race ahead of the main thread's POST and leave the
+        POST mock 'mocked but not requested' — a flaky pytest_httpx teardown
+        error (it intermittently failed CI on ubuntu 3.11). The probe still
+        returns False because no initialize response ever arrives."""
+        post_attempted = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages\n\n"
+            # Hold the stream open until the POST is in flight, then EOF with no
+            # initialize response so the probe reports 'stream ended' → False.
+            post_attempted.wait(timeout=3)
+
         httpx_mock.add_response(
             url=self.SSE_URL,
             method="GET",
-            stream=IteratorStream([b"event: endpoint\ndata: /messages\n\n"]),
+            stream=IteratorStream(sse_gen()),
             headers={"content-type": "text/event-stream"},
         )
-        httpx_mock.add_response(
-            url="https://example.com/messages", method="POST", status_code=202
-        )
+
+        def on_post(request: httpx.Request) -> httpx.Response:
+            post_attempted.set()
+            return httpx.Response(status_code=202)
+
+        httpx_mock.add_callback(on_post, url="https://example.com/messages")
         assert (
             check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
             is False
