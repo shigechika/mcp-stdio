@@ -33,12 +33,17 @@ _RATE_LIMIT_SLEEP_CAP_SECS = 60.0
 
 # Status codes whose ``Retry-After`` we honour for a backoff-and-retry, and
 # whose final value we surface as ``error.data.retryAfter`` when we give up.
-# Both are spec-sanctioned Retry-After carriers that mean "the request was
-# NOT processed, try again later" — so replaying the non-idempotent POST is
-# safe (no work was done server-side). 429 Too Many Requests (RFC 6585 §4)
-# is rate limiting; 503 Service Unavailable (RFC 9110 §15.6.4) is a
-# transient overload / maintenance window — RFC 9110 §10.2.3 explicitly
-# lists 503 as a Retry-After carrier alongside 429.
+# Both are spec-sanctioned Retry-After carriers (RFC 9110 §10.2.3 lists 503
+# alongside 429). 429 Too Many Requests (RFC 6585 §4) is rate limiting and
+# means the request was rejected at the gate, so replaying the non-idempotent
+# POST is genuinely safe — no server-side work happened. 503 Service
+# Unavailable (RFC 9110 §15.6.4) is a weaker guarantee: it means the server is
+# *currently unable* to handle the request (transient overload / maintenance),
+# which usually but does not STRICTLY guarantee no side effect occurred (a
+# server could begin work, hit overload, then answer 503). We still replay it —
+# retrying 503 on POST is conventional and the partial-work case is rare — but
+# a server that performs non-idempotent work before it can answer 503 could see
+# a duplicated effect after replay. Accepted as the conventional tradeoff.
 _RETRYABLE_RATE_LIMIT_STATUSES = (429, 503)
 
 # TCP keepalive tuning. Together (60 s idle + 4 × 15 s probes) a silent
@@ -1588,234 +1593,247 @@ def run(
             if not line:
                 continue
 
-            if normalize_arguments:
-                line = _normalize_null_arguments(line)
+            req_id, req_has_id = None, False
+            try:
+                if normalize_arguments:
+                    line = _normalize_null_arguments(line)
 
-            if tracker is not None:
-                cid = _extract_cancel_id(line)
-                if cid is not None:
-                    tracker.add(cid)
+                if tracker is not None:
+                    cid = _extract_cancel_id(line)
+                    if cid is not None:
+                        tracker.add(cid)
 
-            # Derive both the id value and its presence from one parse (the
-            # hot path). A notification (no id) must never receive a response —
-            # even when an upstream misbehaves and returns a 4xx/5xx to a POSTed
-            # notification, synthesizing an `id:null` error to stdout would be a
-            # JSON-RPC violation. Gate all synthesized error responses on
-            # req_has_id.
-            req_id, req_has_id = _extract_id_and_presence(line)
-            if tracker is not None and req_id is not None:
-                # A request reusing a previously-cancelled id supersedes that
-                # cancel — untrack it so its response is delivered, not dropped.
-                tracker.discard(req_id)
+                # Derive both the id value and its presence from one parse (the
+                # hot path). A notification (no id) must never receive a response —
+                # even when an upstream misbehaves and returns a 4xx/5xx to a POSTed
+                # notification, synthesizing an `id:null` error to stdout would be a
+                # JSON-RPC violation. Gate all synthesized error responses on
+                # req_has_id.
+                req_id, req_has_id = _extract_id_and_presence(line)
+                if tracker is not None and req_id is not None:
+                    # A request reusing a previously-cancelled id supersedes that
+                    # cancel — untrack it so its response is delivered, not dropped.
+                    tracker.discard(req_id)
 
-            req_headers = _prepare_headers()
+                req_headers = _prepare_headers()
 
-            def _dispatch(content: str, h: dict[str, str]) -> _StreamResult | None:
-                nonlocal protocol_version
-                detected = _detect_paginated_list(content)
-                if detected:
-                    # The pagination branch never captures protocol_version.
-                    # That is correct because `initialize` is not in
-                    # PAGINATED_LIST_METHODS, so an initialize request can never
-                    # take this branch — keep that invariant if the table grows.
-                    return _paginate_and_stream(
-                        client, url, content, h, req_id, detected[1], tracker,
-                        has_id=req_has_id,
-                    )
-                # Any `initialize` request is a capture point — not just the
-                # first. A client-driven re-initialize that renegotiates a
-                # different version is adopted so the injected
-                # MCP-Protocol-Version header stays equal to the version in
-                # force (the 2025-06-18 spec requires the header to match the
-                # negotiated version). The added per-line cost is one cheap
-                # `_looks_like_initialize` regex; the heavier
-                # `_extract_protocol_version` still runs only inside
-                # `_post_and_stream` for lines that are actually initializes.
-                #
-                # Response-only: the version comes from the server's
-                # InitializeResult, not the client's requested version. If a
-                # (non-compliant) server omits result.protocolVersion, no
-                # header is sent rather than guessing — a server that both
-                # omits it and enforces the header would be self-contradictory.
-                capture_init = _looks_like_initialize(content)
-                if capture_init and protocol_version is not None:
-                    # An initialize request IS the (re)negotiation and predates a
-                    # known version, so it must not advertise the prior one
-                    # (2025-06-18: the header carries the negotiated version and
-                    # applies to requests AFTER initialization). Strip the value
-                    # _prepare_headers injected, matching _reinitialize. The gate
-                    # on ``protocol_version is not None`` means we only drop the
-                    # relay's OWN injected header — on a cold-start initialize
-                    # (no version yet) a user-pinned ``-H MCP-Protocol-Version``
-                    # is left intact. Mcp-Session-Id is untouched.
-                    h = {
-                        k: v
-                        for k, v in h.items()
-                        if k.lower() != "mcp-protocol-version"
-                    }
-                result = _post_and_stream(
-                    client, url, content, h, req_id, tracker,
-                    capture_init=capture_init, has_id=req_has_id,
-                )
-                if result is not None and result.protocol_version:
-                    if result.protocol_version != protocol_version:
-                        log(
-                            f"negotiated MCP protocol version: "
-                            f"{result.protocol_version}"
+                def _dispatch(content: str, h: dict[str, str]) -> _StreamResult | None:
+                    nonlocal protocol_version
+                    detected = _detect_paginated_list(content)
+                    if detected:
+                        # The pagination branch never captures protocol_version.
+                        # That is correct because `initialize` is not in
+                        # PAGINATED_LIST_METHODS, so an initialize request can never
+                        # take this branch — keep that invariant if the table grows.
+                        return _paginate_and_stream(
+                            client, url, content, h, req_id, detected[1], tracker,
+                            has_id=req_has_id,
                         )
-                    protocol_version = result.protocol_version
-                return result
+                    # Any `initialize` request is a capture point — not just the
+                    # first. A client-driven re-initialize that renegotiates a
+                    # different version is adopted so the injected
+                    # MCP-Protocol-Version header stays equal to the version in
+                    # force (the 2025-06-18 spec requires the header to match the
+                    # negotiated version). The added per-line cost is one cheap
+                    # `_looks_like_initialize` regex; the heavier
+                    # `_extract_protocol_version` still runs only inside
+                    # `_post_and_stream` for lines that are actually initializes.
+                    #
+                    # Response-only: the version comes from the server's
+                    # InitializeResult, not the client's requested version. If a
+                    # (non-compliant) server omits result.protocolVersion, no
+                    # header is sent rather than guessing — a server that both
+                    # omits it and enforces the header would be self-contradictory.
+                    capture_init = _looks_like_initialize(content)
+                    if capture_init and protocol_version is not None:
+                        # An initialize request IS the (re)negotiation and predates a
+                        # known version, so it must not advertise the prior one
+                        # (2025-06-18: the header carries the negotiated version and
+                        # applies to requests AFTER initialization). Strip the value
+                        # _prepare_headers injected, matching _reinitialize. The gate
+                        # on ``protocol_version is not None`` means we only drop the
+                        # relay's OWN injected header — on a cold-start initialize
+                        # (no version yet) a user-pinned ``-H MCP-Protocol-Version``
+                        # is left intact. Mcp-Session-Id is untouched.
+                        h = {
+                            k: v
+                            for k, v in h.items()
+                            if k.lower() != "mcp-protocol-version"
+                        }
+                    result = _post_and_stream(
+                        client, url, content, h, req_id, tracker,
+                        capture_init=capture_init, has_id=req_has_id,
+                    )
+                    if result is not None and result.protocol_version:
+                        if result.protocol_version != protocol_version:
+                            log(
+                                f"negotiated MCP protocol version: "
+                                f"{result.protocol_version}"
+                            )
+                        protocol_version = result.protocol_version
+                    return result
 
-            result = _dispatch(line, req_headers)
-            if result is None:
-                # All retries exhausted on a TRANSPORT error (the error was
-                # already printed). ``None`` is never a 4xx — every non-200
-                # status returns a _StreamResult — so the server-side session was
-                # NOT invalidated; only the network blipped. KEEP session_id so
-                # the next request still carries it and can trigger 404 self-heal
-                # if the session truly expired. Clearing it here would instead
-                # defeat that recovery on a mere blip (the next 404 could not
-                # fire its recovery branch, which is gated on session_id).
-                continue
-
-            # Adopt a server-supplied session id from THIS response before the
-            # 401/403 recovery branches rebuild their retry headers, so a server
-            # that rotates/assigns Mcp-Session-Id alongside an auth challenge is
-            # honoured on the retry rather than re-sending the stale one. (The
-            # 404 branch re-establishes its own fresh session below.)
-            if result.session_id:
-                session_id = result.session_id
-
-            # Recovery is single-pass and ordered auth-before-session: the three
-            # branches below are sequential `if`s (not `elif`), each firing at
-            # most once per stdin line. A 401/403 whose retry returns 404 still
-            # flows into the 404 branch and recovers; the converse does NOT — a
-            # 404 retry that comes back 401/403 (token expired during the reinit
-            # window), or a 401/403 retry that fails the same way again, is not
-            # re-recovered and surfaces as a JSON-RPC error (never a hang, #11).
-            # The downstream client retries at its own level. This bounded
-            # single attempt is deliberate: it avoids unbounded recovery loops.
-            #
-            # Worst case the same line is dispatched up to 4 times in one
-            # iteration (initial + 401-refresh + 403-step-up + 404-reinit, when
-            # each retry returns the next branch's status). That is safe only
-            # because each prior dispatch returned a non-200 with NO body
-            # delivered to stdout — the at-most-once guard in _post_and_stream
-            # covers replay after a partial 200, not these distinct non-200
-            # recovery dispatches, which a server is not expected to have
-            # executed for side effects.
-
-            # Token expired (401) — refresh and retry once
-            if result.status_code == 401 and token_refresher:
-                log("received 401, attempting token refresh")
-                new_headers = token_refresher()
-                if new_headers:
-                    headers.update(new_headers)
-                    req_headers = _prepare_headers()
-                    result = _dispatch(line, req_headers)
-                    if result is None:
-                        # Transport exhaustion on the refreshed retry (None is
-                        # never a 4xx). Keep session_id — see the top-level None
-                        # handling: a transient blip must not defeat 404 recovery.
-                        continue
-                    # Re-adopt a session id the server rotated alongside this 401
-                    # retry's response, so a chained 403 step-up below rebuilds
-                    # its retry headers from the fresh id, not the stale one
-                    # (mirrors the once-adoption above the recovery branches).
-                    if result.session_id:
-                        session_id = result.session_id
-                else:
-                    log("token refresh failed, returning error")
-                    if req_has_id:
-                        _write_line(_error_response("authentication failed", req_id))
+                result = _dispatch(line, req_headers)
+                if result is None:
+                    # All retries exhausted on a TRANSPORT error (the error was
+                    # already printed). ``None`` is never a 4xx — every non-200
+                    # status returns a _StreamResult — so the server-side session was
+                    # NOT invalidated; only the network blipped. KEEP session_id so
+                    # the next request still carries it and can trigger 404 self-heal
+                    # if the session truly expired. Clearing it here would instead
+                    # defeat that recovery on a mere blip (the next 404 could not
+                    # fire its recovery branch, which is gated on session_id).
                     continue
 
-            # Insufficient scope (403) — step-up authorization and retry once
-            if result.status_code == 403 and scope_upgrader:
-                required_scope = _parse_www_authenticate_scope(
-                    result.www_authenticate
-                )
-                if required_scope is not None:
-                    log(
-                        f"received 403 insufficient_scope "
-                        f"(required: {required_scope}), attempting step-up"
-                    )
-                    new_headers = scope_upgrader(required_scope)
+                # Adopt a server-supplied session id from THIS response before the
+                # 401/403 recovery branches rebuild their retry headers, so a server
+                # that rotates/assigns Mcp-Session-Id alongside an auth challenge is
+                # honoured on the retry rather than re-sending the stale one. (The
+                # 404 branch re-establishes its own fresh session below.)
+                if result.session_id:
+                    session_id = result.session_id
+
+                # Recovery is single-pass and ordered auth-before-session: the three
+                # branches below are sequential `if`s (not `elif`), each firing at
+                # most once per stdin line. A 401/403 whose retry returns 404 still
+                # flows into the 404 branch and recovers; the converse does NOT — a
+                # 404 retry that comes back 401/403 (token expired during the reinit
+                # window), or a 401/403 retry that fails the same way again, is not
+                # re-recovered and surfaces as a JSON-RPC error (never a hang, #11).
+                # The downstream client retries at its own level. This bounded
+                # single attempt is deliberate: it avoids unbounded recovery loops.
+                #
+                # Worst case the same line is dispatched up to 4 times in one
+                # iteration (initial + 401-refresh + 403-step-up + 404-reinit, when
+                # each retry returns the next branch's status). That is safe only
+                # because each prior dispatch returned a non-200 with NO body
+                # delivered to stdout — the at-most-once guard in _post_and_stream
+                # covers replay after a partial 200, not these distinct non-200
+                # recovery dispatches, which a server is not expected to have
+                # executed for side effects.
+
+                # Token expired (401) — refresh and retry once
+                if result.status_code == 401 and token_refresher:
+                    log("received 401, attempting token refresh")
+                    new_headers = token_refresher()
                     if new_headers:
                         headers.update(new_headers)
                         req_headers = _prepare_headers()
                         result = _dispatch(line, req_headers)
                         if result is None:
-                            # Transport exhaustion on the stepped-up retry (None
-                            # is never a 4xx). Keep session_id — see the top-level
-                            # None handling.
+                            # Transport exhaustion on the refreshed retry (None is
+                            # never a 4xx). Keep session_id — see the top-level None
+                            # handling: a transient blip must not defeat 404 recovery.
                             continue
-                        # Re-adopt a session id rotated alongside this step-up
-                        # retry's response so a chained 404 sees the fresh id
-                        # (mirrors the 401-branch re-adoption above).
+                        # Re-adopt a session id the server rotated alongside this 401
+                        # retry's response, so a chained 403 step-up below rebuilds
+                        # its retry headers from the fresh id, not the stale one
+                        # (mirrors the once-adoption above the recovery branches).
                         if result.session_id:
                             session_id = result.session_id
                     else:
-                        log("step-up authorization failed, returning error")
+                        log("token refresh failed, returning error")
                         if req_has_id:
-                            _write_line(_error_response("authorization failed", req_id))
+                            _write_line(_error_response("authentication failed", req_id))
                         continue
 
-            # Session expired (404) — reset, re-initialize, then retry
-            if result.status_code == 404 and session_id:
-                log("session expired, re-initializing and retrying")
-                session_id = None
-                new_session_id, renegotiated = _reinitialize(
-                    client, url, dict(headers), protocol_version
-                )
-                if new_session_id is None:
-                    log("re-initialize failed, dropping request")
+                # Insufficient scope (403) — step-up authorization and retry once
+                if result.status_code == 403 and scope_upgrader:
+                    required_scope = _parse_www_authenticate_scope(
+                        result.www_authenticate
+                    )
+                    if required_scope is not None:
+                        log(
+                            f"received 403 insufficient_scope "
+                            f"(required: {required_scope}), attempting step-up"
+                        )
+                        new_headers = scope_upgrader(required_scope)
+                        if new_headers:
+                            headers.update(new_headers)
+                            req_headers = _prepare_headers()
+                            result = _dispatch(line, req_headers)
+                            if result is None:
+                                # Transport exhaustion on the stepped-up retry (None
+                                # is never a 4xx). Keep session_id — see the top-level
+                                # None handling.
+                                continue
+                            # Re-adopt a session id rotated alongside this step-up
+                            # retry's response so a chained 404 sees the fresh id
+                            # (mirrors the 401-branch re-adoption above).
+                            if result.session_id:
+                                session_id = result.session_id
+                        else:
+                            log("step-up authorization failed, returning error")
+                            if req_has_id:
+                                _write_line(_error_response("authorization failed", req_id))
+                            continue
+
+                # Session expired (404) — reset, re-initialize, then retry
+                if result.status_code == 404 and session_id:
+                    log("session expired, re-initializing and retrying")
+                    session_id = None
+                    new_session_id, renegotiated = _reinitialize(
+                        client, url, dict(headers), protocol_version
+                    )
+                    if new_session_id is None:
+                        log("re-initialize failed, dropping request")
+                        if req_has_id:
+                            _write_line(_error_response("session lost", req_id))
+                        continue
+                    session_id = new_session_id
+                    # Track the re-negotiated version so the MCP-Protocol-Version
+                    # header on the retried request matches the recovered session.
+                    if renegotiated and renegotiated != protocol_version:
+                        log(f"re-negotiated MCP protocol version: {renegotiated}")
+                        protocol_version = renegotiated
+                    req_headers = _prepare_headers()
+                    result = _dispatch(line, req_headers)
+                    if result is None:
+                        continue
+
+                if result.session_id:
+                    session_id = result.session_id
+
+                # Fall-through error for any unhandled 4xx/5xx so the MCP client
+                # never hangs waiting for a response. 200 bodies were already
+                # streamed by _post_and_stream. 202 is reserved for the client's own
+                # responses/notifications (MCP Streamable HTTP "Sending Messages"
+                # rule 4); a compliant server answers a REQUEST with 200 + an SSE /
+                # JSON body (rule 5). So a 202 to a request-WITH-id is non-compliant
+                # and would leave the client hanging forever (no body now, no async
+                # reply on Streamable HTTP) — synthesize an error for it too, matching
+                # the empty-200 guard in _post_and_stream. A 202 to a NOTIFICATION
+                # (no id) stays correctly silent. See #11 and #4 (round16).
+                req_202_hang = result.status_code == 202 and req_has_id
+                if result.status_code >= 400 or req_202_hang:
+                    log(f"upstream returned HTTP {result.status_code}")
                     if req_has_id:
-                        _write_line(_error_response("session lost", req_id))
-                    continue
-                session_id = new_session_id
-                # Track the re-negotiated version so the MCP-Protocol-Version
-                # header on the retried request matches the recovered session.
-                if renegotiated and renegotiated != protocol_version:
-                    log(f"re-negotiated MCP protocol version: {renegotiated}")
-                    protocol_version = renegotiated
-                req_headers = _prepare_headers()
-                result = _dispatch(line, req_headers)
-                if result is None:
-                    continue
-
-            if result.session_id:
-                session_id = result.session_id
-
-            # Fall-through error for any unhandled 4xx/5xx so the MCP client
-            # never hangs waiting for a response. 200 bodies were already
-            # streamed by _post_and_stream. 202 is reserved for the client's own
-            # responses/notifications (MCP Streamable HTTP "Sending Messages"
-            # rule 4); a compliant server answers a REQUEST with 200 + an SSE /
-            # JSON body (rule 5). So a 202 to a request-WITH-id is non-compliant
-            # and would leave the client hanging forever (no body now, no async
-            # reply on Streamable HTTP) — synthesize an error for it too, matching
-            # the empty-200 guard in _post_and_stream. A 202 to a NOTIFICATION
-            # (no id) stays correctly silent. See #11 and #4 (round16).
-            req_202_hang = result.status_code == 202 and req_has_id
-            if result.status_code >= 400 or req_202_hang:
-                log(f"upstream returned HTTP {result.status_code}")
+                        # On a 429/503 whose retries were exhausted / over-cap,
+                        # surface the server's Retry-After (when present) as
+                        # error.data so a client can back off intelligently. See #8.
+                        err_data = (
+                            {"retryAfter": result.retry_after}
+                            if result.status_code in _RETRYABLE_RATE_LIMIT_STATUSES
+                            and result.retry_after is not None
+                            else None
+                        )
+                        msg = (
+                            f"HTTP {result.status_code} (no response body for request)"
+                            if req_202_hang
+                            else f"HTTP {result.status_code}"
+                        )
+                        _write_line(_error_response(msg, req_id, data=err_data))
+            except Exception as e:  # noqa: BLE001 — never crash the gateway (#1 round17)
+                # The #11 contract is structural here, not just per-helper: an
+                # unexpected non-httpx exception escaping _dispatch / the recovery
+                # branches (e.g. a future parsing helper, a BrokenPipeError from
+                # _write_line) must degrade THIS request to a JSON-RPC error and
+                # keep the session alive, mirroring the SSE reader's own safety
+                # net. A request gets one error; a notification (no id) stays silent.
+                log(f"internal relay error handling request: {e}")
                 if req_has_id:
-                    # On a 429/503 whose retries were exhausted / over-cap,
-                    # surface the server's Retry-After (when present) as
-                    # error.data so a client can back off intelligently. See #8.
-                    err_data = (
-                        {"retryAfter": result.retry_after}
-                        if result.status_code in _RETRYABLE_RATE_LIMIT_STATUSES
-                        and result.retry_after is not None
-                        else None
-                    )
-                    msg = (
-                        f"HTTP {result.status_code} (no response body for request)"
-                        if req_202_hang
-                        else f"HTTP {result.status_code}"
-                    )
-                    _write_line(_error_response(msg, req_id, data=err_data))
+                    _write_line(_error_response("internal relay error", req_id))
+                continue
     finally:
         client.close()
 
@@ -2116,123 +2134,102 @@ def run_sse(
             if not line:
                 continue
 
-            if normalize_arguments:
-                line = _normalize_null_arguments(line)
-
-            if tracker is not None:
-                cid = _extract_cancel_id(line)
-                if cid is not None:
-                    tracker.add(cid)
-
-            # Derive both the id value and its presence from one parse (the
-            # hot path). A notification (no id) must never receive a response —
-            # even when an upstream misbehaves and returns a 4xx/5xx to a POSTed
-            # notification, synthesizing an `id:null` error to stdout would be a
-            # JSON-RPC violation. Gate all synthesized error responses on
-            # req_has_id.
-            req_id, req_has_id = _extract_id_and_presence(line)
-            if tracker is not None and req_id is not None:
-                # A request reusing a previously-cancelled id supersedes that
-                # cancel — untrack it so its response is delivered, not dropped.
-                tracker.discard(req_id)
-            # Resolve the POST endpoint, waiting out a reconnect in progress.
-            # endpoint_url is published lock-free, so a reconnect may clear it in
-            # the TOCTOU window between this check and the read below; if the
-            # capture comes back None, wait on ``ready`` (up to timeout_read) and
-            # re-read once before giving up, rather than failing an otherwise
-            # recoverable in-flight request with a spurious error.
-            endpoint = state.endpoint_url
-            if endpoint is None:
-                if state.ready.wait(timeout=timeout_read):
-                    endpoint = state.endpoint_url
-                if endpoint is None:
-                    if req_has_id:
-                        _write_line(_error_response("SSE endpoint unavailable", req_id))
-                    continue
-
+            req_id, req_has_id = None, False
             try:
-                post_timeout = httpx.Timeout(
-                    connect=timeout_connect,
-                    read=timeout_read,
-                    write=timeout_write,
-                    pool=10,
-                )
-                # Honour Retry-After on 429/503 up to the cap; over-cap or
-                # retries-exhausted falls through with the final status and
-                # is surfaced to the caller by the generic 4xx/5xx branch
-                # below (typescript-sdk#1892).
-                for attempt in range(1, MAX_RETRIES + 1):
-                    resp = client.post(
-                        endpoint,
-                        content=line,
-                        headers=_snapshot_headers(),
-                        timeout=post_timeout,
-                    )
-                    if resp.status_code not in _RETRYABLE_RATE_LIMIT_STATUSES:
-                        break
-                    sleep_secs = _handle_rate_limit(resp.headers, attempt)
-                    if sleep_secs is None:
-                        break
-                    log(
-                        f"attempt {attempt}/{MAX_RETRIES} got HTTP "
-                        f"{resp.status_code}, sleeping {sleep_secs:.1f}s before retry"
-                    )
-                    time.sleep(sleep_secs)
+                if normalize_arguments:
+                    line = _normalize_null_arguments(line)
 
-                # NOTE (#3 round16): the re-POST below resends the same JSON-RPC
-                # id after a refresh/step-up. Unlike a non-2xx (which reliably
-                # means "not accepted"), a 401/403 does NOT guarantee the origin
-                # rejected the request — an edge proxy can inject the 401 while
-                # the origin already accepted and enqueued a reply. The re-POST
-                # then makes the server push a SECOND async reply for the same id
-                # on the GET stream, and the reader's _emit writes both (the same
-                # no-shared-de-dup-map window documented at the non-2xx branch
-                # below). Left undeduplicated by design — a shared seen-id set
-                # would be heavier than the project's minimalism warrants.
-                if resp.status_code == 401 and token_refresher:
-                    log("received 401, attempting token refresh")
-                    new_headers = token_refresher()
-                    if new_headers:
-                        with headers_lock:
-                            headers.update(new_headers)
-                        # Re-read the endpoint: if the reader thread reconnected
-                        # between the first POST and this retry it may have
-                        # published a fresh endpoint; honour it rather than the
-                        # stale capture (fall back to the captured one if the
-                        # reader has it momentarily nulled mid-reconnect).
-                        endpoint = state.endpoint_url or endpoint
+                if tracker is not None:
+                    cid = _extract_cancel_id(line)
+                    if cid is not None:
+                        tracker.add(cid)
+
+                # Derive both the id value and its presence from one parse (the
+                # hot path). A notification (no id) must never receive a response —
+                # even when an upstream misbehaves and returns a 4xx/5xx to a POSTed
+                # notification, synthesizing an `id:null` error to stdout would be a
+                # JSON-RPC violation. Gate all synthesized error responses on
+                # req_has_id.
+                req_id, req_has_id = _extract_id_and_presence(line)
+                if tracker is not None and req_id is not None:
+                    # A request reusing a previously-cancelled id supersedes that
+                    # cancel — untrack it so its response is delivered, not dropped.
+                    tracker.discard(req_id)
+                # Resolve the POST endpoint, waiting out a reconnect in progress.
+                # endpoint_url is published lock-free, so a reconnect may clear it in
+                # the TOCTOU window between this check and the read below; if the
+                # capture comes back None, wait on ``ready`` (up to timeout_read) and
+                # re-read once before giving up, rather than failing an otherwise
+                # recoverable in-flight request with a spurious error.
+                #
+                # NOTE (#3 round17): ``ready`` is a LATCHED Event. The reconnect
+                # paths clear it before nulling endpoint_url, but the fail-fast
+                # branches (cross-origin endpoint refusal, first-connect failure)
+                # deliberately set it with endpoint_url still None to unblock this
+                # wait EARLY instead of hanging the full timeout_read. So a stale
+                # latched set can make the wait below return immediately with
+                # endpoint still None — by design: there is genuinely no usable
+                # endpoint, and "SSE endpoint unavailable" is the correct answer.
+                # The wait is a best-effort grace period, not a strict barrier.
+                endpoint = state.endpoint_url
+                if endpoint is None:
+                    if state.ready.wait(timeout=timeout_read):
+                        endpoint = state.endpoint_url
+                    if endpoint is None:
+                        if req_has_id:
+                            _write_line(_error_response("SSE endpoint unavailable", req_id))
+                        continue
+
+                try:
+                    post_timeout = httpx.Timeout(
+                        connect=timeout_connect,
+                        read=timeout_read,
+                        write=timeout_write,
+                        pool=10,
+                    )
+                    # Honour Retry-After on 429/503 up to the cap; over-cap or
+                    # retries-exhausted falls through with the final status and
+                    # is surfaced to the caller by the generic 4xx/5xx branch
+                    # below (typescript-sdk#1892).
+                    for attempt in range(1, MAX_RETRIES + 1):
                         resp = client.post(
                             endpoint,
                             content=line,
                             headers=_snapshot_headers(),
-                            timeout=httpx.Timeout(
-                                connect=timeout_connect,
-                                read=timeout_read,
-                                write=timeout_write,
-                                pool=10,
-                            ),
+                            timeout=post_timeout,
                         )
-                    else:
-                        log("token refresh failed, returning error")
-                        if req_has_id:
-                            _write_line(_error_response("authentication failed", req_id))
-                        continue
-
-                if resp.status_code == 403 and scope_upgrader:
-                    required_scope = _parse_www_authenticate_scope(
-                        resp.headers.get("www-authenticate")
-                    )
-                    if required_scope is not None:
+                        if resp.status_code not in _RETRYABLE_RATE_LIMIT_STATUSES:
+                            break
+                        sleep_secs = _handle_rate_limit(resp.headers, attempt)
+                        if sleep_secs is None:
+                            break
                         log(
-                            f"received 403 insufficient_scope "
-                            f"(required: {required_scope}), attempting step-up"
+                            f"attempt {attempt}/{MAX_RETRIES} got HTTP "
+                            f"{resp.status_code}, sleeping {sleep_secs:.1f}s before retry"
                         )
-                        new_headers = scope_upgrader(required_scope)
+                        time.sleep(sleep_secs)
+
+                    # NOTE (#3 round16): the re-POST below resends the same JSON-RPC
+                    # id after a refresh/step-up. Unlike a non-2xx (which reliably
+                    # means "not accepted"), a 401/403 does NOT guarantee the origin
+                    # rejected the request — an edge proxy can inject the 401 while
+                    # the origin already accepted and enqueued a reply. The re-POST
+                    # then makes the server push a SECOND async reply for the same id
+                    # on the GET stream, and the reader's _emit writes both (the same
+                    # no-shared-de-dup-map window documented at the non-2xx branch
+                    # below). Left undeduplicated by design — a shared seen-id set
+                    # would be heavier than the project's minimalism warrants.
+                    if resp.status_code == 401 and token_refresher:
+                        log("received 401, attempting token refresh")
+                        new_headers = token_refresher()
                         if new_headers:
                             with headers_lock:
                                 headers.update(new_headers)
-                            # Honour a fresh endpoint if the reader reconnected
-                            # since the first POST (see the 401 retry above).
+                            # Re-read the endpoint: if the reader thread reconnected
+                            # between the first POST and this retry it may have
+                            # published a fresh endpoint; honour it rather than the
+                            # stale capture (fall back to the captured one if the
+                            # reader has it momentarily nulled mid-reconnect).
                             endpoint = state.endpoint_url or endpoint
                             resp = client.post(
                                 endpoint,
@@ -2246,40 +2243,82 @@ def run_sse(
                                 ),
                             )
                         else:
-                            log(
-                                "step-up authorization failed, returning error"
-                            )
+                            log("token refresh failed, returning error")
                             if req_has_id:
-                                _write_line(_error_response("authorization failed", req_id))
+                                _write_line(_error_response("authentication failed", req_id))
                             continue
 
-                if resp.status_code not in (200, 202):
-                    log(f"POST returned HTTP {resp.status_code}")
-                    # NOTE (#1): on the legacy SSE transport the POST only
-                    # carries an HTTP ack; the JSON-RPC reply arrives async on
-                    # the GET stream (written by the reader via _emit). These two
-                    # threads do not share a per-id de-dup map, so if a server
-                    # both non-2xx's the POST AND later pushes a reply for the
-                    # same id, the client can receive two responses for one id.
-                    # In practice a non-2xx POST means the request was not
-                    # accepted and no reply follows, so the window is narrow;
-                    # mcp-stdio deliberately does not de-duplicate it (consistent
-                    # with the cancel filter's narrow scope).
-                    if req_has_id:
-                        err_data = None
-                        if resp.status_code in _RETRYABLE_RATE_LIMIT_STATUSES:
-                            secs = _parse_retry_after(resp.headers.get("retry-after"))
-                            if secs is not None:
-                                err_data = {"retryAfter": secs}  # See #8.
-                        _write_line(
-                            _error_response(
-                                f"HTTP {resp.status_code}", req_id, data=err_data
-                            )
+                    if resp.status_code == 403 and scope_upgrader:
+                        required_scope = _parse_www_authenticate_scope(
+                            resp.headers.get("www-authenticate")
                         )
-            except httpx.HTTPError as e:
-                log(f"POST failed: {e}")
+                        if required_scope is not None:
+                            log(
+                                f"received 403 insufficient_scope "
+                                f"(required: {required_scope}), attempting step-up"
+                            )
+                            new_headers = scope_upgrader(required_scope)
+                            if new_headers:
+                                with headers_lock:
+                                    headers.update(new_headers)
+                                # Honour a fresh endpoint if the reader reconnected
+                                # since the first POST (see the 401 retry above).
+                                endpoint = state.endpoint_url or endpoint
+                                resp = client.post(
+                                    endpoint,
+                                    content=line,
+                                    headers=_snapshot_headers(),
+                                    timeout=httpx.Timeout(
+                                        connect=timeout_connect,
+                                        read=timeout_read,
+                                        write=timeout_write,
+                                        pool=10,
+                                    ),
+                                )
+                            else:
+                                log(
+                                    "step-up authorization failed, returning error"
+                                )
+                                if req_has_id:
+                                    _write_line(_error_response("authorization failed", req_id))
+                                continue
+
+                    if resp.status_code not in (200, 202):
+                        log(f"POST returned HTTP {resp.status_code}")
+                        # NOTE (#1): on the legacy SSE transport the POST only
+                        # carries an HTTP ack; the JSON-RPC reply arrives async on
+                        # the GET stream (written by the reader via _emit). These two
+                        # threads do not share a per-id de-dup map, so if a server
+                        # both non-2xx's the POST AND later pushes a reply for the
+                        # same id, the client can receive two responses for one id.
+                        # In practice a non-2xx POST means the request was not
+                        # accepted and no reply follows, so the window is narrow;
+                        # mcp-stdio deliberately does not de-duplicate it (consistent
+                        # with the cancel filter's narrow scope).
+                        if req_has_id:
+                            err_data = None
+                            if resp.status_code in _RETRYABLE_RATE_LIMIT_STATUSES:
+                                secs = _parse_retry_after(resp.headers.get("retry-after"))
+                                if secs is not None:
+                                    err_data = {"retryAfter": secs}  # See #8.
+                            _write_line(
+                                _error_response(
+                                    f"HTTP {resp.status_code}", req_id, data=err_data
+                                )
+                            )
+                except httpx.HTTPError as e:
+                    log(f"POST failed: {e}")
+                    if req_has_id:
+                        _write_line(_error_response(str(e), req_id))
+            except Exception as e:  # noqa: BLE001 — never crash the gateway (#1 round17)
+                # Structural #11 guard, mirroring run() and the SSE reader: an
+                # unexpected non-httpx exception (a future helper, a _write_line
+                # BrokenPipeError on the endpoint-unavailable path) degrades THIS
+                # request to an error and keeps the loop alive, never crashing.
+                log(f"internal relay error handling request: {e}")
                 if req_has_id:
-                    _write_line(_error_response(str(e), req_id))
+                    _write_line(_error_response("internal relay error", req_id))
+                continue
     finally:
         state.stop.set()
         # Set stop first, then briefly join so the reader can exit its own
