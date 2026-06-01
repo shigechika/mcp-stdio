@@ -1108,6 +1108,24 @@ class TestOAuthFailureExit:
             assert exc_info.value.code == 1
         assert "OAuth authentication failed" in capsys.readouterr().err
 
+    def test_keyboard_interrupt_during_oauth_exits_130(self, capsys):
+        """#2(round35): Ctrl-C during the pre-relay OAuth flow (before run()
+        installs signal handlers) exits cleanly with 130, not a raw
+        KeyboardInterrupt traceback. KeyboardInterrupt is a BaseException, so the
+        OAuth block's `except Exception` does not catch it — main()'s top-level
+        handler must."""
+        with (
+            patch("sys.argv", ["mcp-stdio", "--oauth", "https://example.com/mcp"]),
+            patch(
+                "mcp_stdio.oauth.ensure_token",
+                side_effect=KeyboardInterrupt(),
+            ),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 130
+        assert "interrupted" in capsys.readouterr().err
+
 
 class TestOAuthClientHardening:
     def test_oauth_client_disables_redirects(self, monkeypatch):
