@@ -1577,6 +1577,17 @@ def run(
             and returns updated headers containing a broader-scope
             token, or None on failure (RFC 9470 step-up authorization;
             cf. anthropics/claude-code#44652).
+
+    Limitation — JSON-RPC batches (#2 round22): a top-level array (a batch) is
+    treated like a notification for error synthesis. ``_extract_id_and_presence``
+    returns ``has_id=False`` for any non-object line, so if a batch's POST fails
+    upstream (transport exhaustion, an empty 200, a >=400, or a non-compliant
+    202), NO JSON-RPC error is synthesized and any requests-with-ids INSIDE the
+    batch are left unanswered — a silent hang rather than a per-id error. This
+    mirrors the cancel-filter's deliberate batch exemption: synthesizing an
+    ``id:null`` error for a batch would itself violate JSON-RPC, and MCP removed
+    batching in spec rev 2025-06-18, so the exposure is minimal. A single
+    (non-batch) request always gets a synthesized error on the same failures.
     """
 
     # Graceful shutdown on SIGTERM/SIGINT
@@ -2246,6 +2257,15 @@ def run_sse(
                     # retries-exhausted falls through with the final status and
                     # is surfaced to the caller by the generic 4xx/5xx branch
                     # below (typescript-sdk#1892).
+                    #
+                    # NOTE (#4 round22): this time.sleep runs on the STDIN thread,
+                    # so while parked here (up to the 60 s cap) the loop cannot
+                    # read the next stdin line — a notifications/cancelled for the
+                    # very request being rate-limit-retried sits unprocessed until
+                    # the sleep ends. Accepted: the cancel only delays, never
+                    # corrupts; the reader thread keeps delivering replies; and an
+                    # interruptible sleep would add cross-thread signalling the
+                    # project deliberately avoids. The Retry-After cap bounds it.
                     for attempt in range(1, MAX_RETRIES + 1):
                         resp = client.post(
                             endpoint,

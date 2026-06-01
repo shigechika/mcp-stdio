@@ -2598,6 +2598,10 @@ class TestPagination:
         names = [t["name"] for t in merged["result"]["tools"]]
         assert names == ["t1", "t2", "t3"]  # exactly MAX_LIST_PAGES pages
         assert len(httpx_mock.get_requests()) == 3
+        # #14(round22): page 3 still advertised nextCursor 'p4', so the cap path
+        # MUST re-expose it on the merged result for the client to resume past
+        # the cap — pinning resumability like the sibling truncation tests.
+        assert merged["result"]["nextCursor"] == "p4"
 
     def test_mid_flow_error_returns_partial_result(self, httpx_mock):
         """Page N>=2 HTTP error returns the pages collected so far."""
@@ -5031,6 +5035,22 @@ class TestCancelTracker:
         clock.advance(31)  # past 60 s
         assert not t.contains(5)
 
+    def test_default_ttl_constant_is_60s_and_wired(self):
+        """#15(round22): pin the production TTL constant AND that the DEFAULT
+        tracker (the one run()/run_sse() build) uses it, so an accidental change
+        to _CANCEL_TTL_SECS — or a default-arg that stops referencing it — is
+        caught rather than silently widening/shrinking the cancel window."""
+        from mcp_stdio.relay import _CANCEL_TTL_SECS
+
+        assert _CANCEL_TTL_SECS == 60.0
+        clock = _FakeClock()
+        t = _CancelTracker(now=clock)  # default ttl
+        t.add(5)
+        clock.advance(59)
+        assert t.contains(5)  # still within the 60 s default
+        clock.advance(2)  # past 60 s
+        assert not t.contains(5)
+
     def test_consume_drops_once_then_id_reuse_passes(self):
         """consume() removes the entry on first match, so a cancelled id's late
         response is dropped exactly once; a reused id within the TTL passes."""
@@ -5507,6 +5527,60 @@ class TestRunSseCancelFilter:
             run_sse(self.URL, {"Content-Type": "application/json"})
 
         assert "late" not in stdout.getvalue()
+
+    def test_cancel_ttl_expired_then_sse_message_is_delivered(
+        self, httpx_mock, monkeypatch
+    ):
+        """#16(round22): the cancel-drop is TTL-bounded END-TO-END. With the
+        tracker's TTL already elapsed, a cancelled id's late SSE response is
+        DELIVERED, not dropped — the integration analogue of the unit
+        consume-expired test. (Patch the tracker run_sse builds to a negative TTL
+        so any entry is immediately past-window.)"""
+        import mcp_stdio.relay as relay_mod
+
+        real_cls = relay_mod._CancelTracker
+        monkeypatch.setattr(
+            "mcp_stdio.relay._CancelTracker", lambda: real_cls(ttl=-1.0)
+        )
+
+        payload = '{"jsonrpc":"2.0","result":{"late":true},"id":11}'
+        post_received = threading.Event()
+        release_stdin = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=abc\n\n"
+            post_received.wait(timeout=3)
+            yield f"event: message\ndata: {payload}\n\n".encode()
+            time.sleep(0.1)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        def on_post(request: httpx.Request) -> httpx.Response:
+            post_received.set()
+            return httpx.Response(status_code=202)
+
+        httpx_mock.add_callback(
+            on_post, url="https://example.com/messages?sessionId=abc"
+        )
+
+        stdin = _BlockingStdin(
+            (
+                '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+                '"params":{"requestId":11}}'
+            ),
+            release_stdin,
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {"Content-Type": "application/json"})
+
+        # TTL elapsed → the late response is NOT dropped.
+        assert "late" in stdout.getvalue()
 
     def test_sse_message_without_cancel_passes_through(self, httpx_mock):
         payload = '{"jsonrpc":"2.0","result":{"kept":true},"id":21}'
