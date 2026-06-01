@@ -735,7 +735,11 @@ def _iter_sse_events(lines: Iterable[str]) -> Iterator[tuple[str, str]]:
         if value.startswith(" "):
             value = value[1:]
         if field == "event":
-            event_type = value
+            # WHATWG SSE "dispatch the event": an EMPTY event-type buffer
+            # dispatches as the default "message". A frame `event:\ndata: {...}`
+            # (explicitly-empty event field) must therefore be treated as a
+            # message, not silently dropped under an "" type. See #4 (round25).
+            event_type = value or "message"
         elif field == "data":
             data_lines.append(value)
     data = "\n".join(data_lines)
@@ -858,7 +862,15 @@ def _post_and_stream(
                     _write_line(
                         _error_response(f"upstream stream interrupted: {e}", req_id)
                     )
-                return None
+                # Return a 200 result carrying any captured protocol_version (#1
+                # round25) instead of None: the InitializeResult was already
+                # delivered, so the client considers init complete. Returning None
+                # would discard the negotiated version, leaving the relay's
+                # protocol_version None and omitting MCP-Protocol-Version on every
+                # subsequent request — which a strict 2025-06-18 server 400s.
+                # (session/pv are bound here: emitted implies the loop ran past
+                # their assignment.)
+                return _StreamResult(session, 200, protocol_version=pv)
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY * attempt)
 
