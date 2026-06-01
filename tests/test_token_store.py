@@ -584,6 +584,39 @@ class TestLegacyMigration:
         assert new_file.exists()
         assert not legacy_file.exists()
 
+    def test_exdev_copy_through_with_corrupt_legacy_writes_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        """#6(round14): the EXDEV copy-through fallback must NOT write a corrupt
+        or empty legacy file through to the new path — it persists only a real
+        dict; an unparseable legacy read leaves the target absent."""
+        legacy_dir = tmp_path / "legacy"
+        legacy_file = legacy_dir / "tokens.json"
+        new_dir = tmp_path / "new"
+        new_file = new_dir / "tokens.json"
+        legacy_dir.mkdir()
+        legacy_file.write_text("{ this is not valid json")  # corrupt legacy
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", new_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", new_file)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_DIR", legacy_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
+
+        # Force the copy-through branch by making the migration rename raise
+        # EXDEV. Patch Path.rename itself (the production code calls
+        # _LEGACY_STORE_FILE.rename): on Python 3.10 a patch of the module's
+        # os.rename does NOT reach pathlib's pre-bound accessor, so the real
+        # same-fs rename would succeed and skip the branch under test.
+        def exdev_rename(self, target, *a, **k):
+            raise OSError(18, "Invalid cross-device link")  # EXDEV
+
+        monkeypatch.setattr("pathlib.Path.rename", exdev_rename)
+        loaded = load_token("https://example.com/mcp")  # must not raise
+
+        assert loaded is None
+        # The corrupt legacy content was NOT copied through to the new path.
+        assert not new_file.exists()
+
     def test_concurrent_migration_race_does_not_clobber_store(
         self, tmp_path, monkeypatch
     ):
