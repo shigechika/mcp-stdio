@@ -667,6 +667,30 @@ class TestLegacyMigration:
         assert loaded.access_token == "new"
         assert not legacy_file.exists()
 
+    def test_empty_xdg_store_does_not_delete_legacy(self, tmp_path, monkeypatch):
+        """#4(round14): if the XDG store exists but is EMPTY (e.g. a 0-byte
+        placeholder from an interrupted write / backup restore), the legacy file
+        must NOT be unlinked — that would silently lose still-real tokens."""
+        legacy_dir = tmp_path / "legacy"
+        legacy_file = legacy_dir / "tokens.json"
+        new_dir = tmp_path / "new"
+        new_file = new_dir / "tokens.json"
+
+        legacy_dir.mkdir()
+        legacy_file.write_text('{"https://example.com/mcp": {"access_token": "old"}}')
+        new_dir.mkdir()
+        new_file.write_text("")  # 0-byte placeholder, NOT a completed migration
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", new_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", new_file)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_DIR", legacy_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
+
+        load_token("https://example.com/mcp")
+        # The legacy tokens survive (not deleted by the bogus empty XDG store).
+        assert legacy_file.exists()
+        assert "old" in legacy_file.read_text()
+
     def test_legacy_unlink_failure_when_new_exists_does_not_crash(
         self, tmp_path, monkeypatch
     ):
