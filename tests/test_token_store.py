@@ -474,6 +474,59 @@ class TestLoadSaveDelete:
         assert stat.S_ISFIFO(os.stat(store_file).st_mode)
         assert "could not be read" in capsys.readouterr().err
 
+    def test_mid_read_failure_aborts_save_and_load_returns_none(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """#8(round27): _read_store's open SUCCEEDS but the read itself fails
+        (e.g. EIO on a flaky fs). The write path must raise _StoreUnreadable so a
+        save ABORTS (never clobbers the unread store), and the read path must
+        degrade to {} so a load returns None — the third raise site (mid-read),
+        symmetric with the open-failure and non-regular-file guards."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        save_token("https://a.com/mcp", TokenData(access_token="tok-a"))
+        save_token("https://b.com/mcp", TokenData(access_token="tok-b"))
+
+        real_fdopen = os.fdopen
+
+        class _BadReader:
+            def __init__(self, fd):
+                self._fd = fd
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                os.close(self._fd)
+                return False
+
+            def read(self, *a):
+                raise OSError(5, "EIO")
+
+        def failing_read_fdopen(fd, mode="r", *a, **k):
+            # Only the READ-open of the store gets a failing handle; the write
+            # path ("wb") and everything else stay real.
+            if "r" in mode:
+                return _BadReader(fd)
+            return real_fdopen(fd, mode, *a, **k)
+
+        monkeypatch.setattr(
+            "mcp_stdio.token_store.os.fdopen", failing_read_fdopen
+        )
+        # Read path: mid-read OSError degrades to {} → load returns None.
+        assert load_token("https://a.com/mcp") is None
+        # Write path: mid-read OSError raises _StoreUnreadable → save aborts soft.
+        save_token("https://c.com/mcp", TokenData(access_token="tok-c"))
+        assert "could not be read" in capsys.readouterr().err
+
+        monkeypatch.setattr("mcp_stdio.token_store.os.fdopen", real_fdopen)
+        # The pre-existing tokens survive; the aborted save persisted nothing.
+        assert load_token("https://a.com/mcp").access_token == "tok-a"
+        assert load_token("https://b.com/mcp").access_token == "tok-b"
+        assert load_token("https://c.com/mcp") is None
+
     @pytest.mark.skipif(
         sys.platform == "win32",
         reason="O_NOFOLLOW is 0 on Windows, so the symlink is not refused (ELOOP)",
@@ -837,6 +890,66 @@ class TestLegacyMigration:
         mode = os.stat(new_file).st_mode
         assert mode & stat.S_IRWXG == 0
         assert mode & stat.S_IRWXO == 0
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX symlink semantics; O_NOFOLLOW is 0 on Windows",
+    )
+    def test_migration_refuses_symlinked_legacy_store(self, tmp_path, monkeypatch):
+        """#1(round27): a SYMLINK planted at the legacy path must NOT be renamed
+        into the trusted XDG store path — Path.rename would move the symlink
+        itself, after which every O_NOFOLLOW read ELOOPs and save/delete abort
+        forever (a permanent token-cache DoS). The migration is refused and the
+        XDG store is left absent (clean re-auth)."""
+        legacy_dir = tmp_path / "legacy"
+        new_dir = tmp_path / "new"
+        legacy_dir.mkdir()
+        legacy_file = legacy_dir / "tokens.json"
+        new_file = new_dir / "tokens.json"
+        # A real decoy the symlink points at — if the bug regressed and the
+        # symlink were moved to new_file, new_file.exists() would follow to it.
+        decoy = tmp_path / "decoy.json"
+        decoy.write_text('{"https://evil.com/mcp": {"access_token": "stolen"}}')
+        legacy_file.symlink_to(decoy)
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", new_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", new_file)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_DIR", legacy_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
+
+        # Migration is refused: nothing is read from or moved out of the symlink.
+        assert load_token("https://evil.com/mcp") is None
+        assert not new_file.exists()  # no symlink/file landed in the trusted path
+        assert not new_file.is_symlink()
+        assert legacy_file.is_symlink()  # the legacy symlink is left untouched
+        assert decoy.exists()  # the decoy target was never consumed
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or not hasattr(os, "mkfifo"),
+        reason="os.mkfifo is POSIX-only",
+    )
+    def test_migration_skips_fifo_legacy_store_without_hanging(
+        self, tmp_path, monkeypatch
+    ):
+        """#1/#2(round27): a FIFO at the legacy path must not be migrated and must
+        not hang the load — the rename-branch fstat guard (and _read_legacy_data's
+        O_NONBLOCK) refuse the special file. load returns None, no hang."""
+        legacy_dir = tmp_path / "legacy"
+        new_dir = tmp_path / "new"
+        legacy_dir.mkdir()
+        legacy_file = legacy_dir / "tokens.json"
+        new_file = new_dir / "tokens.json"
+        os.mkfifo(legacy_file)
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", new_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", new_file)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_DIR", legacy_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
+
+        # If the fstat/O_NONBLOCK guards regressed, this would hang forever.
+        assert load_token("https://example.com/mcp") is None
+        assert not new_file.exists()
+        assert stat.S_ISFIFO(os.lstat(legacy_file).st_mode)  # FIFO left in place
 
     def test_migration_survives_cross_device_rename(self, tmp_path, monkeypatch):
         """An EXDEV (cross-filesystem) rename must not brick the store — the
