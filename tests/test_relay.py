@@ -28,8 +28,10 @@ from mcp_stdio.relay import (
     _extract_id_and_presence,
     _extract_protocol_version,
     _handle_rate_limit,
+    _is_initialize_request,
     _iter_sse_events,
     _iter_sse_lines,
+    _looks_like_initialize,
     _make_httpx_transport,
     _normalize_null_arguments,
     _parse_retry_after,
@@ -753,6 +755,38 @@ class TestExtractProtocolVersion:
         # The canonical date-form version is visible ASCII → accepted.
         payload = '{"result":{"protocolVersion":"2024-11-05"}}'
         assert _extract_protocol_version(payload) == "2024-11-05"
+
+
+class TestIsInitializeRequest:
+    """_is_initialize_request is the parse-AUTHORITATIVE gate (vs the cheap
+    _looks_like_initialize substring pre-filter) used to strip the
+    MCP-Protocol-Version header AND to capture the negotiated version. A false
+    positive would wrongly drop the header from a real tools/call."""
+
+    def test_real_initialize_request_is_true(self):
+        assert _is_initialize_request('{"jsonrpc":"2.0","method":"initialize","id":1}')
+
+    def test_nested_method_initialize_is_false(self):
+        # The substring matches the cheap regex, but the top-level method is
+        # tools/call, so the authoritative check rejects it.
+        line = (
+            '{"jsonrpc":"2.0","method":"tools/call","id":1,"params":'
+            '{"arguments":{"method":"initialize"}}}'
+        )
+        assert _looks_like_initialize(line) is True  # regex pre-filter matched
+        assert _is_initialize_request(line) is False  # but parse says no
+
+    def test_malformed_json_after_regex_match_is_false(self):
+        """#9(round43): the regex pre-filter matches but the line is not valid
+        JSON — the json.loads-failure branch must return False, not raise. (The
+        only protocol-version gate path that previously had no direct test.)"""
+        line = '{"method":"initialize" broken json'
+        assert _looks_like_initialize(line) is True  # regex matched the substring
+        assert _is_initialize_request(line) is False  # parse failed → not an init
+
+    def test_non_matching_line_short_circuits_to_false(self):
+        # No substring → cheap regex returns False without a parse.
+        assert _is_initialize_request('{"method":"tools/list","id":1}') is False
 
 
 class TestIterSseEvents:

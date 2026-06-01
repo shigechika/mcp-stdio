@@ -937,6 +937,36 @@ class TestDiscoverMetadata:
         meta = discover_oauth_metadata("https://api.example.com/mcp", client)
         assert meta.authorization_endpoint == "https://auth.example.com/authorize"
 
+    def test_rfc9728_resource_match_ignores_userinfo_in_server_url(
+        self, httpx_mock, capsys
+    ):
+        """#4(round43): the §3.3 resource comparison uses the userinfo-STRIPPED
+        identifier (the form the rest of the flow uses), so an operator server_url
+        carrying user:pass@ does NOT trip a spurious mismatch warning against a
+        compliant PRM resource that (correctly) omits userinfo."""
+        # The PRM well-known URL is itself built from the userinfo-stripped host.
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource/mcp",
+            json={
+                "resource": "https://api.example.com/mcp",  # stripped form — matches
+                "authorization_servers": ["https://auth.example.com"],
+            },
+        )
+        httpx_mock.add_response(
+            url="https://auth.example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://auth.example.com/authorize",
+                "token_endpoint": "https://auth.example.com/token",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata(
+            "https://user:pass@api.example.com/mcp", client
+        )
+        assert meta.authorization_endpoint == "https://auth.example.com/authorize"
+        # No spurious §3.3 mismatch warning despite the userinfo in server_url.
+        assert "resource mismatch" not in capsys.readouterr().err
+
     @pytest.mark.parametrize("body", [[], ["https://evil"], 42, "a string"])
     def test_non_object_prm_body_skipped(self, httpx_mock, body):
         """#L2(round38): a PRM document whose body is not an OBJECT (a bare array
