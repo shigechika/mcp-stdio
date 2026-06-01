@@ -729,6 +729,31 @@ class TestExtractProtocolVersion:
     def test_non_string_protocol_version_returns_none(self):
         assert _extract_protocol_version('{"result":{"protocolVersion":123}}') is None
 
+    @pytest.mark.parametrize(
+        "pv",
+        [
+            "2025-06-18\r\nEvil: 1",  # CRLF header injection
+            "2025-06-18\nEvil: 1",  # bare LF
+            "2025-06-18\rEvil",  # bare CR
+            "2025-06-18\x00",  # NUL
+            "2025 06 18",  # space (not a visible-ASCII token)
+            "ver\x7fsion",  # DEL control char
+            "",  # empty
+        ],
+    )
+    def test_malformed_protocol_version_rejected(self, pv):
+        """#M1(round37): protocolVersion comes from the JSON body and is injected
+        as the MCP-Protocol-Version request header, so a value carrying CR/LF/NUL
+        (or any non-visible-ASCII) must be rejected to None — otherwise it poisons
+        the header and httpx's send-time LocalProtocolError bricks the session."""
+        payload = json.dumps({"result": {"protocolVersion": pv}})
+        assert _extract_protocol_version(payload) is None
+
+    def test_valid_date_form_protocol_version_accepted(self):
+        # The canonical date-form version is visible ASCII → accepted.
+        payload = '{"result":{"protocolVersion":"2024-11-05"}}'
+        assert _extract_protocol_version(payload) == "2024-11-05"
+
 
 class TestIterSseEvents:
     """WHATWG Server-Sent Events line decoder shared by all SSE-decode sites."""
@@ -4962,6 +4987,24 @@ class TestRunSse:
             RuntimeError("boom"),
         )
         assert out.strip() == ""
+
+    def test_recovery_write_brokenpipe_does_not_crash(self, httpx_mock):
+        """#L4(round37): when the client closed stdout, the recovery write in
+        run_sse's outer handler raises BrokenPipeError too. It must be swallowed
+        (mirroring run()'s guard) so the SSE loop exits cleanly instead of
+        crashing the gateway — the SSE analogue of the run() BrokenPipe test."""
+        with patch(
+            "mcp_stdio.relay._write_line",
+            side_effect=BrokenPipeError(32, "Broken pipe"),
+        ):
+            # The POST raises a non-httpx exception → the outer handler's recovery
+            # write also raises BrokenPipeError → must be swallowed, not propagate.
+            self._sse_post_raises(
+                httpx_mock,
+                '{"jsonrpc":"2.0","method":"tools/call","id":99}',
+                RuntimeError("boom"),
+            )
+        # Reaching here = run_sse returned without propagating the BrokenPipeError.
 
     def test_cross_origin_endpoint_refused_end_to_end(self, httpx_mock):
         """#7(round21): an SSE endpoint event pointing cross-origin while an

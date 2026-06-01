@@ -277,7 +277,19 @@ def _extract_protocol_version(payload: str) -> str | None:
     if not isinstance(result, dict):
         return None
     pv = result.get("protocolVersion")
-    return pv if isinstance(pv, str) else None
+    # Validate before this value can be injected as the MCP-Protocol-Version
+    # request header on every subsequent request (#M1 round37). Unlike
+    # Mcp-Session-Id (an HTTP RESPONSE header h11 already vets for CR/LF), this
+    # comes from the JSON BODY and bypasses all header validation — a malicious /
+    # buggy server returning "2025-06-18\r\nEvil: 1" (or a NUL) would otherwise
+    # poison the header, and httpx's send-time LocalProtocolError would brick the
+    # session permanently, breaking the #11 never-crash invariant. Restrict to a
+    # non-empty visible-ASCII token (0x21-0x7E: no control / CR / LF / NUL /
+    # space), which every real date-form protocolVersion satisfies; anything else
+    # degrades to None so the header is simply omitted (server assumes default).
+    if isinstance(pv, str) and pv and all(0x21 <= ord(c) <= 0x7E for c in pv):
+        return pv
+    return None
 
 
 # Cancel-aware response filter (MCP cancellation spec SHOULDs).
@@ -1200,6 +1212,11 @@ def _paginate_and_stream(
             f"truncating results"
         )
 
+    # Defensive only / unreachable in practice (#N6 round37): the loop always
+    # runs page 1, and every path that reaches here either early-returned or
+    # merged page 1's dict into merged_result first, so it is never None. Kept as
+    # a belt-and-suspenders guard; intentionally not covered by a test (the state
+    # cannot be constructed).
     if merged_result is None:
         merged_result = {result_key: []}
 
