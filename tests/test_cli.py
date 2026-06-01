@@ -295,6 +295,31 @@ class TestMain:
             assert exc_info.value.code == 2
         assert "must be >= 0" in capsys.readouterr().err
 
+    @pytest.mark.parametrize(
+        "flag",
+        [
+            "--timeout-connect",
+            "--timeout-read",
+            "--sse-read-timeout",
+            "--oauth-refresh-leeway",
+            "--oauth-timeout",
+        ],
+    )
+    @pytest.mark.parametrize("value", ["nan", "inf", "Infinity"])
+    def test_non_finite_floats_rejected(self, flag, value, capsys):
+        """#4(round27): float() parses nan/inf, which slip past the < 0 / == 0
+        comparisons and defeat the validators (a nan/inf timeout never fires →
+        silent hang). Every float flag must reject non-finite values at parse
+        time. (-inf is omitted: argparse intercepts a leading '-' as an option
+        before the validator runs; it is already caught by the < 0 guard.)"""
+        with patch(
+            "sys.argv", ["mcp-stdio", flag, value, "https://example.com/mcp"]
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 2
+        assert "must be finite" in capsys.readouterr().err
+
     @pytest.mark.parametrize("flag", ["--timeout-connect", "--timeout-read"])
     def test_zero_connect_read_timeout_rejected(self, flag, capsys):
         """#9: --timeout-connect 0 / --timeout-read 0 are rejected at parse time

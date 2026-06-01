@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import re
 import sys
@@ -19,6 +20,15 @@ def _non_negative_float(value: str) -> float:
         f = float(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid float value: {value!r}") from exc
+    # #4 (round27): float() parses "nan" / "inf" / "-inf", which silently slip
+    # past the `f < 0` / `f == 0` comparisons (every comparison with nan is
+    # False) and defeat the very failure mode these validators guard against — a
+    # nan/inf timeout makes httpx's elapsed-vs-deadline check always False, so a
+    # connect/read never times out (a silent hang); a nan refresh-leeway forces
+    # a refresh every call. Reject non-finite values up front. This also covers
+    # _positive_float and every flag that reuses these (one fix, five flags).
+    if not math.isfinite(f):
+        raise argparse.ArgumentTypeError(f"value must be finite (got {value!r})")
     if f < 0:
         raise argparse.ArgumentTypeError(f"value must be >= 0 (got {f})")
     return f
