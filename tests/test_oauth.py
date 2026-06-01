@@ -2766,6 +2766,60 @@ class TestStepUpAuthorize:
         # The grant is authorization_code (full flow), not refresh_token
         assert b"grant_type=authorization_code" in token_calls[0].content
 
+    def test_rediscovery_probes_www_authenticate_for_prm_hint(
+        self, tmp_path, monkeypatch
+    ):
+        """#6(round16): when the cached token lacks endpoints, step_up's
+        re-discovery probes WWW-Authenticate for an RFC 9728 PRM hint FIRST and
+        threads it into discovery — mirroring ensure_token — so a server
+        publishing PRM at a non-standard URL is discoverable on this path too,
+        not only on initial auth."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+        from mcp_stdio.token_store import save_token
+
+        # Cached token has NO token/authorization endpoints → forces re-discovery.
+        save_token(
+            self.SERVER_URL,
+            TokenData(access_token="old_at", scope="mcp:connect"),
+        )
+
+        hint = 'Bearer resource_metadata="https://as.example/.well-known/custom"'
+        probe_calls: list[str] = []
+
+        def fake_probe(server_url, client):
+            probe_calls.append(server_url)
+            return hint
+
+        discover_hints: list[str | None] = []
+        sentinel_md = OAuthMetadata(
+            authorization_endpoint="https://as.example/authorize",
+            token_endpoint="https://as.example/token",
+        )
+
+        def fake_discover(server_url, client, www_authenticate=None):
+            discover_hints.append(www_authenticate)
+            return sentinel_md
+
+        flow_md: list[object] = []
+
+        def fake_flow(server_url, client, *, metadata, **kwargs):
+            flow_md.append(metadata)
+            return TokenData(access_token="upgraded_at")
+
+        monkeypatch.setattr("mcp_stdio.oauth._probe_www_authenticate", fake_probe)
+        monkeypatch.setattr("mcp_stdio.oauth.discover_oauth_metadata", fake_discover)
+        monkeypatch.setattr("mcp_stdio.oauth._run_authorization_flow", fake_flow)
+
+        client = httpx.Client()
+        data = step_up_authorize(self.SERVER_URL, client, "hr:read", timeout=5)
+
+        assert data.access_token == "upgraded_at"
+        assert probe_calls == [self.SERVER_URL]  # PRM probe ran
+        assert discover_hints == [hint]  # hint threaded into discovery
+        assert flow_md == [sentinel_md]  # discovered metadata used by the flow
+
     def test_respects_cached_no_resource_indicator(
         self, tmp_path, monkeypatch, httpx_mock
     ):

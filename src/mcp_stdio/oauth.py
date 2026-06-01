@@ -1581,7 +1581,17 @@ def step_up_authorize(
             issuer=cached.issuer,
         )
     else:
-        metadata = discover_oauth_metadata(server_url, client)
+        # Mirror ensure_token's discovery (the _probe_www_authenticate call
+        # above): probe the server's WWW-Authenticate for an RFC 9728
+        # resource_metadata hint FIRST, so a server publishing its PRM at a
+        # non-standard URL is discoverable on this step-up re-discovery path too,
+        # not only on initial auth. Every endpoint is still re-validated by the
+        # discovery validators, so no credential can be routed to an unsafe host.
+        # See #6 (round16).
+        www_authenticate = _probe_www_authenticate(server_url, client)
+        metadata = discover_oauth_metadata(
+            server_url, client, www_authenticate=www_authenticate
+        )
 
     resource_indicator = not (cached.no_resource_indicator if cached else False)
     return _run_authorization_flow(
