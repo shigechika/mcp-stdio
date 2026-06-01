@@ -1255,7 +1255,16 @@ def _paginate_and_stream(
         "id": req_id,
         "result": merged_result,
     }
-    _emit(json.dumps(merged_response), tracker)
+    # Gate the synthesized response on has_id (#1 round44): a JSON-RPC notification
+    # (no id key) MUST never receive a response. _detect_paginated_list keys only
+    # off method + cursor-absence, so a `tools/list` sent as a notification reaches
+    # here with has_id=False; emitting the merged response would deliver a spurious
+    # `{"id":null,...}` frame to a strict client — the exact violation every other
+    # synthesized-write path (_post_and_stream's empty-200 / interrupted / retry-
+    # exhausted writes) already guards. The _StreamResult return stays unconditional
+    # so session-id adoption still works for a notification.
+    if has_id:
+        _emit(json.dumps(merged_response), tracker)
     return _StreamResult(last_session, 200)
 
 

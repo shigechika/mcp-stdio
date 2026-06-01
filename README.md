@@ -36,7 +36,7 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
   - [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) Resource Indicators
     - §2 `resource` parameter in authorization, token exchange, **and refresh** requests
   - [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) PKCE
-    - §4.1–4.2 S256 `code_challenge_method` with a ~86-char `code_verifier`
+    - §4.1–4.2 S256 `code_challenge_method` with an 86-char `code_verifier`
   - [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628) Device Authorization Grant
     - §3.1 device authorization request with `resource` indicator (RFC 8707)
     - §3.4–3.5 token polling with `authorization_pending` / `slow_down` (interval +=5 s) / `expired_token` / `access_denied` handling

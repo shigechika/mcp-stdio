@@ -16,6 +16,7 @@ from mcp_stdio.oauth import (
     _build_well_known_url,
     _is_client_secret_expired,
     _is_loopback,
+    _origin,
     _make_callback_handler,
     _parse_resource_metadata_hint,
     _parse_token_response,
@@ -3873,6 +3874,32 @@ class TestStepUpAuthorize:
 
 
 # --- RFC 9728 authorization_server validation (SSRF hardening, #13) ---
+
+
+class TestOrigin:
+    """_origin folds case / default ports / userinfo to one comparable tuple and
+    returns a string sentinel for a malformed port so it never spuriously matches
+    a valid origin (#8 round44 pins the otherwise-uncovered sentinel branch)."""
+
+    def test_malformed_port_returns_string_sentinel(self):
+        from urllib.parse import urlparse
+
+        origin = _origin(urlparse("https://h:999999/"))
+        assert origin == ("https", "h", "invalid-port")
+        # The third element is the string sentinel, never an int or None.
+        assert isinstance(origin[2], str)
+
+    def test_malformed_port_never_equals_a_valid_origin(self):
+        from urllib.parse import urlparse
+
+        bad = _origin(urlparse("https://h:999999/"))
+        good = _origin(urlparse("https://h/"))  # same host, valid (default) port
+        assert bad != good
+
+    def test_default_port_folds_to_implicit(self):
+        from urllib.parse import urlparse
+
+        assert _origin(urlparse("https://h:443/")) == _origin(urlparse("https://h/"))
 
 
 class TestIsLoopback:

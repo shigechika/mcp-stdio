@@ -34,7 +34,7 @@ Bearer token、カスタムヘッダー、OAuth 2.1 認証情報をリモート�
   - [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) Resource Indicators
     - §2 `resource` パラメータを認可リクエスト・トークン交換・**リフレッシュ**に送信
   - [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) PKCE
-    - §4.1–4.2 S256 `code_challenge_method`、約 86 文字の `code_verifier`
+    - §4.1–4.2 S256 `code_challenge_method`、86 文字の `code_verifier`
   - [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628) Device Authorization Grant
     - §3.1 `resource` インジケータ付きデバイス認可リクエスト（RFC 8707）
     - §3.4–3.5 `authorization_pending` / `slow_down`（interval +=5 s）/ `expired_token` / `access_denied` ハンドリング

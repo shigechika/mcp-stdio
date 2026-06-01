@@ -242,8 +242,19 @@ def _read_json_object_file(path: Path) -> dict[str, Any] | None:
     except OSError:
         os.close(fd)
         return None
+    # Close the bare fd if os.fdopen itself raises (#5 round44): under resource
+    # pressure fdopen can raise OSError, and since the `with` never engages the
+    # file object that would close `fd` is never created — the broad except below
+    # would then swallow the error and leak the raw fd. Wrap fdopen separately so
+    # the descriptor is always released, matching the explicit os.close on the
+    # fstat-guard error paths above.
     try:
-        with os.fdopen(fd, "r", encoding="utf-8") as f:
+        f = os.fdopen(fd, "r", encoding="utf-8")
+    except OSError:
+        os.close(fd)
+        return None
+    try:
+        with f:
             data = json.loads(f.read())
     except (json.JSONDecodeError, OSError):
         return None
@@ -613,13 +624,42 @@ def _write_store(data: dict[str, Any]) -> None:
     # allow_nan=False (#7 round31): Python's default would serialise a non-finite
     # expires_at (inf/nan) as the non-standard literal `Infinity`/`NaN`, which a
     # strict JSON parser rejects and which only the load-side math.isfinite guard
-    # catches. Raise ValueError instead so the bad value never reaches disk — the
-    # save_token / delete_token / migration callers already catch Exception and
-    # degrade to a soft-fail warning (token simply not cached), keeping the store
-    # standards-compliant rather than relying on the read-side backstop.
-    payload = json.dumps(data, indent=2, sort_keys=True, allow_nan=False).encode(
-        "utf-8"
-    )
+    # catches. Raise ValueError instead so the bad value never reaches disk —
+    # keeping the store standards-compliant rather than relying on the read-side
+    # backstop.
+    try:
+        payload = json.dumps(data, indent=2, sort_keys=True, allow_nan=False).encode(
+            "utf-8"
+        )
+    except ValueError:
+        # One PRE-EXISTING entry from a foreign writer (a hand-edited / 3rd-party
+        # tokens.json carrying a non-finite Infinity/NaN — which load_token
+        # rejects on read but _read_store returns unfiltered) would otherwise make
+        # allow_nan=False reject the ENTIRE dict, wedging EVERY server's save, not
+        # just the bad entry's. Drop only the entries that individually fail to
+        # serialise (they are already unusable on the read side) and retry, so one
+        # foreign bad entry cannot block all future writes. The entry being saved
+        # is always finite (_token_response_to_data's isfinite guard), so it
+        # survives. (#6 round44)
+        clean = {}
+        dropped = 0
+        for key, value in data.items():
+            try:
+                json.dumps(value, allow_nan=False)
+            except ValueError:
+                dropped += 1
+                continue
+            clean[key] = value
+        if dropped:
+            print(
+                f"mcp-stdio: warning: dropped {dropped} unserialisable token-store "
+                f"entr{'y' if dropped == 1 else 'ies'} (non-finite numbers from a "
+                f"foreign writer); affected servers need re-auth.",
+                file=sys.stderr,
+            )
+        payload = json.dumps(
+            clean, indent=2, sort_keys=True, allow_nan=False
+        ).encode("utf-8")
     # Per-write unique temp name. PID alone is not enough: when the advisory
     # lock degrades to a no-op (lock fs unavailable), two THREADS in one process
     # share the PID and would otherwise pick the same temp path and clobber each
@@ -866,6 +906,13 @@ def save_token(server_url: str, data: TokenData) -> None:
             store.pop(server_url, None)
         store[key] = asdict(data)
         try:
+            # Round-31 contract: reject the caller's OWN non-finite value before
+            # any write, so it never reaches disk as non-standard JSON and soft-
+            # fails loudly. This is deliberately separate from _write_store's
+            # drop-and-retry, which only sanitises FOREIGN pre-existing entries so
+            # one of them cannot wedge this save — our own bad input is a caller
+            # error and must not be silently dropped to {} on disk. (#6 round44)
+            json.dumps(store[key], allow_nan=False)
             _write_store(store)
         except Exception as e:
             # #4 (round21): a write failure (full / read-only FS, permission)
