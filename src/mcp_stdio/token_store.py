@@ -202,8 +202,27 @@ def _migrate_legacy_store() -> None:
         pass  # Not empty or already gone
 
 
-def _read_store() -> dict[str, Any]:
-    """Read the token store file."""
+class _StoreUnreadable(Exception):
+    """The store file exists but could not be READ (permission / symlink /
+    I/O error) — distinct from 'absent' (→ {}) and 'corrupt JSON' (which is
+    overwrite-safe). A writer must ABORT on this rather than clobber a store
+    whose real contents it never saw, which would destroy every other
+    server's tokens.
+    """
+
+
+def _read_store(*, for_write: bool = False) -> dict[str, Any]:
+    """Read the token store file.
+
+    Returns ``{}`` when the store is absent / genuinely empty. On the READ
+    path any failure also degrades to ``{}`` (load_token tolerates that). On the
+    WRITE path (``for_write=True``) a read failure raises ``_StoreUnreadable``
+    so the caller aborts instead of overwriting a store it could not read — a
+    transient EACCES, an ELOOP from a swapped-in symlink, or a backup-restore
+    race would otherwise let the next save persist ONLY its one key and wipe
+    every other server's cached token. A corrupt-JSON store stays overwrite-safe
+    (``{}``), preserving the intentional corrupt-store-replacement behaviour.
+    """
     _migrate_legacy_store()
     if not _STORE_FILE.exists():
         return {}
@@ -221,9 +240,13 @@ def _read_store() -> dict[str, Any]:
     # NTFS ACLs govern access anyway.
     try:
         fd = os.open(_STORE_FILE, os.O_RDONLY | _O_NOFOLLOW)
-    except OSError:
-        # ELOOP (a symlink was swapped in — refused), ENOENT (race), or a
-        # permission error: treat as no readable store.
+    except OSError as e:
+        # The file EXISTS but we could not open it: ELOOP (a symlink swapped
+        # in — refused), EACCES, or a transient I/O error. On the write path
+        # this must NOT degrade to {} (which a save would then clobber over the
+        # unread store); raise so the caller aborts.
+        if for_write:
+            raise _StoreUnreadable(str(e)) from e
         return {}
     try:
         _fchmod = getattr(os, "fchmod", None)
@@ -233,9 +256,19 @@ def _read_store() -> dict[str, Any]:
             except OSError:
                 pass  # best-effort tighten
         with os.fdopen(fd, "r", encoding="utf-8") as f:
-            return json.loads(f.read())
-    except (json.JSONDecodeError, OSError):
+            text = f.read()
+    except OSError as e:
+        # Opened but the read itself failed — same trust problem as open failure.
+        if for_write:
+            raise _StoreUnreadable(str(e)) from e
         return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        # Genuinely corrupt JSON is overwrite-safe (the contents are unusable);
+        # both read and write paths treat it as an empty store.
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _write_store(data: dict[str, Any]) -> None:
@@ -366,7 +399,19 @@ def load_token(server_url: str) -> TokenData | None:
 def save_token(server_url: str, data: TokenData) -> None:
     """Save token data for a server URL."""
     with _store_lock():
-        store = _read_store()
+        try:
+            store = _read_store(for_write=True)
+        except _StoreUnreadable as e:
+            # The store exists but we could not read it — writing now would
+            # persist only this one key and destroy every other server's token.
+            # Skip the save (the token is simply not cached; the caller re-auths
+            # next time) rather than corrupt the store.
+            print(
+                f"warning: token store exists but could not be read ({e}); "
+                f"not saving to avoid overwriting other servers' tokens",
+                file=sys.stderr,
+            )
+            return
         key = _normalize_key(server_url)
         # Drop any stale entry stored under the un-normalised key by an older
         # version so the two spellings don't both linger.
@@ -379,7 +424,18 @@ def save_token(server_url: str, data: TokenData) -> None:
 def delete_token(server_url: str) -> None:
     """Delete token data for a server URL."""
     with _store_lock():
-        store = _read_store()
+        try:
+            store = _read_store(for_write=True)
+        except _StoreUnreadable as e:
+            # Same reasoning as save_token: never write over a store we could
+            # not read. The targeted entry stays (a stale token at worst), the
+            # other servers' tokens are preserved.
+            print(
+                f"warning: token store exists but could not be read ({e}); "
+                f"not deleting to avoid overwriting other servers' tokens",
+                file=sys.stderr,
+            )
+            return
         removed = False
         for key in {_normalize_key(server_url), server_url}:
             if key in store:
