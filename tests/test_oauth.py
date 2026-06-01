@@ -5225,7 +5225,9 @@ class TestDeviceAuthorizationFlow:
             MCP_URL, client, metadata=_device_meta(), cached=None
         )
         err = capsys.readouterr().err
-        assert f"expires in {_DEVICE_FLOW_MAX_LIFETIME_SECS}s" in err
+        # No --oauth-timeout here, so the effective wait equals the clamped
+        # server lifetime (#L9 round39 reworded the message to "giving up in").
+        assert f"giving up in {_DEVICE_FLOW_MAX_LIFETIME_SECS}s" in err
         assert "999999999" not in err
 
     def test_verification_uri_complete_printed(self, httpx_mock, tmp_path, monkeypatch, capsys):
@@ -5637,6 +5639,69 @@ class TestDeviceAuthorizationFlow:
         with pytest.raises(TimeoutError, match="timed out"):
             _run_device_authorization_flow(
                 MCP_URL, client, metadata=_device_meta(), cached=None
+            )
+
+    def test_oauth_timeout_clamps_device_poll_lifetime(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """#L9(round39): --oauth-timeout bounds the device-code wait. With a
+        timeout (5s) far below the server-advertised expires_in (1800s), the poll
+        deadline is clamped to the timeout: a clock jump of 6s — past the 5s
+        timeout but nowhere near the 1800s server lifetime — ends the flow with
+        TimeoutError, proving the deadline was the clamped value, not 1800."""
+        self._patch_store(tmp_path, monkeypatch)
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response(expires_in=1800))
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={"error": "authorization_pending"},
+            status_code=400,
+            is_reusable=True,
+        )
+        clock = {"t": 0.0}
+        monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+
+        def jump_sleep(_secs: float) -> None:
+            clock["t"] += 6  # past the 5s timeout, far below the 1800s expires_in
+
+        monkeypatch.setattr(time, "sleep", jump_sleep)
+        client = httpx.Client()
+        with pytest.raises(TimeoutError, match="timed out"):
+            _run_device_authorization_flow(
+                MCP_URL, client, metadata=_device_meta(), cached=None, timeout=5
+            )
+        # Exactly one token poll fired before the clamped 5s deadline was crossed;
+        # without the clamp the 1800s deadline would have driven ~300 polls.
+        polls = [r for r in httpx_mock.get_requests() if str(r.url) == TOKEN_URL]
+        assert len(polls) == 1
+
+    def test_oauth_timeout_does_not_extend_beyond_server_lifetime(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """#L9(round39): the clamp is min(timeout, expires_in) — a timeout LARGER
+        than the server lifetime must not extend the wait. expires_in=10, a huge
+        timeout, and a 11s clock jump (past expires_in, below timeout) still ends
+        with TimeoutError: the deadline stayed at the 10s server lifetime."""
+        self._patch_store(tmp_path, monkeypatch)
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response(expires_in=10))
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={"error": "authorization_pending"},
+            status_code=400,
+            is_reusable=True,
+        )
+        clock = {"t": 0.0}
+        monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+
+        def jump_sleep(_secs: float) -> None:
+            clock["t"] += 11  # past the 10s server lifetime, below the huge timeout
+
+        monkeypatch.setattr(time, "sleep", jump_sleep)
+        client = httpx.Client()
+        with pytest.raises(TimeoutError, match="timed out"):
+            _run_device_authorization_flow(
+                MCP_URL, client, metadata=_device_meta(), cached=None, timeout=99999
             )
 
     def test_poll_network_error_is_retried(
