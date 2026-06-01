@@ -26,6 +26,7 @@ from mcp_stdio.relay import (
     _escape_js_line_separators,
     _extract_cancel_id,
     _extract_id,
+    _extract_protocol_version,
     _handle_rate_limit,
     _iter_sse_events,
     _iter_sse_lines,
@@ -34,6 +35,7 @@ from mcp_stdio.relay import (
     _parse_retry_after,
     _parse_www_authenticate_scope,
     _post_and_stream,
+    _same_origin,
     _split_sse_text,
     _sse_reader_loop,
     _tcp_keepalive_socket_options,
@@ -463,6 +465,90 @@ class TestPostAndStream:
         # The server payload is passed through; no synthesized id:null error.
         assert lines == [delivered]
 
+    def test_empty_200_body_to_request_synthesizes_error(self, httpx_mock):
+        """#4(round11): a 200 with NO JSON-RPC payload would leave a
+        request-with-id hanging; synthesize an error so the client recovers."""
+        httpx_mock.add_response(
+            status_code=200, text="", headers={"content-type": "application/json"}
+        )
+        client = httpx.Client()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            result = _post_and_stream(
+                client, "https://example.com/mcp", '{"id":3}', {}, 3, has_id=True
+            )
+        assert result is not None and result.status_code == 200
+        err = json.loads(stdout.getvalue().strip())
+        assert err["id"] == 3 and "error" in err
+
+    def test_empty_200_body_to_notification_is_silent(self, httpx_mock):
+        """A notification (has_id False) getting an empty 200 stays silent."""
+        httpx_mock.add_response(
+            status_code=200, text="", headers={"content-type": "application/json"}
+        )
+        client = httpx.Client()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            _post_and_stream(
+                client,
+                "https://example.com/mcp",
+                '{"jsonrpc":"2.0","method":"x"}',
+                {},
+                None,
+                has_id=False,
+            )
+        assert stdout.getvalue() == ""
+
+
+class TestSameOrigin:
+    """RFC 6454 origin comparison used by the SSE cross-origin endpoint guard."""
+
+    def test_identical_urls_same_origin(self):
+        assert _same_origin("https://h.example/sse", "https://h.example/post")
+
+    def test_explicit_default_port_folds(self):
+        assert _same_origin("https://h.example:443/a", "https://h.example/b")
+        assert _same_origin("http://h.example:80/a", "http://h.example/b")
+
+    def test_host_case_insensitive(self):
+        assert _same_origin("https://H.Example/a", "https://h.example/b")
+
+    def test_different_host_is_cross_origin(self):
+        assert not _same_origin("https://a.example/x", "https://b.example/x")
+
+    def test_different_scheme_is_cross_origin(self):
+        assert not _same_origin("http://h.example/x", "https://h.example/x")
+
+    def test_different_explicit_port_is_cross_origin(self):
+        assert not _same_origin("https://h.example:8443/x", "https://h.example/x")
+
+
+class TestExtractProtocolVersion:
+    """_extract_protocol_version reads result.protocolVersion from an
+    InitializeResult, tolerating malformed / non-object inputs."""
+
+    def test_extracts_from_initialize_result(self):
+        payload = '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}'
+        assert _extract_protocol_version(payload) == "2025-06-18"
+
+    def test_missing_result_returns_none(self):
+        assert _extract_protocol_version('{"jsonrpc":"2.0","id":1}') is None
+
+    def test_result_without_protocol_version_returns_none(self):
+        assert _extract_protocol_version('{"result":{"capabilities":{}}}') is None
+
+    def test_non_object_result_returns_none(self):
+        assert _extract_protocol_version('{"result":"oops"}') is None
+
+    def test_batch_array_returns_none(self):
+        assert _extract_protocol_version('[{"result":{"protocolVersion":"x"}}]') is None
+
+    def test_malformed_json_returns_none(self):
+        assert _extract_protocol_version("{not json") is None
+
+    def test_non_string_protocol_version_returns_none(self):
+        assert _extract_protocol_version('{"result":{"protocolVersion":123}}') is None
+
 
 class TestIterSseEvents:
     """WHATWG Server-Sent Events line decoder shared by all SSE-decode sites."""
@@ -684,10 +770,11 @@ class TestRun:
         assert replay_body["method"] == "call"
         assert replay_body["id"] == 2
 
-    def test_401_retry_exhaustion_resets_session_id(self, httpx_mock):
-        """When a 401-refresh retry exhausts all retries (connection dead), the
-        session id is reset — the next request must not re-send a maybe-stale
-        Mcp-Session-Id, matching the top-level retries-exhausted policy."""
+    def test_401_retry_exhaustion_preserves_session_id(self, httpx_mock):
+        """#1(round11): a 401-refresh retry exhausted by a TRANSPORT error must
+        PRESERVE the session id — the blip did not invalidate the session, so the
+        next request still carries it (and could trigger 404 self-heal). Clearing
+        it would defeat that recovery."""
         # 1: init -> establishes sess-1
         httpx_mock.add_response(
             text='{"jsonrpc":"2.0","result":{},"id":1}',
@@ -700,7 +787,7 @@ class TestRun:
         # 3-5: refreshed retry exhausts all retries with connection errors
         for _ in range(MAX_RETRIES):
             httpx_mock.add_exception(httpx.ConnectError("dead"))
-        # 6: a later call -> 200 (must carry NO session header)
+        # 6: a later call -> 200 (must STILL carry the session header)
         httpx_mock.add_response(
             text='{"jsonrpc":"2.0","result":{},"id":3}',
             headers={"content-type": "application/json"},
@@ -721,13 +808,13 @@ class TestRun:
             )
 
         reqs = httpx_mock.get_requests()
-        # The final request must not carry the (possibly stale) session id.
-        assert "mcp-session-id" not in reqs[-1].headers
+        # The session id survives the transient exhaustion, not cleared.
+        assert reqs[-1].headers.get("mcp-session-id") == "sess-1"
 
-    def test_403_stepup_retry_exhaustion_resets_session_id(self, httpx_mock):
-        """#13: when a 403 step-up retry exhausts all retries, session_id is
-        reset (symmetric with the 401 path) so the next request does not
-        re-send a maybe-stale Mcp-Session-Id."""
+    def test_403_stepup_retry_exhaustion_preserves_session_id(self, httpx_mock):
+        """#1(round11): a 403 step-up retry exhausted by a TRANSPORT error
+        PRESERVES the session id (symmetric with the 401 path) so the next
+        request still carries it and 404 self-heal stays possible."""
         # 1: init -> sess-1
         httpx_mock.add_response(
             text='{"jsonrpc":"2.0","result":{},"id":1}',
@@ -745,7 +832,7 @@ class TestRun:
         # 3-5: the upgraded retry exhausts all retries with connection errors
         for _ in range(MAX_RETRIES):
             httpx_mock.add_exception(httpx.ConnectError("dead"))
-        # 6: a later call -> 200 (must carry NO session header)
+        # 6: a later call -> 200 (must STILL carry the session header)
         httpx_mock.add_response(
             text='{"jsonrpc":"2.0","result":{},"id":3}',
             headers={"content-type": "application/json"},
@@ -766,7 +853,7 @@ class TestRun:
             )
 
         reqs = httpx_mock.get_requests()
-        assert "mcp-session-id" not in reqs[-1].headers
+        assert reqs[-1].headers.get("mcp-session-id") == "sess-1"
 
     def test_404_reinit_replay_retry_exhaustion_emits_error(self, httpx_mock):
         """#13: after a successful 404 re-initialize, if the replayed request
@@ -2067,7 +2154,9 @@ class TestPagination:
         )
         merged = json.loads(output.strip())
         assert [t["name"] for t in merged["result"]["tools"]] == ["ok1"]
-        assert "nextCursor" not in merged["result"]
+        # #2(round11): a truncated list keeps the pending cursor so the client
+        # can RESUME, rather than being told the list is complete.
+        assert merged["result"]["nextCursor"] == "p2"
 
     def test_page2_retry_exhaustion_returns_partial_result(self, httpx_mock):
         """#11: page 2 exhausting all retries (repeated transport error) must
@@ -2092,7 +2181,8 @@ class TestPagination:
             )
         merged = json.loads(output.strip())
         assert [t["name"] for t in merged["result"]["tools"]] == ["ok1"]
-        assert "nextCursor" not in merged["result"]
+        # Truncated → pending cursor preserved for resumption (#2 round11).
+        assert merged["result"]["nextCursor"] == "p2"
 
     def test_page2_unparseable_body_returns_partial_result(self, httpx_mock):
         """#11: page 2 returning an unparseable 200 body must flush the page-1
@@ -2120,7 +2210,8 @@ class TestPagination:
         )
         merged = json.loads(output.strip())
         assert [t["name"] for t in merged["result"]["tools"]] == ["ok1"]
-        assert "nextCursor" not in merged["result"]
+        # Truncated → pending cursor preserved for resumption (#2 round11).
+        assert merged["result"]["nextCursor"] == "p2"
 
     def test_first_page_401_triggers_token_refresh(self, httpx_mock):
         """401 on page 1 must go through the normal refresh path."""
@@ -3122,6 +3213,65 @@ class TestSseReaderLoop:
         assert seen_auth[0] == "Bearer old"
         assert seen_auth[1] == "Bearer new"  # reconnect re-snapshotted the update
 
+    def test_non200_reconnect_after_establish_keeps_retrying(self, httpx_mock):
+        """#3(round11): a non-200 on RECONNECT (after an endpoint was once
+        established) must retry, not kill the reader. Before the fix the reader
+        died after the first reconnect 500 (2 GETs); now it keeps reconnecting."""
+        state = _SseState()
+        calls = {"n": 0}
+
+        def first_gen():
+            yield b"event: endpoint\ndata: /messages\n\n"  # establish, then end
+
+        def get_callback(request):
+            calls["n"] += 1
+            n = calls["n"]
+            if n == 1:
+                return httpx.Response(
+                    200,
+                    stream=IteratorStream(first_gen()),
+                    headers={"content-type": "text/event-stream"},
+                )
+            # Reconnect attempts 500; stop after the 2nd so the loop terminates
+            # while still proving it reconnected past the first failure.
+            if n >= 3:
+                state.stop.set()
+            return httpx.Response(500)
+
+        httpx_mock.add_callback(
+            get_callback, url=self.URL, method="GET", is_reusable=True
+        )
+
+        client = httpx.Client()
+        try:
+            with (
+                patch("sys.stdout", StringIO()),
+                patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            ):
+                _sse_reader_loop(client, self.URL, {}, state)
+        finally:
+            client.close()
+
+        assert calls["n"] >= 3  # survived the first reconnect 500 and retried
+
+    def test_non200_first_connect_is_fatal(self, httpx_mock):
+        """A non-200 on the VERY FIRST connect (never established) stays fatal:
+        the reader signals ready (endpoint None) and returns so run_sse exits."""
+        state = _SseState()
+        httpx_mock.add_response(url=self.URL, method="GET", status_code=500)
+        client = httpx.Client()
+        try:
+            with (
+                patch("sys.stdout", StringIO()),
+                patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            ):
+                _sse_reader_loop(client, self.URL, {}, state)
+        finally:
+            client.close()
+        assert state.ready.is_set()
+        assert state.endpoint_url is None
+        assert len(httpx_mock.get_requests()) == 1  # did not retry
+
 
 class _BlockingStdin:
     """Stdin iterator that yields one line then blocks until released.
@@ -4110,6 +4260,21 @@ class TestCancelTracker:
 
     def test_consume_none(self):
         assert _CancelTracker().consume(None) is False
+
+    def test_discard_untracks_so_later_response_is_delivered(self):
+        """#14(round11): discard() removes a tracked id (used when a request
+        REUSES a cancelled id), so the id's response is then delivered, not
+        dropped. discard(None) and discarding an absent id are safe no-ops."""
+        t = _CancelTracker()
+        t.add(9)
+        assert t.contains(9)
+        t.discard(9)
+        assert not t.contains(9)
+        assert t.consume(9) is False  # delivered (no longer tracked)
+        # Safe no-ops:
+        t.discard(9)  # already absent
+        t.discard(None)
+        assert not t.contains(None)
 
     def test_gc_bounds_memory(self):
         clock = _FakeClock()
