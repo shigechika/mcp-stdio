@@ -1007,6 +1007,56 @@ class TestRun:
         # Line 3's request (index 3) still carries "s1", not the 500's "bad-rotated".
         assert reqs[3].headers.get("mcp-session-id") == "s1"
 
+    def test_inline_401_retry_unparseable_403_session_id_not_adopted(
+        self, httpx_mock
+    ):
+        """#1(round28): the INLINE 401-retry re-adoption must require a PARSEABLE
+        insufficient_scope challenge on a 403, mirroring the top-level
+        feeds_recovery gate. A 401 retry that returns a 403 with a generic
+        (unparseable) WWW-Authenticate AND a rotated session id, while a
+        scope_upgrader is configured, must NOT adopt the rotated id — the step-up
+        branch declines to fire (no parseable scope), so the id is never consumed
+        and would poison the next stdin line."""
+        # Line 1: init -> 200, session "s1".
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json", "mcp-session-id": "s1"},
+        )
+        # Line 2: call -> 401 (triggers refresh).
+        httpx_mock.add_response(
+            status_code=401, text="", headers={"content-type": "application/json"}
+        )
+        # 401 refresh retry -> 403 with a NON-insufficient_scope challenge
+        # (unparseable) AND a rotated id. Step-up will NOT fire; the id must not
+        # be adopted.
+        httpx_mock.add_response(
+            status_code=403,
+            text="",
+            headers={
+                "content-type": "application/json",
+                "www-authenticate": 'Bearer realm="x"',
+                "mcp-session-id": "bad-rotated",
+            },
+        )
+        # Line 3: call -> 200.
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":3}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","method":"init","id":1}',
+                '{"jsonrpc":"2.0","method":"call","id":2}',
+                '{"jsonrpc":"2.0","method":"call","id":3}',
+            ],
+            token_refresher=lambda: {"Authorization": "Bearer new"},
+            scope_upgrader=lambda _s: {"Authorization": "Bearer broader"},
+        )
+        reqs = httpx_mock.get_requests()
+        # Line 3's request still carries "s1", not the 403's "bad-rotated".
+        assert reqs[3].headers.get("mcp-session-id") == "s1"
+
     def test_session_expired_triggers_reinitialize_then_retry(self, httpx_mock):
         """Reproduces the 404 -> 400 hang from FastMCP StreamableHTTP.
 
@@ -3226,6 +3276,40 @@ class TestPagination:
         )
         merged = json.loads(output.strip())
         assert [t["name"] for t in merged["result"]["tools"]] == ["a"]
+
+    def test_page2_nonlist_result_key_keeps_page1_and_merges_late_field(
+        self, httpx_mock
+    ):
+        """#F-2(round28): a page-2 dict whose result_key is present but NOT a list
+        (e.g. tools:"oops") must not crash or discard page-1 items — the
+        non-list value is skipped (isinstance(items, list) is False) while the
+        late top-level field still merges. Complements the page-1 non-list and
+        page-2 non-dict cases."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "a"}], "nextCursor": "p2"},
+        }
+        page2 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": "not-a-list", "_meta": {"x": 1}},
+        }
+        for page in (page1, page2):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=json.dumps(page),
+                headers={"content-type": "application/json"},
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())
+        # Page-1 items survive; page-2's non-list value is ignored, late merges.
+        assert [t["name"] for t in merged["result"]["tools"]] == ["a"]
+        assert merged["result"]["_meta"] == {"x": 1}
+        assert "nextCursor" not in merged["result"]
 
     def test_late_top_level_result_field_preserved(self, httpx_mock):
         """#14: a top-level result field (e.g. _meta) that appears only on a
@@ -5966,6 +6050,54 @@ class TestRunSseCancelFilter:
             run_sse(self.URL, {"Content-Type": "application/json"})
 
         # TTL elapsed → the late response is NOT dropped.
+        assert "late" in stdout.getvalue()
+
+    def test_no_cancel_filter_lets_sse_response_through(self, httpx_mock):
+        """#F-1(round28): run_sse(..., cancel_filter=False) builds no tracker, so
+        the SSE reader's None-tracker branch is taken and a late response for a
+        cancelled id is DELIVERED, not dropped. The opt-out is the cancel
+        filter's reason to exist, and the late-drop only reproduces on the SSE
+        path, so its runtime behaviour must be pinned here (the run() side is
+        already covered)."""
+        payload = '{"jsonrpc":"2.0","result":{"late":true},"id":11}'
+        post_received = threading.Event()
+        release_stdin = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=abc\n\n"
+            post_received.wait(timeout=3)
+            yield f"event: message\ndata: {payload}\n\n".encode()
+            time.sleep(0.1)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        def on_post(request: httpx.Request) -> httpx.Response:
+            post_received.set()
+            return httpx.Response(status_code=202)
+
+        httpx_mock.add_callback(
+            on_post, url="https://example.com/messages?sessionId=abc"
+        )
+
+        stdin = _BlockingStdin(
+            (
+                '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+                '"params":{"requestId":11}}'
+            ),
+            release_stdin,
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(
+                self.URL, {"Content-Type": "application/json"}, cancel_filter=False
+            )
+
+        # With the filter disabled the cancelled id is not tracked → delivered.
         assert "late" in stdout.getvalue()
 
     def test_sse_message_without_cancel_passes_through(self, httpx_mock):
