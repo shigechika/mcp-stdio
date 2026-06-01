@@ -50,7 +50,7 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
     - §2.1 `Authorization: Bearer <token>` request header
 - **Retry with backoff** — retries up to 3 times on connection errors
 - **HTTP 429 / 503 handling** — honours `Retry-After` (delta-seconds or HTTP-date) up to a 60-second cap on both 429 (Too Many Requests) and 503 (Service Unavailable) — the two spec-sanctioned Retry-After carriers (RFC 9110 §10.2.3) — then surfaces the status so the client can decide (cf. modelcontextprotocol/typescript-sdk#1892)
-- **Auto-pagination** — transparently follows `nextCursor` for `tools/list` / `resources/list` / `resources/templates/list` / `prompts/list` and merges the pages into one response, so clients that drop pages beyond the first still see the full list (cf. anthropics/claude-code#39586)
+- **Auto-pagination** (Streamable HTTP transport) — transparently follows `nextCursor` for `tools/list` / `resources/list` / `resources/templates/list` / `prompts/list` and merges the pages into one response, so clients that drop pages beyond the first still see the full list (cf. anthropics/claude-code#39586)
 - **Streaming resilience** — streams SSE responses in real time; auto-reconnects on mid-stream disconnect
 - **Line-separator safety** — escapes raw `U+2028` / `U+2029` (legal in JSON, but JavaScript line terminators) in upstream responses so clients that treat them as line breaks cannot mis-frame the output; lossless (cf. modelcontextprotocol/typescript-sdk#2155)
 - **Argument normalization** — rewrites a `tools/call` request whose `arguments` is `null` to `{}` so strict servers that reject the null form accept the call; on by default, opt out with `--no-normalize-arguments` (cf. modelcontextprotocol/typescript-sdk#2012)
