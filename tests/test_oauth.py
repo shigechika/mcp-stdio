@@ -1747,6 +1747,39 @@ class TestCallbackServer:
         assert cb_result.auth_code == "test_code_123"
         assert cb_result.state == "test_state"
 
+    def test_bare_callback_hit_does_not_render_success(self):
+        """#2(round21): a /callback hit carrying neither code nor error (a
+        browser prefetch, a manual GET) captured nothing — the page must NOT say
+        'Authorization successful' (which could mislead a phishing victim), and
+        auth_code/error stay None so the main loop keeps waiting."""
+        cb_result = CallbackResult()
+        handler_cls = _make_callback_handler(cb_result)
+
+        from http.server import HTTPServer
+
+        server = HTTPServer(("127.0.0.1", 0), handler_cls)
+        port = server.server_address[1]
+        done = threading.Event()
+
+        def serve():
+            while not done.is_set():
+                server.handle_request()
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        time.sleep(0.3)
+
+        resp = httpx.get(f"http://127.0.0.1:{port}/callback")
+        done.set()
+        server.server_close()
+
+        assert resp.status_code == 200
+        assert "Authorization successful" not in resp.text
+        assert "Waiting for authorization" in resp.text
+        # Nothing captured → the main loop must keep blocking.
+        assert cb_result.auth_code is None
+        assert cb_result.error is None
+
     def test_receives_error(self):
         """Server sends an OAuth error via callback."""
         cb_result = CallbackResult()
