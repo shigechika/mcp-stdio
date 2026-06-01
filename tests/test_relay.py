@@ -1001,6 +1001,41 @@ class TestRun:
         parsed = json.loads(output.strip())
         assert parsed["id"] == 5 and "error" in parsed
 
+    def test_request_with_falsy_id_zero_gets_error(self, httpx_mock):
+        """#6: id 0 is a valid JSON-RPC id (not absent). A 4xx must produce an
+        error carrying id:0 — id=0 must not be mis-treated as a notification by
+        a falsy check."""
+        httpx_mock.add_response(
+            status_code=400, text="", headers={"content-type": "application/json"}
+        )
+        output = self._run_with_stdin(
+            httpx_mock, ['{"jsonrpc":"2.0","method":"tools/call","id":0}']
+        )
+        parsed = json.loads(output.strip())
+        assert parsed["id"] == 0 and "error" in parsed
+
+    def test_batch_request_passes_through(self, httpx_mock):
+        """#11: a JSON-RPC batch array is forwarded verbatim and its batch
+        response relayed end-to-end through run()."""
+        batch_resp = (
+            '[{"jsonrpc":"2.0","result":{},"id":1},'
+            '{"jsonrpc":"2.0","result":{},"id":2}]'
+        )
+        httpx_mock.add_response(
+            text=batch_resp, headers={"content-type": "application/json"}
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                '[{"jsonrpc":"2.0","method":"a","id":1},'
+                '{"jsonrpc":"2.0","method":"b","id":2}]'
+            ],
+        )
+        assert json.loads(output.strip()) == json.loads(batch_resp)
+        # The request reached the wire as a batch array, unchanged.
+        sent = json.loads(httpx_mock.get_requests()[0].read())
+        assert isinstance(sent, list) and len(sent) == 2
+
     def test_notification_transport_failure_gets_no_synthesized_response(
         self, httpx_mock
     ):
@@ -1467,11 +1502,13 @@ class TestProtocolVersionHeader:
             ]
         )
         reqs = httpx_mock.get_requests()
-        # req[0] first initialize: no header yet (it IS the negotiation).
+        # req[0] first initialize: no header (it IS the negotiation).
         assert "mcp-protocol-version" not in reqs[0].headers
-        # req[1] second initialize carries the first-negotiated version.
-        assert reqs[1].headers["mcp-protocol-version"] == "2025-03-26"
-        # req[2] carries the RE-negotiated version — proof of re-capture.
+        # req[1] second initialize ALSO carries no header — an initialize is the
+        # (re)negotiation and must not advertise the prior version (#4).
+        assert "mcp-protocol-version" not in reqs[1].headers
+        # req[2] (a normal request) carries the RE-negotiated version — proof
+        # the second initialize's response was re-captured.
         assert reqs[2].headers["mcp-protocol-version"] == "2025-06-18"
 
     def test_reinitialize_recaptures_version_from_sse_framed_response(self, httpx_mock):
@@ -2289,6 +2326,30 @@ class TestPagination:
         assert [t["name"] for t in merged["result"]["tools"]] == ["a", "b"]
         assert merged["result"]["_meta"] == {"total": 2}  # late field kept
         assert "nextCursor" not in merged["result"]
+
+    def test_page_sse_skips_interleaved_notification(self, httpx_mock):
+        """#1: a server may interleave a notification on the POST's SSE stream
+        BEFORE the list result. _post_parsed must skip it and return the real
+        response, not mistake the notification for the page result."""
+        notif = '{"jsonrpc":"2.0","method":"notifications/message","params":{}}'
+        result = '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}]}}'
+        body = (
+            f"event: message\ndata: {notif}\n\n"
+            f"event: message\ndata: {result}\n\n"
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text=body,
+            headers={"content-type": "text/event-stream"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())
+        assert [t["name"] for t in merged["result"]["tools"]] == ["a"]
+        # The interleaved notification must not have been forwarded as the result.
+        assert "notifications/message" not in output
 
 
 # --- check_connection ---
@@ -3176,6 +3237,25 @@ class TestRunSse:
                 {},
                 sse_read_timeout=300,
             )
+
+    def test_sse_startup_timeout_exits(self, monkeypatch):
+        """#7: if the SSE reader never signals ready within timeout_connect,
+        run_sse must exit(1) rather than block on stdin forever."""
+
+        def blocking_reader(
+            client, url, headers, state, tracker=None, headers_lock=None
+        ):
+            # Never set state.ready; just park until told to stop.
+            state.stop.wait(timeout=2)
+
+        monkeypatch.setattr("mcp_stdio.relay._sse_reader_loop", blocking_reader)
+        with (
+            patch("sys.stdin", StringIO("")),
+            patch("sys.stdout", StringIO()),
+            pytest.raises(SystemExit) as exc,
+        ):
+            run_sse(self.URL, {}, timeout_connect=0.05)
+        assert exc.value.code == 1
 
     def test_post_during_reconnect_window_emits_error(self, monkeypatch):
         """A stdin line arriving while the reader is mid-reconnect (endpoint
