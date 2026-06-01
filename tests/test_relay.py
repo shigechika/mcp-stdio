@@ -586,6 +586,30 @@ class TestIterSseEvents:
     def test_event_without_data_not_dispatched(self):
         assert list(_iter_sse_events(["event:message", ""])) == []
 
+    def test_leading_bom_stripped(self):
+        """#2(round13): WHATWG SSE stream-decode removes ONE leading U+FEFF BOM.
+        A BOM-prefixed first line must still parse as its real field, so the
+        critical first `endpoint` event is recognised, not misclassified.
+        (BOM written as the "\\ufeff" escape — never a raw byte in source.)"""
+        lines = ["\ufeff" + "event: endpoint", "data: /messages", ""]
+        assert list(_iter_sse_events(lines)) == [("endpoint", "/messages")]
+
+    def test_only_first_line_bom_stripped(self):
+        """Only ONE leading BOM at the very start is removed — a stray U+FEFF on
+        a later line is left as part of that field's content."""
+        lines = ["data: a", "\ufeff" + "data: b", ""]
+        # First line clean; the second line's BOM makes its field unrecognised
+        # (not a `data` field), so only "a" is collected.
+        assert list(_iter_sse_events(lines)) == [("message", "a")]
+
+    def test_bom_via_split_sse_text(self):
+        """End-to-end through _split_sse_text: a BOM-prefixed buffered body still
+        yields the endpoint event."""
+        body = "\ufeff" + "event: endpoint\ndata: /m\n\n"
+        assert list(_iter_sse_events(_split_sse_text(body))) == [
+            ("endpoint", "/m")
+        ]
+
 
 class TestSseLineSplitting:
     """SSE lines split on CR/LF/CRLF only — NOT the wider str.splitlines() set

@@ -627,7 +627,19 @@ def _iter_sse_events(lines: Iterable[str]) -> Iterator[tuple[str, str]]:
     """
     event_type = "message"
     data_lines: list[str] = []
+    first = True
     for line in lines:
+        if first:
+            first = False
+            # WHATWG SSE stream-decode mandates removing ONE leading U+FEFF BOM
+            # before line decoding. httpx does not strip it, so a BOM-prefixed
+            # stream would otherwise parse the first field as a BOM-prefixed field
+            # name (e.g. a U+FEFF before ``event``) — an unrecognised field —
+            # silently misclassifying the critical first event (the legacy SSE
+            # ``endpoint`` bootstrap) as a default ``message`` and breaking
+            # startup. (Escape used, not a raw BOM, to keep the source ASCII.)
+            if line[:1] == "\ufeff":
+                line = line[1:]
         if line == "":
             if data_lines:
                 yield event_type, "\n".join(data_lines)
@@ -1244,6 +1256,14 @@ def _check_connection_sse(
     # thread. On a POST failure the helper closes the stream so the probe fails
     # fast instead of hanging until the read timeout for a response that will
     # never arrive.
+    #
+    # ``holder`` is shared between the two threads WITHOUT a lock, relying on
+    # CPython dict item get/set being atomic under the GIL (the same convention
+    # _SseState documents). ``resp`` is published before the POST thread spawns,
+    # so its read is ordered. ``post_error`` is only used to pick which of two
+    # diagnostic strings to log on a probe failure; a benign read-before-write
+    # race there can mis-pick the message but never affects the bool verdict and
+    # never touches stdout — this is the one-shot --check path, not the relay.
     holder: dict[str, Any] = {"resp": None, "post_error": None}
 
     def do_post(endpoint: str) -> None:
