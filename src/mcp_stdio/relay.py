@@ -185,6 +185,23 @@ def _has_id(line: str) -> bool:
     return isinstance(msg, dict) and "id" in msg
 
 
+def _extract_id_and_presence(line: str) -> tuple[Any, bool]:
+    """Return ``(id_value, has_id)`` from a SINGLE JSON parse of a line.
+
+    Equivalent to ``(_extract_id(line), _has_id(line))`` but parses once — the
+    relay's per-stdin-line hot path needs both facts, and re-walking the JSON
+    twice is wasteful under load. A notification (no id) → ``(None, False)``; a
+    request → ``(id, True)``; a non-object / malformed line → ``(None, False)``.
+    """
+    try:
+        msg = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return None, False
+    if not isinstance(msg, dict):
+        return None, False
+    return msg.get("id"), "id" in msg
+
+
 _DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
 
 
@@ -369,12 +386,20 @@ def _extract_cancel_id(line: str) -> Any:
     return params.get("requestId")
 
 
-def _error_response(message: str, req_id: Any = None) -> str:
-    """Build a JSON-RPC error response."""
+def _error_response(message: str, req_id: Any = None, data: Any = None) -> str:
+    """Build a JSON-RPC error response.
+
+    ``data`` is attached as the optional ``error.data`` member when not None
+    (JSON-RPC 2.0 §5.1) — used to surface machine-readable hints such as a 429
+    ``retryAfter`` alongside the human-readable message.
+    """
+    error: dict[str, Any] = {"code": -32000, "message": message}
+    if data is not None:
+        error["data"] = data
     return json.dumps(
         {
             "jsonrpc": "2.0",
-            "error": {"code": -32000, "message": message},
+            "error": error,
             "id": req_id,
         }
     )
@@ -507,7 +532,13 @@ def _emit(line: str, tracker: "_CancelTracker | None") -> None:
 class _StreamResult:
     """Result of a streaming request."""
 
-    __slots__ = ("session_id", "status_code", "www_authenticate", "protocol_version")
+    __slots__ = (
+        "session_id",
+        "status_code",
+        "www_authenticate",
+        "protocol_version",
+        "retry_after",
+    )
 
     def __init__(
         self,
@@ -515,6 +546,7 @@ class _StreamResult:
         status_code: int,
         www_authenticate: str | None = None,
         protocol_version: str | None = None,
+        retry_after: float | None = None,
     ):
         self.session_id = session_id
         self.status_code = status_code
@@ -522,6 +554,10 @@ class _StreamResult:
         # Negotiated MCP protocol version captured from an InitializeResult
         # (only populated when the caller requests capture). See run().
         self.protocol_version = protocol_version
+        # Retry-After seconds parsed from a 429 whose retries were exhausted or
+        # whose wait exceeded the cap — surfaced in the synthesized error's
+        # ``data.retryAfter`` so a client can back off. See #8.
+        self.retry_after = retry_after
 
 
 _INSUFFICIENT_SCOPE_RE = re.compile(r'error\s*=\s*"?insufficient_scope"?')
@@ -712,7 +748,14 @@ def _post_and_stream(
                     resp.read()
                     sleep_secs = _handle_rate_limit(resp.headers, attempt)
                     if sleep_secs is None:
-                        return _StreamResult(session, 429, www_auth)
+                        return _StreamResult(
+                            session,
+                            429,
+                            www_auth,
+                            retry_after=_parse_retry_after(
+                                resp.headers.get("retry-after")
+                            ),
+                        )
                     log(
                         f"attempt {attempt}/{MAX_RETRIES} got HTTP 429, "
                         f"sleeping {sleep_secs:.1f}s before retry"
@@ -819,7 +862,14 @@ def _post_parsed(
             if resp.status_code == 429:
                 sleep_secs = _handle_rate_limit(resp.headers, attempt)
                 if sleep_secs is None:
-                    return None, _StreamResult(session, 429, www_auth)
+                    return None, _StreamResult(
+                        session,
+                        429,
+                        www_auth,
+                        retry_after=_parse_retry_after(
+                            resp.headers.get("retry-after")
+                        ),
+                    )
                 log(
                     f"attempt {attempt}/{MAX_RETRIES} got HTTP 429, "
                     f"sleeping {sleep_secs:.1f}s before retry"
@@ -1531,12 +1581,13 @@ def run(
                 if cid is not None:
                     tracker.add(cid)
 
-            req_id = _extract_id(line)
-            # A notification (no id) must never receive a response — even when an
-            # upstream misbehaves and returns a 4xx/5xx to a POSTed notification,
-            # synthesizing an `id:null` error to stdout would be a JSON-RPC
-            # violation. Gate all synthesized error responses on this.
-            req_has_id = _has_id(line)
+            # Derive both the id value and its presence from one parse (the
+            # hot path). A notification (no id) must never receive a response —
+            # even when an upstream misbehaves and returns a 4xx/5xx to a POSTed
+            # notification, synthesizing an `id:null` error to stdout would be a
+            # JSON-RPC violation. Gate all synthesized error responses on
+            # req_has_id.
+            req_id, req_has_id = _extract_id_and_presence(line)
             if tracker is not None and req_id is not None:
                 # A request reusing a previously-cancelled id supersedes that
                 # cancel — untrack it so its response is delivered, not dropped.
@@ -1729,7 +1780,19 @@ def run(
             if result.status_code >= 400:
                 log(f"upstream returned HTTP {result.status_code}")
                 if req_has_id:
-                    _write_line(_error_response(f"HTTP {result.status_code}", req_id))
+                    # On a 429 whose retries were exhausted / over-cap, surface
+                    # the server's Retry-After (when present) as error.data so a
+                    # client can back off intelligently. See #8.
+                    err_data = (
+                        {"retryAfter": result.retry_after}
+                        if result.status_code == 429 and result.retry_after is not None
+                        else None
+                    )
+                    _write_line(
+                        _error_response(
+                            f"HTTP {result.status_code}", req_id, data=err_data
+                        )
+                    )
     finally:
         client.close()
 
@@ -2003,12 +2066,13 @@ def run_sse(
                 if cid is not None:
                     tracker.add(cid)
 
-            req_id = _extract_id(line)
-            # A notification (no id) must never receive a response — even when an
-            # upstream misbehaves and returns a 4xx/5xx to a POSTed notification,
-            # synthesizing an `id:null` error to stdout would be a JSON-RPC
-            # violation. Gate all synthesized error responses on this.
-            req_has_id = _has_id(line)
+            # Derive both the id value and its presence from one parse (the
+            # hot path). A notification (no id) must never receive a response —
+            # even when an upstream misbehaves and returns a 4xx/5xx to a POSTed
+            # notification, synthesizing an `id:null` error to stdout would be a
+            # JSON-RPC violation. Gate all synthesized error responses on
+            # req_has_id.
+            req_id, req_has_id = _extract_id_and_presence(line)
             if tracker is not None and req_id is not None:
                 # A request reusing a previously-cancelled id supersedes that
                 # cancel — untrack it so its response is delivered, not dropped.
@@ -2123,8 +2187,27 @@ def run_sse(
 
                 if resp.status_code not in (200, 202):
                     log(f"POST returned HTTP {resp.status_code}")
+                    # NOTE (#1): on the legacy SSE transport the POST only
+                    # carries an HTTP ack; the JSON-RPC reply arrives async on
+                    # the GET stream (written by the reader via _emit). These two
+                    # threads do not share a per-id de-dup map, so if a server
+                    # both non-2xx's the POST AND later pushes a reply for the
+                    # same id, the client can receive two responses for one id.
+                    # In practice a non-2xx POST means the request was not
+                    # accepted and no reply follows, so the window is narrow;
+                    # mcp-stdio deliberately does not de-duplicate it (consistent
+                    # with the cancel filter's narrow scope).
                     if req_has_id:
-                        _write_line(_error_response(f"HTTP {resp.status_code}", req_id))
+                        err_data = None
+                        if resp.status_code == 429:
+                            secs = _parse_retry_after(resp.headers.get("retry-after"))
+                            if secs is not None:
+                                err_data = {"retryAfter": secs}  # See #8.
+                        _write_line(
+                            _error_response(
+                                f"HTTP {resp.status_code}", req_id, data=err_data
+                            )
+                        )
             except httpx.HTTPError as e:
                 log(f"POST failed: {e}")
                 if req_has_id:

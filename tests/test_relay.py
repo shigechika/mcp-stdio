@@ -1114,6 +1114,49 @@ class TestRun:
         )
         assert output.strip() == ""
 
+    def test_notification_404_reinit_failure_gets_no_response(self, httpx_mock):
+        """#5(round14): a notification whose POST 404s (with a prior session) and
+        whose _reinitialize then fails must produce NO id:null 'session lost'
+        error — the req_has_id gate covers the 404 recovery branch."""
+        # init -> sess-1
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json", "mcp-session-id": "sess-1"},
+        )
+        # notification -> 404 (session expired)
+        httpx_mock.add_response(status_code=404, text="")
+        # reinit initialize -> 500 (recovery fails)
+        httpx_mock.add_response(status_code=500, text="")
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","method":"init","id":1}',
+                '{"jsonrpc":"2.0","method":"notifications/progress","params":{}}',
+            ],
+        )
+        lines = [x for x in output.strip().splitlines() if x]
+        assert len(lines) == 1  # only the init response; nothing for the notif
+        assert json.loads(lines[0])["id"] == 1
+
+    def test_notification_403_stepup_failure_gets_no_response(self, httpx_mock):
+        """#5(round14): a notification whose POST 403s insufficient_scope and
+        whose scope_upgrader returns None must produce no id:null error."""
+        httpx_mock.add_response(
+            status_code=403,
+            text="",
+            headers={
+                "content-type": "application/json",
+                "www-authenticate": 'Bearer error="insufficient_scope", scope="x"',
+            },
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","method":"notifications/progress","params":{}}'],
+            scope_upgrader=lambda _s: None,
+        )
+        assert output.strip() == ""
+
     def test_request_drawing_4xx_still_gets_error(self, httpx_mock):
         """A request (with id) that draws a 4xx still gets a JSON-RPC error."""
         httpx_mock.add_response(
@@ -2899,6 +2942,35 @@ class TestCheckConnectionSse:
             check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
             is True
         )
+
+    def test_sse_message_before_endpoint_is_skipped(self, httpx_mock):
+        """#15(round14): a message event arriving BEFORE the endpoint event must
+        be ignored (no POST can target an unknown endpoint yet); the probe POSTs
+        only after the endpoint and still completes on the real result."""
+        early = '{"jsonrpc":"2.0","method":"notifications/message","params":{}}'
+        httpx_mock.add_response(
+            url=self.SSE_URL,
+            method="GET",
+            stream=IteratorStream(
+                [
+                    f"event: message\ndata: {early}\n\n".encode(),  # before endpoint
+                    b"event: endpoint\ndata: /messages\n\n",
+                    f"event: message\ndata: {self._INIT_RESULT}\n\n".encode(),
+                ]
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url="https://example.com/messages", method="POST", status_code=202
+        )
+        assert (
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
+            is True
+        )
+        # Exactly one POST, and only to the resolved endpoint (after it arrived).
+        posts = [r for r in httpx_mock.get_requests() if r.method == "POST"]
+        assert len(posts) == 1
+        assert str(posts[0].url) == "https://example.com/messages"
 
 
 # --- SSE transport ---
@@ -5037,6 +5109,22 @@ class TestRun429Retry:
         assert slept == [], f"expected no sleep for over-cap, got {slept!r}"
         # Only one upstream POST should have been made
         assert len(httpx_mock.get_requests()) == 1
+
+    def test_429_over_cap_surfaces_retry_after_in_error_data(
+        self, httpx_mock, monkeypatch
+    ):
+        """#8(round14): a 429 whose wait exceeds the cap surfaces the server's
+        Retry-After as error.data.retryAfter so a client can back off."""
+        monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: None)
+        httpx_mock.add_response(
+            status_code=429, headers={"retry-after": "120"}, text=""
+        )
+        output = self._run_with_stdin(
+            httpx_mock, ['{"jsonrpc":"2.0","method":"tools/call","id":1}']
+        )
+        err = json.loads(output.strip())
+        assert err["id"] == 1 and "429" in err["error"]["message"]
+        assert err["error"]["data"]["retryAfter"] == 120.0
 
     def test_429_repeated_exhausts_retries_and_surfaces(
         self, httpx_mock, monkeypatch
