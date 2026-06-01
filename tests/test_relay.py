@@ -1508,6 +1508,24 @@ class TestRun:
         )
         assert output.strip() == ""
 
+    def test_202_to_request_with_id_synthesizes_error(self, httpx_mock):
+        """#4(round16): a non-compliant 202 to a REQUEST (with id) on Streamable
+        HTTP delivers no body and no async reply, so the relay must synthesize a
+        JSON-RPC error instead of leaving the client hanging — unlike the silent
+        202-to-notification case above."""
+        httpx_mock.add_response(
+            status_code=202,
+            text="",
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","method":"tools/call","id":7}'],
+        )
+        result = json.loads(output.strip())
+        assert result["id"] == 7
+        assert "202" in result["error"]["message"]
+
     def test_401_without_refresher_emits_error(self, httpx_mock):
         """#11: unhandled non-2xx must never produce a silent stdin hang."""
         httpx_mock.add_response(
@@ -1567,6 +1585,40 @@ class TestProtocolVersionHeader:
         # initialize itself carries no header (version not yet negotiated)
         assert "mcp-protocol-version" not in reqs[0].headers
         # the next request carries the negotiated version
+        assert reqs[1].headers["mcp-protocol-version"] == "2025-06-18"
+
+    def test_user_pinned_header_survives_cold_start_initialize(self, httpx_mock):
+        """#12(round16): on a cold-start initialize (version not yet negotiated)
+        a user-supplied -H MCP-Protocol-Version is deliberately preserved on the
+        initialize POST (relay.py only strips its OWN injected header once a
+        version is captured). The next request then carries the relay-injected
+        NEGOTIATED version, not the pinned one. Guards the `protocol_version is
+        not None` gate against a regression that stripped the cold-start header."""
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"protocolVersion":"2025-06-18"},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":2}',
+            headers={"content-type": "application/json"},
+        )
+        stdin_data = (
+            '{"jsonrpc":"2.0","method":"initialize","id":1}\n'
+            '{"jsonrpc":"2.0","method":"tools/call","id":2}\n'
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", StringIO(stdin_data)), patch("sys.stdout", stdout):
+            run(
+                "https://example.com/mcp",
+                {
+                    "Content-Type": "application/json",
+                    "MCP-Protocol-Version": "2024-11-05",
+                },
+            )
+        reqs = httpx_mock.get_requests()
+        # (a) the cold-start initialize keeps the user's pinned version
+        assert reqs[0].headers["mcp-protocol-version"] == "2024-11-05"
+        # (b) the next request carries the relay-injected negotiated version
         assert reqs[1].headers["mcp-protocol-version"] == "2025-06-18"
 
     def test_initialized_notification_carries_header(self, httpx_mock):
@@ -3267,9 +3319,11 @@ class TestSseReaderLoop:
         assert state.endpoint_url is None
 
     def test_generic_exception_safety_net_sets_ready(self, httpx_mock, monkeypatch):
-        """A non-HTTP exception inside the reader must hit the catch-all that
-        sets ready and returns — so run_sse's startup wait() unblocks instead of
-        hanging to the connect timeout."""
+        """A non-HTTP exception on the FIRST connect (before any endpoint event,
+        so `established` is False) must hit the catch-all's fail-fast branch: set
+        ready and return — so run_sse's startup wait() unblocks instead of hanging
+        to the connect timeout. (The established-mid-session branch reconnects
+        instead; see TestRunSseReaderRecovery. #1 round16.)"""
         httpx_mock.add_response(
             url=self.URL,
             method="GET",
@@ -3599,6 +3653,84 @@ class _BlockingStdin:
             return self._line
         self._release.wait(timeout=5)
         raise StopIteration
+
+
+class TestRunSseReaderRecovery:
+    """#1(round16): an unexpected (non-HTTPError) exception in the SSE reader
+    must not permanently kill it. The reader nulls endpoint_url and reconnects,
+    so async reply delivery recovers instead of every later request-with-id
+    hanging forever on a dead stream."""
+
+    URL = "https://example.com/sse"
+
+    def test_reader_reconnects_after_unexpected_emit_error(
+        self, httpx_mock, monkeypatch
+    ):
+        monkeypatch.setattr("mcp_stdio.relay.RETRY_DELAY", 0.05)
+        import mcp_stdio.relay as relay_mod
+
+        real_emit = relay_mod._emit
+        emit_calls = {"n": 0}
+
+        def flaky_emit(line, tracker):
+            emit_calls["n"] += 1
+            if emit_calls["n"] == 1:
+                # Simulate an unexpected decode/_write_line bug on one event.
+                raise RuntimeError("simulated reader-side bug on a malformed event")
+            real_emit(line, tracker)
+
+        monkeypatch.setattr("mcp_stdio.relay._emit", flaky_emit)
+
+        release_stdin = threading.Event()
+        hold_gen2 = threading.Event()
+
+        def sse_gen_1():
+            yield b"event: endpoint\ndata: /messages?sid=abc\n\n"
+            # This message triggers flaky_emit's first-call raise, which throws
+            # out of the reader's for-loop into the catch-all.
+            yield b'event: message\ndata: {"jsonrpc":"2.0","result":{"first":1},"id":1}\n\n'
+
+        def sse_gen_2():
+            yield b"event: endpoint\ndata: /messages?sid=abc\n\n"
+            yield b'event: message\ndata: {"jsonrpc":"2.0","result":{"recovered":1},"id":2}\n\n'
+            # The recovered reply has been _emit'd to stdout by the time the
+            # reader pulls the next event; let the main loop exit, then hold the
+            # stream so the reader parks here (no third unmocked GET) until stop.
+            release_stdin.set()
+            hold_gen2.wait(timeout=2)
+
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream(sse_gen_1()),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream(sse_gen_2()),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url="https://example.com/messages?sid=abc",
+            method="POST",
+            status_code=202,
+            is_reusable=True,
+        )
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}',
+            release_stdin,
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {"Content-Type": "application/json"})
+
+        # The reader survived the unexpected error: it reconnected (>=2 GETs)
+        # and delivered the post-recovery reply — proving it did not die.
+        gets = [r for r in httpx_mock.get_requests() if r.method == "GET"]
+        assert len(gets) >= 2, f"expected a reconnect (>=2 GETs), got {len(gets)}"
+        assert "recovered" in stdout.getvalue()
 
 
 class TestRunSse:

@@ -1789,10 +1789,16 @@ def run(
 
             # Fall-through error for any unhandled 4xx/5xx so the MCP client
             # never hangs waiting for a response. 200 bodies were already
-            # streamed by _post_and_stream; 202 is reserved for notifications
-            # and intentionally produces no stdout. A notification (no id) that
-            # draws a 4xx/5xx is logged but gets no synthesized response. See #11.
-            if result.status_code >= 400:
+            # streamed by _post_and_stream. 202 is reserved for the client's own
+            # responses/notifications (MCP Streamable HTTP "Sending Messages"
+            # rule 4); a compliant server answers a REQUEST with 200 + an SSE /
+            # JSON body (rule 5). So a 202 to a request-WITH-id is non-compliant
+            # and would leave the client hanging forever (no body now, no async
+            # reply on Streamable HTTP) — synthesize an error for it too, matching
+            # the empty-200 guard in _post_and_stream. A 202 to a NOTIFICATION
+            # (no id) stays correctly silent. See #11 and #4 (round16).
+            req_202_hang = result.status_code == 202 and req_has_id
+            if result.status_code >= 400 or req_202_hang:
                 log(f"upstream returned HTTP {result.status_code}")
                 if req_has_id:
                     # On a 429/503 whose retries were exhausted / over-cap,
@@ -1804,11 +1810,12 @@ def run(
                         and result.retry_after is not None
                         else None
                     )
-                    _write_line(
-                        _error_response(
-                            f"HTTP {result.status_code}", req_id, data=err_data
-                        )
+                    msg = (
+                        f"HTTP {result.status_code} (no response body for request)"
+                        if req_202_hang
+                        else f"HTTP {result.status_code}"
                     )
+                    _write_line(_error_response(msg, req_id, data=err_data))
     finally:
         client.close()
 
@@ -1944,9 +1951,33 @@ def _sse_reader_loop(
             if state.stop.wait(RETRY_DELAY):
                 return
         except Exception as e:  # noqa: BLE001 — thread safety net
-            log(f"SSE reader unexpected error: {e}")
-            state.ready.set()
-            return
+            if state.stop.is_set():
+                return
+            # An UNEXPECTED (non-HTTPError) exception — e.g. a decode bug in
+            # _iter_sse_events on a single server-controlled malformed event, or
+            # a _write_line failure surfacing through _emit. Split on `established`
+            # exactly like the non-200 path above:
+            if not established:
+                # First connect never succeeded — fail fast: unblock run_sse's
+                # startup wait() (endpoint stays None so run_sse exits) rather than
+                # spin reconnecting on a deterministic startup-time bug.
+                log(f"SSE reader unexpected error before first connect: {e}")
+                state.ready.set()
+                return
+            # Established mid-session: do NOT permanently die. The earlier
+            # unconditional "set ready; return" left endpoint_url non-None, so the
+            # main loop's `endpoint = state.endpoint_url` stayed truthy and it kept
+            # POSTing requests whose async JSON-RPC replies arrive ONLY on this
+            # now-dead GET stream — every later request-with-id then hung forever
+            # (silent, permanent). Mirror the disconnect paths: clear ready + null
+            # endpoint_url so in-flight ids surface "SSE endpoint unavailable"
+            # instead of hanging, then reconnect — a one-off bad event should not be
+            # fatal (cf. the loop's stated intent above). See #1 (round16).
+            log(f"SSE reader unexpected error, reconnecting: {e}")
+            state.ready.clear()
+            state.endpoint_url = None
+            if state.stop.wait(RETRY_DELAY):
+                return
 
 
 def run_sse(
@@ -2148,6 +2179,16 @@ def run_sse(
                     )
                     time.sleep(sleep_secs)
 
+                # NOTE (#3 round16): the re-POST below resends the same JSON-RPC
+                # id after a refresh/step-up. Unlike a non-2xx (which reliably
+                # means "not accepted"), a 401/403 does NOT guarantee the origin
+                # rejected the request — an edge proxy can inject the 401 while
+                # the origin already accepted and enqueued a reply. The re-POST
+                # then makes the server push a SECOND async reply for the same id
+                # on the GET stream, and the reader's _emit writes both (the same
+                # no-shared-de-dup-map window documented at the non-2xx branch
+                # below). Left undeduplicated by design — a shared seen-id set
+                # would be heavier than the project's minimalism warrants.
                 if resp.status_code == 401 and token_refresher:
                     log("received 401, attempting token refresh")
                     new_headers = token_refresher()
