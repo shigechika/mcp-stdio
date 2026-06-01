@@ -1842,8 +1842,16 @@ def run(
                         is not None
                     )
                 )
-                if result.session_id and (
-                    result.status_code < 400 or feeds_recovery
+                # A 202-to-request is classified as an error below (req_202_hang)
+                # and synthesized into a JSON-RPC error, so — like a 4xx/5xx — its
+                # echoed (possibly rotated) session id must NOT be adopted: it is an
+                # id the server is about to reject. The `< 400` predicate alone
+                # admits 202, so exclude a 202-to-request explicitly, matching the
+                # authoritative post-recovery gate's `not is_error`. (#1 round33)
+                if (
+                    result.session_id
+                    and not (result.status_code == 202 and req_has_id)
+                    and (result.status_code < 400 or feeds_recovery)
                 ):
                     session_id = result.session_id
 
@@ -1898,15 +1906,21 @@ def run(
                         # top-level feeds_recovery gate exactly (#1 round28). (A 404 is
                         # excluded: its branch reinitializes from scratch, ignoring any
                         # rotated id, and a cold 404 must stay a terminal error.)
-                        if result.session_id and (
-                            result.status_code < 400
-                            or (
-                                result.status_code == 403
-                                and scope_upgrader is not None
-                                and _parse_www_authenticate_scope(
-                                    result.www_authenticate
+                        if (
+                            result.session_id
+                            and not (
+                                result.status_code == 202 and req_has_id
+                            )  # #1 round33: a 202-to-request is errored, not adopted
+                            and (
+                                result.status_code < 400
+                                or (
+                                    result.status_code == 403
+                                    and scope_upgrader is not None
+                                    and _parse_www_authenticate_scope(
+                                        result.www_authenticate
+                                    )
+                                    is not None
                                 )
-                                is not None
                             )
                         ):
                             session_id = result.session_id
@@ -1942,7 +1956,11 @@ def run(
                             # only downstream branch is 404, which reinitializes from
                             # scratch (ignoring any rotated id), so a terminal status
                             # echoing a session id must not poison the next line.
-                            if result.session_id and result.status_code < 400:
+                            if (
+                                result.session_id
+                                and not (result.status_code == 202 and req_has_id)
+                                and result.status_code < 400
+                            ):  # #1 round33: a 202-to-request is errored, not adopted
                                 session_id = result.session_id
                         else:
                             log("step-up authorization failed, returning error")

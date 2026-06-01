@@ -957,6 +957,44 @@ class TestRun:
         # The 500's "bad-rotated" was NOT adopted — request 3 still sends "good".
         assert reqs[2].headers.get("mcp-session-id") == "good"
 
+    def test_202_to_request_session_id_not_adopted(self, httpx_mock):
+        """#1(round33): a 202 returned to a request-WITH-id is synthesized into a
+        JSON-RPC error (a non-compliant server can't ack a request), so its echoed
+        (rotated) session id must NOT be adopted — exactly like a 4xx/5xx. The
+        pre-recovery `< 400` gate previously admitted 202; the next request must
+        still carry the established session, not the just-rejected one."""
+        # Line 1: 200 establishes session "good".
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json", "mcp-session-id": "good"},
+        )
+        # Line 2: 202 to a request-with-id, echoing a ROTATED id — must be ignored
+        # (the relay synthesizes an error for the 202-to-request).
+        httpx_mock.add_response(
+            status_code=202,
+            text="",
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "bad-rotated",
+            },
+        )
+        # Line 3: 200 — must still carry "good", not "bad-rotated".
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":3}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","method":"init","id":1}',
+                '{"jsonrpc":"2.0","method":"call","id":2}',
+                '{"jsonrpc":"2.0","method":"call","id":3}',
+            ],
+        )
+        reqs = httpx_mock.get_requests()
+        # The 202's "bad-rotated" was NOT adopted — request 3 still sends "good".
+        assert reqs[2].headers.get("mcp-session-id") == "good"
+
     def test_unparseable_403_session_id_not_adopted_with_scope_upgrader(
         self, httpx_mock
     ):
@@ -3239,6 +3277,84 @@ class TestPagination:
         requests = httpx_mock.get_requests()
         assert requests[1].headers["authorization"] == "Bearer new-token"
 
+    def test_page1_404_reinitializes_then_replays_through_pagination(
+        self, httpx_mock
+    ):
+        """#2(round33): a page-1 404 on a paginated method must cascade through the
+        run() 404 branch — reinitialize, then RE-ENTER _paginate_and_stream with
+        the fresh session and replay the full paginated fetch. Pins the
+        pagination-path re-entry (recovered session adopted, no double-emit) the
+        non-paginated 404 tests do not exercise."""
+        # Line 1: tools/list establishes sess-old over two pages.
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"tools": [{"name": "a"}], "nextCursor": "p2"},
+                }
+            ),
+            headers={"content-type": "application/json", "mcp-session-id": "sess-old"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "b"}]}}
+            ),
+            headers={"content-type": "application/json"},
+        )
+        # Line 2: tools/list page-1 -> 404 (session expired).
+        httpx_mock.add_response(url=self.URL, status_code=404, text="")
+        # Reinitialize: initialize -> 200 sess-new, then notifications/initialized.
+        httpx_mock.add_response(
+            text=(
+                '{"jsonrpc":"2.0","id":0,"result":'
+                '{"protocolVersion":"2024-11-05"}}'
+            ),
+            headers={"content-type": "application/json", "mcp-session-id": "sess-new"},
+        )
+        httpx_mock.add_response(status_code=202, text="")
+        # Replayed paginated tools/list over two pages with sess-new.
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {"tools": [{"name": "c"}], "nextCursor": "q2"},
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(
+                {"jsonrpc": "2.0", "id": 2, "result": {"tools": [{"name": "d"}]}}
+            ),
+            headers={"content-type": "application/json"},
+        )
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            ],
+        )
+        lines = [json.loads(x) for x in output.strip().splitlines() if x]
+        # Exactly two merged responses (line 1: a,b; line 2: c,d), no double-emit.
+        assert len(lines) == 2
+        assert [t["name"] for t in lines[0]["result"]["tools"]] == ["a", "b"]
+        assert [t["name"] for t in lines[1]["result"]["tools"]] == ["c", "d"]
+        assert "nextCursor" not in lines[1]["result"]
+        reqs = httpx_mock.get_requests()
+        # req[3] is the reinitialize's initialize; req[5] is the replay page-1,
+        # which must carry the freshly re-established session.
+        assert json.loads(reqs[3].content)["method"] == "initialize"
+        assert reqs[5].headers.get("mcp-session-id") == "sess-new"
+        assert json.loads(reqs[5].content)["method"] == "tools/list"
+
     def test_page2_401_does_not_trigger_recovery_returns_partial(self, httpx_mock):
         """#L(round30): a 401 on page>=2 must NOT reach run()'s token-refresh
         recovery — _paginate_and_stream flushes the accumulated partial (status
@@ -3484,6 +3600,35 @@ class TestPagination:
         assert merged["result"]["tools"] == [{"name": "a"}]
         assert "nextCursor" not in merged["result"]  # empty cursor not re-exposed
         assert len(httpx_mock.get_requests()) == 1  # no second-page fetch
+
+    def test_non_string_next_cursor_is_threaded_without_crashing(self, httpx_mock):
+        """#6(round33): a non-compliant server may return a non-string (e.g.
+        numeric) nextCursor. It is threaded back into params.cursor verbatim
+        (json-serializable, so json.dumps cannot raise) and the merge stays
+        well-formed — opaque-token handling, zero blast radius."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "a"}], "nextCursor": 42},  # numeric
+        }
+        page2 = {"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "b"}]}}
+        for page in (page1, page2):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=json.dumps(page),
+                headers={"content-type": "application/json"},
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())
+        # No crash; both pages merged; page-2 POST carried cursor=42.
+        assert [t["name"] for t in merged["result"]["tools"]] == ["a", "b"]
+        assert "nextCursor" not in merged["result"]
+        assert json.loads(httpx_mock.get_requests()[1].content)["params"][
+            "cursor"
+        ] == 42
 
     def test_page2_nonlist_result_key_keeps_page1_and_merges_late_field(
         self, httpx_mock
