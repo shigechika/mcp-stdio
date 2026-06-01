@@ -1440,6 +1440,40 @@ class TestProtocolVersionHeader:
         reinit_body = json.loads(reqs[2].read())
         assert reinit_body["params"]["protocolVersion"] == "2025-06-18"
 
+    def test_client_driven_reinitialize_updates_header(self, httpx_mock):
+        """#2: a client that sends a SECOND initialize renegotiating a newer
+        version must have subsequent requests carry the UPDATED
+        MCP-Protocol-Version, not the stale first-negotiated one."""
+        # 1: initialize -> 2025-03-26
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"protocolVersion":"2025-03-26"},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+        # 2: a second, client-driven initialize -> renegotiates 2025-06-18
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"protocolVersion":"2025-06-18"},"id":2}',
+            headers={"content-type": "application/json"},
+        )
+        # 3: a later request
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":3}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            [
+                '{"jsonrpc":"2.0","method":"initialize","id":1}',
+                '{"jsonrpc":"2.0","method":"initialize","id":2}',
+                '{"jsonrpc":"2.0","method":"tools/call","id":3}',
+            ]
+        )
+        reqs = httpx_mock.get_requests()
+        # req[0] first initialize: no header yet (it IS the negotiation).
+        assert "mcp-protocol-version" not in reqs[0].headers
+        # req[1] second initialize carries the first-negotiated version.
+        assert reqs[1].headers["mcp-protocol-version"] == "2025-03-26"
+        # req[2] carries the RE-negotiated version — proof of re-capture.
+        assert reqs[2].headers["mcp-protocol-version"] == "2025-06-18"
+
     def test_reinitialize_recaptures_version_from_sse_framed_response(self, httpx_mock):
         """The 404-recovery re-initialize response may itself be SSE-framed —
         the protocol version must still be re-captured and injected."""
@@ -2227,6 +2261,34 @@ class TestPagination:
         )
         merged = json.loads(output.strip())
         assert [t["name"] for t in merged["result"]["tools"]] == ["a"]
+
+    def test_late_top_level_result_field_preserved(self, httpx_mock):
+        """#14: a top-level result field (e.g. _meta) that appears only on a
+        later page must survive the merge (last-write-wins), not be dropped."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "a"}], "nextCursor": "p2"},
+        }
+        page2 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "b"}], "_meta": {"total": 2}},
+        }
+        for page in (page1, page2):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=json.dumps(page),
+                headers={"content-type": "application/json"},
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())
+        assert [t["name"] for t in merged["result"]["tools"]] == ["a", "b"]
+        assert merged["result"]["_meta"] == {"total": 2}  # late field kept
+        assert "nextCursor" not in merged["result"]
 
 
 # --- check_connection ---
@@ -3195,6 +3257,80 @@ class TestRunSse:
 
         out = stdout.getvalue()
         assert payload in out
+
+    def test_arguments_null_normalized_on_sse_post(self, httpx_mock):
+        """#10: run_sse must rewrite tools/call arguments:null -> {} on the wire
+        before POSTing, symmetric with run() (covered for the streamable path
+        by TestRunNormalizeArguments but previously untested for SSE)."""
+        release_stdin = threading.Event()
+        captured: dict = {}
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=xyz\n\n"
+            release_stdin.wait(timeout=3)
+
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        def post_callback(request):
+            captured["body"] = json.loads(request.read())
+            release_stdin.set()
+            return httpx.Response(status_code=202)
+
+        httpx_mock.add_callback(
+            post_callback,
+            url="https://example.com/messages?sessionId=xyz",
+            method="POST",
+        )
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"tools/call","id":1,'
+            '"params":{"name":"t","arguments":null}}\n',
+            release_stdin,
+        )
+        with patch("sys.stdin", stdin), patch("sys.stdout", StringIO()):
+            run_sse(self.URL, {})
+        assert captured["body"]["params"]["arguments"] == {}
+
+    def test_arguments_null_opt_out_on_sse_post(self, httpx_mock):
+        """--no-normalize-arguments must forward null verbatim on the SSE path."""
+        release_stdin = threading.Event()
+        captured: dict = {}
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=xyz\n\n"
+            release_stdin.wait(timeout=3)
+
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        def post_callback(request):
+            captured["body"] = json.loads(request.read())
+            release_stdin.set()
+            return httpx.Response(status_code=202)
+
+        httpx_mock.add_callback(
+            post_callback,
+            url="https://example.com/messages?sessionId=xyz",
+            method="POST",
+        )
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"tools/call","id":1,'
+            '"params":{"name":"t","arguments":null}}\n',
+            release_stdin,
+        )
+        with patch("sys.stdin", stdin), patch("sys.stdout", StringIO()):
+            run_sse(self.URL, {}, normalize_arguments=False)
+        assert captured["body"]["params"]["arguments"] is None
 
     def test_post_401_triggers_token_refresh(self, httpx_mock):
         """On POST 401, run_sse calls token_refresher and retries."""
@@ -4320,6 +4456,69 @@ class TestRunSseCancelFilter:
         with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
             run_sse(self.URL, {"Content-Type": "application/json"})
 
+        assert "kept" in stdout.getvalue()
+
+    def test_sse_id_reuse_supersedes_cancel(self, httpx_mock):
+        """#19: a request REUSING a previously-cancelled id supersedes the
+        cancel (tracker.discard), so its later SSE response is DELIVERED, not
+        dropped — the SSE analogue of the streamable-path discard."""
+        payload = '{"jsonrpc":"2.0","result":{"kept":true},"id":11}'
+        second_post = threading.Event()
+        release_stdin = threading.Event()
+        post_count = {"n": 0}
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=abc\n\n"
+            # Hold the late response until BOTH the cancel and the reused-id
+            # request have been POSTed — by then discard() has run.
+            second_post.wait(timeout=3)
+            yield f"event: message\ndata: {payload}\n\n".encode()
+            time.sleep(0.1)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        def on_post(request: httpx.Request) -> httpx.Response:
+            post_count["n"] += 1
+            if post_count["n"] >= 2:
+                second_post.set()
+            return httpx.Response(status_code=202)
+
+        httpx_mock.add_callback(
+            on_post,
+            url="https://example.com/messages?sessionId=abc",
+            is_reusable=True,
+        )
+
+        class _TwoLineStdin:
+            def __init__(self) -> None:
+                self._lines = [
+                    '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+                    '"params":{"requestId":11}}\n',
+                    '{"jsonrpc":"2.0","method":"tools/call","id":11}\n',
+                ]
+                self._i = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self) -> str:
+                if self._i < len(self._lines):
+                    line = self._lines[self._i]
+                    self._i += 1
+                    return line
+                release_stdin.wait(timeout=5)
+                raise StopIteration
+
+        stdout = StringIO()
+        with patch("sys.stdin", _TwoLineStdin()), patch("sys.stdout", stdout):
+            run_sse(self.URL, {"Content-Type": "application/json"})
+
+        # The reused id superseded the cancel, so the response is delivered.
         assert "kept" in stdout.getvalue()
 
 

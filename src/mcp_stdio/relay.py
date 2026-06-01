@@ -972,6 +972,13 @@ def _paginate_and_stream(
 
         if parsed is None:
             if page == 1:
+                # Page-1 body was a 200 that did not parse: fall back to a plain
+                # streamed POST so the client still gets the raw response. This
+                # re-POSTs the request (the first body was buffered by
+                # _post_parsed and discarded), which is only safe because
+                # PAGINATED_LIST_METHODS holds idempotent reads only — keep that
+                # invariant (mirrors the capture-init note in run()'s _dispatch)
+                # if the table ever grows to a non-idempotent method.
                 return _post_and_stream(
                     client, url, line, headers, req_id, tracker, has_id=has_id
                 )
@@ -998,6 +1005,12 @@ def _paginate_and_stream(
             items = page_result.get(result_key)
             if isinstance(items, list):
                 merged_result[result_key].extend(items)
+            # Preserve top-level result fields (e.g. a late ``_meta``) that arrive
+            # only on a later page — last-write-wins. The accumulated list and the
+            # ``nextCursor`` are managed explicitly above, so skip them here.
+            for k, v in page_result.items():
+                if k not in (result_key, "nextCursor"):
+                    merged_result[k] = v
 
         next_cursor = page_result.get("nextCursor")
         if not next_cursor:
@@ -1479,28 +1492,33 @@ def run(
                         client, url, content, h, req_id, detected[1], tracker,
                         has_id=req_has_id,
                     )
-                # Capture-once semantics: we only learn the version from the
-                # first initialize. A later client-driven re-initialize that
-                # renegotiates a different version is not picked up — rare, and
-                # avoids re-parsing every response on the hot path.
+                # Any `initialize` request is a capture point — not just the
+                # first. A client-driven re-initialize that renegotiates a
+                # different version is adopted so the injected
+                # MCP-Protocol-Version header stays equal to the version in
+                # force (the 2025-06-18 spec requires the header to match the
+                # negotiated version). The added per-line cost is one cheap
+                # `_looks_like_initialize` regex; the heavier
+                # `_extract_protocol_version` still runs only inside
+                # `_post_and_stream` for lines that are actually initializes.
                 #
                 # Response-only: the version comes from the server's
                 # InitializeResult, not the client's requested version. If a
                 # (non-compliant) server omits result.protocolVersion, no
                 # header is sent rather than guessing — a server that both
                 # omits it and enforces the header would be self-contradictory.
-                capture_init = protocol_version is None and _looks_like_initialize(content)
+                capture_init = _looks_like_initialize(content)
                 result = _post_and_stream(
                     client, url, content, h, req_id, tracker,
                     capture_init=capture_init, has_id=req_has_id,
                 )
-                if (
-                    result is not None
-                    and result.protocol_version
-                    and protocol_version is None
-                ):
+                if result is not None and result.protocol_version:
+                    if result.protocol_version != protocol_version:
+                        log(
+                            f"negotiated MCP protocol version: "
+                            f"{result.protocol_version}"
+                        )
                     protocol_version = result.protocol_version
-                    log(f"negotiated MCP protocol version: {protocol_version}")
                 return result
 
             result = _dispatch(line, req_headers)
@@ -1526,6 +1544,15 @@ def run(
             # re-recovered and surfaces as a JSON-RPC error (never a hang, #11).
             # The downstream client retries at its own level. This bounded
             # single attempt is deliberate: it avoids unbounded recovery loops.
+            #
+            # Worst case the same line is dispatched up to 4 times in one
+            # iteration (initial + 401-refresh + 403-step-up + 404-reinit, when
+            # each retry returns the next branch's status). That is safe only
+            # because each prior dispatch returned a non-200 with NO body
+            # delivered to stdout — the at-most-once guard in _post_and_stream
+            # covers replay after a partial 200, not these distinct non-200
+            # recovery dispatches, which a server is not expected to have
+            # executed for side effects.
 
             # Token expired (401) — refresh and retry once
             if result.status_code == 401 and token_refresher:
