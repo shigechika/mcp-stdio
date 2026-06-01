@@ -602,6 +602,26 @@ class TestLoadSaveDelete:
         # Nothing persisted (the write was aborted), so a later load re-auths.
         assert load_token("https://example.com/mcp") is None
 
+    @pytest.mark.parametrize("bad_expiry", [float("inf"), float("-inf"), float("nan")])
+    def test_save_rejects_non_finite_expiry_before_disk(
+        self, tmp_path, monkeypatch, capsys, bad_expiry
+    ):
+        """#7(round31): _write_store uses allow_nan=False, so a non-finite
+        expires_at raises ValueError before reaching disk (instead of writing the
+        non-standard `Infinity`/`NaN` literal that only the load-side guard
+        catches). save_token catches it and soft-fails — nothing is persisted and
+        the on-disk store never contains non-standard JSON."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        bad = TokenData(access_token="tok", expires_at=bad_expiry)
+        save_token("https://example.com/mcp", bad)  # must not raise
+
+        assert "could not write token store" in capsys.readouterr().err
+        assert not store_file.exists()  # nothing reached disk
+        assert load_token("https://example.com/mcp") is None
+
     def test_save_degrades_to_unlocked_when_lock_open_fails(
         self, tmp_path, monkeypatch
     ):
