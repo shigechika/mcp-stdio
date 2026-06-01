@@ -875,6 +875,7 @@ def _post_parsed(
     headers: dict[str, str],
     req_id: Any,
     *,
+    tracker: "_CancelTracker | None" = None,
     has_id: bool = True,
     emit_error_on_failure: bool = True,
 ) -> tuple[dict[str, Any] | None, _StreamResult | None]:
@@ -934,17 +935,32 @@ def _post_parsed(
                 # neither, and returning it would make the pagination merge treat
                 # it as the page result and drop the real list. Mirrors the
                 # keep-reading gate in _check_connection_sse.
+                #
+                # #5 (round23): every NON-response message event (a server-
+                # initiated request / notification) must still be DELIVERED to
+                # stdout — _post_and_stream emits every message event, so the
+                # pagination path must too, or interleaved frames are silently
+                # dropped only on the paginated methods.
                 for event_type, payload in _iter_sse_events(_split_sse_text(resp.text)):
                     if event_type != "message":
                         continue
                     try:
                         parsed = json.loads(payload)
                     except json.JSONDecodeError:
+                        # Non-JSON message: not the response object. Leave it to
+                        # trigger the parsed=None fallback (re-POST) rather than
+                        # forwarding garbage — the fallback re-fetches the real
+                        # result, so dropping the malformed frame loses nothing.
                         continue
                     if isinstance(parsed, dict) and (
                         "result" in parsed or "error" in parsed
                     ):
                         return parsed, _StreamResult(session, 200)
+                    # A well-formed but NON-response message (a server-initiated
+                    # request / notification interleaved before the response) must
+                    # be delivered, not dropped — _post_and_stream emits every
+                    # message event, so the pagination path must too.
+                    _emit(payload, tracker)
                 return None, _StreamResult(session, 200)
 
             text = resp.text.strip()
@@ -1082,6 +1098,7 @@ def _paginate_and_stream(
             page_content,
             headers,
             req_id,
+            tracker=tracker,
             has_id=has_id,
             # Page 1 has no partial to flush, so its exhaustion error IS the
             # response. Page>=2 flushes the partial below, so suppress the error
@@ -1751,11 +1768,16 @@ def run(
 
                 # Recovery is single-pass and ordered auth-before-session: the three
                 # branches below are sequential `if`s (not `elif`), each firing at
-                # most once per stdin line. A 401/403 whose retry returns 404 still
-                # flows into the 404 branch and recovers; the converse does NOT — a
-                # 404 retry that comes back 401/403 (token expired during the reinit
-                # window), or a 401/403 retry that fails the same way again, is not
-                # re-recovered and surfaces as a JSON-RPC error (never a hang, #11).
+                # most once per stdin line. A 401/403 whose retry returns 404 flows
+                # into the 404 branch and recovers ONLY when a session_id was
+                # already established — the 404 branch is gated on `and session_id`
+                # (#1 round23). A COLD 404 (no session ever existed, e.g. the
+                # initialize itself 401'd) is a genuine not-found, not a session
+                # expiry, so it correctly surfaces as a JSON-RPC error rather than
+                # re-initializing a session that never was. The converse does NOT
+                # recover either — a 404 retry that comes back 401/403 (token
+                # expired during the reinit window), or a 401/403 retry that fails
+                # the same way again, surfaces as a JSON-RPC error (never a hang, #11).
                 # The downstream client retries at its own level. This bounded
                 # single attempt is deliberate: it avoids unbounded recovery loops.
                 #
