@@ -15,6 +15,7 @@ import json
 import os
 import stat
 import sys
+import threading
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -282,7 +283,13 @@ def _write_store(data: dict[str, Any]) -> None:
     """
     _ensure_store_dir()
     payload = json.dumps(data, indent=2).encode("utf-8")
-    tmp_path = _STORE_FILE.with_suffix(_STORE_FILE.suffix + f".tmp.{os.getpid()}")
+    # Per-write unique temp name. PID alone is not enough: when the advisory
+    # lock degrades to a no-op (lock fs unavailable), two THREADS in one process
+    # share the PID and would otherwise pick the same temp path and clobber each
+    # other's in-flight write. Thread id + random make every temp file distinct,
+    # leaving only the documented os.replace last-writer-wins on the final file.
+    uniq = f"{os.getpid()}.{threading.get_ident()}.{os.urandom(4).hex()}"
+    tmp_path = _STORE_FILE.with_suffix(_STORE_FILE.suffix + f".tmp.{uniq}")
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW
     fd = os.open(tmp_path, flags, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
     try:
