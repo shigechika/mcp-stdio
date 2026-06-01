@@ -413,16 +413,23 @@ class TestLoadSaveDelete:
         loaded = load_token("https://example.com/mcp")
         assert loaded is not None and loaded.iss_parameter_supported is True
 
-    def test_save_over_corrupt_store_succeeds(self, tmp_path, monkeypatch):
-        """A corrupt store file is replaced (not appended to) on the next save."""
+    def test_save_over_corrupt_store_succeeds_with_warning(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A corrupt store file is replaced (not appended to) on the next save —
+        its unparseable bytes are already unrecoverable. #L2(round37): the
+        previously-silent replacement now emits a one-time stderr warning so the
+        operator learns their token store was corrupt."""
         store_file = tmp_path / "tokens.json"
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
         monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+        monkeypatch.setattr("mcp_stdio.token_store._warned_corrupt_store", False)
 
         store_file.write_text("not json")
         save_token("https://example.com/mcp", TokenData(access_token="fresh"))
         loaded = load_token("https://example.com/mcp")
         assert loaded is not None and loaded.access_token == "fresh"
+        assert "corrupt JSON" in capsys.readouterr().err
 
     def test_save_aborts_when_store_unreadable(self, tmp_path, monkeypatch, capsys):
         """#3: if the store EXISTS but cannot be read (e.g. transient EACCES),
