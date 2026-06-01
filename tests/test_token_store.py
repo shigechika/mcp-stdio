@@ -253,6 +253,31 @@ class TestLoadSaveDelete:
         )
         assert load_token("https://example.com/mcp") is None
 
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            # #9(round23): bool is an int subclass; a corrupted bool expiry must
+            # be rejected, not read as a 1970-epoch 1/0.
+            '{"access_token": "t", "expires_at": true}',
+            '{"access_token": "t", "client_secret_expires_at": false}',
+            # #14(round23): the sibling validation branches not previously covered.
+            '{"access_token": "t", "client_secret_expires_at": "never"}',
+            '{"access_token": "t", "no_resource_indicator": "yes"}',
+        ],
+    )
+    def test_load_corrupted_typed_fields_return_none(
+        self, tmp_path, monkeypatch, entry
+    ):
+        """#9/#14(round23): bool expiries and the not-previously-covered
+        client_secret_expires_at / no_resource_indicator type branches all
+        degrade load_token to None rather than reaching the OAuth path."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        store_file.write_text('{"https://example.com/mcp": ' + entry + "}")
+        assert load_token("https://example.com/mcp") is None
+
     def test_load_non_string_access_token_returns_none(self, tmp_path, monkeypatch):
         """A corrupted access_token (wrong type) must not produce a usable token."""
         store_file = tmp_path / "tokens.json"
