@@ -372,8 +372,10 @@ class TestPostAndStream:
             )
         # No retry: the POST was issued exactly once.
         assert len(httpx_mock.get_requests()) == 1
-        # Caller sees "error already printed".
-        assert result is None
+        # #1(round25): the interrupt now returns a 200 result (carrying any
+        # captured protocol_version) rather than None — the payload was already
+        # delivered, so its negotiated state must not be discarded.
+        assert result is not None and result.status_code == 200
         lines = [json.loads(x) for x in stdout.getvalue().strip().splitlines() if x]
         # The already-delivered payload, then exactly one synthesized error
         # for the same request id — never a duplicate of the payload.
@@ -492,10 +494,90 @@ class TestPostAndStream:
                 None,
                 has_id=False,
             )
-        assert result is None
+        # #1(round25): the emitted-interrupt branch now returns a 200 result
+        # (carrying any captured protocol_version) rather than None, so the
+        # already-delivered payload's negotiated state is not discarded.
+        assert result is not None and result.status_code == 200
         lines = [x for x in stdout.getvalue().strip().splitlines() if x]
         # The server payload is passed through; no synthesized id:null error.
         assert lines == [delivered]
+
+    def test_initialize_interrupt_preserves_protocol_version(self, httpx_mock):
+        """#1(round25): an initialize SSE stream that emits the InitializeResult
+        and THEN errors must still surface the captured protocolVersion (a 200
+        result), so the relay keeps injecting MCP-Protocol-Version on subsequent
+        requests instead of losing the negotiated version to a None return."""
+        init_result = (
+            '{"jsonrpc":"2.0","result":{"protocolVersion":"2025-06-18"},"id":1}'
+        )
+
+        def gen():
+            yield f"event: message\ndata: {init_result}\n\n".encode()
+            raise httpx.ReadError("dropped after the InitializeResult")
+
+        httpx_mock.add_response(
+            stream=IteratorStream(gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+        client = httpx.Client()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout), patch("mcp_stdio.relay.time.sleep"):
+            result = _post_and_stream(
+                client,
+                "https://example.com/mcp",
+                '{"jsonrpc":"2.0","method":"initialize","id":1}',
+                {},
+                1,
+                capture_init=True,
+                has_id=True,
+            )
+        assert result is not None
+        assert result.status_code == 200
+        assert result.protocol_version == "2025-06-18"
+
+    def test_sse_only_ping_event_synthesizes_error_for_request(self, httpx_mock):
+        """#14(round25): a 200 text/event-stream body with ONLY a non-message
+        (ping) event delivers no JSON-RPC payload, so a request-with-id must get
+        a synthesized 'empty response' error — the SSE arm of the empty-200
+        guard, previously covered only on the JSON arm."""
+        httpx_mock.add_response(
+            text="event: ping\ndata: {}\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+        client = httpx.Client()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            result = _post_and_stream(
+                client,
+                "https://example.com/mcp",
+                '{"jsonrpc":"2.0","method":"x","id":9}',
+                {},
+                9,
+                has_id=True,
+            )
+        assert result is not None and result.status_code == 200
+        err = json.loads(stdout.getvalue().strip())
+        assert err["id"] == 9
+        assert "empty response" in err["error"]["message"]
+
+    def test_sse_only_ping_event_notification_stays_silent(self, httpx_mock):
+        """The symmetric notification (no id) case stays silent."""
+        httpx_mock.add_response(
+            text="event: ping\ndata: {}\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+        client = httpx.Client()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            _post_and_stream(
+                client,
+                "https://example.com/mcp",
+                '{"jsonrpc":"2.0","method":"x"}',
+                {},
+                None,
+                has_id=False,
+            )
+        assert stdout.getvalue().strip() == ""
 
     def test_empty_200_body_to_request_synthesizes_error(self, httpx_mock):
         """#4(round11): a 200 with NO JSON-RPC payload would leave a
@@ -620,6 +702,20 @@ class TestIterSseEvents:
         # interleaved between data lines too — the data buffer is unaffected
         lines = ["data:a", "id: 7", "data:b", "retry: 200", ""]
         assert list(_iter_sse_events(lines)) == [("message", "a\nb")]
+
+    def test_empty_event_field_defaults_to_message(self):
+        """#4(round25): WHATWG 'dispatch the event' uses the default type
+        'message' when the event-type buffer is the empty string, so an
+        explicitly-empty `event:` must NOT yield a ('', data) event that the
+        message-only consumers then drop."""
+        assert list(_iter_sse_events(["event:", "data:hi", ""])) == [
+            ("message", "hi")
+        ]
+        # An empty event: after a real one resets back to the default too.
+        assert list(_iter_sse_events(["event: ping", "data:a", "", "event:", "data:b", ""])) == [
+            ("ping", "a"),
+            ("message", "b"),
+        ]
 
     def test_trailing_event_without_blank_line_flushed(self):
         # httpx may not surface a final empty line; a complete event must still
@@ -2341,6 +2437,17 @@ class TestNormalizeNullArguments:
 
     def test_rewrites_null_arguments_to_empty_object(self):
         line = '{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"t","arguments":null}}'
+        out = json.loads(_normalize_null_arguments(line))
+        assert out["params"]["arguments"] == {}
+
+    def test_rewrites_null_arguments_with_whitespace_around_colon(self):
+        """#15(round25): the cheap pre-gate regex tolerates whitespace around the
+        `arguments` colon, but every other test uses the compact form — pin the
+        whitespace variant so a server emitting `"arguments" : null` is rewritten."""
+        line = (
+            '{"jsonrpc":"2.0","method":"tools/call","id":1,'
+            '"params":{"name":"t","arguments" : null}}'
+        )
         out = json.loads(_normalize_null_arguments(line))
         assert out["params"]["arguments"] == {}
 
