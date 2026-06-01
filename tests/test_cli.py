@@ -965,17 +965,24 @@ class TestBuildScopeUpgrader:
     def test_returns_bearer_headers_and_closes_client(self, monkeypatch):
         _SpyClient.instances.clear()
         monkeypatch.setattr("mcp_stdio.cli.httpx.Client", _SpyClient)
-        monkeypatch.setattr(
-            "mcp_stdio.oauth.step_up_authorize",
-            lambda url, client, scope: TokenData(access_token="upgraded"),
-        )
+        captured = {}
+
+        def fake_step_up(url, client, scope, *, timeout):
+            captured["timeout"] = timeout
+            return TokenData(access_token="upgraded")
+
+        monkeypatch.setattr("mcp_stdio.oauth.step_up_authorize", fake_step_up)
         upgrader = _build_scope_upgrader(
-            "https://example.com/mcp", {"X-Base": "1"}, 10, 120
+            "https://example.com/mcp", {"X-Base": "1"}, 10, 120, 90
         )
         out = upgrader("hr:read hr:write")
         assert out["Authorization"] == "Bearer upgraded"
         assert out["X-Base"] == "1"
         assert _SpyClient.instances[-1].closed
+        # #13(round26): --oauth-timeout must reach the mid-session step-up too,
+        # not just the cold-start ensure_token — otherwise a step-up silently
+        # falls back to step_up_authorize's hardcoded 120 s default.
+        assert captured["timeout"] == 90
         # #11(round19): the RFC 9470 step-up path carries the same credential-leak
         # exposure as refresh, so its client must pin follow_redirects=False too
         # (an AS-controlled token endpoint could otherwise 302 the credential POST
@@ -986,11 +993,11 @@ class TestBuildScopeUpgrader:
         _SpyClient.instances.clear()
         monkeypatch.setattr("mcp_stdio.cli.httpx.Client", _SpyClient)
 
-        def boom(url, client, scope):
+        def boom(url, client, scope, *, timeout):
             raise RuntimeError("step-up denied")
 
         monkeypatch.setattr("mcp_stdio.oauth.step_up_authorize", boom)
-        upgrader = _build_scope_upgrader("https://example.com/mcp", {}, 10, 120)
+        upgrader = _build_scope_upgrader("https://example.com/mcp", {}, 10, 120, 90)
         assert upgrader("hr:read") is None
         assert _SpyClient.instances[-1].closed
         assert "step-up authorization failed" in capsys.readouterr().err
