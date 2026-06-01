@@ -21,7 +21,7 @@ from mcp_stdio.token_store import (
 
 class TestReadJsonObjectFile:
     """The shared side-effect-free O_NOFOLLOW probe used by both _read_legacy_data
-    and the migration's XDG-store check. #10(round43): pin its non-regular-file
+    and the migration's XDG-store check.: pin its non-regular-file
     and unreadable branches directly, independent of which caller reaches them."""
 
     def test_absent_file_returns_none(self, tmp_path):
@@ -61,7 +61,7 @@ class TestReadJsonObjectFile:
         assert _read_json_object_file(fifo) is None
 
     def test_closes_fd_when_fdopen_raises(self, tmp_path, monkeypatch):
-        """#5(round44): if os.fdopen itself raises (e.g. resource pressure), the
+        """: if os.fdopen itself raises (e.g. resource pressure), the
         bare fd must still be closed — not leaked — and the function returns
         None."""
         p = tmp_path / "ok.json"
@@ -84,7 +84,7 @@ class TestReadJsonObjectFile:
 
 
 class TestForeignNonFiniteEntry:
-    """#6(round44): a foreign writer's non-finite entry must not wedge all saves."""
+    """: a foreign writer's non-finite entry must not wedge all saves."""
 
     def test_save_drops_foreign_non_finite_entry_instead_of_failing(
         self, tmp_path, monkeypatch, capsys
@@ -171,7 +171,7 @@ class TestLoadSaveDelete:
         assert load_token("https://example.com/mcp") is None
 
     def test_delete_nonexistent(self, tmp_path, monkeypatch):
-        """#B-3(round34): deleting a missing key is a no-op — it must not raise
+        """: deleting a missing key is a no-op — it must not raise
         AND must not materialize the store file (no write when nothing was
         removed), so the store stays untouched."""
         store_file = tmp_path / "tokens.json"
@@ -201,7 +201,7 @@ class TestLoadSaveDelete:
         reason="POSIX mode bits don't model the NTFS ACL Windows uses",
     )
     def test_newly_created_parent_dirs_are_tightened(self, tmp_path, monkeypatch):
-        """#L2(round29): mkdir(mode=) only tightens the final component, so an
+        """: mkdir(mode=) only tightens the final component, so an
         intermediate dir parents=True creates (e.g. ~/.config on a fresh home)
         would otherwise be left at the umask. Each ancestor WE create must be
         0o700. A pre-existing ancestor (tmp_path) is untouched."""
@@ -229,7 +229,7 @@ class TestLoadSaveDelete:
         reason="POSIX mode bits don't model the NTFS ACL Windows uses",
     )
     def test_lock_file_retightened_to_0600(self, tmp_path, monkeypatch):
-        """#9(round19): a PRE-EXISTING loose-mode lock file is re-tightened to
+        """: a PRE-EXISTING loose-mode lock file is re-tightened to
         0o600 via fchmod when _store_lock opens it — the O_CREAT mode only
         applies on creation, so a pre-planted group/other-writable lock file
         (a local-DoS handle) is closed off, mirroring the store-file re-chmod."""
@@ -263,7 +263,7 @@ class TestLoadSaveDelete:
     def test_save_token_write_failure_is_fail_soft(
         self, tmp_path, monkeypatch, capsys
     ):
-        """#4(round21): a _write_store OSError (full / read-only FS) must NOT
+        """: a _write_store OSError (full / read-only FS) must NOT
         propagate out of save_token — it warns and returns, so a refresh whose
         cache-write fails still yields a usable token instead of crashing the
         OAuth/relay path. Symmetric with the _StoreUnreadable read path."""
@@ -311,7 +311,7 @@ class TestLoadSaveDelete:
     def test_corrupt_file_warns_once_on_read_path(
         self, tmp_path, monkeypatch, capsys
     ):
-        """#L8(round39): a corrupt store surfaces a one-time stderr warning on the
+        """: a corrupt store surfaces a one-time stderr warning on the
         pure READ path too (load_token), not only when a later save reaches the
         write path — otherwise a read-only invocation gives the operator zero
         signal beyond an unexplained re-auth. The one-shot flag keeps it to a
@@ -333,7 +333,7 @@ class TestLoadSaveDelete:
     def test_non_object_store_warns_and_degrades_to_empty(
         self, tmp_path, monkeypatch, capsys, body
     ):
-        """#L3(round40): a token store whose top-level JSON is valid but NOT an
+        """: a token store whose top-level JSON is valid but NOT an
         object (a bare array / number / string / null) is unusable as a store and
         overwrite-safe — it must surface the SAME one-shot warning as corrupt
         JSON, not silently degrade to {} with only an unexplained re-auth."""
@@ -353,7 +353,7 @@ class TestLoadSaveDelete:
     def test_load_fifo_store_returns_none_without_hanging(
         self, tmp_path, monkeypatch
     ):
-        """#10(round25): a FIFO (or other non-regular file) pre-planted at the
+        """: a FIFO (or other non-regular file) pre-planted at the
         store path must be refused (O_NONBLOCK open + fstat regular-file check),
         not read — an O_RDONLY read of a writer-less pipe would block forever and
         hang load/save and the relay startup. load_token returns None, no hang."""
@@ -369,7 +369,7 @@ class TestLoadSaveDelete:
     def test_load_non_finite_expires_at_returns_none(
         self, tmp_path, monkeypatch, literal
     ):
-        """#11(round25): json.loads parses the NaN / Infinity literals, which pass
+        """: json.loads parses the NaN / Infinity literals, which pass
         an isinstance(float) check but poison the expiry comparison (inf = never
         expires, NaN = always expired). A non-finite expires_at must degrade to
         None (clean re-auth)."""
@@ -458,11 +458,11 @@ class TestLoadSaveDelete:
     @pytest.mark.parametrize(
         "entry",
         [
-            # #9(round23): bool is an int subclass; a corrupted bool expiry must
+            # bool is an int subclass; a corrupted bool expiry must
             # be rejected, not read as a 1970-epoch 1/0.
             '{"access_token": "t", "expires_at": true}',
             '{"access_token": "t", "client_secret_expires_at": false}',
-            # #14(round23): the sibling validation branches not previously covered.
+            # the sibling validation branches not previously covered.
             '{"access_token": "t", "client_secret_expires_at": "never"}',
             '{"access_token": "t", "no_resource_indicator": "yes"}',
         ],
@@ -470,7 +470,7 @@ class TestLoadSaveDelete:
     def test_load_corrupted_typed_fields_return_none(
         self, tmp_path, monkeypatch, entry
     ):
-        """#9/#14(round23): bool expiries and the not-previously-covered
+        """#9/: bool expiries and the not-previously-covered
         client_secret_expires_at / no_resource_indicator type branches all
         degrade load_token to None rather than reaching the OAuth path."""
         store_file = tmp_path / "tokens.json"
@@ -492,7 +492,7 @@ class TestLoadSaveDelete:
         assert load_token("https://example.com/mcp") is None
 
     def test_load_non_string_scope_returns_none(self, tmp_path, monkeypatch):
-        """#6(round13): a non-string scope (corrupted store) must degrade to None
+        """: a non-string scope (corrupted store) must degrade to None
         — otherwise cached.scope.split() crashes the step-up path."""
         store_file = tmp_path / "tokens.json"
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
@@ -518,7 +518,7 @@ class TestLoadSaveDelete:
     def test_load_non_bool_iss_parameter_supported_returns_none(
         self, tmp_path, monkeypatch
     ):
-        """#10(round22): iss_parameter_supported is security-load-bearing (it
+        """: iss_parameter_supported is security-load-bearing (it
         gates the RFC 9207 §2.4 missing-iss reject on step-up). A corrupted
         non-bool value must degrade to None / re-auth, not silently mis-set the
         defence — validated like no_resource_indicator."""
@@ -549,7 +549,7 @@ class TestLoadSaveDelete:
         self, tmp_path, monkeypatch, capsys
     ):
         """A corrupt store file is replaced (not appended to) on the next save —
-        its unparseable bytes are already unrecoverable. #L2(round37): the
+        its unparseable bytes are already unrecoverable.: the
         previously-silent replacement now emits a one-time stderr warning so the
         operator learns their token store was corrupt."""
         store_file = tmp_path / "tokens.json"
@@ -627,7 +627,7 @@ class TestLoadSaveDelete:
         reason="os.mkfifo is POSIX-only",
     )
     def test_save_aborts_when_store_is_fifo(self, tmp_path, monkeypatch, capsys):
-        """#13(round26): a FIFO (non-regular file) pre-planted at the store path
+        """: a FIFO (non-regular file) pre-planted at the store path
         must make a save ABORT — the for_write=True fstat regular-file guard
         raises _StoreUnreadable, so save_token skips the write rather than
         clobbering (or hanging on) the special file. Complements the read-path
@@ -648,7 +648,7 @@ class TestLoadSaveDelete:
     def test_mid_read_failure_aborts_save_and_load_returns_none(
         self, tmp_path, monkeypatch, capsys
     ):
-        """#8(round27): _read_store's open SUCCEEDS but the read itself fails
+        """: _read_store's open SUCCEEDS but the read itself fails
         (e.g. EIO on a flaky fs). The write path must raise _StoreUnreadable so a
         save ABORTS (never clobbers the unread store), and the read path must
         degrade to {} so a load returns None — the third raise site (mid-read),
@@ -705,7 +705,7 @@ class TestLoadSaveDelete:
     def test_lock_symlink_emits_one_warning_and_proceeds(
         self, tmp_path, monkeypatch, capsys
     ):
-        """#11(round26): a symlink planted at the lock path (refused via
+        """: a symlink planted at the lock path (refused via
         O_NOFOLLOW -> ELOOP) silently disables cross-process serialization. The
         save must still proceed unlocked AND emit a one-time warning so the
         advisory-lock DoS is visible to the operator."""
@@ -732,7 +732,7 @@ class TestLoadSaveDelete:
     def test_lock_fifo_does_not_hang_and_proceeds(
         self, tmp_path, monkeypatch, capsys
     ):
-        """#1(round32): a FIFO planted at the lock path must NOT hang the save —
+        """: a FIFO planted at the lock path must NOT hang the save —
         an O_WRONLY open of a writer-less FIFO blocks forever WITHOUT O_NONBLOCK.
         With O_NONBLOCK the open returns ENXIO and the save degrades to an
         unlocked write (and warns once), instead of stalling every save/delete."""
@@ -753,7 +753,7 @@ class TestLoadSaveDelete:
     def test_save_soft_fails_on_non_serializable_value(
         self, tmp_path, monkeypatch, capsys
     ):
-        """#12(round26): _write_store's json.dumps runs before its inner try, so a
+        """: _write_store's json.dumps runs before its inner try, so a
         non-serializable value raises a non-OSError (TypeError). save_token's
         except must catch Exception (not only OSError) so the soft-fail contract
         holds and the relay is not crashed mid-session."""
@@ -774,7 +774,7 @@ class TestLoadSaveDelete:
     def test_save_rejects_non_finite_expiry_before_disk(
         self, tmp_path, monkeypatch, capsys, bad_expiry
     ):
-        """#7(round31): _write_store uses allow_nan=False, so a non-finite
+        """: _write_store uses allow_nan=False, so a non-finite
         expires_at raises ValueError before reaching disk (instead of writing the
         non-standard `Infinity`/`NaN` literal that only the load-side guard
         catches). save_token catches it and soft-fails — nothing is persisted and
@@ -985,7 +985,7 @@ class TestNormalizeKey:
         assert _normalize_key("https://[::1]:443/mcp") == "https://[::1]/mcp"
 
     def test_userinfo_dropped_and_warned_once(self, monkeypatch, capsys):
-        """#7(round17): embedded userinfo is dropped from the key (two URLs
+        """: embedded userinfo is dropped from the key (two URLs
         differing only in credentials fold to one slot), and a one-time stderr
         warning surfaces the silent token-sharing — emitted only once."""
         monkeypatch.setattr("mcp_stdio.token_store._warned_userinfo_key", False)
@@ -1041,7 +1041,7 @@ class TestKeyNormalizationInStore:
         assert load_token("https://x.com/mcp/") is None
 
     def test_write_store_output_is_key_sorted(self, tmp_path, monkeypatch):
-        """#8(round17): on-disk tokens.json keys are sorted for stable,
+        """: on-disk tokens.json keys are sorted for stable,
         diff-friendly output regardless of save order."""
         store_file = self._patch(tmp_path, monkeypatch)
         save_token("https://zebra.com/mcp", TokenData(access_token="z"))
@@ -1053,7 +1053,7 @@ class TestKeyNormalizationInStore:
     def test_write_path_enoent_treated_as_absent_not_unreadable(
         self, tmp_path, monkeypatch, capsys
     ):
-        """#9(round17): if the store vanishes in the TOCTOU window between
+        """: if the store vanishes in the TOCTOU window between
         exists() and os.open on the WRITE path, treat it as absent (the save
         proceeds from {}) rather than _StoreUnreadable (which would abort the
         save with a misleading 'could not be read' warning)."""
@@ -1112,7 +1112,7 @@ class TestLegacyMigration:
         reason="POSIX symlink semantics; O_NOFOLLOW is 0 on Windows",
     )
     def test_migration_refuses_symlinked_legacy_store(self, tmp_path, monkeypatch):
-        """#1(round27): a SYMLINK planted at the legacy path must NOT be renamed
+        """: a SYMLINK planted at the legacy path must NOT be renamed
         into the trusted XDG store path — Path.rename would move the symlink
         itself, after which every O_NOFOLLOW read ELOOPs and save/delete abort
         forever (a permanent token-cache DoS). The migration is refused and the
@@ -1147,7 +1147,7 @@ class TestLegacyMigration:
     def test_migration_skips_fifo_legacy_store_without_hanging(
         self, tmp_path, monkeypatch
     ):
-        """#1/#2(round27): a FIFO at the legacy path must not be migrated and must
+        """#1/: a FIFO at the legacy path must not be migrated and must
         not hang the load — the rename-branch fstat guard (and _read_legacy_data's
         O_NONBLOCK) refuse the special file. load returns None, no hang."""
         legacy_dir = tmp_path / "legacy"
@@ -1170,7 +1170,7 @@ class TestLegacyMigration:
     def test_placeholder_copy_through_non_serializable_does_not_crash_read(
         self, tmp_path, monkeypatch
     ):
-        """#C-3(round28): the empty-placeholder copy-through catches Exception
+        """: the empty-placeholder copy-through catches Exception
         (not just OSError), matching the widened save/delete contract. A
         non-serializable legacy value makes _write_store's json.dumps raise a
         TypeError, which must NOT propagate out of the unlocked read path —
@@ -1231,7 +1231,7 @@ class TestLegacyMigration:
     def test_exdev_copy_through_with_corrupt_legacy_writes_nothing(
         self, tmp_path, monkeypatch
     ):
-        """#6(round14): the EXDEV copy-through fallback must NOT write a corrupt
+        """: the EXDEV copy-through fallback must NOT write a corrupt
         or empty legacy file through to the new path — it persists only a real
         dict; an unparseable legacy read leaves the target absent."""
         legacy_dir = tmp_path / "legacy"
@@ -1264,7 +1264,7 @@ class TestLegacyMigration:
     def test_copy_through_write_failure_does_not_crash_load(
         self, tmp_path, monkeypatch
     ):
-        """#11(round15): if the EXDEV copy-through _write_store raises (disk
+        """: if the EXDEV copy-through _write_store raises (disk
         full / read-only FS), load_token (unlocked) must NOT propagate it — it
         degrades to None and leaves the legacy file intact for a later retry."""
         legacy_dir = tmp_path / "legacy"
@@ -1379,7 +1379,7 @@ class TestLegacyMigration:
         assert not legacy_file.exists()
 
     def test_empty_xdg_store_copies_legacy_through(self, tmp_path, monkeypatch):
-        """#8(round16): if the XDG store exists but is EMPTY (a 0-byte
+        """: if the XDG store exists but is EMPTY (a 0-byte
         placeholder from an interrupted write / backup restore), the legacy
         tokens must not be stranded behind it — they are copied through into the
         placeholder (and load_token returns them), then the now-redundant legacy
@@ -1410,7 +1410,7 @@ class TestLegacyMigration:
     def test_empty_dict_xdg_store_does_not_strand_or_lose_legacy(
         self, tmp_path, monkeypatch
     ):
-        """#L7(round39): an XDG store of `{}` (2 bytes — all tokens were deleted)
+        """: an XDG store of `{}` (2 bytes — all tokens were deleted)
         is NOT proof the migration completed. The old `st_size > 0` test treated
         it as "has data" and unlinked still-real legacy tokens (data loss). The
         content-based probe routes `{}` into the copy-through branch instead: the
@@ -1441,7 +1441,7 @@ class TestLegacyMigration:
     def test_empty_dict_xdg_preserves_legacy_when_copy_through_fails(
         self, tmp_path, monkeypatch
     ):
-        """#L7(round39): the data-loss guard — if the copy-through write fails for
+        """: the data-loss guard — if the copy-through write fails for
         a `{}` XDG store, the legacy file must be PRESERVED (not unlinked), so a
         later run can retry. The old size-based path would have unlinked it."""
         legacy_dir = tmp_path / "legacy"
@@ -1472,7 +1472,7 @@ class TestLegacyMigration:
     def test_empty_xdg_copy_through_write_failure_preserves_legacy(
         self, tmp_path, monkeypatch
     ):
-        """#8(round16): if the empty-placeholder copy-through write FAILS (disk
+        """: if the empty-placeholder copy-through write FAILS (disk
         full / read-only FS), load_token must not crash and the legacy file must
         be preserved (not unlinked) for a later run to retry."""
         legacy_dir = tmp_path / "legacy"
@@ -1505,7 +1505,7 @@ class TestLegacyMigration:
         reason="POSIX mode bits don't model the NTFS ACL Windows uses",
     )
     def test_migration_tightens_legacy_dir_permissions(self, tmp_path, monkeypatch):
-        """#9(round16): the legacy DIR is re-chmod'd to 0o700 before its secrets
+        """: the legacy DIR is re-chmod'd to 0o700 before its secrets
         are exposed to a rename/copy-through, mirroring _ensure_store_dir's
         defensive re-chmod of the XDG dir."""
         legacy_dir = tmp_path / "legacy"
@@ -1543,7 +1543,7 @@ class TestLegacyMigration:
     def test_ensure_store_dir_warns_once_on_unfixable_loose_perms(
         self, tmp_path, monkeypatch, capsys
     ):
-        """#10(round16): if the store dir cannot be tightened and stays group/
+        """: if the store dir cannot be tightened and stays group/
         other-accessible, emit a single operator warning instead of failing
         silently — and only once, not on every call."""
         from mcp_stdio.token_store import _ensure_store_dir

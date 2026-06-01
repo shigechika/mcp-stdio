@@ -278,7 +278,7 @@ def _extract_protocol_version(payload: str) -> str | None:
         return None
     pv = result.get("protocolVersion")
     # Validate before this value can be injected as the MCP-Protocol-Version
-    # request header on every subsequent request (#M1 round37). Unlike
+    # request header on every subsequent request. Unlike
     # Mcp-Session-Id (an HTTP RESPONSE header h11 already vets for CR/LF), this
     # comes from the JSON BODY and bypasses all header validation — a malicious /
     # buggy server returning "2025-06-18\r\nEvil: 1" (or a NUL) would otherwise
@@ -424,7 +424,7 @@ def _extract_cancel_id(line: str) -> Any:
     # stdin hot path — and such an id can never match a real response id anyway.
     # Drop it (return None) so a malformed cancellation is a clean no-op rather
     # than an exception. ``null`` already returns None here and is filtered by
-    # the caller's ``cid is not None`` guard. (#9 round42)
+    # the caller's ``cid is not None`` guard.
     if rid is not None and not isinstance(rid, (str, int, float)):
         return None
     return rid
@@ -573,7 +573,7 @@ def _emit(line: str, tracker: "_CancelTracker | None") -> None:
     # a response — so a malformed peer that sends `method` alongside
     # result/error under a (coincidentally cancelled) id must still pass
     # through, matching this function's documented scope ("server-initiated
-    # requests ... pass through"). See #1 (round30).
+    # requests ... pass through").
     if rid is not None and "method" not in msg and ("result" in msg or "error" in msg):
         if tracker.consume(rid):
             log(f"dropped late response for cancelled id {rid!r}")
@@ -748,7 +748,7 @@ def _iter_sse_events(lines: Iterable[str]) -> Iterator[tuple[str, str]]:
             # WHATWG SSE "dispatch the event": an EMPTY event-type buffer
             # dispatches as the default "message". A frame `event:\ndata: {...}`
             # (explicitly-empty event field) must therefore be treated as a
-            # message, not silently dropped under an "" type. See #4 (round25).
+            # message, not silently dropped under an "" type.
             event_type = value or "message"
         elif field == "data":
             data_lines.append(value)
@@ -837,8 +837,7 @@ def _post_and_stream(
                         # bypasses the httpx.HTTPError handler below and unwinds
                         # to run()/run_sse()'s outer `except Exception` safety
                         # net, which swallows the re-raised write error: a dead
-                        # reader cannot observe the truncated body anyway (#L2
-                        # round39).
+                        # reader cannot observe the truncated body anyway.
                         _emit(payload, tracker)
                         emitted = True
                 else:
@@ -860,7 +859,7 @@ def _post_and_stream(
                 # pv is intentionally None here: no InitializeResult was
                 # delivered, so an empty-200 to an `initialize` request leaves
                 # the relay's protocol_version unset rather than guessing a
-                # version it never negotiated (#6 round27). The client received
+                # version it never negotiated. The client received
                 # the synthesized error above and will re-initialize; the server
                 # that answered initialize with an empty 200 is already
                 # non-compliant. Contrast the partial-delivery path below, which
@@ -888,8 +887,7 @@ def _post_and_stream(
                     _write_line(
                         _error_response(f"upstream stream interrupted: {e}", req_id)
                     )
-                # Return a 200 result carrying any captured protocol_version (#1
-                # round25) instead of None: the InitializeResult was already
+                # Return a 200 result carrying any captured protocol_version instead of None: the InitializeResult was already
                 # delivered, so the client considers init complete. Returning None
                 # would discard the negotiated version, leaving the relay's
                 # protocol_version None and omitting MCP-Protocol-Version on every
@@ -974,7 +972,7 @@ def _post_parsed(
                 # it as the page result and drop the real list. Mirrors the
                 # keep-reading gate in _check_connection_sse.
                 #
-                # #5 (round23): every NON-response message event (a server-
+                # every NON-response message event (a server-
                 # initiated request / notification) must still be DELIVERED to
                 # stdout — _post_and_stream emits every message event, so the
                 # pagination path must too, or interleaved frames are silently
@@ -1230,7 +1228,7 @@ def _paginate_and_stream(
             f"truncating results"
         )
 
-    # Defensive only / unreachable in practice (#N6 round37): the loop always
+    # Defensive only / unreachable in practice: the loop always
     # runs page 1, and every path that reaches here either early-returned or
     # merged page 1's dict into merged_result first, so it is never None. Kept as
     # a belt-and-suspenders guard; intentionally not covered by a test (the state
@@ -1247,7 +1245,7 @@ def _paginate_and_stream(
     merged_response: dict[str, Any] = {
         "jsonrpc": request.get("jsonrpc", "2.0"),
         # Reuse the id run() already parsed (and tracks/discards in the cancel
-        # filter) rather than re-deriving it from this second parse (#1 round42).
+        # filter) rather than re-deriving it from this second parse.
         # They are provably identical today, but keying the emitted id off req_id
         # removes a latent divergence point — _emit's cancel filter matches on the
         # BODY id, so any future drift would both mis-correlate the response and
@@ -1255,7 +1253,7 @@ def _paginate_and_stream(
         "id": req_id,
         "result": merged_result,
     }
-    # Gate the synthesized response on has_id (#1 round44): a JSON-RPC notification
+    # Gate the synthesized response on has_id: a JSON-RPC notification
     # (no id key) MUST never receive a response. _detect_paginated_list keys only
     # off method + cursor-absence, so a `tools/list` sent as a notification reaches
     # here with has_id=False; emitting the merged response would deliver a spurious
@@ -1321,11 +1319,10 @@ def _reinitialize(
     # reaches here (the caller passes the base headers, not _prepare_headers
     # output), but an operator who pinned `-H MCP-Protocol-Version: <x>` would
     # otherwise have it ride this initialize POST — inconsistent with the
-    # dispatch path, which strips it from a real initialize (see #3 round18).
+    # dispatch path, which strips it from a real initialize (see).
     # Mirror that strip so both initialize paths behave identically. Also drop a
     # pinned case-variant Mcp-Session-Id: an initialize POST establishes a FRESH
-    # session, so a stale operator-pinned session id must not ride it (#B-1
-    # round28).
+    # session, so a stale operator-pinned session id must not ride it.
     init_headers = {
         k: v
         for k, v in headers.items()
@@ -1366,7 +1363,7 @@ def _reinitialize(
     # Drop any operator-pinned case-variant before injecting, mirroring
     # _prepare_headers' strip discipline, so the notifications/initialized POST
     # never serialises two Mcp-Session-Id / MCP-Protocol-Version lines that a
-    # strict 2025-06-18 server treats as a singleton field (#B-1 round28). The
+    # strict 2025-06-18 server treats as a singleton field. The
     # protocol-version strip is gated on `negotiated` (only stripped when set),
     # so an operator pin still rides through if the relay negotiated none.
     initialized_headers = {
@@ -1486,7 +1483,7 @@ def _check_connection_sse(
         if holder["post_error"] is not None:
             stream = holder["resp"]
             if stream is not None:
-                # #2 (round24): this closes the GET stream from the POST helper
+                # this closes the GET stream from the POST helper
                 # thread while the MAIN thread may be mid-iter_text(). It is the
                 # intended fast-fail (don't block the read until timeout for a
                 # reply that will never come), confined to the one-shot --check
@@ -1629,7 +1626,7 @@ def check_connection(
                 # matching the keep-reading gate in _post_parsed /
                 # _check_connection_sse. Breaking on the first message would
                 # mis-report a server that sends a notification frame first as
-                # "could not parse initialize result". (#1 round36)
+                # "could not parse initialize result".
                 if isinstance(parsed, dict) and (
                     "result" in parsed or "error" in parsed
                 ):
@@ -1705,7 +1702,7 @@ def run(
             token, or None on failure (RFC 9470 step-up authorization;
             cf. anthropics/claude-code#44652).
 
-    Limitation — JSON-RPC batches (#2 round22): a top-level array (a batch) is
+    Limitation — JSON-RPC batches: a top-level array (a batch) is
     treated like a notification for error synthesis. ``_extract_id_and_presence``
     returns ``has_id=False`` for any non-object line, so if a batch's POST fails
     upstream (transport exhaustion, an empty 200, a >=400, or a non-compliant
@@ -1753,7 +1750,7 @@ def run(
         fields and would reject or mis-select. Mirrors the initialize-path strip
         in ``_dispatch`` / ``_reinitialize``. The strip is gated on the relay
         actually having a value, so an operator pin still rides through on the
-        paths where the relay manages no value of its own. See #3 (round27).
+        paths where the relay manages no value of its own.
         """
         h = dict(headers)
         if session_id:
@@ -1827,7 +1824,7 @@ def run(
                     # `arguments` merely contains a "method":"initialize" key from
                     # capturing a spurious result.protocolVersion out of its tool
                     # response and then injecting a never-negotiated version on
-                    # every later request (#3 round42). The cheap
+                    # every later request. The cheap
                     # _INITIALIZE_METHOD_RE inside _is_initialize_request still
                     # short-circuits the common non-matching line without a parse.
                     capture_init = _is_initialize_request(content)
@@ -1843,7 +1840,7 @@ def run(
                         # is left intact. Mcp-Session-Id is untouched. Both capture
                         # and strip now share the parse-authoritative gate, so a
                         # tools/call whose arguments contains a "method":"initialize"
-                        # key keeps its header. See #3 (round18), #3 (round42).
+                        # key keeps its header.
                         h = {
                             k: v
                             for k, v in h.items()
@@ -1880,7 +1877,7 @@ def run(
                 # honoured on the retry rather than re-sending the stale one. (The
                 # 404 branch re-establishes its own fresh session below.)
                 #
-                # Gate it (#1 round19): adopt only when this response is a SUCCESS
+                # Gate it: adopt only when this response is a SUCCESS
                 # or a 401/403 whose recovery retry actually needs the rotated id.
                 # A terminal 4xx/5xx with no recovery (e.g. a bare 500) that merely
                 # echoes a session id must NOT poison session_id for the next stdin
@@ -1907,7 +1904,7 @@ def run(
                 # echoed (possibly rotated) session id must NOT be adopted: it is an
                 # id the server is about to reject. The `< 400` predicate alone
                 # admits 202, so exclude a 202-to-request explicitly, matching the
-                # authoritative post-recovery gate's `not is_error`. (#1 round33)
+                # authoritative post-recovery gate's `not is_error`.
                 if (
                     result.session_id
                     and not (result.status_code == 202 and req_has_id)
@@ -1920,7 +1917,7 @@ def run(
                 # most once per stdin line. A 401/403 whose retry returns 404 flows
                 # into the 404 branch and recovers ONLY when a session_id was
                 # already established — the 404 branch is gated on `and session_id`
-                # (#1 round23). A COLD 404 (no session ever existed, e.g. the
+                #. A COLD 404 (no session ever existed, e.g. the
                 # initialize itself 401'd) is a genuine not-found, not a session
                 # expiry, so it correctly surfaces as a JSON-RPC error rather than
                 # re-initializing a session that never was. The converse does NOT
@@ -1955,7 +1952,7 @@ def run(
                         # Re-adopt a session id the server rotated alongside this 401
                         # retry's response, so a chained 403 step-up below rebuilds
                         # its retry headers from the fresh id, not the stale one.
-                        # Gate it like the pre-recovery adoption (#1 round24/26): adopt
+                        # Gate it like the pre-recovery adoption (/26): adopt
                         # only when the retry SUCCEEDED, or returned a 403 that the
                         # step-up branch below will actually CONSUME — i.e. a PARSEABLE
                         # insufficient_scope challenge. A terminal status (bare 500/400,
@@ -1963,14 +1960,14 @@ def run(
                         # not parse so step-up never fires) that merely echoes a session
                         # id must NOT poison session_id for the next stdin line — that
                         # id was just rejected. The parseable-scope conjunct mirrors the
-                        # top-level feeds_recovery gate exactly (#1 round28). (A 404 is
+                        # top-level feeds_recovery gate exactly. (A 404 is
                         # excluded: its branch reinitializes from scratch, ignoring any
                         # rotated id, and a cold 404 must stay a terminal error.)
                         if (
                             result.session_id
                             and not (
                                 result.status_code == 202 and req_has_id
-                            )  # #1 round33: a 202-to-request is errored, not adopted
+                            )  #: a 202-to-request is errored, not adopted
                             and (
                                 result.status_code < 400
                                 or (
@@ -2011,8 +2008,7 @@ def run(
                                 # None handling.
                                 continue
                             # Re-adopt a session id rotated alongside this step-up
-                            # retry's response. Gate it like the 401 branch (#1
-                            # round24): adopt only on SUCCESS. After the step-up the
+                            # retry's response. Gate it like the 401 branch: adopt only on SUCCESS. After the step-up the
                             # only downstream branch is 404, which reinitializes from
                             # scratch (ignoring any rotated id), so a terminal status
                             # echoing a session id must not poison the next line.
@@ -2020,7 +2016,7 @@ def run(
                                 result.session_id
                                 and not (result.status_code == 202 and req_has_id)
                                 and result.status_code < 400
-                            ):  # #1 round33: a 202-to-request is errored, not adopted
+                            ):  #: a 202-to-request is errored, not adopted
                                 session_id = result.session_id
                         else:
                             log("step-up authorization failed, returning error")
@@ -2060,7 +2056,7 @@ def run(
                 # and would leave the client hanging forever (no body now, no async
                 # reply on Streamable HTTP) — synthesize an error for it too, matching
                 # the empty-200 guard in _post_and_stream. A 202 to a NOTIFICATION
-                # (no id) stays correctly silent. See #11 and #4 (round16).
+                # (no id) stays correctly silent. See #11 and.
                 req_202_hang = result.status_code == 202 and req_has_id
                 is_error = result.status_code >= 400 or req_202_hang
 
@@ -2071,7 +2067,7 @@ def run(
                 # The next line's 404 recovery would self-heal it, but don't carry
                 # known-bad state forward. The inline 401/403 re-adoptions above
                 # stay unconditional — they feed the very next chained recovery
-                # dispatch, not the next stdin line. See #1 (round19).
+                # dispatch, not the next stdin line.
                 if result.session_id and not is_error:
                     session_id = result.session_id
 
@@ -2093,7 +2089,7 @@ def run(
                             else f"HTTP {result.status_code}"
                         )
                         _write_line(_error_response(msg, req_id, data=err_data))
-            except Exception as e:  # noqa: BLE001 — never crash the gateway (#1 round17)
+            except Exception as e:  # noqa: BLE001 — never crash the gateway
                 # The #11 contract is structural here, not just per-helper: an
                 # unexpected non-httpx exception escaping _dispatch / the recovery
                 # branches (e.g. a future parsing helper, a BrokenPipeError from
@@ -2105,7 +2101,7 @@ def run(
                     try:
                         _write_line(_error_response("internal relay error", req_id))
                     except OSError:
-                        # #3 (round31): the original exception may itself be a
+                        # the original exception may itself be a
                         # BrokenPipeError from _write_line (client closed stdout).
                         # The recovery write would then re-raise it and crash out
                         # of the loop — breaking the "keep the session alive"
@@ -2171,7 +2167,7 @@ def _sse_reader_loop(
     window where a server keeps the GET alive on an expired token would be
     over-engineering for no observed failure mode.
 
-    The cross-origin credential guard on the endpoint event (#D-1 round34)
+    The cross-origin credential guard on the endpoint event
     evaluates ``has_auth`` against this SAME per-connect snapshot, so it is only
     as fresh as the current GET connection — acceptable because Authorization is
     established at startup, not introduced mid-session: a refresh that ADDED an
@@ -2278,7 +2274,7 @@ def _sse_reader_loop(
             # (silent, permanent). Mirror the disconnect paths: clear ready + null
             # endpoint_url so in-flight ids surface "SSE endpoint unavailable"
             # instead of hanging, then reconnect — a one-off bad event should not be
-            # fatal (cf. the loop's stated intent above). See #1 (round16).
+            # fatal (cf. the loop's stated intent above).
             log(f"SSE reader unexpected error, reconnecting: {e}")
             state.ready.clear()
             state.endpoint_url = None
@@ -2454,7 +2450,7 @@ def run_sse(
                 # re-read once before giving up, rather than failing an otherwise
                 # recoverable in-flight request with a spurious error.
                 #
-                # NOTE (#3 round17): ``ready`` is a LATCHED Event. The reconnect
+                # NOTE: ``ready`` is a LATCHED Event. The reconnect
                 # paths clear it before nulling endpoint_url, but the fail-fast
                 # branches (cross-origin endpoint refusal, first-connect failure)
                 # deliberately set it with endpoint_url still None to unblock this
@@ -2484,7 +2480,7 @@ def run_sse(
                     # is surfaced to the caller by the generic 4xx/5xx branch
                     # below (typescript-sdk#1892).
                     #
-                    # NOTE (#4 round22): this time.sleep runs on the STDIN thread,
+                    # NOTE: this time.sleep runs on the STDIN thread,
                     # so while parked here (up to the 60 s cap) the loop cannot
                     # read the next stdin line — a notifications/cancelled for the
                     # very request being rate-limit-retried sits unprocessed until
@@ -2510,7 +2506,7 @@ def run_sse(
                         )
                         time.sleep(sleep_secs)
 
-                    # NOTE (#3 round16): the re-POST below resends the same JSON-RPC
+                    # NOTE: the re-POST below resends the same JSON-RPC
                     # id after a refresh/step-up. Unlike a non-2xx (which reliably
                     # means "not accepted"), a 401/403 does NOT guarantee the origin
                     # rejected the request — an edge proxy can inject the 401 while
@@ -2611,7 +2607,7 @@ def run_sse(
                     log(f"POST failed: {e}")
                     if req_has_id:
                         _write_line(_error_response(str(e), req_id))
-            except Exception as e:  # noqa: BLE001 — never crash the gateway (#1 round17)
+            except Exception as e:  # noqa: BLE001 — never crash the gateway
                 # Structural #11 guard, mirroring run() and the SSE reader: an
                 # unexpected non-httpx exception (a future helper, a _write_line
                 # BrokenPipeError on the endpoint-unavailable path) degrades THIS
@@ -2621,7 +2617,7 @@ def run_sse(
                     try:
                         _write_line(_error_response("internal relay error", req_id))
                     except OSError:
-                        # #3 (round31): swallow a second write failure when the
+                        # swallow a second write failure when the
                         # original exception was a BrokenPipeError from
                         # _write_line — mirrors run(); a dead stdout can receive
                         # nothing, and the stderr log above already recorded it.

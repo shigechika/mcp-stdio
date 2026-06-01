@@ -47,7 +47,7 @@ def _safe_int(value: Any, default: int) -> int:
     try:
         return int(float(value))
     except (TypeError, ValueError, OverflowError):
-        # OverflowError (#M1 round38): json.loads parses the non-standard literal
+        # OverflowError: json.loads parses the non-standard literal
         # Infinity / -Infinity by default, and int(float('inf')) raises
         # OverflowError (not ValueError). Without this, a hostile / misconfigured
         # AS returning {"expires_in": Infinity} would crash the device flow with
@@ -149,7 +149,7 @@ def _resource_indicator(server_url: str) -> str:
     Mirrors the userinfo-strip discipline of ``_authorization_base_url`` /
     ``_build_well_known_url``. Keeps the path and query (they distinguish
     resources) but drops any fragment (RFC 8707 §2 MUST NOT). Returns the input
-    unchanged if it does not parse as an http(s) URL with a host (#L1 round37).
+    unchanged if it does not parse as an http(s) URL with a host.
     """
     try:
         parsed = urlparse(server_url)
@@ -208,7 +208,7 @@ def _origin(parsed: ParseResult) -> tuple[str, str, int | str | None]:
     try:
         port = parsed.port
     except ValueError:
-        # #1 (round31): urllib parses the port LAZILY and raises ValueError on a
+        # urllib parses the port LAZILY and raises ValueError on a
         # non-numeric / out-of-range port (e.g. ``host:999999``) only on access.
         # Guard it like _authorization_base_url / _build_well_known_url so a
         # malformed-port URL never crashes a caller mid-discovery; return a
@@ -274,7 +274,7 @@ def _validate_auth_server_url(auth_server_url: str, mcp_server_url: str) -> bool
     try:
         parsed.port  # force the lazy port parse; raises on out-of-range/non-numeric
     except ValueError:
-        # #1 (round31): a malformed port makes this URL unusable AND would crash
+        # a malformed port makes this URL unusable AND would crash
         # the _origin() comparison below. Skip the candidate (return False) so the
         # discovery walk advances to the next authorization_server instead of
         # letting a single bad entry abort the whole OAuth flow with a ValueError.
@@ -413,7 +413,7 @@ def _validate_endpoint_url(endpoint_url: str | None, *, label: str) -> str | Non
     try:
         parsed.port  # force the lazy port parse; raises on out-of-range/non-numeric
     except ValueError:
-        # #2 (round31): a malformed port (e.g. ``host:999999``) is unusable and
+        # a malformed port (e.g. ``host:999999``) is unusable and
         # must be dropped here — otherwise this attacker-influenced endpoint
         # passes validation and a credential POST surfaces an opaque httpx error
         # deep in exchange_code / refresh instead of a clean validation drop.
@@ -479,7 +479,7 @@ def _fetch_authorization_server_metadata(
     """
     # RFC 8414 issuer has no query component, so do not carry one through.
     well_known = _build_well_known_url(auth_server_url, "oauth-authorization-server")
-    # #7 (round23): on the Phase-2 path-scoped fallback this function is called
+    # on the Phase-2 path-scoped fallback this function is called
     # with the full operator server_url, which may carry a query. _build_well_known_url
     # already strips the query when forming the discovery URL, so the issuer
     # comparison and the synthesized default endpoints must use the SAME
@@ -620,7 +620,7 @@ def discover_oauth_metadata(
         # AttributeError and abort the whole flow — skip to the next candidate
         # (host-root PRM / Phase 2/3) instead of crashing the multi-candidate
         # fallback. Symmetric with the isinstance(candidate, str) guard on the
-        # authorization_servers walk below. (#L2 round38)
+        # authorization_servers walk below.
         if not isinstance(prm_data, dict):
             continue
         # RFC 9728 §3.3 actually says the `resource` value MUST be identical to
@@ -635,11 +635,11 @@ def discover_oauth_metadata(
         # PRM URL itself derives from the operator-trusted server_url — so the
         # softening does not widen the trust boundary, only the citation's letter.
         prm_resource = prm_data.get("resource")
-        # Guard the type too (#L2 round38): a non-string `resource` (e.g. 123)
+        # Guard the type too: a non-string `resource` (e.g. 123)
         # would make .rstrip raise. A non-string is simply not a usable
         # identifier — skip the mismatch warning rather than crash.
         #
-        # Compare against the userinfo-STRIPPED identifier (#4 round43):
+        # Compare against the userinfo-STRIPPED identifier:
         # a compliant PRM `resource` never carries userinfo, and the rest of the
         # flow already uses the stripped form (_resource_indicator /
         # _build_well_known_url / _authorization_base_url). Comparing the raw
@@ -683,7 +683,7 @@ def discover_oauth_metadata(
 
     # If auth server differs from base, also try base as fallback.
     #
-    # #4 (round20): when PRM advertised a CROSS-ORIGIN AS whose own RFC 8414
+    # when PRM advertised a CROSS-ORIGIN AS whose own RFC 8414
     # metadata fetch failed, this fetches metadata from the MCP-host base — the
     # endpoints returned then derive from the MCP host, not the PRM-advertised
     # AS. This is a deliberate tradeoff, NOT the Phase-3 default-endpoint pinning
@@ -696,7 +696,7 @@ def discover_oauth_metadata(
     if auth_server_url != base:
         meta = _fetch_authorization_server_metadata(base, client)
         if meta:
-            # Surface the origin re-anchoring (#4 round44): the token/authorize
+            # Surface the origin re-anchoring: the token/authorize
             # endpoints now come from the MCP host, not the PRM-advertised AS the
             # operator may have expected. Benign for the common co-located
             # deployment, but in a genuine federated setup this is worth seeing.
@@ -727,7 +727,7 @@ def discover_oauth_metadata(
     # wrong origin entirely. When no PRM AS was found, auth_server_url == base,
     # so this reduces to the previous MCP-host defaults.
     as_base = auth_server_url.rstrip("/")
-    # #5 (round19): re-validate the synthesized endpoints through the same #13
+    # re-validate the synthesized endpoints through the same #13
     # policy the metadata path applies (no cleartext / no userinfo), so this
     # fallback enforces the credential-leak guard too. as_base was already
     # validated upstream (_validate_auth_server_url or _authorization_base_url),
@@ -799,7 +799,7 @@ def _warn_if_basic_auth_lacks_secret(
     The callers then fall back to sending only client_id in the request body,
     which an AS expecting HTTP Basic credentials for a confidential client
     rejects. Surfacing the inconsistency turns an opaque AS 401 into an
-    actionable message (#L5 round39).
+    actionable message.
     """
     if auth_method == "client_secret_basic" and not client_secret:
         log(
@@ -890,7 +890,7 @@ def register_client(
         raise ValueError(
             "Client registration response is missing client_id (RFC 7591 §3.2.1)."
         )
-    # Type-validate the AS-supplied credentials (#A-1 round34). A non-conformant
+    # Type-validate the AS-supplied credentials. A non-conformant
     # AS returning a non-string client_id / client_secret would otherwise be
     # str()-coerced into the authorize URL or raise an OPAQUE TypeError deep in
     # quote() during HTTP Basic auth. Convert it to an actionable RFC 7591 error
@@ -914,7 +914,7 @@ def register_client(
     # AS-assigned value when we implement it, so the subsequent token exchange
     # frames credentials the way the AS expects (Basic header vs request body)
     # instead of the way we asked — otherwise the exchange fails with an opaque
-    # AS rejection. (#L4 round39)
+    # AS rejection.
     assigned_method = data.get("token_endpoint_auth_method")
     if isinstance(assigned_method, str) and assigned_method != auth_method:
         if assigned_method in _SUPPORTED_AUTH_METHODS:
@@ -954,7 +954,7 @@ def generate_pkce() -> tuple[str, str]:
     """
     # token_urlsafe(64) is always 86 chars (64 bytes base64url, unpadded) = 512
     # bits of entropy, within the RFC 7636 §4.1 43-128 range and well above the
-    # OAuth 2.1 256-bit floor. (#6 round19: a former [:96] slice was a dead
+    # OAuth 2.1 256-bit floor. (: a former [:96] slice was a dead
     # no-op — 86 < 96 — and is dropped; nothing is truncated.)
     verifier = secrets.token_urlsafe(64)
     digest = hashlib.sha256(verifier.encode("ascii")).digest()
@@ -999,7 +999,7 @@ def _make_callback_handler(
                 self.end_headers()
                 return
 
-            # Reject a Host header that is not the loopback callback (#5 round42):
+            # Reject a Host header that is not the loopback callback:
             # DNS-rebinding defense-in-depth (RFC 8252 §8.x native-app guidance).
             # The server binds 127.0.0.1, so a legitimate browser redirect carries
             # ``Host: 127.0.0.1:<port>`` (or localhost). A hostile page that rebound
@@ -1027,7 +1027,7 @@ def _make_callback_handler(
             if result.auth_code is not None or result.error is not None:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html")
-                # #6 (round32): the callback URL carries the auth code/state, so
+                # the callback URL carries the auth code/state, so
                 # no-store keeps the browser from caching the response and
                 # no-referrer keeps any (future) sub-resource from leaking the
                 # URL via the Referer header. The page has no sub-resources
@@ -1040,7 +1040,7 @@ def _make_callback_handler(
                 )
                 return
 
-            # Write ordering matters (#4 round42): the main loop gates on
+            # Write ordering matters: the main loop gates on
             # ``cb_result.auth_code or cb_result.error`` and, the instant it
             # observes either, breaks out and reads ``cb_result.state`` for the
             # CSRF compare. CallbackResult is lock-free, so the CSRF-relevant
@@ -1050,7 +1050,7 @@ def _make_callback_handler(
             # spuriously fail the state compare (fails closed, but wrongly). Set
             # the gating field LAST in each branch.
             if "error" in params:
-                # Capture state on the error branch too (#1 round35) so the flow
+                # Capture state on the error branch too so the flow
                 # can bind an error response to the CSRF state before acting on
                 # it. RFC 6749 §4.1.2.1 requires a compliant AS to echo `state`
                 # on error responses; an error callback WITHOUT the matching
@@ -1064,7 +1064,7 @@ def _make_callback_handler(
 
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
-            self.send_header("Cache-Control", "no-store")  # #6 (round32)
+            self.send_header("Cache-Control", "no-store")  #
             self.send_header("Referrer-Policy", "no-referrer")
             self.end_headers()
 
@@ -1074,7 +1074,7 @@ def _make_callback_handler(
             elif result.auth_code is not None:
                 body = "<h1>Authorization successful</h1><p>You can close this tab.</p>"
             else:
-                # #2 (round21): a bare /callback hit with neither code nor error
+                # a bare /callback hit with neither code nor error
                 # (a browser prefetch, a manual GET) captured nothing — the main
                 # loop is still waiting. Don't render "successful": a misleading
                 # success page could let an attacker convince a victim that a
@@ -1111,7 +1111,7 @@ def _parse_token_response(resp: httpx.Response) -> dict[str, Any]:
     GitHub OAuth (and some others) may return application/x-www-form-urlencoded.
     Some servers return HTTP 200 with an error in the body (GitHub legacy).
     """
-    # #1 (round34): RFC 6749 §5.2 — a token error is a 4xx carrying
+    # RFC 6749 §5.2 — a token error is a 4xx carrying
     # ``{"error": ..., "error_description": ...}``. Surface that actionable
     # description BEFORE raise_for_status() collapses it into an opaque
     # ``HTTPStatusError`` (which omits the body), mirroring the 200-with-error
@@ -1141,7 +1141,7 @@ def _parse_token_response(resp: httpx.Response) -> dict[str, Any]:
     content_type = resp.headers.get("content-type", "")
     if "application/x-www-form-urlencoded" in content_type:
         parsed = dict(parse_qs(resp.text, keep_blank_values=True))
-        # parse_qs returns lists; take the FIRST value for every key (#8 round19).
+        # parse_qs returns lists; take the FIRST value for every key.
         # A non-conformant duplicate (e.g. access_token=a&access_token=b) must NOT
         # leave a LIST in result — that would flow into TokenData.access_token or
         # be str()-ed by _sanitize_oauth_error. No real provider emits duplicates;
@@ -1150,7 +1150,7 @@ def _parse_token_response(resp: httpx.Response) -> dict[str, Any]:
         _raise_for_body_error(result)
         return result
 
-    # #8 (round22): a 200 with any other content-type (text/plain, text/html, or
+    # a 200 with any other content-type (text/plain, text/html, or
     # a missing content-type over a non-JSON body) would otherwise raise a raw
     # json.JSONDecodeError out of resp.json() — fine on the refresh path (caught,
     # degrades to None) but it propagates as an opaque error on the auth-code
@@ -1168,8 +1168,7 @@ def _parse_token_response(resp: httpx.Response) -> dict[str, Any]:
     # non-compliant (RFC 6749 §5.1 mandates a JSON object). Surface a clear error
     # rather than the opaque TypeError that `_raise_for_body_error`'s
     # `"error" in result` would raise on a non-iterable — or the misleading
-    # substring/list behaviour, or a later AttributeError on result.get. (#L3
-    # round38)
+    # substring/list behaviour, or a later AttributeError on result.get.
     if not isinstance(result, dict):
         raise RuntimeError(
             f"token endpoint returned a non-object JSON body "
@@ -1326,12 +1325,12 @@ def _token_response_to_data(
             expires_in = float(raw["expires_in"])
         except (TypeError, ValueError):
             expires_in = None
-        # #9 (round22): a non-positive expires_in (0 or negative — malformed or
+        # a non-positive expires_in (0 or negative — malformed or
         # hostile) would make expires_at <= now, so ensure_token would treat the
         # FRESHLY obtained token as already expired and immediately re-refresh /
         # re-run the whole flow instead of using it once. Treat it as "no expiry
         # advertised" (expires_at = None) and warn, rather than burning the token.
-        # #6 (round42): also reject a NON-FINITE expires_in. json.loads parses the
+        # also reject a NON-FINITE expires_in. json.loads parses the
         # non-standard literals Infinity / NaN by default, and `float("inf") > 0`
         # is True — so without isfinite a hostile/buggy AS sending
         # `"expires_in": Infinity` would set expires_at = now + inf = inf, and
@@ -1384,7 +1383,7 @@ def _token_response_to_data(
         no_resource_indicator=no_resource_indicator,
         # Persist the RFC 9207 §3 flag so a later step-up that reconstructs
         # metadata from this cached entry keeps the §2.4 missing-iss MUST-reject
-        # active (otherwise it silently defaults off). See #3 (round20).
+        # active (otherwise it silently defaults off).
         iss_parameter_supported=metadata.iss_parameter_supported,
     )
 
@@ -1413,7 +1412,7 @@ def refresh_cached_token(
         log("OAuth client_secret expired (RFC 7591 §3.2.1) — cannot refresh")
         return None
     log("access token expired, attempting refresh")
-    # Defence-in-depth (#L4 round38): the cached token_endpoint was validated at
+    # Defence-in-depth: the cached token_endpoint was validated at
     # persist time, but re-validate before re-POSTing credentials to it. The
     # store is 0o600, so this is not an exploitable path today — but it mirrors
     # the discovery-path validation so a tampered/legacy store cannot redirect
@@ -1448,7 +1447,7 @@ def refresh_cached_token(
         # (_token_response_to_data now writes metadata.issuer into TokenData).
         issuer=cached.issuer,
         # Carry the RFC 9207 §3 flag through too so a refresh round-trip does not
-        # reset it to False in the re-persisted TokenData (#3 round20). Refresh
+        # reset it to False in the re-persisted TokenData. Refresh
         # has no authorization callback, so it is not load-bearing here — but it
         # keeps the cached flag intact for the next step-up.
         iss_parameter_supported=cached.iss_parameter_supported,
@@ -1466,7 +1465,7 @@ def refresh_cached_token(
             no_resource_indicator=no_resource_indicator,
         )
     except Exception as e:
-        # #M2 (round37): a non-compliant 200 token response MISSING access_token
+        # a non-compliant 200 token response MISSING access_token
         # (e.g. {"token_type":"Bearer"} with no `error`) slips past
         # _parse_token_response and makes _token_response_to_data raise. This
         # call was outside the try above, so the RuntimeError propagated out of
@@ -1507,7 +1506,7 @@ def _run_authorization_flow(
     # bind is the premise the single-shot + state-binding CSRF model rests on —
     # do not widen it. The ephemeral port (0) further narrows the attack window.
     callback_server = HTTPServer(("127.0.0.1", 0), handler_cls)
-    # #4 (round18): bound handle_request()'s block so the serve() daemon below
+    # bound handle_request()'s block so the serve() daemon below
     # re-checks ``done`` between requests instead of parking forever in
     # select(None) after the single callback. Without this the thread stays
     # alive for the whole (long-lived) relay process — one leaked thread + a
@@ -1602,7 +1601,7 @@ def _run_authorization_flow(
         done.set()
         callback_server.server_close()
 
-    # Validate state BEFORE acting on EITHER a code or an error (#1 round35).
+    # Validate state BEFORE acting on EITHER a code or an error.
     # Use a constant-time comparison so the rejection path does not leak the
     # common-prefix length of the two state tokens via timing. Over a loopback
     # callback the attack is theoretical, but every mainstream OAuth client does
@@ -1626,13 +1625,13 @@ def _run_authorization_flow(
     # being exchanged at AS-B. On the metadata path both values come from the
     # same AS (its metadata `issuer` and its callback `iss`) so they are
     # byte-identical and the comparison is exact. The trailing-slash tolerance
-    # below (#7 round25) is a no-op there, but matters on the PHASE-3 fallback
+    # below is a no-op there, but matters on the PHASE-3 fallback
     # where `metadata.issuer` is a SYNTHESIZED guess (`as_base`, an origin with
     # no path/slash): a real AS whose issuer is `https://as/` would otherwise
     # false-mismatch and block a legitimate flow. A genuine mix-up always differs
     # by HOST, which rstrip does not mask, so the defence is preserved.
     #
-    # Honest deviation note (#N1 round37): RFC 9207 §2.4 specifies a SIMPLE
+    # Honest deviation note: RFC 9207 §2.4 specifies a SIMPLE
     # STRING comparison (RFC 3986 §6.2.1), i.e. byte-exact. The rstrip("/")
     # tolerance is a deliberate, security-preserving relaxation of that letter
     # (same spirit as the RFC 9728 §3.3 / RFC 8414 §3.3 warn-and-continue
@@ -1644,7 +1643,7 @@ def _run_authorization_flow(
     # otherwise a mix-up attacker could simply strip `iss` to silence the compare
     # above. Enforce that when the AS advertised support. (When it did NOT
     # advertise, a missing `iss` is accepted: PKCE + state already cover the
-    # common attacks, so this whole check is defence-in-depth.) See #4 (round19).
+    # common attacks, so this whole check is defence-in-depth.)
     if metadata.iss_parameter_supported and cb_result.iss is None:
         raise RuntimeError(
             "OAuth issuer missing (RFC 9207 §2.4) — the authorization server "
@@ -1687,8 +1686,7 @@ def _run_authorization_flow(
         # TokenData's still-valid refresh_token with None — breaking every future
         # silent refresh until the next interactive flow. Carry the cached token
         # through, mirroring the refresh path (refresh_cached_token). Harmless on
-        # initial auth, where `cached` is None or carries no refresh_token. (#L2
-        # round41)
+        # initial auth, where `cached` is None or carries no refresh_token.
         previous_refresh_token=cached.refresh_token if cached else None,
         # RFC 6749 §5.1 lets the AS omit `scope` when it equals the requested
         # scope — exactly what a step-up does (requested == merged union). Fall
@@ -1791,7 +1789,7 @@ def _run_device_authorization_flow(
     da_resp.raise_for_status()
     da = da_resp.json()
     # A non-object device-authorization body would make da.get(...) below raise
-    # AttributeError; surface a clear error instead (#L3 round38).
+    # AttributeError; surface a clear error instead.
     if not isinstance(da, dict):
         raise RuntimeError(
             f"device authorization endpoint returned a non-object JSON body "
@@ -1841,7 +1839,7 @@ def _run_device_authorization_flow(
         1, min(_safe_int(da.get("expires_in"), 1800), _DEVICE_FLOW_MAX_LIFETIME_SECS)
     )
     # Honour the operator's --oauth-timeout as an UPPER bound on the human wait
-    # (#L9 round39). The CLI help promises --oauth-timeout covers "device-code
+    #. The CLI help promises --oauth-timeout covers "device-code
     # confirmation", but it was never plumbed here, so the device flow silently
     # ran on the server-advertised lifetime alone. Clamp the effective poll
     # lifetime to min(timeout, expires_in) so the documented contract holds; a
@@ -1867,7 +1865,7 @@ def _run_device_authorization_flow(
     # verification_uri_complete (which embeds it) is used — the AS asks the user
     # to confirm the code matches, as a device-disambiguation / remote-phishing
     # mitigation (§5.4). So show it unconditionally, not only on the no-complete
-    # branch. See #5 (round18).
+    # branch.
     print(f"  Code (verify it matches): {user_code}", file=sys.stderr)
     print(
         f"\nWaiting for authorization (giving up in {effective_lifetime}s)...",
@@ -1906,7 +1904,7 @@ def _run_device_authorization_flow(
             ).decode()
             poll_headers["Authorization"] = f"Basic {creds}"
         else:
-            # #5 (round17): a registered client_secret is always sent as a body
+            # a registered client_secret is always sent as a body
             # credential here even when auth_method is "none" (the AS advertised
             # no token_endpoint_auth_methods_supported but DCR still issued a
             # secret). That is effectively client_secret_post and is the
@@ -1926,7 +1924,7 @@ def _run_device_authorization_flow(
                 headers=poll_headers,
             )
         except Exception as exc:
-            # Sanitise like the refresh path (#B-2 round28): today's reachable
+            # Sanitise like the refresh path: today's reachable
             # exception is an httpx transport error whose str() carries only the
             # operator-trusted token-endpoint URL (no AS body), but bounding it
             # keeps any future exception type that embeds resp.text from writing
@@ -1960,7 +1958,7 @@ def _run_device_authorization_flow(
             # Non-JSON body. raise_for_status fails a 4xx/5xx; a non-compliant
             # 2xx-non-200 / 3xx (which raise_for_status would NOT catch, being
             # <400) would otherwise spin to the device-code deadline — fast-fail
-            # it by name instead of wasting the code's whole lifetime (#2 round36).
+            # it by name instead of wasting the code's whole lifetime.
             tok_resp.raise_for_status()
             raise RuntimeError(
                 f"Device flow failed: unexpected non-JSON HTTP "
@@ -1979,7 +1977,7 @@ def _run_device_authorization_flow(
             # error. FAST-FAIL with an actionable message — never spin to the
             # device-code deadline on a status retrying cannot resolve (RFC 8628
             # §3.5 mandates 200 or 400+error; a non-compliant 2xx-non-200 / 3xx
-            # would otherwise no-op raise_for_status and loop) (#2 round36).
+            # would otherwise no-op raise_for_status and loop).
             # Surface the AS error_description when present, mirroring the
             # _parse_token_response extraction the auth-code / refresh paths use.
             desc = ""
@@ -2069,7 +2067,7 @@ def ensure_token(
             client_id_override=client_id,
             scope=scope,
             resource_indicator=resource_indicator,
-            # #L9 round39: honour --oauth-timeout for the device-code wait too,
+            # honour --oauth-timeout for the device-code wait too,
             # matching the auth-code branch below and the CLI help text.
             timeout=timeout,
         )
@@ -2139,7 +2137,7 @@ def step_up_authorize(
     merged_scope = " ".join(sorted(scope_parts))
     log(f"step-up authorization requested with scope: {merged_scope}")
 
-    # Defence-in-depth (#L4 round38): re-validate the cached endpoints before
+    # Defence-in-depth: re-validate the cached endpoints before
     # reusing them for the full browser+callback flow + token exchange. They were
     # validated at persist time and the store is 0o600 (not an exploitable path
     # today), but a tampered/legacy store must not redirect this credential-
@@ -2168,7 +2166,7 @@ def step_up_authorize(
             # so BOTH halves of the §2.4 mix-up defence stay active on this
             # cache-hit path — step-up runs a full browser+callback flow, the case
             # most exposed to AS mix-up. Without the flag the missing-iss
-            # MUST-reject would silently no-op precisely here (#3 round20); the
+            # MUST-reject would silently no-op precisely here; the
             # iss MISMATCH check needs only the rehydrated issuer.
             issuer=cached.issuer,
             iss_parameter_supported=cached.iss_parameter_supported,
@@ -2180,7 +2178,7 @@ def step_up_authorize(
         # non-standard URL is discoverable on this step-up re-discovery path too,
         # not only on initial auth. Every endpoint is still re-validated by the
         # discovery validators, so no credential can be routed to an unsafe host.
-        # See #6 (round16).
+        #
         www_authenticate = _probe_www_authenticate(server_url, client)
         metadata = discover_oauth_metadata(
             server_url, client, www_authenticate=www_authenticate
