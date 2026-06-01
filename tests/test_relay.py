@@ -6298,6 +6298,48 @@ class TestRunCancelFilter:
         )
         assert '"keep":true' in output
 
+    def test_cancel_then_paginated_request_merged_result_is_forwarded(
+        self, httpx_mock
+    ):
+        """#9(round35): closes the cancel x pagination coverage matrix end-to-end.
+        A cancelled id reused by a paginated tools/list is a brand-new call: the
+        request discards the tracked cancel before dispatch, so the MERGED
+        multi-page result is FORWARDED, not dropped. (The drop case is not
+        reproducible here — pagination is synchronous, so no late cancel can
+        pre-empt the emit, unlike the async SSE path; the _emit drop seam itself
+        is unit-covered by test_drops_merged_paginated_result.)"""
+        httpx_mock.add_response(status_code=202, text="")  # cancel ACK
+        httpx_mock.add_response(
+            url="https://example.com/mcp",
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "result": {"tools": [{"name": "a"}], "nextCursor": "p2"},
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url="https://example.com/mcp",
+            text=json.dumps(
+                {"jsonrpc": "2.0", "id": 7, "result": {"tools": [{"name": "b"}]}}
+            ),
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                (
+                    '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+                    '"params":{"requestId":7}}'
+                ),
+                '{"jsonrpc":"2.0","id":7,"method":"tools/list"}',
+            ],
+        )
+        merged = json.loads(output.strip())
+        assert [t["name"] for t in merged["result"]["tools"]] == ["a", "b"]
+
     def test_cancel_is_forwarded_upstream(self, httpx_mock):
         httpx_mock.add_response(status_code=202, text="")
         self._run_with_stdin(
