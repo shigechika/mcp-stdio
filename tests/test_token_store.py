@@ -951,6 +951,37 @@ class TestLegacyMigration:
         assert not new_file.exists()
         assert stat.S_ISFIFO(os.lstat(legacy_file).st_mode)  # FIFO left in place
 
+    def test_placeholder_copy_through_non_serializable_does_not_crash_read(
+        self, tmp_path, monkeypatch
+    ):
+        """#C-3(round28): the empty-placeholder copy-through catches Exception
+        (not just OSError), matching the widened save/delete contract. A
+        non-serializable legacy value makes _write_store's json.dumps raise a
+        TypeError, which must NOT propagate out of the unlocked read path —
+        load returns None and the legacy file is left for a later retry."""
+        legacy_dir = tmp_path / "legacy"
+        new_dir = tmp_path / "new"
+        legacy_dir.mkdir()
+        new_dir.mkdir()
+        legacy_file = legacy_dir / "tokens.json"
+        new_file = new_dir / "tokens.json"
+        legacy_file.write_text('{"https://example.com/mcp": {"access_token": "x"}}')
+        new_file.write_text("")  # empty placeholder → triggers copy-through
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", new_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", new_file)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_DIR", legacy_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
+        # Return a non-serializable dict so _write_store's json.dumps raises
+        # TypeError (a non-OSError) inside the copy-through.
+        monkeypatch.setattr(
+            "mcp_stdio.token_store._read_legacy_data", lambda: {"k": object()}
+        )
+
+        # Must NOT raise; the read degrades to None.
+        assert load_token("https://example.com/mcp") is None
+        assert legacy_file.exists()  # migration left it for a later retry
+
     def test_migration_survives_cross_device_rename(self, tmp_path, monkeypatch):
         """An EXDEV (cross-filesystem) rename must not brick the store — the
         copy-through fallback persists the tokens at the new path."""
