@@ -399,6 +399,70 @@ class TestPostAndStream:
         emitted = json.loads(stdout.getvalue().strip())
         assert emitted["result"] == {"ok": True}
 
+    def test_notification_retry_exhaustion_emits_no_error(self, httpx_mock):
+        """has_id=False (a notification): retry exhaustion must NOT synthesize an
+        id:null error — a notification can never receive a response."""
+        for _ in range(3):
+            httpx_mock.add_exception(httpx.ConnectError("net down"))
+        client = httpx.Client()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout), patch("mcp_stdio.relay.time.sleep"):
+            result = _post_and_stream(
+                client,
+                "https://example.com/mcp",
+                '{"jsonrpc":"2.0","method":"notifications/progress"}',
+                {},
+                None,
+                has_id=False,
+            )
+        assert result is None
+        assert stdout.getvalue() == ""  # no id:null error written
+
+    def test_request_retry_exhaustion_still_emits_error(self, httpx_mock):
+        """has_id=True (a request): retry exhaustion still synthesizes the error
+        for the request id — the gate must not suppress legitimate responses."""
+        for _ in range(3):
+            httpx_mock.add_exception(httpx.ConnectError("net down"))
+        client = httpx.Client()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout), patch("mcp_stdio.relay.time.sleep"):
+            result = _post_and_stream(
+                client, "https://example.com/mcp", '{"id":7}', {}, 7, has_id=True
+            )
+        assert result is None
+        emitted = json.loads(stdout.getvalue().strip())
+        assert emitted["id"] == 7
+        assert "error" in emitted
+
+    def test_notification_midstream_interrupt_emits_no_error(self, httpx_mock):
+        """has_id=False: a mid-stream disconnect after partial delivery passes the
+        already-emitted server payload through but synthesizes NO id:null error."""
+        delivered = '{"jsonrpc":"2.0","method":"server/event","params":{}}'
+
+        def gen():
+            yield f"event: message\ndata: {delivered}\n\n".encode()
+            raise httpx.ReadError("dropped mid-stream")
+
+        httpx_mock.add_response(
+            stream=IteratorStream(gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+        client = httpx.Client()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout), patch("mcp_stdio.relay.time.sleep"):
+            result = _post_and_stream(
+                client,
+                "https://example.com/mcp",
+                '{"jsonrpc":"2.0","method":"x"}',
+                {},
+                None,
+                has_id=False,
+            )
+        assert result is None
+        lines = [x for x in stdout.getvalue().strip().splitlines() if x]
+        # The server payload is passed through; no synthesized id:null error.
+        assert lines == [delivered]
+
 
 class TestIterSseEvents:
     """WHATWG Server-Sent Events line decoder shared by all SSE-decode sites."""
@@ -792,6 +856,34 @@ class TestRun:
         parsed = json.loads(output.strip())
         assert parsed["id"] == 5 and "error" in parsed
 
+    def test_notification_transport_failure_gets_no_synthesized_response(
+        self, httpx_mock
+    ):
+        """End-to-end: a notification whose POST exhausts all retries with a
+        transport error must NOT receive a synthesized id:null error. This
+        covers the helper-level gate (_post_and_stream has_id=False), one frame
+        deeper than the loop-level 4xx gate above."""
+        for _ in range(3):
+            httpx_mock.add_exception(httpx.ConnectError("net down"))
+        with patch("mcp_stdio.relay.time.sleep"):
+            output = self._run_with_stdin(
+                httpx_mock,
+                ['{"jsonrpc":"2.0","method":"notifications/progress","params":{}}'],
+            )
+        assert output.strip() == ""
+
+    def test_request_transport_failure_still_gets_error(self, httpx_mock):
+        """Contrast with the notification case: a request that exhausts retries
+        with a transport error still receives its JSON-RPC error response."""
+        for _ in range(3):
+            httpx_mock.add_exception(httpx.ConnectError("net down"))
+        with patch("mcp_stdio.relay.time.sleep"):
+            output = self._run_with_stdin(
+                httpx_mock, ['{"jsonrpc":"2.0","method":"tools/call","id":9}']
+            )
+        parsed = json.loads(output.strip())
+        assert parsed["id"] == 9 and "error" in parsed
+
     def test_401_retry_returns_404_cascades_into_reinitialize(self, httpx_mock):
         """The documented cross-branch cascade: a 401 whose refreshed retry
         returns 404 flows into the 404 re-initialize branch and recovers."""
@@ -1167,6 +1259,41 @@ class TestProtocolVersionHeader:
         assert reqs[3].headers["mcp-protocol-version"] == "2024-11-05"
         assert reqs[4].headers["mcp-protocol-version"] == "2024-11-05"
         assert reqs[5].headers["mcp-protocol-version"] == "2024-11-05"
+
+    def test_reinitialize_advertises_previously_negotiated_version(self, httpx_mock):
+        """The 404-recovery initialize must request the previously-negotiated
+        version, not the 2024-11-05 floor — volunteering the floor would invite
+        a silent downgrade of a session that had negotiated something newer."""
+        # 1: initialize -> negotiate 2025-06-18, session sess-1
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"protocolVersion":"2025-06-18"},"id":1}',
+            headers={"content-type": "application/json", "mcp-session-id": "sess-1"},
+        )
+        # 2: tools/call -> 404 (session expired)
+        httpx_mock.add_response(
+            status_code=404, text="", headers={"content-type": "application/json"}
+        )
+        # 3: reinit initialize -> server keeps 2025-06-18, new session
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"protocolVersion":"2025-06-18"},"id":0}',
+            headers={"content-type": "application/json", "mcp-session-id": "sess-2"},
+        )
+        httpx_mock.add_response(status_code=202, text="")  # reinit initialized
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":2}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            [
+                '{"jsonrpc":"2.0","method":"initialize","id":1}',
+                '{"jsonrpc":"2.0","method":"tools/call","id":2}',
+            ]
+        )
+        reqs = httpx_mock.get_requests()
+        # reqs[2] is the recovery initialize; its body must advertise the
+        # already-negotiated version, not the floor.
+        reinit_body = json.loads(reqs[2].read())
+        assert reinit_body["params"]["protocolVersion"] == "2025-06-18"
 
     def test_reinitialize_recaptures_version_from_sse_framed_response(self, httpx_mock):
         """The 404-recovery re-initialize response may itself be SSE-framed —
