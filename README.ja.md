@@ -134,6 +134,10 @@ mcp-stdio --transport sse https://your-server.example.com:8080/sse
 
 ```bash
 mcp-stdio --check https://your-server.example.com:8080/mcp
+
+# SSE サーバーの場合は --transport sse を渡すと、--check は Streamable HTTP の
+# プローブではなくレガシーの GET/endpoint/POST ハンドシェイクで確認する：
+mcp-stdio --check --transport sse https://your-server.example.com:8080/sse
 ```
 
 ## Claude Desktop の設定
