@@ -1189,6 +1189,10 @@ def _paginate_and_stream(
                     merged_result[k] = v
 
         next_cursor = page_result.get("nextCursor")
+        # An empty-string nextCursor is treated as terminal alongside null /
+        # absent: the MCP spec models a continuation token whose ABSENCE ends the
+        # list, and an empty cursor cannot be round-tripped (it is indistinct from
+        # "no cursor / first page"), so it is a degenerate, not a real, next page.
         if not next_cursor:
             break
         params["cursor"] = next_cursor
@@ -1266,8 +1270,18 @@ def _reinitialize(
             },
         }
     )
+    # An initialize request IS the (re)negotiation, so it must not advertise a
+    # prior protocol version. The relay-injected MCP-Protocol-Version never
+    # reaches here (the caller passes the base headers, not _prepare_headers
+    # output), but an operator who pinned `-H MCP-Protocol-Version: <x>` would
+    # otherwise have it ride this initialize POST — inconsistent with the
+    # dispatch path, which strips it from a real initialize (see #3 round18).
+    # Mirror that strip so both initialize paths behave identically.
+    init_headers = {
+        k: v for k, v in headers.items() if k.lower() != "mcp-protocol-version"
+    }
     try:
-        resp = client.post(url, content=initialize_msg, headers=headers)
+        resp = client.post(url, content=initialize_msg, headers=init_headers)
     except httpx.HTTPError as e:
         log(f"re-initialize request failed: {e}")
         return None, protocol_version
@@ -1778,9 +1792,21 @@ def run(
                 # echoes a session id must NOT poison session_id for the next stdin
                 # line — the relay would otherwise send the next request an id the
                 # server just rejected.
+                # The 403 disjunct mirrors its CONSUMER at line ~1853: step-up only
+                # fires when _parse_www_authenticate_scope returns a scope, so adopt
+                # the rotated id only when the challenge is a PARSEABLE
+                # insufficient_scope one. A generic/malformed/absent-WWW-Authenticate
+                # 403 (a plain authorization denial) does NOT feed a retry that
+                # consumes the id — adopting it would poison session_id for the next
+                # stdin line for nothing (one wasted round-trip until 404 self-heal).
                 feeds_recovery = (
                     (result.status_code == 401 and token_refresher is not None)
-                    or (result.status_code == 403 and scope_upgrader is not None)
+                    or (
+                        result.status_code == 403
+                        and scope_upgrader is not None
+                        and _parse_www_authenticate_scope(result.www_authenticate)
+                        is not None
+                    )
                 )
                 if result.session_id and (
                     result.status_code < 400 or feeds_recovery
