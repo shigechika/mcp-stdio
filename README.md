@@ -57,7 +57,7 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
 - **Cancellation-aware filtering** — tracks request ids cancelled via `notifications/cancelled` on stdin and drops any late upstream response carrying one of those ids before it reaches the client, per the MCP cancellation spec; on by default (60 s TTL), opt out with `--no-cancel-filter`
 - **Session recovery** — resets MCP session ID on 404 and retries
 - **Protocol version header** — captures the negotiated `protocolVersion` from the `initialize` response and injects `MCP-Protocol-Version` on every subsequent Streamable HTTP request (MCP spec rev 2025-06-18); servers that enforce the header would otherwise reject post-initialize requests with `400 Bad Request`
-- **Token refresh on 401** — automatically refreshes expired OAuth tokens mid-session
+- **Token refresh on 401** — automatically refreshes expired OAuth tokens mid-session (OAuth mode only)
 - **Step-up authorization on 403** — on a `Bearer error="insufficient_scope"` challenge, re-authorizes for the union of the granted and required scopes ([RFC 9470](https://www.rfc-editor.org/rfc/rfc9470) / MCP step-up; cf. anthropics/claude-code#44652)
 - **Bearer token auth** — via `--bearer-token` flag or `MCP_BEARER_TOKEN` env var
 - **Custom headers** — pass any header with `-H` / `--header`

@@ -55,7 +55,7 @@ Bearer token、カスタムヘッダー、OAuth 2.1 認証情報をリモート�
 - **キャンセル対応フィルタ** — stdin の `notifications/cancelled` でキャンセルされた id を追跡し、その id を持つ遅延レスポンスがクライアントに届く前に drop する（MCP キャンセル仕様準拠）。デフォルト有効（TTL 60 秒）、`--no-cancel-filter` で無効化
 - **セッション回復** — 404 でセッション ID をリセットして再試行
 - **プロトコルバージョンヘッダー** — `initialize` 応答から交渉済みの `protocolVersion` を捕捉し、以降の Streamable HTTP リクエストすべてに `MCP-Protocol-Version` を付与（MCP 仕様 rev 2025-06-18）。このヘッダーを強制するサーバーは未送信時に初期化後リクエストを `400 Bad Request` で拒否する
-- **401 時の自動トークンリフレッシュ** — セッション中に OAuth トークンが失効しても自動更新
+- **401 時の自動トークンリフレッシュ** — セッション中に OAuth トークンが失効しても自動更新（OAuth モード時のみ）
 - **403 時のステップアップ認可** — `Bearer error="insufficient_scope"` チャレンジを受けると、付与済みスコープと要求スコープの和集合で再認可（[RFC 9470](https://www.rfc-editor.org/rfc/rfc9470) / MCP step-up、cf. anthropics/claude-code#44652）
 - **Bearer token 認証** — `--bearer-token` フラグまたは `MCP_BEARER_TOKEN` 環境変数
 - **カスタムヘッダー** — `-H` / `--header` で任意のヘッダーを送信
