@@ -602,14 +602,16 @@ class TestLegacyMigration:
         monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_DIR", legacy_dir)
         monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
 
-        real_rename = os.rename
-
-        def exdev_rename(src, dst, *a, **k):
+        # Force the copy-through branch by making the migration rename raise
+        # EXDEV. Patch Path.rename itself (the production code calls
+        # _LEGACY_STORE_FILE.rename): on Python 3.10 a patch of the module's
+        # os.rename does NOT reach pathlib's pre-bound accessor, so the real
+        # same-fs rename would succeed and skip the branch under test.
+        def exdev_rename(self, target, *a, **k):
             raise OSError(18, "Invalid cross-device link")  # EXDEV
 
-        monkeypatch.setattr("mcp_stdio.token_store.os.rename", exdev_rename)
+        monkeypatch.setattr("pathlib.Path.rename", exdev_rename)
         loaded = load_token("https://example.com/mcp")  # must not raise
-        monkeypatch.setattr("mcp_stdio.token_store.os.rename", real_rename)
 
         assert loaded is None
         # The corrupt legacy content was NOT copied through to the new path.
