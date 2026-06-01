@@ -4015,17 +4015,26 @@ class TestAuthorizationFlowFailurePaths:
         assert "state=%3Credacted%3E" in err
         assert real_state not in err
 
-    def test_callback_error_raises_runtime_error(self, monkeypatch):
-        """A callback carrying ?error=... → RuntimeError, no code exchange."""
+    def test_callback_error_with_matching_state_raises_oauth_error(
+        self, monkeypatch
+    ):
+        """A LEGITIMATE error callback echoes `state` (RFC 6749 §4.1.2.1) →
+        surfaces the OAuth error, no code exchange. (#1 round35: state is now
+        validated before the error is acted on.)"""
         from urllib.parse import parse_qs, urlparse
         from urllib.request import urlopen
 
         def fake_open(auth_url: str) -> bool:
-            redirect_uri = parse_qs(urlparse(auth_url).query)["redirect_uri"][0]
+            q = parse_qs(urlparse(auth_url).query)
+            redirect_uri = q["redirect_uri"][0]
+            sent_state = q["state"][0]
 
             def hit() -> None:
                 try:
-                    urlopen(f"{redirect_uri}?error=access_denied", timeout=5).read()
+                    urlopen(
+                        f"{redirect_uri}?error=access_denied&state={sent_state}",
+                        timeout=5,
+                    ).read()
                 except Exception:
                     pass
 
@@ -4035,6 +4044,40 @@ class TestAuthorizationFlowFailurePaths:
         monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", fake_open)
         client = httpx.Client()
         with pytest.raises(RuntimeError, match="OAuth error"):
+            _run_authorization_flow(
+                "https://ex.com/mcp",
+                client,
+                metadata=self.META,
+                cached=None,
+                client_id_override="cid",
+                timeout=5,
+            )
+
+    def test_callback_error_without_state_rejected_as_csrf(self, monkeypatch):
+        """#1(round35): an error callback that does NOT carry the matching state
+        is an unauthenticated abort attempt (a local process / port-guessing page
+        hitting /callback?error=... during the auth window), not a real AS error.
+        State is validated first, so it is rejected as a CSRF mismatch — it
+        cannot grief the flow with an attacker-chosen error."""
+        from urllib.parse import parse_qs, urlparse
+        from urllib.request import urlopen
+
+        def fake_open(auth_url: str) -> bool:
+            redirect_uri = parse_qs(urlparse(auth_url).query)["redirect_uri"][0]
+
+            def hit() -> None:
+                try:
+                    # No state -> unauthenticated abort.
+                    urlopen(f"{redirect_uri}?error=access_denied", timeout=5).read()
+                except Exception:
+                    pass
+
+            threading.Thread(target=hit, daemon=True).start()
+            return True
+
+        monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", fake_open)
+        client = httpx.Client()
+        with pytest.raises(RuntimeError, match="state mismatch"):
             _run_authorization_flow(
                 "https://ex.com/mcp",
                 client,
