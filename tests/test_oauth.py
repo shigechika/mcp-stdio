@@ -760,6 +760,18 @@ class TestDiscoverMetadata:
                 "token_endpoint": "https://api.example.com/token",
             },
         )
+        # Rejecting the spoofed metadata makes discovery continue to the
+        # path-scoped RFC 8414 §3.1 fetch before Phase 3 — mock it as 404 so no
+        # unexpected request escapes. pytest_httpx strict mode flags it at
+        # TEARDOWN, where _fetch_authorization_server_metadata's broad except
+        # cannot swallow it (a local run passed without this; see #151 round21).
+        httpx_mock.add_response(
+            url=(
+                "https://api.example.com/.well-known/"
+                "oauth-authorization-server/mcp"
+            ),
+            status_code=404,
+        )
         client = httpx.Client()
         meta = discover_oauth_metadata("https://api.example.com/mcp", client)
         # The spoofed metadata's "/auth" is NOT used — the synthesized default
