@@ -110,6 +110,11 @@ class TokenData:
     no_resource_indicator: bool = False
 
 
+# Set once if we ever fail to tighten the store dir to 0o700 and detect it is
+# still group/other-accessible, so the operator warning is emitted only once.
+_warned_loose_store_dir = False
+
+
 def _ensure_store_dir() -> None:
     """Create the store directory with secure permissions.
 
@@ -117,11 +122,49 @@ def _ensure_store_dir() -> None:
     the directory pre-existed with looser permissions (created earlier by
     another tool, or under a permissive umask).
     """
+    global _warned_loose_store_dir
     _STORE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
         os.chmod(_STORE_DIR, stat.S_IRWXU)  # 0o700
     except OSError:
-        pass
+        # #10 (round16): the chmod can genuinely fail (a dir owned by another
+        # uid after a botched restore, some network mounts). The token file is
+        # still written 0o600 so the secret bytes stay protected, but a loose
+        # store DIR widens the listing/symlink-swap surface. Fail closed but
+        # surface it ONCE so an operator on a problem filesystem is not blind to
+        # it — silence here previously hid a persistently world-readable dir.
+        if not _warned_loose_store_dir:
+            try:
+                mode = stat.S_IMODE(os.stat(_STORE_DIR).st_mode)
+                if mode & (stat.S_IRWXG | stat.S_IRWXO):
+                    print(
+                        f"mcp-stdio: warning: could not tighten {_STORE_DIR} to "
+                        f"0o700 (current mode {mode:#o}); cached tokens' directory "
+                        f"is group/other-accessible.",
+                        file=sys.stderr,
+                    )
+                    _warned_loose_store_dir = True
+            except OSError:
+                pass
+
+
+def _read_legacy_data() -> dict[str, Any] | None:
+    """Read the legacy token file via ``O_NOFOLLOW``.
+
+    Returns the parsed dict, or ``None`` if the file is absent, unreadable,
+    not valid JSON, or not a JSON object — so callers never write garbage (or
+    an attacker-redirected symlink target) over the XDG store.
+    """
+    try:
+        fd = os.open(_LEGACY_STORE_FILE, os.O_RDONLY | _O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            data = json.loads(f.read())
+    except (json.JSONDecodeError, OSError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _migrate_legacy_store() -> None:
@@ -159,10 +202,40 @@ def _migrate_legacy_store() -> None:
                 _LEGACY_STORE_FILE.unlink()
             except OSError:
                 pass
-        # else: leave the legacy file intact; a later run with a valid XDG
-        # store (or after the bogus placeholder is removed) reconciles it.
+        else:
+            # #8 (round16): the XDG store is an EMPTY placeholder (a stray
+            # `touch`, an interrupted external write, a backup restore) that
+            # otherwise shadows still-valid legacy tokens forever — _read_store
+            # would read {} and load_token would force a needless re-auth. Copy
+            # the legacy data through into the placeholder instead of stranding
+            # it. Re-stat under the same call so a placeholder that CONCURRENTLY
+            # gained real data (a locked save_token) is never clobbered; the
+            # residual TOCTOU is the documented one-time migration race above.
+            data = _read_legacy_data()
+            if data:
+                try:
+                    if _STORE_FILE.stat().st_size == 0:
+                        _write_store(data)
+                        try:
+                            _LEGACY_STORE_FILE.unlink()
+                        except OSError:
+                            pass
+                except OSError:
+                    # Unlocked read path: a failed stat/write must never crash
+                    # the read — leave the legacy file for a later run to retry.
+                    pass
     else:
         _ensure_store_dir()
+        # #9 (round16): re-assert 0o700 on the legacy DIR before exposing the
+        # secrets to a rename/copy-through, mirroring _ensure_store_dir's
+        # defensive re-chmod of the XDG dir. An older version (or permissive
+        # umask) may have created ~/.mcp-stdio/ group/other-readable; if the
+        # migration then fails partway the legacy tokens.json keeps living in a
+        # loose-mode dir. Best-effort — the 0o600 file mode is the primary guard.
+        try:
+            os.chmod(_LEGACY_STORE_DIR, stat.S_IRWXU)  # 0o700
+        except OSError:
+            pass
         # Tighten the legacy file's mode BEFORE moving it, so the secrets never
         # sit at the new XDG path with a looser (pre-0o600) mode, even briefly:
         # rename() preserves the source inode's permission bits.
@@ -186,22 +259,12 @@ def _migrate_legacy_store() -> None:
             if _STORE_FILE.exists() or not _LEGACY_STORE_FILE.exists():
                 pass  # another process won the migration race — leave it intact
             else:
-                # Read the legacy file via O_NOFOLLOW like every other read in
-                # this module, so a symlink swapped in at the legacy path cannot
-                # redirect the copy-through to read an attacker-chosen file.
-                data = None
-                try:
-                    fd = os.open(_LEGACY_STORE_FILE, os.O_RDONLY | _O_NOFOLLOW)
-                except OSError:
-                    fd = None
-                if fd is not None:
-                    try:
-                        with os.fdopen(fd, "r", encoding="utf-8") as f:
-                            data = json.loads(f.read())
-                    except (json.JSONDecodeError, OSError):
-                        data = None
+                # Read the legacy file via O_NOFOLLOW (see _read_legacy_data) so
+                # a symlink swapped in at the legacy path cannot redirect the
+                # copy-through to read an attacker-chosen file.
+                data = _read_legacy_data()
                 # Never write an empty/failed read over the target.
-                if isinstance(data, dict) and data:
+                if data:
                     written = False
                     try:
                         _write_store(data)
