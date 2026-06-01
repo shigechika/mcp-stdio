@@ -640,9 +640,10 @@ def discover_oauth_metadata(
 
     # Path-scoped issuers (Keycloak realm URLs, AWS Cognito user pools, etc.)
     # publish metadata at /.well-known/oauth-authorization-server/<path> per
-    # RFC 8414 §3.1 (the well-known string is inserted between the host and the
-    # issuer's path component). Try the original server_url when it has a path
-    # component that neither the PRM-discovered AS nor the base URL tried.
+    # RFC 8414 §3 (the well-known string is inserted between the host and the
+    # issuer's path component; §3.1 illustrates it for the metadata request).
+    # Try the original server_url when it has a path component that neither the
+    # PRM-discovered AS nor the base URL tried.
     if server_url not in (auth_server_url, base):
         meta = _fetch_authorization_server_metadata(server_url, client)
         if meta:
@@ -802,9 +803,25 @@ def register_client(
         raise ValueError(
             "Client registration response is missing client_id (RFC 7591 §3.2.1)."
         )
+    # Type-validate the AS-supplied credentials (#A-1 round34). A non-conformant
+    # AS returning a non-string client_id / client_secret would otherwise be
+    # str()-coerced into the authorize URL or raise an OPAQUE TypeError deep in
+    # quote() during HTTP Basic auth. Convert it to an actionable RFC 7591 error
+    # here, matching the missing-client_id guard above and the str validation
+    # load_token / _parse_token_response already apply to AS-supplied values.
+    client_secret = data.get("client_secret")
+    if not isinstance(client_id, str):
+        raise ValueError(
+            "Client registration response client_id is not a string (RFC 7591 §3.2.1)."
+        )
+    if client_secret is not None and not isinstance(client_secret, str):
+        raise ValueError(
+            "Client registration response client_secret is not a string "
+            "(RFC 7591 §3.2.1)."
+        )
     return ClientRegistration(
         client_id=client_id,
-        client_secret=data.get("client_secret"),
+        client_secret=client_secret,
         client_secret_expires_at=expiry,
         auth_method=auth_method,
     )
@@ -945,6 +962,31 @@ def _parse_token_response(resp: httpx.Response) -> dict[str, Any]:
     GitHub OAuth (and some others) may return application/x-www-form-urlencoded.
     Some servers return HTTP 200 with an error in the body (GitHub legacy).
     """
+    # #1 (round34): RFC 6749 §5.2 — a token error is a 4xx carrying
+    # ``{"error": ..., "error_description": ...}``. Surface that actionable
+    # description BEFORE raise_for_status() collapses it into an opaque
+    # ``HTTPStatusError`` (which omits the body), mirroring the 200-with-error
+    # handling in _raise_for_body_error. Best-effort: an unparseable / error-less
+    # 4xx body falls through to raise_for_status (an honest but generic HTTP
+    # error). On the refresh path the resulting RuntimeError degrades to None
+    # exactly as the HTTPStatusError did, so only the interactive auth-code
+    # exchange gains the better message.
+    if resp.status_code >= 400:
+        body: dict[str, Any] | None = None
+        try:
+            if "application/x-www-form-urlencoded" in resp.headers.get(
+                "content-type", ""
+            ):
+                _qs = dict(parse_qs(resp.text, keep_blank_values=True))
+                body = {k: (v[0] if v else "") for k, v in _qs.items()}
+            else:
+                body = resp.json()
+        except Exception:
+            body = None
+        if isinstance(body, dict) and "error" in body:
+            desc = body.get("error_description", body["error"])
+            raise RuntimeError(f"OAuth token error: {_sanitize_oauth_error(desc)}")
+
     resp.raise_for_status()
 
     content_type = resp.headers.get("content-type", "")

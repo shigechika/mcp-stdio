@@ -983,6 +983,35 @@ class TestRegisterClient:
         with pytest.raises(ValueError, match="client_id"):
             register_client(meta, "http://127.0.0.1:9999/callback", client)
 
+    @pytest.mark.parametrize(
+        "reg,match",
+        [
+            ({"client_id": 12345}, "client_id is not a string"),
+            (
+                {"client_id": "cid", "client_secret": {"x": 1}},
+                "client_secret is not a string",
+            ),
+        ],
+    )
+    def test_non_string_dcr_credentials_raise_clear_error(
+        self, httpx_mock, reg, match
+    ):
+        """#A-1(round34): a non-conformant AS returning a non-string client_id /
+        client_secret must raise an actionable RFC 7591 ValueError here, not an
+        opaque TypeError deep in quote() during HTTP Basic auth (or a silently
+        str-coerced client_id in the authorize URL)."""
+        httpx_mock.add_response(
+            url="https://api.example.com/register", json=reg
+        )
+        meta = OAuthMetadata(
+            authorization_endpoint="https://api.example.com/authorize",
+            token_endpoint="https://api.example.com/token",
+            registration_endpoint="https://api.example.com/register",
+        )
+        client = httpx.Client()
+        with pytest.raises(ValueError, match=match):
+            register_client(meta, "http://127.0.0.1:9999/callback", client)
+
     def test_no_registration_endpoint(self):
         meta = OAuthMetadata(
             authorization_endpoint="https://api.example.com/authorize",
@@ -1242,10 +1271,40 @@ class TestExchangeCode:
         assert b"resource=https" in req.content
 
     def test_token_exchange_failure(self, httpx_mock):
+        """#1(round34): a standard RFC 6749 §5.2 token error (4xx + error /
+        error_description) surfaces the actionable error_description as a
+        RuntimeError, not an opaque HTTPStatusError that drops the body."""
         httpx_mock.add_response(
             url="https://api.example.com/token",
             status_code=400,
             json={"error": "invalid_grant", "error_description": "Code expired"},
+        )
+        meta = OAuthMetadata(
+            authorization_endpoint="https://api.example.com/authorize",
+            token_endpoint="https://api.example.com/token",
+        )
+        client = httpx.Client()
+        with pytest.raises(RuntimeError, match="Code expired"):
+            exchange_code(
+                meta,
+                "cid",
+                None,
+                "bad-code",
+                "verifier",
+                "http://127.0.0.1:9999/callback",
+                client,
+            )
+
+    def test_token_exchange_4xx_without_error_body_raises_http_error(
+        self, httpx_mock
+    ):
+        """A 4xx whose body is NOT an RFC 6749 §5.2 error (no `error` key) falls
+        through to raise_for_status — an honest, generic HTTP error."""
+        httpx_mock.add_response(
+            url="https://api.example.com/token",
+            status_code=400,
+            text="upstream rejected",
+            headers={"content-type": "text/plain"},
         )
         meta = OAuthMetadata(
             authorization_endpoint="https://api.example.com/authorize",
@@ -1305,14 +1364,17 @@ class TestRefreshToken:
         assert result["refresh_token"] == "new_rt"
 
     def test_invalid_grant(self, httpx_mock):
-        """Refresh token expired or revoked."""
+        """Refresh token expired or revoked — an RFC 6749 §5.2 error body (here
+        with no error_description) surfaces the `error` code as a RuntimeError
+        (#1 round34). On the refresh path refresh_cached_token catches it and
+        degrades to None, exactly as it did for the prior HTTPStatusError."""
         httpx_mock.add_response(
             url="https://api.example.com/token",
             status_code=400,
             json={"error": "invalid_grant"},
         )
         client = httpx.Client()
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(RuntimeError, match="invalid_grant"):
             refresh_access_token(
                 "https://api.example.com/token", "cid", None, "bad_rt", client
             )
@@ -1852,11 +1914,27 @@ class TestParseTokenResponse:
         with pytest.raises(RuntimeError, match="Code expired"):
             _parse_token_response(resp)
 
-    def test_http_400_raises(self, httpx_mock):
+    def test_http_400_with_error_body_raises_runtime_error(self, httpx_mock):
+        """#1(round34): a 4xx whose body is an RFC 6749 §5.2 error surfaces the
+        `error` code as a RuntimeError (actionable), not the opaque
+        HTTPStatusError that drops the body."""
         httpx_mock.add_response(
             url="https://example.com/token",
             status_code=400,
             json={"error": "invalid_grant"},
+        )
+        client = httpx.Client()
+        resp = client.post("https://example.com/token")
+        with pytest.raises(RuntimeError, match="invalid_grant"):
+            _parse_token_response(resp)
+
+    def test_http_400_without_error_body_raises_http_error(self, httpx_mock):
+        """A 4xx whose body has no `error` key falls through to raise_for_status."""
+        httpx_mock.add_response(
+            url="https://example.com/token",
+            status_code=400,
+            text="plain rejection",
+            headers={"content-type": "text/plain"},
         )
         client = httpx.Client()
         resp = client.post("https://example.com/token")
