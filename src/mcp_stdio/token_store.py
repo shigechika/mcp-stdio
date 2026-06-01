@@ -51,6 +51,11 @@ _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 # so the credential-sharing warning is emitted only once per process.
 _warned_userinfo_key = False
 
+# Set once if the advisory lock file could not be opened because a symlink was
+# planted at its path (O_NOFOLLOW -> ELOOP). That silently disables
+# cross-process serialization, so the operator gets one warning per process.
+_warned_lock_symlink = False
+
 
 def _normalize_key(server_url: str) -> str:
     """Normalise a server URL into a stable token-store key.
@@ -503,7 +508,23 @@ def _store_lock() -> Iterator[None]:
             os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW,
             stat.S_IRUSR | stat.S_IWUSR,
         )
-    except OSError:
+    except OSError as e:
+        # A symlink planted at the lock path (O_NOFOLLOW -> ELOOP) silently
+        # disables cross-process serialization — distinct from a benign
+        # read-only / missing-dir failure that just degrades to a no-op lock.
+        # Warn ONCE so the operator can notice the advisory-lock DoS, then
+        # proceed unlocked (a lock failure must never block the save). The dir's
+        # 0o700 mode is the primary guard against another user planting it.
+        if e.errno == errno.ELOOP:
+            global _warned_lock_symlink
+            if not _warned_lock_symlink:
+                _warned_lock_symlink = True
+                print(
+                    f"warning: token store lock path {lock_path} is a symlink "
+                    f"(refused via O_NOFOLLOW); proceeding without cross-process "
+                    f"locking — concurrent saves may last-writer-wins",
+                    file=sys.stderr,
+                )
         yield
         return
     # #9 (round19): the 0o600 mode above applies only on CREATION. Re-tighten a
@@ -649,7 +670,7 @@ def save_token(server_url: str, data: TokenData) -> None:
         store[key] = asdict(data)
         try:
             _write_store(store)
-        except OSError as e:
+        except Exception as e:
             # #4 (round21): a write failure (full / read-only FS, permission)
             # must fail SOFT, mirroring the _StoreUnreadable read path above. The
             # token is simply not cached — the caller re-auths next time — rather
@@ -657,6 +678,10 @@ def save_token(server_url: str, data: TokenData) -> None:
             # a worse case: a refresh whose save fails would otherwise propagate
             # out of refresh_cached_token and make the relay emit an auth error
             # even though the freshly refreshed token was perfectly usable.
+            # #12 (round26): catch Exception, not just OSError — _write_store's
+            # json.dumps runs before its inner try, so a non-serializable value
+            # injected upstream raises ValueError/TypeError that would otherwise
+            # bypass this soft-fail contract and crash the relay mid-session.
             print(
                 f"warning: could not write token store ({e}); token not cached, "
                 f"will re-authenticate next time",
@@ -687,11 +712,12 @@ def delete_token(server_url: str) -> None:
         if removed:
             try:
                 _write_store(store)
-            except OSError as e:
-                # Fail soft like save_token (#4 round21): a failed delete leaves
-                # the (stale) entry in place — a stale cached token at worst —
-                # rather than propagating an OSError up the caller. A later
-                # successful write reconciles it.
+            except Exception as e:
+                # Fail soft like save_token (#4 round21, #12 round26): a failed
+                # delete leaves the (stale) entry in place — a stale cached token
+                # at worst — rather than propagating up the caller. Catch
+                # Exception so a non-OSError from _write_store's pre-try
+                # json.dumps also degrades. A later successful write reconciles.
                 print(
                     f"warning: could not write token store ({e}); "
                     f"token not deleted",
