@@ -451,6 +451,76 @@ class TestLoadSaveDelete:
         assert load_token("https://b.com/mcp").access_token == "tok-b"
         assert "could not be read" in capsys.readouterr().err
 
+    @pytest.mark.skipif(
+        sys.platform == "win32" or not hasattr(os, "mkfifo"),
+        reason="os.mkfifo is POSIX-only",
+    )
+    def test_save_aborts_when_store_is_fifo(self, tmp_path, monkeypatch, capsys):
+        """#13(round26): a FIFO (non-regular file) pre-planted at the store path
+        must make a save ABORT — the for_write=True fstat regular-file guard
+        raises _StoreUnreadable, so save_token skips the write rather than
+        clobbering (or hanging on) the special file. Complements the read-path
+        FIFO test (which only covers for_write=False -> {})."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        os.mkfifo(store_file)
+        # Must not hang and must not raise — the save aborts soft.
+        save_token("https://example.com/mcp", TokenData(access_token="tok"))
+
+        # The FIFO is untouched (not overwritten by a regular file) and a
+        # warning explains the skipped save.
+        assert stat.S_ISFIFO(os.stat(store_file).st_mode)
+        assert "could not be read" in capsys.readouterr().err
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="O_NOFOLLOW is 0 on Windows, so the symlink is not refused (ELOOP)",
+    )
+    def test_lock_symlink_emits_one_warning_and_proceeds(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """#11(round26): a symlink planted at the lock path (refused via
+        O_NOFOLLOW -> ELOOP) silently disables cross-process serialization. The
+        save must still proceed unlocked AND emit a one-time warning so the
+        advisory-lock DoS is visible to the operator."""
+        store_file = tmp_path / "tokens.json"
+        lock_path = tmp_path / "tokens.json.lock"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+        monkeypatch.setattr("mcp_stdio.token_store._warned_lock_symlink", False)
+
+        # Plant a symlink at the lock path; O_NOFOLLOW makes os.open raise ELOOP.
+        lock_path.symlink_to(tmp_path / "decoy")
+
+        save_token("https://example.com/mcp", TokenData(access_token="tok"))
+
+        # The save still succeeded (unlocked) and warned about the symlink.
+        assert load_token("https://example.com/mcp").access_token == "tok"
+        err = capsys.readouterr().err
+        assert "lock path" in err and "symlink" in err
+
+    def test_save_soft_fails_on_non_serializable_value(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """#12(round26): _write_store's json.dumps runs before its inner try, so a
+        non-serializable value raises a non-OSError (TypeError). save_token's
+        except must catch Exception (not only OSError) so the soft-fail contract
+        holds and the relay is not crashed mid-session."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        # object() survives asdict() and makes json.dumps raise TypeError.
+        bad = TokenData(access_token=object())  # type: ignore[arg-type]
+        # Must not raise — degrades to a warning.
+        save_token("https://example.com/mcp", bad)
+
+        assert "could not write token store" in capsys.readouterr().err
+        # Nothing persisted (the write was aborted), so a later load re-auths.
+        assert load_token("https://example.com/mcp") is None
+
     def test_save_degrades_to_unlocked_when_lock_open_fails(
         self, tmp_path, monkeypatch
     ):
