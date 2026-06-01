@@ -140,16 +140,27 @@ def _migrate_legacy_store() -> None:
     if not _LEGACY_STORE_FILE.exists():
         return
     if _STORE_FILE.exists():
-        # New file already exists — best-effort removal of the now-redundant
-        # legacy file. This runs UNLOCKED from load_token, so the unlink can
-        # lose a TOCTOU race against a concurrent migration (ENOENT) or hit a
-        # read-only / permission-locked legacy FS. Neither must be allowed to
-        # crash a read of the already-migrated store, so guard it like every
-        # other filesystem op in this function.
+        # The XDG store exists — but only discard the legacy copy once it is
+        # confirmed to hold usable data. A 0-byte / unreadable _STORE_FILE (an
+        # interrupted external write, a stray `touch`, a backup restore that
+        # left an empty placeholder) is NOT proof the migration completed;
+        # unlinking the legacy file then would silently lose still-real tokens.
         try:
-            _LEGACY_STORE_FILE.unlink()
+            xdg_has_data = _STORE_FILE.stat().st_size > 0
         except OSError:
-            pass
+            xdg_has_data = False
+        if xdg_has_data:
+            # Best-effort removal of the now-redundant legacy file. This runs
+            # UNLOCKED from load_token, so the unlink can lose a TOCTOU race
+            # against a concurrent migration (ENOENT) or hit a read-only /
+            # permission-locked legacy FS. Neither must crash a read of the
+            # already-migrated store, so guard it like every other fs op here.
+            try:
+                _LEGACY_STORE_FILE.unlink()
+            except OSError:
+                pass
+        # else: leave the legacy file intact; a later run with a valid XDG
+        # store (or after the bogus placeholder is removed) reconciles it.
     else:
         _ensure_store_dir()
         # Tighten the legacy file's mode BEFORE moving it, so the secrets never
@@ -323,7 +334,7 @@ def _write_store(data: dict[str, Any]) -> None:
     # directory fsync, and opening a directory fails on Windows — neither should
     # fail the write.
     try:
-        dir_fd = os.open(str(_STORE_DIR), os.O_RDONLY)
+        dir_fd = os.open(str(_STORE_DIR), os.O_RDONLY | _O_NOFOLLOW)
         try:
             os.fsync(dir_fd)
         finally:
