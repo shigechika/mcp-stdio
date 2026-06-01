@@ -202,11 +202,21 @@ def _migrate_legacy_store() -> None:
                         data = None
                 # Never write an empty/failed read over the target.
                 if isinstance(data, dict) and data:
-                    _write_store(data)
+                    written = False
                     try:
-                        _LEGACY_STORE_FILE.unlink()
+                        _write_store(data)
+                        written = True
                     except OSError:
+                        # This copy-through runs UNLOCKED from load_token. A
+                        # failed write (disk full, read-only FS, permission) must
+                        # NOT propagate out and crash the read — leave the legacy
+                        # file intact for a later run to retry the migration.
                         pass
+                    if written:
+                        try:
+                            _LEGACY_STORE_FILE.unlink()
+                        except OSError:
+                            pass
         else:
             # rename() succeeded — re-assert 0o600 on the moved inode as a
             # belt-and-suspenders step (the line-143 pre-tighten already set

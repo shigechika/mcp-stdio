@@ -617,6 +617,40 @@ class TestLegacyMigration:
         # The corrupt legacy content was NOT copied through to the new path.
         assert not new_file.exists()
 
+    def test_copy_through_write_failure_does_not_crash_load(
+        self, tmp_path, monkeypatch
+    ):
+        """#11(round15): if the EXDEV copy-through _write_store raises (disk
+        full / read-only FS), load_token (unlocked) must NOT propagate it — it
+        degrades to None and leaves the legacy file intact for a later retry."""
+        legacy_dir = tmp_path / "legacy"
+        legacy_file = legacy_dir / "tokens.json"
+        new_dir = tmp_path / "new"
+        new_file = new_dir / "tokens.json"
+        legacy_dir.mkdir()
+        legacy_file.write_text('{"https://example.com/mcp": {"access_token": "old"}}')
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", new_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", new_file)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_DIR", legacy_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
+
+        def exdev_rename(self, target, *a, **k):
+            raise OSError(18, "Invalid cross-device link")  # force copy-through
+
+        def failing_write(_data):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr("pathlib.Path.rename", exdev_rename)
+        monkeypatch.setattr("mcp_stdio.token_store._write_store", failing_write)
+
+        loaded = load_token("https://example.com/mcp")  # must not raise
+
+        assert loaded is None
+        # The legacy tokens survive — not unlinked when the write failed.
+        assert legacy_file.exists()
+        assert "old" in legacy_file.read_text()
+
     def test_concurrent_migration_race_does_not_clobber_store(
         self, tmp_path, monkeypatch
     ):
