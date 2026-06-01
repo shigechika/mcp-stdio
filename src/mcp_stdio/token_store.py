@@ -26,6 +26,10 @@ from urllib.parse import urlsplit, urlunsplit
 
 
 _STORE_DIR = Path.home() / ".config" / "mcp-stdio"
+# _STORE_FILE is FROZEN at import (derived once from _STORE_DIR), while
+# _store_lock re-derives its lock path LIVE from _STORE_DIR. Production never
+# mutates _STORE_DIR after import, so the two always agree; tests that redirect
+# the store must monkeypatch BOTH _STORE_DIR and _STORE_FILE (see #8 round36).
 _STORE_FILE = _STORE_DIR / "tokens.json"
 
 # Legacy path (v0.3.0 and earlier)
@@ -154,28 +158,38 @@ _warned_loose_store_dir = False
 def _ensure_store_dir() -> None:
     """Create the store directory with secure permissions.
 
-    ``mkdir``'s ``mode`` only applies on creation, so re-assert 0o700 in case
-    the directory pre-existed with looser permissions (created earlier by
-    another tool, or under a permissive umask). ``mkdir(mode=)`` also tightens
-    only the FINAL component; any intermediate dir ``parents=True`` creates
-    (e.g. ``~/.config`` on a fresh home) uses the umask, so each ancestor WE
-    create is 0o700'd too — but a pre-existing ancestor (the user's shared
-    ``~/.config``) is left untouched.
+    Create each missing ancestor with ``os.mkdir(mode=0o700)`` parent-first,
+    then re-assert 0o700 on the final component in case it PRE-existed with
+    looser permissions. ``os.mkdir(0o700)`` yields exactly 0o700 regardless of
+    umask (0o700 has no group/other bits for the umask to clear), so — unlike
+    ``mkdir(parents=True)``, which 0o700's only the leaf and leaves intermediates
+    at the umask mode, then path-chmods them — there is no umask-mode window and
+    no path-based chmod on a just-created ancestor to be redirected by a symlink
+    swap (#3 round36). A pre-existing ancestor (the user's shared ``~/.config``)
+    is left untouched; only directories WE create are tightened.
     """
     global _warned_loose_store_dir
-    # #L2 (round29): the ancestors that do not yet exist are exactly the ones
-    # mkdir(parents=True) is about to create. Capture them BEFORE mkdir so we can
-    # tighten only those — never re-mode a directory we did not create. The list
-    # stops naturally at the first existing ancestor (home is always present).
-    new_ancestors = [p for p in _STORE_DIR.parents if not p.exists()]
-    _STORE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    for ancestor in new_ancestors:
-        try:
-            os.chmod(ancestor, stat.S_IRWXU)  # 0o700, only dirs we just created
-        except OSError:
-            pass  # best-effort; the 0o600 token file is the primary guard
+    # Create missing ancestors top-down (parent before child) AT 0o700. #L2
+    # round29 tightened them post-hoc; creating them at 0o700 closes the window
+    # entirely. reversed(parents) yields root-ward → leaf-ward, so each parent
+    # exists before its child; the leaf is created just below.
+    for ancestor in reversed(_STORE_DIR.parents):
+        if not ancestor.exists():
+            try:
+                os.mkdir(ancestor, stat.S_IRWXU)  # 0o700, umask-proof
+            except FileExistsError:
+                pass  # a concurrent process created it; leave its mode alone
+            except OSError:
+                break  # cannot create deeper; the leaf mkdir below surfaces it
     try:
-        os.chmod(_STORE_DIR, stat.S_IRWXU)  # 0o700
+        _STORE_DIR.mkdir(mode=0o700, exist_ok=True)
+    except FileNotFoundError:
+        # An ancestor we could not create above is still missing — fall back to
+        # parents=True (loses per-component 0o700 on intermediates only in this
+        # rare error case, but keeps the store working).
+        _STORE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(_STORE_DIR, stat.S_IRWXU)  # 0o700 — re-assert for a pre-existing leaf
     except OSError:
         # #10 (round16): the chmod can genuinely fail (a dir owned by another
         # uid after a botched restore, some network mounts). The token file is
