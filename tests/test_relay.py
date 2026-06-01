@@ -239,6 +239,32 @@ class TestPostAndStream:
             result = _post_and_stream(client, "https://example.com/mcp", '{"id":1}', {}, 1)
         assert result is None
 
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            httpx.ConnectTimeout("connect timed out"),
+            httpx.PoolTimeout("pool timed out"),
+            httpx.RemoteProtocolError("server disconnected mid-response"),
+            httpx.WriteError("write failed"),
+        ],
+    )
+    def test_all_transport_errors_are_retried_not_crashed(self, httpx_mock, exc):
+        """ConnectTimeout/PoolTimeout/RemoteProtocolError/WriteError are transient
+        TransportError subtypes — they must be retried, never propagate and crash
+        the gateway."""
+        httpx_mock.add_exception(exc)
+        httpx_mock.add_response(
+            json={"jsonrpc": "2.0", "result": {"ok": True}, "id": 1},
+            headers={"content-type": "application/json"},
+        )
+        client = httpx.Client()
+        with patch("sys.stdout", StringIO()), patch("mcp_stdio.relay.time.sleep"):
+            result = _post_and_stream(
+                client, "https://example.com/mcp", '{"id":1}', {}, 1
+            )
+        assert result is not None and result.status_code == 200
+        assert len(httpx_mock.get_requests()) == 2  # retried after the transient
+
     def test_non_200_returns_status(self, httpx_mock):
         httpx_mock.add_response(
             status_code=404, text="", headers={"content-type": "application/json"}
@@ -1966,6 +1992,58 @@ class TestSseReaderLoop:
             [b"event: endpoint\ndata: https://other.example.com/post\n\n"],
         )
         assert state.endpoint_url == "https://other.example.com/post"
+
+    def _reader_with_headers(self, httpx_mock, sse_bytes, headers):
+        state = _SseState()
+
+        def gen():
+            for chunk in sse_bytes:
+                yield chunk
+            state.stop.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream(gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+        client = httpx.Client()
+        try:
+            with patch("sys.stdout", StringIO()):
+                _sse_reader_loop(client, self.URL, headers, state)
+        finally:
+            client.close()
+        return state
+
+    def test_cross_origin_endpoint_refused_when_authorized(self, httpx_mock, capsys):
+        """A cross-origin absolute endpoint must be refused when the GET carries
+        an Authorization header — POSTing credentials there would leak them."""
+        state = self._reader_with_headers(
+            httpx_mock,
+            [b"event: endpoint\ndata: https://evil.example/post\n\n"],
+            {"Authorization": "Bearer secret"},
+        )
+        assert state.endpoint_url is None  # refused
+        assert state.ready.is_set()  # but startup is unblocked
+        assert "cross-origin" in capsys.readouterr().err
+
+    def test_cross_origin_endpoint_allowed_without_credentials(self, httpx_mock):
+        """No Authorization header → a cross-origin endpoint is allowed (nothing
+        to leak)."""
+        state = self._reader_with_headers(
+            httpx_mock,
+            [b"event: endpoint\ndata: https://other.example.com/post\n\n"],
+            {},
+        )
+        assert state.endpoint_url == "https://other.example.com/post"
+
+    def test_same_origin_absolute_endpoint_allowed_with_credentials(self, httpx_mock):
+        state = self._reader_with_headers(
+            httpx_mock,
+            [b"event: endpoint\ndata: https://example.com/messages\n\n"],
+            {"Authorization": "Bearer secret"},
+        )
+        assert state.endpoint_url == "https://example.com/messages"
 
     def test_message_event_relayed_to_stdout(self, httpx_mock):
         payload = '{"jsonrpc":"2.0","result":{},"id":1}'

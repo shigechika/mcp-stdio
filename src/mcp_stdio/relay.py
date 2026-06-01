@@ -14,7 +14,7 @@ import time
 from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -168,6 +168,22 @@ def _extract_id(line: str) -> Any:
         return json.loads(line).get("id")
     except (json.JSONDecodeError, AttributeError):
         return None
+
+
+_DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
+
+
+def _same_origin(url_a: str, url_b: str) -> bool:
+    """Return True if two URLs share an RFC 6454 origin (scheme/host/port)."""
+    try:
+        a, b = urlsplit(url_a), urlsplit(url_b)
+        oa = (a.scheme, (a.hostname or "").lower(),
+              a.port if a.port is not None else _DEFAULT_SCHEME_PORTS.get(a.scheme))
+        ob = (b.scheme, (b.hostname or "").lower(),
+              b.port if b.port is not None else _DEFAULT_SCHEME_PORTS.get(b.scheme))
+    except ValueError:
+        return False
+    return oa == ob
 
 
 # MCP-Protocol-Version header (spec rev 2025-06-18, "Protocol Version Header").
@@ -683,12 +699,13 @@ def _post_and_stream(
                         emitted = True
 
                 return _StreamResult(session, 200, protocol_version=pv)
-        except (
-            httpx.ConnectError,
-            httpx.ReadTimeout,
-            httpx.WriteTimeout,
-            httpx.ReadError,
-        ) as e:
+        except httpx.TransportError as e:
+            # TransportError is the supertype of every transient network/timeout/
+            # protocol failure: ConnectError/ReadError/Write*, ConnectTimeout/
+            # ReadTimeout/PoolTimeout, and RemoteProtocolError (mid-response
+            # server disconnect — common during half-open recovery). Catching
+            # the narrow leaf list missed several of these and let them crash the
+            # whole gateway. Non-transport (programming) errors still propagate.
             last_error = e
             log(f"attempt {attempt}/{MAX_RETRIES} failed: {e}")
             if emitted:
@@ -764,12 +781,13 @@ def _post_parsed(
                 return json.loads(text), _StreamResult(session, 200)
             except json.JSONDecodeError:
                 return None, _StreamResult(session, 200)
-        except (
-            httpx.ConnectError,
-            httpx.ReadTimeout,
-            httpx.WriteTimeout,
-            httpx.ReadError,
-        ) as e:
+        except httpx.TransportError as e:
+            # TransportError is the supertype of every transient network/timeout/
+            # protocol failure: ConnectError/ReadError/Write*, ConnectTimeout/
+            # ReadTimeout/PoolTimeout, and RemoteProtocolError (mid-response
+            # server disconnect — common during half-open recovery). Catching
+            # the narrow leaf list missed several of these and let them crash the
+            # whole gateway. Non-transport (programming) errors still propagate.
             last_error = e
             log(f"attempt {attempt}/{MAX_RETRIES} failed: {e}")
             if attempt < MAX_RETRIES:
@@ -1435,6 +1453,21 @@ def _sse_reader_loop(
                         return
                     if event_type == "endpoint":
                         resolved = urljoin(url, data)
+                        # The endpoint event may be a relative path (resolved
+                        # against the GET url) or absolute. A compromised / MITM'd
+                        # stream that injects an absolute cross-origin endpoint
+                        # would otherwise redirect every authenticated POST — and
+                        # its Authorization header — to a different origin. Refuse
+                        # a cross-origin endpoint when credentials would be sent.
+                        has_auth = any(k.lower() == "authorization" for k in req_headers)
+                        if has_auth and not _same_origin(resolved, url):
+                            log(
+                                f"warning: refusing cross-origin SSE endpoint "
+                                f"{resolved!r} (differs from {url!r}) — would leak "
+                                f"credentials. Ignoring. See #13."
+                            )
+                            state.ready.set()  # unblock startup; endpoint stays None
+                            continue
                         state.endpoint_url = resolved
                         state.ready.set()
                         log(f"SSE endpoint: {resolved}")
@@ -1444,8 +1477,12 @@ def _sse_reader_loop(
                 if state.stop.is_set():
                     return
                 log("SSE stream ended, reconnecting")
-                state.endpoint_url = None
+                # Clear ``ready`` BEFORE nulling endpoint_url so the main loop's
+                # ready.wait() blocks out the in-progress reconnect instead of
+                # returning immediately on a stale set() and surfacing a spurious
+                # "SSE endpoint unavailable".
                 state.ready.clear()
+                state.endpoint_url = None
                 # Responsive reconnect delay: exits immediately on stop.
                 if state.stop.wait(RETRY_DELAY):
                     return
@@ -1453,8 +1490,8 @@ def _sse_reader_loop(
             if state.stop.is_set():
                 return
             log(f"SSE disconnected, reconnecting: {e}")
+            state.ready.clear()  # clear before nulling endpoint_url (see above)
             state.endpoint_url = None
-            state.ready.clear()
             if state.stop.wait(RETRY_DELAY):
                 return
         except Exception as e:  # noqa: BLE001 — thread safety net
