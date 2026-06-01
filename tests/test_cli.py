@@ -5,12 +5,29 @@ from unittest.mock import patch
 import pytest
 
 from mcp_stdio.cli import (
+    _bearer_header_value,
     _build_scope_upgrader,
     _build_token_refresher,
     _parse_header,
     main,
 )
 from mcp_stdio.token_store import TokenData
+
+
+class TestBearerHeaderValue:
+    """#5(round21): an OAuth AS-supplied token gets the same CR/LF/NUL ban as
+    -H values and --bearer-token, so it cannot inject/split request headers."""
+
+    def test_clean_token_builds_header(self):
+        assert _bearer_header_value("abc.def-123") == "Bearer abc.def-123"
+
+    @pytest.mark.parametrize(
+        "bad",
+        ["tok\r\nX-Inject: 1", "tok\nX: 1", "tok\rX: 1", "tok\x00hidden"],
+    )
+    def test_control_char_token_rejected(self, bad):
+        with pytest.raises(ValueError, match="forbidden control character"):
+            _bearer_header_value(bad)
 
 
 class TestParseHeader:
@@ -831,6 +848,25 @@ class TestBuildTokenRefresher:
         assert _SpyClient.instances and _SpyClient.instances[-1].closed
         # AS-controlled redirects must not be auto-followed on the OAuth flow.
         assert _SpyClient.instances[-1].kwargs.get("follow_redirects") is False
+
+    def test_refresh_token_with_control_char_degrades_to_none(
+        self, monkeypatch, capsys
+    ):
+        """#5(round21): a refreshed token carrying CR/LF/NUL must NOT reach the
+        wire — the refresher degrades to None (relay emits an auth error) rather
+        than building an injectable Authorization header."""
+        _SpyClient.instances.clear()
+        monkeypatch.setattr("mcp_stdio.cli.httpx.Client", _SpyClient)
+        monkeypatch.setattr(
+            "mcp_stdio.oauth.refresh_cached_token",
+            lambda url, client: TokenData(access_token="bad\r\nX-Inject: 1"),
+        )
+        refresher = _build_token_refresher(
+            "https://example.com/mcp", {}, 10, 120
+        )
+        assert refresher() is None
+        assert _SpyClient.instances[-1].closed
+        assert "token refresh failed" in capsys.readouterr().err
 
     def test_returns_none_on_refresh_failure_and_closes(self, monkeypatch):
         _SpyClient.instances.clear()
