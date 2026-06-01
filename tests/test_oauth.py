@@ -335,6 +335,39 @@ class TestDiscoverMetadata:
         assert meta.authorization_endpoint == "https://api.example.com/auth"
         assert meta.registration_endpoint is None  # not in response
 
+    def test_iss_parameter_supported_parsed(self, httpx_mock):
+        """#4(round19): the RFC 9207 §3 flag is parsed into OAuthMetadata so the
+        §2.4 missing-iss rejection can fire; a non-true value stays False."""
+        self._mock_no_prm(httpx_mock)
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-authorization-server",
+            json={
+                "issuer": "https://api.example.com",
+                "authorization_endpoint": "https://api.example.com/auth",
+                "token_endpoint": "https://api.example.com/tok",
+                "authorization_response_iss_parameter_supported": True,
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata("https://api.example.com/mcp", client)
+        assert meta.iss_parameter_supported is True
+
+    def test_iss_parameter_supported_defaults_false(self, httpx_mock):
+        """Absent the RFC 9207 §3 flag, iss_parameter_supported is False — a
+        response without iss is then accepted (present-only check)."""
+        self._mock_no_prm(httpx_mock)
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-authorization-server",
+            json={
+                "issuer": "https://api.example.com",
+                "authorization_endpoint": "https://api.example.com/auth",
+                "token_endpoint": "https://api.example.com/tok",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata("https://api.example.com/mcp", client)
+        assert meta.iss_parameter_supported is False
+
     def test_partial_metadata_uses_defaults(self, httpx_mock):
         """Server returns metadata with only some endpoints."""
         self._mock_no_prm(httpx_mock)
@@ -1606,6 +1639,21 @@ class TestParseTokenResponse:
         assert result["access_token"] == "at123"
         assert result["token_type"] == "bearer"
         assert result["scope"] == "repo"
+
+    def test_form_urlencoded_duplicate_key_collapses_to_first(self, httpx_mock):
+        """#8(round19): a non-conformant duplicated form field must collapse to
+        its first value (a string), never leave a LIST that would flow into
+        TokenData.access_token or be str()-ed by the error sanitiser."""
+        httpx_mock.add_response(
+            url="https://example.com/token",
+            text="access_token=first&access_token=second&token_type=bearer",
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        )
+        client = httpx.Client()
+        resp = client.post("https://example.com/token")
+        result = _parse_token_response(resp)
+        assert result["access_token"] == "first"
+        assert isinstance(result["access_token"], str)
 
     def test_http_200_with_error_body(self, httpx_mock):
         """GitHub legacy: HTTP 200 with error in body."""
@@ -3661,6 +3709,57 @@ class TestRfc9207IssValidation:
             "https://ex.com/mcp",
             client,
             metadata=self.META,
+            cached=None,
+            client_id_override="cid",
+            timeout=5,
+        )
+        assert data.access_token == "at"
+
+    # RFC 9207 §2.4 second MUST: reject a missing iss from an AS that advertises
+    # support (authorization_response_iss_parameter_supported). #4/#7 (round19).
+    META_ISS_SUPPORTED = OAuthMetadata(
+        authorization_endpoint="https://ex.com/authorize",
+        token_endpoint="https://ex.com/token",
+        issuer="https://ex.com",
+        iss_parameter_supported=True,
+    )
+
+    def test_missing_iss_rejected_when_as_advertises_support(self, monkeypatch):
+        """An AS that advertised iss support but whose response OMITS iss must be
+        rejected (a mix-up attacker could otherwise strip iss to silence the
+        compare)."""
+        monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", self._driver(""))
+        client = httpx.Client()
+        with pytest.raises(RuntimeError, match="issuer missing"):
+            _run_authorization_flow(
+                "https://ex.com/mcp",
+                client,
+                metadata=self.META_ISS_SUPPORTED,
+                cached=None,
+                client_id_override="cid",
+                timeout=5,
+            )
+
+    def test_present_iss_accepted_when_as_advertises_support(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """When the AS advertises iss support and the response carries a matching
+        iss, the flow proceeds normally."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+        httpx_mock.add_response(
+            url="https://ex.com/token",
+            json={"access_token": "at", "token_type": "Bearer"},
+        )
+        monkeypatch.setattr(
+            "mcp_stdio.oauth.webbrowser.open", self._driver("iss=https://ex.com")
+        )
+        client = httpx.Client()
+        data = _run_authorization_flow(
+            "https://ex.com/mcp",
+            client,
+            metadata=self.META_ISS_SUPPORTED,
             cached=None,
             client_id_override="cid",
             timeout=5,

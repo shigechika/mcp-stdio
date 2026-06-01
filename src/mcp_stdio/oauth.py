@@ -79,6 +79,9 @@ class OAuthMetadata:
     # RFC 8414 issuer identifier — used to validate the RFC 9207 ``iss``
     # parameter on the authorization response (AS mix-up defence).
     issuer: str | None = None
+    # RFC 9207 §3 metadata flag. When the AS advertises this true, RFC 9207 §2.4
+    # makes the client MUST reject an authorization response that lacks ``iss``.
+    iss_parameter_supported: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +448,14 @@ def _fetch_authorization_server_metadata(
                 ),
                 token_endpoint_auth_methods_supported=methods if isinstance(methods, list) else None,
                 issuer=issuer or auth_server_url,
+                # RFC 9207 §3: a true value makes a missing `iss` on the
+                # authorization response a MUST-reject (§2.4). Coerce strictly to
+                # bool so a non-bool JSON value cannot accidentally enable the
+                # stricter check off a truthy string.
+                iss_parameter_supported=(
+                    data.get("authorization_response_iss_parameter_supported")
+                    is True
+                ),
             )
     except Exception:
         pass
@@ -567,10 +578,30 @@ def discover_oauth_metadata(
     # wrong origin entirely. When no PRM AS was found, auth_server_url == base,
     # so this reduces to the previous MCP-host defaults.
     as_base = auth_server_url.rstrip("/")
+    # #5 (round19): re-validate the synthesized endpoints through the same #13
+    # policy the metadata path applies (no cleartext / no userinfo), so this
+    # fallback enforces the credential-leak guard too. as_base was already
+    # validated upstream (_validate_auth_server_url or _authorization_base_url),
+    # so this is defense-in-depth — but if that upstream check ever weakened we
+    # must not silently POST code + client_secret + PKCE verifier to an unsafe
+    # endpoint. Hard-fail instead.
+    authorize_ep = _validate_endpoint_url(
+        f"{as_base}/authorize", label="default authorization_endpoint"
+    )
+    token_ep = _validate_endpoint_url(
+        f"{as_base}/token", label="default token_endpoint"
+    )
+    if not authorize_ep or not token_ep:
+        raise ValueError(
+            f"refusing to synthesize default OAuth endpoints from an unsafe "
+            f"authorization-server base {as_base!r}"
+        )
     return OAuthMetadata(
-        authorization_endpoint=f"{as_base}/authorize",
-        token_endpoint=f"{as_base}/token",
-        registration_endpoint=f"{as_base}/register",
+        authorization_endpoint=authorize_ep,
+        token_endpoint=token_ep,
+        registration_endpoint=_validate_endpoint_url(
+            f"{as_base}/register", label="default registration_endpoint"
+        ),
         # No metadata was validated on this fallback, so it is the LEAST
         # trustworthy discovery outcome — keep the RFC 9207 iss mix-up check
         # active by pinning the issuer to the base the endpoints derive from.
@@ -710,7 +741,11 @@ def generate_pkce() -> tuple[str, str]:
 
     Returns (code_verifier, code_challenge).
     """
-    verifier = secrets.token_urlsafe(64)[:96]  # ~86 chars, capped well within 43-128
+    # token_urlsafe(64) is always 86 chars (64 bytes base64url, unpadded) = 512
+    # bits of entropy, within the RFC 7636 §4.1 43-128 range and well above the
+    # OAuth 2.1 256-bit floor. (#6 round19: a former [:96] slice was a dead
+    # no-op — 86 < 96 — and is dropped; nothing is truncated.)
+    verifier = secrets.token_urlsafe(64)
     digest = hashlib.sha256(verifier.encode("ascii")).digest()
     challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
     return verifier, challenge
@@ -817,8 +852,12 @@ def _parse_token_response(resp: httpx.Response) -> dict[str, Any]:
     content_type = resp.headers.get("content-type", "")
     if "application/x-www-form-urlencoded" in content_type:
         parsed = dict(parse_qs(resp.text, keep_blank_values=True))
-        # parse_qs returns lists; unwrap single values
-        result = {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
+        # parse_qs returns lists; take the FIRST value for every key (#8 round19).
+        # A non-conformant duplicate (e.g. access_token=a&access_token=b) must NOT
+        # leave a LIST in result — that would flow into TokenData.access_token or
+        # be str()-ed by _sanitize_oauth_error. No real provider emits duplicates;
+        # fail closed to a string. (load_token's type check is the final backstop.)
+        result = {k: (v[0] if v else "") for k, v in parsed.items()}
         _raise_for_body_error(result)
         return result
 
@@ -1205,8 +1244,19 @@ def _run_authorization_flow(
     # stops a code issued by AS-A from being exchanged at AS-B. Both values come
     # from the same AS (its metadata `issuer` and its callback `iss`) so they are
     # byte-identical; an exact compare (per §2.4, no normalisation) is correct.
-    # Only checked when both are present; PKCE + state already cover the common
-    # attacks, so this is defence-in-depth.
+    #
+    # §2.4 has a SECOND MUST: a client MUST reject a response that OMITS `iss`
+    # from an AS that advertises iss support (the RFC 9207 §3 metadata flag) —
+    # otherwise a mix-up attacker could simply strip `iss` to silence the compare
+    # above. Enforce that when the AS advertised support. (When it did NOT
+    # advertise, a missing `iss` is accepted: PKCE + state already cover the
+    # common attacks, so this whole check is defence-in-depth.) See #4 (round19).
+    if metadata.iss_parameter_supported and cb_result.iss is None:
+        raise RuntimeError(
+            "OAuth issuer missing (RFC 9207 §2.4) — the authorization server "
+            "advertises iss support but its response omitted iss; possible AS "
+            "mix-up attack"
+        )
     if (
         cb_result.iss is not None
         and metadata.issuer
