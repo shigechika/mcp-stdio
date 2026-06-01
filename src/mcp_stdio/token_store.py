@@ -583,26 +583,34 @@ def _store_lock() -> Iterator[None]:
     # so test monkeypatching of _STORE_DIR redirects the lock file too.
     lock_path = _STORE_DIR / "tokens.json.lock"
     try:
+        # _O_NONBLOCK (#1 round32): without it, an O_WRONLY open of a writer-less
+        # FIFO planted at the lock path BLOCKS forever, hanging every
+        # save_token/delete_token instead of degrading to an unlocked write.
+        # Matches every other os.open in this file (read / legacy / migration),
+        # which all add O_NONBLOCK for exactly this reason. A no-op for the
+        # regular lock file; on a FIFO the open returns ENXIO immediately.
         fd = os.open(
             lock_path,
-            os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW,
+            os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK,
             stat.S_IRUSR | stat.S_IWUSR,
         )
     except OSError as e:
-        # A symlink planted at the lock path (O_NOFOLLOW -> ELOOP) silently
-        # disables cross-process serialization — distinct from a benign
-        # read-only / missing-dir failure that just degrades to a no-op lock.
-        # Warn ONCE so the operator can notice the advisory-lock DoS, then
-        # proceed unlocked (a lock failure must never block the save). The dir's
-        # 0o700 mode is the primary guard against another user planting it.
-        if e.errno == errno.ELOOP:
+        # A symlink (O_NOFOLLOW -> ELOOP) or a FIFO (O_NONBLOCK -> ENXIO) planted
+        # at the lock path silently disables cross-process serialization —
+        # distinct from a benign read-only / missing-dir failure that just
+        # degrades to a no-op lock. Warn ONCE so the operator can notice the
+        # advisory-lock DoS, then proceed unlocked (a lock failure must never
+        # block the save). The dir's 0o700 mode is the primary guard against
+        # another user planting it.
+        if e.errno in (errno.ELOOP, errno.ENXIO):
             global _warned_lock_symlink
             if not _warned_lock_symlink:
                 _warned_lock_symlink = True
                 print(
-                    f"warning: token store lock path {lock_path} is a symlink "
-                    f"(refused via O_NOFOLLOW); proceeding without cross-process "
-                    f"locking — concurrent saves may last-writer-wins",
+                    f"warning: token store lock path {lock_path} is a special "
+                    f"file (symlink/FIFO, refused via O_NOFOLLOW/O_NONBLOCK); "
+                    f"proceeding without cross-process locking — concurrent "
+                    f"saves may last-writer-wins",
                     file=sys.stderr,
                 )
         yield

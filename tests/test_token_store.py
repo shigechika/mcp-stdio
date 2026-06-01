@@ -582,6 +582,31 @@ class TestLoadSaveDelete:
         err = capsys.readouterr().err
         assert "lock path" in err and "symlink" in err
 
+    @pytest.mark.skipif(
+        sys.platform == "win32" or not hasattr(os, "mkfifo"),
+        reason="os.mkfifo is POSIX-only",
+    )
+    def test_lock_fifo_does_not_hang_and_proceeds(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """#1(round32): a FIFO planted at the lock path must NOT hang the save —
+        an O_WRONLY open of a writer-less FIFO blocks forever WITHOUT O_NONBLOCK.
+        With O_NONBLOCK the open returns ENXIO and the save degrades to an
+        unlocked write (and warns once), instead of stalling every save/delete."""
+        store_file = tmp_path / "tokens.json"
+        lock_path = tmp_path / "tokens.json.lock"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+        monkeypatch.setattr("mcp_stdio.token_store._warned_lock_symlink", False)
+
+        os.mkfifo(lock_path)
+        # If the O_NONBLOCK guard regressed, this would hang the test forever.
+        save_token("https://example.com/mcp", TokenData(access_token="tok"))
+
+        assert load_token("https://example.com/mcp").access_token == "tok"
+        err = capsys.readouterr().err
+        assert "lock path" in err and "FIFO" in err
+
     def test_save_soft_fails_on_non_serializable_value(
         self, tmp_path, monkeypatch, capsys
     ):
