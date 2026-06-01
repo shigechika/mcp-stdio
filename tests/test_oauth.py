@@ -23,6 +23,7 @@ from mcp_stdio.oauth import (
     _probe_www_authenticate,
     _run_authorization_flow,
     _run_device_authorization_flow,
+    _sanitize_oauth_error,
     _token_response_to_data,
     _validate_auth_server_url,
     _validate_endpoint_url,
@@ -103,6 +104,30 @@ class TestAuthorizationBaseUrl:
         producing a malformed '://...' base that flows into default endpoints."""
         with pytest.raises(ValueError, match="absolute http"):
             _authorization_base_url(bad)
+
+
+class TestSanitizeOAuthError:
+    """#12(round14): AS-supplied error strings are sanitised to the RFC 6749
+    grammar and length-bounded before reaching logs / exceptions."""
+
+    def test_plain_error_code_passes(self):
+        assert _sanitize_oauth_error("invalid_scope") == "invalid_scope"
+
+    def test_control_characters_stripped(self):
+        assert _sanitize_oauth_error("bad\r\n\tinjected\x00x") == "badinjectedx"
+
+    def test_quote_and_backslash_stripped(self):
+        # 0x22 (") and 0x5C (\\) are outside the RFC 6749 error grammar.
+        assert _sanitize_oauth_error('a"b\\c') == "abc"
+
+    def test_length_bounded(self):
+        assert len(_sanitize_oauth_error("x" * 5000)) == 200
+
+    def test_empty_after_strip_is_placeholder(self):
+        assert _sanitize_oauth_error("\x00\x01\x02") == "<unspecified>"
+
+    def test_non_string_coerced(self):
+        assert _sanitize_oauth_error(12345) == "12345"
 
 
 # --- PKCE ---
@@ -3827,6 +3852,31 @@ class TestDeviceAuthorizationFlow:
         assert data.access_token == "acc"
         assert data.refresh_token == "ref"
         assert data.client_id == "cid"
+
+    def test_explicit_client_id_skips_dcr(self, httpx_mock, tmp_path, monkeypatch):
+        """#7(round14): with an explicit --client-id (client_id_override) the
+        device flow uses it directly — no DCR /register POST — and the
+        device-authorization POST carries that client_id."""
+        self._patch_store(tmp_path, monkeypatch)
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(
+            url=TOKEN_URL, json={"access_token": "acc", "token_type": "Bearer"}
+        )
+
+        client = httpx.Client()
+        data = _run_device_authorization_flow(
+            MCP_URL,
+            client,
+            metadata=_device_meta(reg=False),  # no registration_endpoint
+            cached=None,
+            client_id_override="cid-from-flag",
+        )
+        assert data.access_token == "acc"
+        assert data.client_id == "cid-from-flag"
+        reqs = httpx_mock.get_requests()
+        assert not any(str(r.url) == REG_URL for r in reqs)  # no DCR
+        da = next(r for r in reqs if str(r.url) == DEVICE_AUTH_URL)
+        assert b"client_id=cid-from-flag" in da.read()
 
     def test_expires_in_clamped_to_max_lifetime(
         self, httpx_mock, tmp_path, monkeypatch, capsys

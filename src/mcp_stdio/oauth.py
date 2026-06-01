@@ -49,6 +49,24 @@ def _safe_int(value: Any, default: int) -> int:
         return default
 
 
+# RFC 6749 §4.1.2.1 / §5.2 error / error_description grammar: printable ASCII
+# excluding double-quote (0x22) and backslash (0x5C). Anything outside it is
+# stripped from an AS-supplied error before it reaches a log / exception, so a
+# hostile AS cannot inject control characters or megabytes of text into the
+# operator's logs. See #12.
+_OAUTH_ERROR_DISALLOWED_RE = re.compile(r"[^\x20\x21\x23-\x5B\x5D-\x7E]")
+
+
+def _sanitize_oauth_error(value: Any, *, max_len: int = 200) -> str:
+    """Sanitise an AS-supplied error/description to the RFC 6749 grammar.
+
+    Strips out-of-grammar characters and bounds the length so the value is safe
+    to embed in an exception message or log line.
+    """
+    cleaned = _OAUTH_ERROR_DISALLOWED_RE.sub("", str(value))[:max_len]
+    return cleaned or "<unspecified>"
+
+
 @dataclass
 class OAuthMetadata:
     """Authorization server metadata (RFC 8414)."""
@@ -769,7 +787,7 @@ def _raise_for_body_error(result: dict[str, Any]) -> None:
     """
     if "error" in result and "access_token" not in result:
         desc = result.get("error_description", result["error"])
-        raise RuntimeError(f"OAuth token error: {desc}")
+        raise RuntimeError(f"OAuth token error: {_sanitize_oauth_error(desc)}")
 
 
 def _parse_token_response(resp: httpx.Response) -> dict[str, Any]:
@@ -1148,7 +1166,7 @@ def _run_authorization_flow(
         callback_server.server_close()
 
     if cb_result.error:
-        raise RuntimeError(f"OAuth error: {cb_result.error}")
+        raise RuntimeError(f"OAuth error: {_sanitize_oauth_error(cb_result.error)}")
 
     # Use a constant-time comparison so the rejection path does not leak the
     # common-prefix length of the two state tokens via timing. Over a
