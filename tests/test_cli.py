@@ -398,6 +398,43 @@ class TestMain:
             main()
         assert "ignored without --oauth" not in capsys.readouterr().err
 
+    def test_env_client_id_alone_does_not_warn(self, monkeypatch, capsys):
+        """An ambient MCP_OAUTH_CLIENT_ID without --oauth must NOT trip the
+        'ignored without --oauth' warning (only an explicit --client-id does)."""
+        monkeypatch.setenv("MCP_OAUTH_CLIENT_ID", "cid")
+        with (
+            patch("sys.argv", ["mcp-stdio", "https://example.com/mcp"]),
+            patch("mcp_stdio.cli.run"),
+        ):
+            main()
+        assert "ignored without --oauth" not in capsys.readouterr().err
+
+    def test_explicit_client_id_without_oauth_warns(self, monkeypatch, capsys):
+        monkeypatch.delenv("MCP_OAUTH_CLIENT_ID", raising=False)
+        with (
+            patch(
+                "sys.argv",
+                ["mcp-stdio", "--client-id", "cid", "https://example.com/mcp"],
+            ),
+            patch("mcp_stdio.cli.run"),
+        ):
+            main()
+        assert "ignored without --oauth" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "bad", ["tok\nInjected: x", "tok\rx", "tok\x00x", "tok\r\nInjected: x"]
+    )
+    def test_bearer_token_control_chars_rejected(self, bad, capsys):
+        """A bearer token with CR/LF/NUL must be rejected (header injection),
+        the same ban -H values get."""
+        with patch(
+            "sys.argv", ["mcp-stdio", "--bearer-token", bad, "https://example.com/mcp"]
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 1
+        assert "forbidden control character" in capsys.readouterr().err
+
     def test_dash_h_overrides_default_content_type_case_insensitively(self):
         with (
             patch(

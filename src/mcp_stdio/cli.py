@@ -181,7 +181,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--client-id",
-        default=os.environ.get("MCP_OAUTH_CLIENT_ID", ""),
+        # Default None (not the env value) so an ambient MCP_OAUTH_CLIENT_ID is
+        # distinguishable from an explicit flag — the env var alone must not trip
+        # the "ignored without --oauth" warning below.
+        default=None,
         help="Pre-registered OAuth client ID (or set MCP_OAUTH_CLIENT_ID env var)",
     )
     parser.add_argument(
@@ -333,9 +336,17 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # Warn if OAuth-only options are set without an OAuth flow — they are
-    # silently ignored otherwise. --client-id / --oauth-scope also accept env
-    # defaults, so only treat them as "set" when non-empty.
+    # Resolve --client-id: the explicit flag wins; otherwise the env var. The
+    # warning below only counts an EXPLICIT --client-id (args.client_id is not
+    # None), so an ambient MCP_OAUTH_CLIENT_ID does not trip it.
+    client_id = (
+        args.client_id
+        if args.client_id is not None
+        else os.environ.get("MCP_OAUTH_CLIENT_ID", "")
+    )
+
+    # Warn if OAuth-only options are explicitly set without an OAuth flow — they
+    # are silently ignored otherwise.
     if not (args.oauth or args.oauth_device) and (
         args.client_id or args.oauth_scope or args.no_resource_indicator
     ):
@@ -349,6 +360,17 @@ def main() -> None:
     # the flow below sets the Authorization header itself.
     if args.oauth or args.oauth_device:
         bearer_token = ""
+
+    # A bearer token reaches the wire as the Authorization header value, so it
+    # must satisfy the same CR/LF/NUL ban as -H values (RFC 7230 §3.2) — a
+    # newline in the token would otherwise inject arbitrary headers. See #14.
+    if bearer_token and any(c in bearer_token for c in _HEADER_VALUE_FORBIDDEN):
+        print(
+            "error: bearer token contains a forbidden control character "
+            "(CR, LF, or NUL)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Build headers
     headers: dict[str, str] = {
@@ -391,7 +413,7 @@ def main() -> None:
             token_data = ensure_token(
                 args.url,
                 client,
-                client_id=args.client_id or None,
+                client_id=client_id or None,
                 scope=args.oauth_scope or None,
                 device_flow=args.oauth_device,
                 refresh_leeway=args.oauth_refresh_leeway,
