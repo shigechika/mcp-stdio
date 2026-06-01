@@ -576,11 +576,20 @@ def _write_store(data: dict[str, Any]) -> None:
 def _store_lock() -> Iterator[None]:
     """Best-effort advisory exclusive lock around a read-modify-write.
 
-    Serialises ``save_token`` / ``delete_token`` across concurrent mcp-stdio
-    processes so updates to distinct server keys merge rather than clobbering
-    each other (last-writer-wins). Uses ``fcntl`` on POSIX and ``msvcrt`` on
-    Windows; if no primitive is available or acquisition fails, it proceeds
-    without the lock (the operation must never be blocked by lock trouble).
+    Serialises ``save_token`` / ``delete_token`` so updates to distinct server
+    keys merge rather than clobbering each other (last-writer-wins). Uses
+    ``fcntl.flock`` on POSIX and ``msvcrt`` on Windows; if no primitive is
+    available or acquisition fails, it proceeds without the lock (the operation
+    must never be blocked by lock trouble).
+
+    This is the PRIMARY serialisation mechanism and it covers BOTH concurrent
+    processes AND concurrent threads in one process: each call opens a fresh
+    ``os.open`` fd, and ``flock`` locks the open file description, so two
+    threads with their own fds block each other exactly like two processes
+    (#B-2 round34). The unique temp-file suffix in ``_write_store`` is only the
+    backstop for the degraded no-lock path, NOT the in-process serialiser — do
+    not refactor this to a POSIX record lock (``lockf``/``fcntl.lockf``), which
+    is per-process and would silently stop serialising sibling threads.
     """
     _ensure_store_dir()
     # Derive the lock path from the current _STORE_DIR (not a module constant)
@@ -662,8 +671,13 @@ def load_token(server_url: str) -> TokenData | None:
     """Load token data for a server URL.
 
     Returns None if no token is stored. Looks up the normalised key first,
-    then the verbatim key so entries written by older versions (which used the
-    raw URL as the key) are still found.
+    then the verbatim ``server_url`` key. The verbatim fallback only hits a
+    legacy entry whose key equals THIS call's exact URL string — an old entry
+    written under a different spelling (e.g. a trailing slash) that the caller
+    now passes canonically is missed by both lookups and triggers one
+    re-authentication. That is benign and self-healing: the next ``save_token``
+    rewrites under the normalised key, and a wrong-token return is structurally
+    impossible (#B-1 round34).
     """
     store = _read_store()
     entry = store.get(_normalize_key(server_url))
