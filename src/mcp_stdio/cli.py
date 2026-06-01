@@ -291,7 +291,8 @@ def main() -> None:
         help=(
             "Disable TCP keepalive on the HTTP socket. TCP keepalive is "
             "on by default (60s idle + 4 probes × 15s ≈ 120s half-open "
-            "detection on Linux/macOS/BSD; SO_KEEPALIVE-only on Windows). "
+            "detection on Linux/macOS/FreeBSD/NetBSD; SO_KEEPALIVE-only on "
+            "Windows and other platforms). "
             "Opt out for proxy/NAT paths that strip keepalive packets. "
             "See #9."
         ),
