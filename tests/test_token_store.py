@@ -80,12 +80,16 @@ class TestLoadSaveDelete:
         assert load_token("https://example.com/mcp") is None
 
     def test_delete_nonexistent(self, tmp_path, monkeypatch):
+        """#B-3(round34): deleting a missing key is a no-op — it must not raise
+        AND must not materialize the store file (no write when nothing was
+        removed), so the store stays untouched."""
         store_file = tmp_path / "tokens.json"
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
         monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
 
-        # Should not raise
-        delete_token("https://nonexistent.com/mcp")
+        delete_token("https://nonexistent.com/mcp")  # must not raise
+        # No removal happened, so no write — the store file is not created.
+        assert not store_file.exists()
 
     @pytest.mark.skipif(
         sys.platform == "win32",
