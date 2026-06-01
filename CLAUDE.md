@@ -46,4 +46,4 @@ Entry point: `mcp-stdio` command → `mcp_stdio.cli:main`.
 
 ## Release
 
-Tagging `v*` triggers the GitHub Actions release pipeline: test → build → TestPyPI → PyPI → MCP Registry → GitHub Release → Homebrew tap update. The `server.json` version is patched from the git tag at publish time.
+Releases are driven by **release-please** (Conventional Commits) — do not tag `v*` by hand. Pushing commits to `main` updates a standing "release PR" that bumps `__version__` (`src/mcp_stdio/__init__.py`) and `CHANGELOG.md`. Merging that PR creates the `v*` tag and a GitHub Release (via a PAT so downstream workflows fire). The `release: published` event then runs the publish pipeline: test → build → TestPyPI → PyPI → MCP Registry → GitHub Release assets → Homebrew tap update. The `server.json` version is patched from the git tag at publish time.
