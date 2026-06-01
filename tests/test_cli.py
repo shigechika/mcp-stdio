@@ -548,6 +548,23 @@ class TestMain:
             main()
         assert "ignored without --oauth" in capsys.readouterr().err
 
+    def test_explicit_empty_client_id_without_oauth_warns(
+        self, monkeypatch, capsys
+    ):
+        """#13(round22): an explicit `--client-id ''` (falsy) without an OAuth
+        flow now trips the OAuth-only warning — the gate is presence-based
+        (`is not None`), matching the --bearer-token discipline."""
+        monkeypatch.delenv("MCP_OAUTH_CLIENT_ID", raising=False)
+        with (
+            patch(
+                "sys.argv",
+                ["mcp-stdio", "--client-id", "", "https://example.com/mcp"],
+            ),
+            patch("mcp_stdio.cli.run"),
+        ):
+            main()
+        assert "ignored without --oauth" in capsys.readouterr().err
+
     @pytest.mark.parametrize(
         "bad", ["tok\nInjected: x", "tok\rx", "tok\x00x", "tok\r\nInjected: x"]
     )
