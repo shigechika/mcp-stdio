@@ -2036,7 +2036,17 @@ def run(
                 # net. A request gets one error; a notification (no id) stays silent.
                 log(f"internal relay error handling request: {e}")
                 if req_has_id:
-                    _write_line(_error_response("internal relay error", req_id))
+                    try:
+                        _write_line(_error_response("internal relay error", req_id))
+                    except OSError:
+                        # #3 (round31): the original exception may itself be a
+                        # BrokenPipeError from _write_line (client closed stdout).
+                        # The recovery write would then re-raise it and crash out
+                        # of the loop — breaking the "keep the session alive"
+                        # guarantee this handler names. Swallow a second write
+                        # failure (nothing can reach a dead stdout anyway); the
+                        # stderr log above already recorded it.
+                        pass
                 continue
     finally:
         client.close()
@@ -2530,7 +2540,14 @@ def run_sse(
                 # request to an error and keeps the loop alive, never crashing.
                 log(f"internal relay error handling request: {e}")
                 if req_has_id:
-                    _write_line(_error_response("internal relay error", req_id))
+                    try:
+                        _write_line(_error_response("internal relay error", req_id))
+                    except OSError:
+                        # #3 (round31): swallow a second write failure when the
+                        # original exception was a BrokenPipeError from
+                        # _write_line — mirrors run(); a dead stdout can receive
+                        # nothing, and the stderr log above already recorded it.
+                        pass
                 continue
     finally:
         state.stop.set()

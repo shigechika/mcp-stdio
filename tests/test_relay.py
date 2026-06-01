@@ -448,6 +448,31 @@ class TestPostAndStream:
         err = json.loads(stdout.getvalue().strip())
         assert err["id"] == 1 and "error" in err
 
+    def test_recovery_write_brokenpipe_does_not_crash(self, httpx_mock):
+        """#3(round31): when the client has closed stdout, _write_line raises
+        BrokenPipeError. The outer run() handler's own recovery write would then
+        re-raise it and crash out of the loop — breaking the documented
+        keep-the-session-alive guarantee. The recovery write must swallow a
+        second OSError so run() exits cleanly instead of propagating."""
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+        stdin_data = '{"jsonrpc":"2.0","method":"call","id":1}\n'
+        # Every _write_line raises a broken pipe (client gone): the response
+        # write raises, the outer handler catches it, and its recovery write
+        # raises again — which must be swallowed, not propagate out of run().
+        with (
+            patch("sys.stdin", StringIO(stdin_data)),
+            patch("sys.stdout", StringIO()),
+            patch(
+                "mcp_stdio.relay._write_line",
+                side_effect=BrokenPipeError(32, "Broken pipe"),
+            ),
+        ):
+            # Must NOT raise.
+            run("https://example.com/mcp", {"Content-Type": "application/json"})
+
     def test_notification_retry_exhaustion_emits_no_error(self, httpx_mock):
         """has_id=False (a notification): retry exhaustion must NOT synthesize an
         id:null error — a notification can never receive a response."""
@@ -3514,6 +3539,48 @@ class TestPagination:
         # The real list result is still parsed correctly.
         merged = next(d for d in lines if "result" in d)
         assert [t["name"] for t in merged["result"]["tools"]] == ["a"]
+
+    def test_page_sse_skips_non_message_event(self, httpx_mock):
+        """#4(round31): a non-`message` SSE event (e.g. event: ping) on the
+        paginated POST stream is skipped and the following event: message result
+        is still parsed — pins the buffered-path non-message skip branch (the
+        streaming path covers the equivalent case, the buffered path did not)."""
+        result = '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}]}}'
+        body = "event: ping\ndata: {}\n\n" f"event: message\ndata: {result}\n\n"
+        httpx_mock.add_response(
+            url=self.URL,
+            text=body,
+            headers={"content-type": "text/event-stream"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())
+        assert [t["name"] for t in merged["result"]["tools"]] == ["a"]
+
+    def test_page1_empty_body_falls_back_to_streamed_post(self, httpx_mock):
+        """#4(round31): a page-1 200 with an EMPTY body yields (None, 200), which
+        must trigger the plain-streamed-POST fallback (re-POST) so the client
+        still gets a response — not a silent empty emit. Pins the buffered-path
+        empty-body branch."""
+        # Page 1: empty 200 body -> (None, 200) -> fallback re-POST.
+        httpx_mock.add_response(
+            url=self.URL, text="", headers={"content-type": "application/json"}
+        )
+        # The fallback re-POST returns a normal result.
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}]}}',
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())
+        assert merged["result"]["tools"] == [{"name": "a"}]
+        assert len(httpx_mock.get_requests()) == 2  # original empty + fallback
 
 
 # --- check_connection ---
