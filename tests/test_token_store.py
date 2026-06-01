@@ -188,6 +188,88 @@ class TestLoadSaveDelete:
         loaded = load_token("https://example.com/mcp")
         assert loaded is not None and loaded.access_token == "fresh"
 
+    def test_save_aborts_when_store_unreadable(self, tmp_path, monkeypatch, capsys):
+        """#3: if the store EXISTS but cannot be read (e.g. transient EACCES),
+        a save must ABORT rather than clobber it with a single-key payload that
+        destroys every other server's token."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        save_token("https://a.com/mcp", TokenData(access_token="tok-a"))
+        save_token("https://b.com/mcp", TokenData(access_token="tok-b"))
+
+        real_open = os.open
+
+        def fail_store_read(path, flags, *a, **k):
+            # Fail only the read-open of the store file; allow lock + temp writes.
+            is_read = flags & (os.O_WRONLY | os.O_RDWR) == 0
+            if is_read and os.fspath(path) == os.fspath(store_file):
+                raise PermissionError(13, "store momentarily locked")
+            return real_open(path, flags, *a, **k)
+
+        monkeypatch.setattr("mcp_stdio.token_store.os.open", fail_store_read)
+        save_token("https://c.com/mcp", TokenData(access_token="tok-c"))  # must abort
+        monkeypatch.setattr("mcp_stdio.token_store.os.open", real_open)
+
+        # The pre-existing tokens survive; the unreadable-time save was skipped.
+        assert load_token("https://a.com/mcp").access_token == "tok-a"
+        assert load_token("https://b.com/mcp").access_token == "tok-b"
+        assert load_token("https://c.com/mcp") is None
+        assert "could not be read" in capsys.readouterr().err
+
+    def test_delete_aborts_when_store_unreadable(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """#3: delete must likewise abort on an unreadable store rather than
+        overwrite it and lose the other servers' tokens."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        save_token("https://a.com/mcp", TokenData(access_token="tok-a"))
+        save_token("https://b.com/mcp", TokenData(access_token="tok-b"))
+
+        real_open = os.open
+
+        def fail_store_read(path, flags, *a, **k):
+            is_read = flags & (os.O_WRONLY | os.O_RDWR) == 0
+            if is_read and os.fspath(path) == os.fspath(store_file):
+                raise PermissionError(13, "store momentarily locked")
+            return real_open(path, flags, *a, **k)
+
+        monkeypatch.setattr("mcp_stdio.token_store.os.open", fail_store_read)
+        delete_token("https://a.com/mcp")  # must abort
+        monkeypatch.setattr("mcp_stdio.token_store.os.open", real_open)
+
+        # Nothing deleted (and nothing else lost).
+        assert load_token("https://a.com/mcp").access_token == "tok-a"
+        assert load_token("https://b.com/mcp").access_token == "tok-b"
+        assert "could not be read" in capsys.readouterr().err
+
+    def test_save_degrades_to_unlocked_when_lock_open_fails(
+        self, tmp_path, monkeypatch
+    ):
+        """#8: if the advisory lock file cannot be opened, the save must still
+        proceed (unsynchronised) — lock trouble never blocks a write."""
+        store_file = tmp_path / "tokens.json"
+        lock_path = tmp_path / "tokens.json.lock"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        real_open = os.open
+
+        def fail_lock_open(path, flags, *a, **k):
+            if os.fspath(path) == os.fspath(lock_path):
+                raise PermissionError(13, "cannot create lock file")
+            return real_open(path, flags, *a, **k)
+
+        monkeypatch.setattr("mcp_stdio.token_store.os.open", fail_lock_open)
+        save_token("https://example.com/mcp", TokenData(access_token="t"))
+        monkeypatch.setattr("mcp_stdio.token_store.os.open", real_open)
+
+        assert load_token("https://example.com/mcp").access_token == "t"
+
     @pytest.mark.skipif(
         sys.platform == "win32",
         reason="POSIX mode bits don't model NTFS ACLs",
