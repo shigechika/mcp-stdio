@@ -31,6 +31,16 @@ RETRY_DELAY = 1  # seconds
 # modelcontextprotocol/typescript-sdk#1892.
 _RATE_LIMIT_SLEEP_CAP_SECS = 60.0
 
+# Status codes whose ``Retry-After`` we honour for a backoff-and-retry, and
+# whose final value we surface as ``error.data.retryAfter`` when we give up.
+# Both are spec-sanctioned Retry-After carriers that mean "the request was
+# NOT processed, try again later" — so replaying the non-idempotent POST is
+# safe (no work was done server-side). 429 Too Many Requests (RFC 6585 §4)
+# is rate limiting; 503 Service Unavailable (RFC 9110 §15.6.4) is a
+# transient overload / maintenance window — RFC 9110 §10.2.3 explicitly
+# lists 503 as a Retry-After carrier alongside 429.
+_RETRYABLE_RATE_LIMIT_STATUSES = (429, 503)
+
 # TCP keepalive tuning. Together (60 s idle + 4 × 15 s probes) a silent
 # half-open TCP is surfaced as a socket error within ~120 s — fast enough
 # to matter during a long tool call, slow enough to tolerate transient
@@ -744,21 +754,21 @@ def _post_and_stream(
                 session = resp.headers.get("mcp-session-id")
                 www_auth = resp.headers.get("www-authenticate")
 
-                if resp.status_code == 429:
+                if resp.status_code in _RETRYABLE_RATE_LIMIT_STATUSES:
                     resp.read()
                     sleep_secs = _handle_rate_limit(resp.headers, attempt)
                     if sleep_secs is None:
                         return _StreamResult(
                             session,
-                            429,
+                            resp.status_code,
                             www_auth,
                             retry_after=_parse_retry_after(
                                 resp.headers.get("retry-after")
                             ),
                         )
                     log(
-                        f"attempt {attempt}/{MAX_RETRIES} got HTTP 429, "
-                        f"sleeping {sleep_secs:.1f}s before retry"
+                        f"attempt {attempt}/{MAX_RETRIES} got HTTP "
+                        f"{resp.status_code}, sleeping {sleep_secs:.1f}s before retry"
                     )
                     time.sleep(sleep_secs)
                     continue
@@ -863,20 +873,20 @@ def _post_parsed(
             resp = client.post(url, content=content, headers=headers)
             session = resp.headers.get("mcp-session-id")
             www_auth = resp.headers.get("www-authenticate")
-            if resp.status_code == 429:
+            if resp.status_code in _RETRYABLE_RATE_LIMIT_STATUSES:
                 sleep_secs = _handle_rate_limit(resp.headers, attempt)
                 if sleep_secs is None:
                     return None, _StreamResult(
                         session,
-                        429,
+                        resp.status_code,
                         www_auth,
                         retry_after=_parse_retry_after(
                             resp.headers.get("retry-after")
                         ),
                     )
                 log(
-                    f"attempt {attempt}/{MAX_RETRIES} got HTTP 429, "
-                    f"sleeping {sleep_secs:.1f}s before retry"
+                    f"attempt {attempt}/{MAX_RETRIES} got HTTP "
+                    f"{resp.status_code}, sleeping {sleep_secs:.1f}s before retry"
                 )
                 time.sleep(sleep_secs)
                 continue
@@ -1785,12 +1795,13 @@ def run(
             if result.status_code >= 400:
                 log(f"upstream returned HTTP {result.status_code}")
                 if req_has_id:
-                    # On a 429 whose retries were exhausted / over-cap, surface
-                    # the server's Retry-After (when present) as error.data so a
-                    # client can back off intelligently. See #8.
+                    # On a 429/503 whose retries were exhausted / over-cap,
+                    # surface the server's Retry-After (when present) as
+                    # error.data so a client can back off intelligently. See #8.
                     err_data = (
                         {"retryAfter": result.retry_after}
-                        if result.status_code == 429 and result.retry_after is not None
+                        if result.status_code in _RETRYABLE_RATE_LIMIT_STATUSES
+                        and result.retry_after is not None
                         else None
                     )
                     _write_line(
@@ -1843,6 +1854,17 @@ def _sse_reader_loop(
     401/403 token refresh. ``headers_lock`` (when provided) serialises the
     per-reconnect snapshot taken here against those mutations so the request
     build never iterates a dict that is changing under it.
+
+    Refresh-propagation timing (#3): a token refresh driven by the POST path
+    reaches THIS already-open GET stream only on its NEXT reconnect — the
+    snapshot above is re-taken per connect, so the fresh credential is picked
+    up then, but a refresh does NOT forcibly tear down a healthy live stream.
+    No forced-reconnect signal is wired, by design: a token expiry severe
+    enough to 401 the POST uses the SAME credential as the GET, so the server
+    closes (401s) the long-lived GET too, and the resulting reconnect snapshots
+    the refreshed headers. Adding a cross-thread reconnect kick for the narrow
+    window where a server keeps the GET alive on an expired token would be
+    over-engineering for no observed failure mode.
 
     Reconnects automatically on disconnect.
     """
@@ -2104,9 +2126,9 @@ def run_sse(
                     write=timeout_write,
                     pool=10,
                 )
-                # Honour Retry-After on 429 up to the cap; over-cap or
-                # retries-exhausted falls through with the final 429 and
-                # is surfaced to the caller by the generic 4xx branch
+                # Honour Retry-After on 429/503 up to the cap; over-cap or
+                # retries-exhausted falls through with the final status and
+                # is surfaced to the caller by the generic 4xx/5xx branch
                 # below (typescript-sdk#1892).
                 for attempt in range(1, MAX_RETRIES + 1):
                     resp = client.post(
@@ -2115,14 +2137,14 @@ def run_sse(
                         headers=_snapshot_headers(),
                         timeout=post_timeout,
                     )
-                    if resp.status_code != 429:
+                    if resp.status_code not in _RETRYABLE_RATE_LIMIT_STATUSES:
                         break
                     sleep_secs = _handle_rate_limit(resp.headers, attempt)
                     if sleep_secs is None:
                         break
                     log(
-                        f"attempt {attempt}/{MAX_RETRIES} got HTTP 429, "
-                        f"sleeping {sleep_secs:.1f}s before retry"
+                        f"attempt {attempt}/{MAX_RETRIES} got HTTP "
+                        f"{resp.status_code}, sleeping {sleep_secs:.1f}s before retry"
                     )
                     time.sleep(sleep_secs)
 
@@ -2204,7 +2226,7 @@ def run_sse(
                     # with the cancel filter's narrow scope).
                     if req_has_id:
                         err_data = None
-                        if resp.status_code == 429:
+                        if resp.status_code in _RETRYABLE_RATE_LIMIT_STATUSES:
                             secs = _parse_retry_after(resp.headers.get("retry-after"))
                             if secs is not None:
                                 err_data = {"retryAfter": secs}  # See #8.

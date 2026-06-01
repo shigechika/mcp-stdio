@@ -49,7 +49,7 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
   - [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) Bearer Token usage
     - §2.1 `Authorization: Bearer <token>` request header
 - **Retry with backoff** — retries up to 3 times on connection errors
-- **HTTP 429 handling** — honours `Retry-After` (delta-seconds or HTTP-date) up to a 60-second cap, then surfaces the 429 so the client can decide (cf. modelcontextprotocol/typescript-sdk#1892)
+- **HTTP 429 / 503 handling** — honours `Retry-After` (delta-seconds or HTTP-date) up to a 60-second cap on both 429 (Too Many Requests) and 503 (Service Unavailable) — the two spec-sanctioned Retry-After carriers (RFC 9110 §10.2.3) — then surfaces the status so the client can decide (cf. modelcontextprotocol/typescript-sdk#1892)
 - **Auto-pagination** — transparently follows `nextCursor` for `tools/list` / `resources/list` / `resources/templates/list` / `prompts/list` and merges the pages into one response, so clients that drop pages beyond the first still see the full list (cf. anthropics/claude-code#39586)
 - **Streaming resilience** — streams SSE responses in real time; auto-reconnects on mid-stream disconnect
 - **Line-separator safety** — escapes raw `U+2028` / `U+2029` (legal in JSON, but JavaScript line terminators) in upstream responses so clients that treat them as line breaks cannot mis-frame the output; lossless (cf. modelcontextprotocol/typescript-sdk#2155)
