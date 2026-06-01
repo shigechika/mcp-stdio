@@ -746,24 +746,78 @@ class TestDiscoverMetadata:
             "https://api.example.com:8443/.well-known/oauth-protected-resource/mcp"
         )
 
-    def test_rfc8414_issuer_mismatch_warns_but_continues(self, httpx_mock, caplog):
-        """RFC 8414 §3: issuer in metadata mismatches discovery URL — warn, don't fail."""
-        import logging
-
+    def test_rfc8414_cross_origin_issuer_rejected(self, httpx_mock):
+        """#8(round26): RFC 8414 §3.3 — a CROSS-ORIGIN issuer (different host)
+        is a mix-up / AS-spoofing signal, so the metadata is REJECTED rather
+        than used. Discovery falls back to the synthesized defaults on the
+        discovery origin, so the spoofed endpoints never receive a credential."""
         self._mock_no_prm(httpx_mock)
         httpx_mock.add_response(
             url="https://api.example.com/.well-known/oauth-authorization-server",
             json={
-                "issuer": "https://other.example.com",  # mismatch
+                "issuer": "https://other.example.com",  # cross-origin → spoof
+                "authorization_endpoint": "https://api.example.com/auth",
+                "token_endpoint": "https://api.example.com/token",
+            },
+        )
+        # Rejecting the spoofed metadata makes discovery continue to the
+        # path-scoped RFC 8414 §3.1 fetch before Phase 3 — mock it as 404 so no
+        # unexpected request escapes. pytest_httpx strict mode flags it at
+        # TEARDOWN, where _fetch_authorization_server_metadata's broad except
+        # cannot swallow it (a local run passed without this; see #151 round21).
+        httpx_mock.add_response(
+            url=(
+                "https://api.example.com/.well-known/"
+                "oauth-authorization-server/mcp"
+            ),
+            status_code=404,
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata("https://api.example.com/mcp", client)
+        # The spoofed metadata's "/auth" is NOT used — the synthesized default
+        # "/authorize" on the discovery origin is, proving the reject took hold.
+        assert meta.authorization_endpoint == "https://api.example.com/authorize"
+
+    def test_rfc8414_same_origin_issuer_trailing_slash_warns_but_continues(
+        self, httpx_mock
+    ):
+        """#8(round26): a SAME-origin issuer mismatch (trailing slash / path /
+        case) is the slight misconfiguration real servers ship — warn, but still
+        use the metadata. Only a cross-origin issuer is rejected."""
+        self._mock_no_prm(httpx_mock)
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-authorization-server",
+            json={
+                "issuer": "https://api.example.com/",  # same origin, trailing /
                 "authorization_endpoint": "https://api.example.com/auth",
                 "token_endpoint": "https://api.example.com/token",
             },
         )
         client = httpx.Client()
-        with caplog.at_level(logging.DEBUG):
-            meta = discover_oauth_metadata("https://api.example.com/mcp", client)
-        # Metadata is still returned despite mismatch
+        meta = discover_oauth_metadata("https://api.example.com/mcp", client)
+        # Same-origin drift is tolerated: the metadata endpoints ARE used.
         assert meta.authorization_endpoint == "https://api.example.com/auth"
+
+    def test_phase3_refuses_cleartext_synthesized_endpoints(self, httpx_mock):
+        """#15(round26): when discovery falls to Phase 3 (no PRM, no RFC 8414
+        metadata) and the only base is a cleartext non-loopback http:// origin,
+        synthesizing default /authorize + /token would POST the code +
+        client_secret in plaintext. _validate_endpoint_url rejects them and
+        discover_oauth_metadata HARD-FAILS with ValueError rather than returning
+        unsafe endpoints. Drives the integration path of the #5(round19) guard."""
+        base = "http://evil.example.com"
+        self._mock_no_prm(httpx_mock, base=base, path="/mcp")
+        # RFC 8414 metadata absent on both the base and the path-scoped issuer.
+        httpx_mock.add_response(
+            url=f"{base}/.well-known/oauth-authorization-server", status_code=404
+        )
+        httpx_mock.add_response(
+            url=f"{base}/.well-known/oauth-authorization-server/mcp",
+            status_code=404,
+        )
+        client = httpx.Client()
+        with pytest.raises(ValueError, match="refusing to synthesize"):
+            discover_oauth_metadata(f"{base}/mcp", client)
 
     def test_rfc8414_issuer_match_no_warning(self, httpx_mock):
         """RFC 8414 §3: issuer matches — no warning, metadata returned normally."""
@@ -3624,33 +3678,84 @@ class TestStateCsrfCheck:
         ]
         assert token_calls == []
 
-    def test_uses_constant_time_comparison(self, monkeypatch):
-        """The comparison goes through secrets.compare_digest, not ==.
+    def test_uses_constant_time_comparison(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """#14(round26): the CSRF state check goes through secrets.compare_digest
+        on the PRODUCTION path, not ==.
 
-        Monkeypatches `secrets.compare_digest` in the oauth module and
-        asserts it was called with the expected (callback_state, local_state)
-        pair — no clever timing assertion, just structural evidence that
-        the constant-time path is wired up.
+        The previous version called compare_digest itself in the test body, so it
+        was tautological — a refactor to `==` would not have failed it. This runs
+        the real `ensure_token` flow with a spy installed and asserts the spy was
+        invoked with `(callback_state, sent_state)` from the production code.
+        Swapping the production comparison to `==` makes compare_digest go
+        uncalled, so this test fails — the regression is now guarded.
         """
         import mcp_stdio.oauth as oauth_mod
+        from urllib.parse import parse_qs, urlparse
+        from urllib.request import urlopen
+
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
 
         calls: list[tuple[str, str]] = []
         real_compare = oauth_mod.secrets.compare_digest
 
-        def spying_compare(a: str, b: str) -> bool:
+        def spying_compare(a, b):
             calls.append((a, b))
             return real_compare(a, b)
 
-        monkeypatch.setattr(
-            oauth_mod.secrets, "compare_digest", spying_compare
+        monkeypatch.setattr(oauth_mod.secrets, "compare_digest", spying_compare)
+
+        httpx_mock.add_response(url="https://example.com/mcp", status_code=401)
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource/mcp",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://example.com/authorize",
+                "token_endpoint": "https://example.com/token",
+                "registration_endpoint": "https://example.com/register",
+            },
+        )
+        httpx_mock.add_response(
+            url="https://example.com/register",
+            json={"client_id": "cid"},
         )
 
-        # Exercise the comparison path directly (without running the full
-        # HTTP flow — that is covered by the previous test).
-        assert oauth_mod.secrets.compare_digest("abc", "abc") is True
-        assert calls[-1] == ("abc", "abc")
-        assert oauth_mod.secrets.compare_digest("abc", "abd") is False
-        assert calls[-1] == ("abc", "abd")
+        sent: dict[str, str] = {}
+
+        def fake_open(auth_url: str) -> bool:
+            q = parse_qs(urlparse(auth_url).query)
+            sent["state"] = q["state"][0]
+            redirect_uri = q["redirect_uri"][0]
+
+            def hit_callback() -> None:
+                cb_url = f"{redirect_uri}?code=evil&state=attacker-state"
+                try:
+                    urlopen(cb_url, timeout=5).read()
+                except Exception:
+                    pass
+
+            threading.Thread(target=hit_callback, daemon=True).start()
+            return True
+
+        monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", fake_open)
+
+        client = httpx.Client()
+        with pytest.raises(RuntimeError, match="state mismatch"):
+            ensure_token(self.SERVER_URL, client, timeout=5)
+
+        # The production CSRF check called compare_digest with the callback's
+        # state and the state we sent — proving the constant-time path is live.
+        assert ("attacker-state", sent["state"]) in calls
 
 
 class TestAuthorizationFlowFailurePaths:
