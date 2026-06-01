@@ -231,6 +231,17 @@ class TestMain:
             assert exc_info.value.code == 2
         assert "must be >= 0" in capsys.readouterr().err
 
+    @pytest.mark.parametrize("flag", ["--timeout-connect", "--timeout-read"])
+    def test_zero_connect_read_timeout_rejected(self, flag, capsys):
+        """#9: --timeout-connect 0 / --timeout-read 0 are rejected at parse time
+        (httpx would treat 0 as an immediate timeout that always fails). Unlike
+        --sse-read-timeout, where 0 means 'disable'."""
+        with patch("sys.argv", ["mcp-stdio", flag, "0", "https://example.com/mcp"]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 2
+        assert "must be > 0" in capsys.readouterr().err
+
     def test_sse_read_timeout_zero_still_accepted(self):
         """--sse-read-timeout 0 (disable) must remain valid — 0 is allowed."""
         with (

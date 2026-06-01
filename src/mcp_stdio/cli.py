@@ -24,6 +24,21 @@ def _non_negative_float(value: str) -> float:
     return f
 
 
+def _positive_float(value: str) -> float:
+    """argparse type for strictly-positive floats.
+
+    For ``--timeout-connect`` / ``--timeout-read`` a value of 0 is meaningless:
+    httpx treats it as an immediate timeout, so every connect/read would fail at
+    once. Reject 0 at parse time. (``--sse-read-timeout`` keeps 0 = disable and
+    ``--oauth-refresh-leeway`` keeps 0 = no proactive refresh, so those stay on
+    ``_non_negative_float``.) See #9.
+    """
+    f = _non_negative_float(value)  # reuse non-numeric / negative handling
+    if f == 0:
+        raise argparse.ArgumentTypeError("value must be > 0")
+    return f
+
+
 # RFC 7230 §3.2.6 field-name = token = 1*tchar. tchar covers
 # "!#$%&'*+-.^_`|~" plus DIGIT and ALPHA. Used to reject header names
 # that could be misinterpreted by downstream HTTP parsers.
@@ -248,15 +263,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--timeout-connect",
-        type=_non_negative_float,
+        type=_positive_float,
         default=10,
-        help="Connection timeout in seconds (default: 10)",
+        help="Connection timeout in seconds, > 0 (default: 10)",
     )
     parser.add_argument(
         "--timeout-read",
-        type=_non_negative_float,
+        type=_positive_float,
         default=120,
-        help="Read timeout in seconds (default: 120)",
+        help="Read timeout in seconds, > 0 (default: 120)",
     )
     parser.add_argument(
         "--sse-read-timeout",
