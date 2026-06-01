@@ -538,6 +538,27 @@ class TestDiscoverMetadata:
             == "https://auth.example.com/.well-known/oauth-authorization-server/a/b/c"
         )
 
+    def test_build_well_known_url_strips_userinfo(self):
+        """#5: embedded userinfo must NOT be carried into the discovery GET URL
+        (it would be sent as HTTP Basic auth)."""
+        url = _build_well_known_url(
+            "https://user:pass@api.example.com/mcp", "oauth-authorization-server"
+        )
+        assert "user:pass@" not in url
+        assert url == (
+            "https://api.example.com/.well-known/oauth-authorization-server/mcp"
+        )
+
+    def test_build_well_known_url_strips_userinfo_keeps_port(self):
+        url = _build_well_known_url(
+            "https://u:p@api.example.com:8443/mcp",
+            "oauth-protected-resource",
+            keep_query=False,
+        )
+        assert url == (
+            "https://api.example.com:8443/.well-known/oauth-protected-resource/mcp"
+        )
+
     def test_rfc8414_issuer_mismatch_warns_but_continues(self, httpx_mock, caplog):
         """RFC 8414 §3: issuer in metadata mismatches discovery URL — warn, don't fail."""
         import logging
@@ -2793,15 +2814,18 @@ class TestValidateAuthServerUrl:
         )
         assert "cross-origin" not in capsys.readouterr().err
 
-    def test_userinfo_is_not_cross_origin(self, capsys):
-        """Per RFC 6454 §4, userinfo is not part of the origin."""
+    def test_userinfo_is_rejected(self, capsys):
+        """#10: an authorization_server URL embedding userinfo is refused —
+        it would survive into the (non-revalidated) synthesized token endpoint
+        and route the credential exchange through a userinfo authority. Mirrors
+        _validate_endpoint_url's userinfo rejection."""
         assert (
             _validate_auth_server_url(
                 "https://user:pass@mcp.example.com/authorize", self.SERVER_URL
             )
-            is True
+            is False
         )
-        assert "cross-origin" not in capsys.readouterr().err
+        assert "userinfo" in capsys.readouterr().err
 
     def test_different_port_is_cross_origin(self, capsys):
         """Different explicit ports ARE different origins per RFC 6454."""
@@ -3264,6 +3288,35 @@ class TestRfc9207IssValidation:
             timeout=5,
         )
         assert data.access_token == "at"
+
+    def test_stepup_preserves_requested_scope_when_response_omits_it(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """#2: a step-up token response that OMITS scope (RFC 6749 §5.1, when it
+        equals the requested scope) must keep the requested/merged union in the
+        stored TokenData — not wipe it to None and shrink the next step-up."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+        # Token response deliberately omits "scope".
+        httpx_mock.add_response(
+            url="https://ex.com/token",
+            json={"access_token": "at", "token_type": "Bearer"},
+        )
+        monkeypatch.setattr(
+            "mcp_stdio.oauth.webbrowser.open", self._driver("iss=https://ex.com")
+        )
+        client = httpx.Client()
+        data = _run_authorization_flow(
+            "https://ex.com/mcp",
+            client,
+            metadata=self.META,
+            cached=None,
+            client_id_override="cid",
+            scope="read write admin",  # the merged union a step-up requests
+            timeout=5,
+        )
+        assert data.scope == "read write admin"
 
     def test_no_iss_skips_validation(self, httpx_mock, tmp_path, monkeypatch):
         store_file = tmp_path / "tokens.json"
