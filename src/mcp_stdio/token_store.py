@@ -60,6 +60,10 @@ _warned_userinfo_key = False
 # cross-process serialization, so the operator gets one warning per process.
 _warned_lock_symlink = False
 
+# Set once if a save encountered a corrupt-JSON store and replaced it, so the
+# operator is told their token store was corrupt (and replaced) just once.
+_warned_corrupt_store = False
+
 
 def _normalize_key(server_url: str) -> str:
     """Normalise a server URL into a stable token-store key.
@@ -421,9 +425,9 @@ def _migrate_legacy_store() -> None:
 class _StoreUnreadable(Exception):
     """The store file exists but could not be READ (permission / symlink /
     I/O error) — distinct from 'absent' (→ {}) and 'corrupt JSON' (which is
-    overwrite-safe). A writer must ABORT on this rather than clobber a store
-    whose real contents it never saw, which would destroy every other
-    server's tokens.
+    overwrite-safe, since corrupt bytes are already unrecoverable). A writer
+    must ABORT on this rather than clobber a store whose real contents it never
+    saw, which would destroy every other server's tokens.
     """
 
 
@@ -437,7 +441,8 @@ def _read_store(*, for_write: bool = False) -> dict[str, Any]:
     transient EACCES, an ELOOP from a swapped-in symlink, or a backup-restore
     race would otherwise let the next save persist ONLY its one key and wipe
     every other server's cached token. A corrupt-JSON store stays overwrite-safe
-    (``{}``), preserving the intentional corrupt-store-replacement behaviour.
+    (``{}``) — its bytes are already unrecoverable — but the WRITE path warns once
+    so the replacement is visible to the operator (#L2 round37).
     """
     _migrate_legacy_store()
     if not _STORE_FILE.exists():
@@ -506,8 +511,25 @@ def _read_store(*, for_write: bool = False) -> dict[str, Any]:
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        # Genuinely corrupt JSON is overwrite-safe (the contents are unusable);
-        # both read and write paths treat it as an empty store.
+        # Genuinely corrupt JSON is overwrite-safe: the bytes are UNPARSEABLE, so
+        # every server's token in it is already unrecoverable — replacing it on
+        # the next save loses nothing recoverable and restores a usable store
+        # (aborting would leave it broken AND fail to cache the new token). Both
+        # paths therefore treat it as an empty store. But the silent replacement
+        # previously hid a real event from the operator (a 3rd-party tool / disk
+        # corrupting tokens.json), so the WRITE path warns ONCE that the corrupt
+        # store is being replaced — visibility without changing the recovery
+        # behaviour (#L2 round37).
+        if for_write:
+            global _warned_corrupt_store
+            if not _warned_corrupt_store:
+                _warned_corrupt_store = True
+                print(
+                    f"mcp-stdio: warning: token store {_STORE_FILE} contains "
+                    f"corrupt JSON; replacing it (other servers' cached tokens, "
+                    f"if any, were already unparseable and need re-auth).",
+                    file=sys.stderr,
+                )
         return {}
     return data if isinstance(data, dict) else {}
 
