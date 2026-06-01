@@ -213,7 +213,7 @@ mcp-stdio [OPTIONS] URL
 
 ## ワークアラウンド
 
-Claude Code・mcp-remote・Windows の既知の問題については [WORKAROUNDS.md](WORKAROUNDS.md) を参照してください。
+Claude Code・mcp-remote・MCP SDK・Windows の既知の問題については [WORKAROUNDS.md](WORKAROUNDS.md) を参照してください。
 
 ## 仕組み
 
