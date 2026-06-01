@@ -696,6 +696,15 @@ def discover_oauth_metadata(
     if auth_server_url != base:
         meta = _fetch_authorization_server_metadata(base, client)
         if meta:
+            # Surface the origin re-anchoring (#4 round44): the token/authorize
+            # endpoints now come from the MCP host, not the PRM-advertised AS the
+            # operator may have expected. Benign for the common co-located
+            # deployment, but in a genuine federated setup this is worth seeing.
+            log(
+                f"warning: PRM-advertised authorization server {auth_server_url!r} "
+                f"returned no RFC 8414 metadata; using the MCP-host base {base!r} "
+                f"instead — endpoints are sourced from the resource server's origin"
+            )
             return meta
 
     # Path-scoped issuers (Keycloak realm URLs, AWS Cognito user pools, etc.)

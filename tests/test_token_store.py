@@ -60,6 +60,54 @@ class TestReadJsonObjectFile:
         os.mkfifo(fifo)
         assert _read_json_object_file(fifo) is None
 
+    def test_closes_fd_when_fdopen_raises(self, tmp_path, monkeypatch):
+        """#5(round44): if os.fdopen itself raises (e.g. resource pressure), the
+        bare fd must still be closed — not leaked — and the function returns
+        None."""
+        p = tmp_path / "ok.json"
+        p.write_text('{"a": 1}')
+        closed: list[int] = []
+        real_close = os.close
+
+        def tracking_close(fd: int) -> None:
+            closed.append(fd)
+            real_close(fd)
+
+        def boom_fdopen(*a, **k):
+            raise OSError(24, "Too many open files")
+
+        monkeypatch.setattr("mcp_stdio.token_store.os.fdopen", boom_fdopen)
+        monkeypatch.setattr("mcp_stdio.token_store.os.close", tracking_close)
+        assert _read_json_object_file(p) is None
+        # The fd opened for the read was explicitly closed despite fdopen failing.
+        assert len(closed) == 1
+
+
+class TestForeignNonFiniteEntry:
+    """#6(round44): a foreign writer's non-finite entry must not wedge all saves."""
+
+    def test_save_drops_foreign_non_finite_entry_instead_of_failing(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+        # A foreign tokens.json with a non-finite expires_at (json.loads parses the
+        # Infinity literal) alongside a valid entry.
+        store_file.write_text(
+            '{"https://bad.example.com/mcp": '
+            '{"access_token": "x", "expires_at": Infinity}, '
+            '"https://good.example.com/mcp": {"access_token": "keepme"}}'
+        )
+        # The save must NOT be wedged by the bad entry.
+        save_token("https://new.example.com/mcp", TokenData(access_token="fresh"))
+
+        assert load_token("https://new.example.com/mcp").access_token == "fresh"
+        assert load_token("https://good.example.com/mcp").access_token == "keepme"
+        # The non-finite entry was dropped; the operator was warned once.
+        assert load_token("https://bad.example.com/mcp") is None
+        assert "dropped 1 unserialisable" in capsys.readouterr().err
+
 
 class TestTokenData:
     def test_defaults(self):

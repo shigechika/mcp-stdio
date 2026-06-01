@@ -3107,6 +3107,27 @@ class TestPagination:
         # Page 1 contributed an empty list (coerced); page 2 appended its item.
         assert merged["result"]["tools"] == [{"name": "a"}]
 
+    def test_paginated_notification_no_id_produces_no_response(self, httpx_mock):
+        """#1(round44): a list method sent as a NOTIFICATION (no id key) must get
+        NO response — the merged-response emit is gated on has_id, mirroring every
+        other synthesized-write path. Otherwise a spurious {"id":null,...} frame
+        would be delivered for a notification (a JSON-RPC violation)."""
+        # Single page (no nextCursor) so pagination reaches the success emit.
+        page = {"jsonrpc": "2.0", "result": {"tools": [{"name": "a"}]}}
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(page),
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "method": "tools/list"})],  # no id key
+        )
+        # The notification produced no stdout line at all.
+        assert output.strip() == ""
+        # But the upstream POST still happened (pagination ran, just stayed silent).
+        assert len(httpx_mock.get_requests()) == 1
+
     @pytest.mark.parametrize(
         "method,result_key",
         list(PAGINATED_LIST_METHODS.items()),
@@ -4800,6 +4821,41 @@ class TestSseReaderLoop:
         # The graceful EOF on GET #1 must have triggered GET #2.
         assert state.endpoint_url == "https://example.com/second"
         assert len(httpx_mock.get_requests()) == 2
+
+    def test_stop_during_reconnect_wait_returns_httperror_branch(self, httpx_mock):
+        """#7(round44): when stop is signaled during the post-disconnect
+        RETRY_DELAY wait, the HTTPError reconnect branch returns promptly instead
+        of issuing another GET. (Covers the otherwise-untested stop-early-return.)"""
+        state = _SseState()
+        httpx_mock.add_exception(httpx.ReadError("boom"), url=self.URL, method="GET")
+        # Simulate stop being signaled during the reconnect delay: wait() True.
+        state.stop.wait = lambda *a, **k: True
+        client = httpx.Client()
+        try:
+            with patch("sys.stdout", StringIO()):
+                _sse_reader_loop(client, self.URL, {}, state)  # returns, no reconnect
+        finally:
+            client.close()
+        assert len(httpx_mock.get_requests()) == 1  # no second GET after stop
+
+    def test_stop_during_reconnect_wait_returns_graceful_eof_branch(self, httpx_mock):
+        """#7(round44): the graceful-EOF reconnect path likewise returns promptly
+        when stop is signaled during the RETRY_DELAY wait."""
+        state = _SseState()
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream([b"event: endpoint\ndata: /m\n\n"]),
+            headers={"content-type": "text/event-stream"},
+        )
+        state.stop.wait = lambda *a, **k: True
+        client = httpx.Client()
+        try:
+            with patch("sys.stdout", StringIO()):
+                _sse_reader_loop(client, self.URL, {}, state)
+        finally:
+            client.close()
+        assert len(httpx_mock.get_requests()) == 1  # no reconnect after stop
 
     def test_reconnect_resnapshot_uses_refreshed_headers(self, httpx_mock):
         """When headers are mutated (as a 401 refresh would) between connects,
