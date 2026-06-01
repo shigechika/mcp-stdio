@@ -12,10 +12,53 @@ import pytest
 from mcp_stdio.token_store import (
     TokenData,
     _normalize_key,
+    _read_json_object_file,
     delete_token,
     load_token,
     save_token,
 )
+
+
+class TestReadJsonObjectFile:
+    """The shared side-effect-free O_NOFOLLOW probe used by both _read_legacy_data
+    and the migration's XDG-store check. #10(round43): pin its non-regular-file
+    and unreadable branches directly, independent of which caller reaches them."""
+
+    def test_absent_file_returns_none(self, tmp_path):
+        assert _read_json_object_file(tmp_path / "nope.json") is None
+
+    def test_valid_object_returns_dict(self, tmp_path):
+        p = tmp_path / "ok.json"
+        p.write_text('{"a": 1}')
+        assert _read_json_object_file(p) == {"a": 1}
+
+    def test_non_object_json_returns_none(self, tmp_path):
+        p = tmp_path / "arr.json"
+        p.write_text("[1, 2, 3]")
+        assert _read_json_object_file(p) is None
+
+    def test_corrupt_json_returns_none(self, tmp_path):
+        p = tmp_path / "bad.json"
+        p.write_text("{ not json")
+        assert _read_json_object_file(p) is None
+
+    def test_directory_returns_none(self, tmp_path):
+        d = tmp_path / "adir"
+        d.mkdir()
+        # A directory is not a regular file → the fstat guard rejects it (None),
+        # never an open-for-read that would misbehave.
+        assert _read_json_object_file(d) is None
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or not hasattr(os, "mkfifo"),
+        reason="os.mkfifo is POSIX-only",
+    )
+    def test_fifo_returns_none_without_hanging(self, tmp_path):
+        """A FIFO planted at the path must be refused via O_NONBLOCK + the
+        regular-file fstat guard, not block forever on an O_RDONLY read."""
+        fifo = tmp_path / "pipe"
+        os.mkfifo(fifo)
+        assert _read_json_object_file(fifo) is None
 
 
 class TestTokenData:

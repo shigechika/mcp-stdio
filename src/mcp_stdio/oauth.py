@@ -638,13 +638,22 @@ def discover_oauth_metadata(
         # Guard the type too (#L2 round38): a non-string `resource` (e.g. 123)
         # would make .rstrip raise. A non-string is simply not a usable
         # identifier — skip the mismatch warning rather than crash.
+        #
+        # Compare against the userinfo-STRIPPED identifier (#4 round43):
+        # a compliant PRM `resource` never carries userinfo, and the rest of the
+        # flow already uses the stripped form (_resource_indicator /
+        # _build_well_known_url / _authorization_base_url). Comparing the raw
+        # server_url would emit a misleading §3.3 mismatch warning whenever the
+        # operator passed `https://user:pass@host/mcp` against a correct PRM
+        # advertising `https://host/mcp`.
+        expected_resource = _resource_indicator(server_url)
         if (
             isinstance(prm_resource, str)
-            and prm_resource.rstrip("/") != server_url.rstrip("/")
+            and prm_resource.rstrip("/") != expected_resource.rstrip("/")
         ):
             log(
                 f"warning: RFC 9728 §3.3 resource mismatch — "
-                f"expected {server_url!r}, got {prm_resource!r}"
+                f"expected {expected_resource!r}, got {prm_resource!r}"
             )
         auth_servers = prm_data.get("authorization_servers")
         found = False
