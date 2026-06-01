@@ -1717,12 +1717,25 @@ def run(
                     # fire its recovery branch, which is gated on session_id).
                     continue
 
-                # Adopt a server-supplied session id from THIS response before the
+                # Adopt a server-rotated session id from THIS response before the
                 # 401/403 recovery branches rebuild their retry headers, so a server
                 # that rotates/assigns Mcp-Session-Id alongside an auth challenge is
                 # honoured on the retry rather than re-sending the stale one. (The
                 # 404 branch re-establishes its own fresh session below.)
-                if result.session_id:
+                #
+                # Gate it (#1 round19): adopt only when this response is a SUCCESS
+                # or a 401/403 whose recovery retry actually needs the rotated id.
+                # A terminal 4xx/5xx with no recovery (e.g. a bare 500) that merely
+                # echoes a session id must NOT poison session_id for the next stdin
+                # line — the relay would otherwise send the next request an id the
+                # server just rejected.
+                feeds_recovery = (
+                    (result.status_code == 401 and token_refresher is not None)
+                    or (result.status_code == 403 and scope_upgrader is not None)
+                )
+                if result.session_id and (
+                    result.status_code < 400 or feeds_recovery
+                ):
                     session_id = result.session_id
 
                 # Recovery is single-pass and ordered auth-before-session: the three
@@ -1823,9 +1836,6 @@ def run(
                     if result is None:
                         continue
 
-                if result.session_id:
-                    session_id = result.session_id
-
                 # Fall-through error for any unhandled 4xx/5xx so the MCP client
                 # never hangs waiting for a response. 200 bodies were already
                 # streamed by _post_and_stream. 202 is reserved for the client's own
@@ -1837,7 +1847,20 @@ def run(
                 # the empty-200 guard in _post_and_stream. A 202 to a NOTIFICATION
                 # (no id) stays correctly silent. See #11 and #4 (round16).
                 req_202_hang = result.status_code == 202 and req_has_id
-                if result.status_code >= 400 or req_202_hang:
+                is_error = result.status_code >= 400 or req_202_hang
+
+                # Adopt a server-rotated session id only from a NON-error response.
+                # A 4xx/5xx (or a non-compliant 202-to-request we are about to
+                # error) can still echo an mcp-session-id header; carrying that
+                # into the next request would send an id the server JUST rejected.
+                # The next line's 404 recovery would self-heal it, but don't carry
+                # known-bad state forward. The inline 401/403 re-adoptions above
+                # stay unconditional — they feed the very next chained recovery
+                # dispatch, not the next stdin line. See #1 (round19).
+                if result.session_id and not is_error:
+                    session_id = result.session_id
+
+                if is_error:
                     log(f"upstream returned HTTP {result.status_code}")
                     if req_has_id:
                         # On a 429/503 whose retries were exhausted / over-cap,
