@@ -329,7 +329,13 @@ def main() -> None:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Check connection to the MCP server and exit",
+        help=(
+            "Check connection to the MCP server and exit. Note: combined with "
+            "--oauth / --oauth-device on a cold token cache this runs the FULL "
+            "interactive auth first (may open a browser or print a device code "
+            "and wait), so the check verifies the authenticated path end-to-end "
+            "rather than being a purely non-interactive probe."
+        ),
     )
     parser.add_argument(
         # Deprecated alias for --check; hidden from --help.
@@ -428,6 +434,12 @@ def main() -> None:
     token_refresher: Callable[[], dict[str, str] | None] | None = None
     scope_upgrader: Callable[[str], dict[str, str] | None] | None = None
     if args.oauth or args.oauth_device:
+        # NOTE (#10 round19): this runs BEFORE the --check branch below, and
+        # ensure_token only short-circuits on a valid cached/refreshable token.
+        # So `--oauth --check` on a COLD cache performs the full interactive auth
+        # (browser / device code, blocking up to the flow timeout) — by design,
+        # so a --check of the authenticated path is verified end-to-end. This is
+        # documented in the --check help text; it is not a non-interactive probe.
         from .oauth import ensure_token
 
         client = httpx.Client(
