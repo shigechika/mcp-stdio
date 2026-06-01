@@ -23,6 +23,7 @@ from mcp_stdio.oauth import (
     _probe_www_authenticate,
     _run_authorization_flow,
     _run_device_authorization_flow,
+    _safe_int,
     _sanitize_oauth_error,
     _token_response_to_data,
     _validate_auth_server_url,
@@ -38,6 +39,40 @@ from mcp_stdio.oauth import (
     step_up_authorize,
 )
 from mcp_stdio.token_store import TokenData
+
+
+# --- _safe_int ---
+
+
+class TestSafeInt:
+    """#M1(round38): _safe_int coerces an AS-supplied JSON value to int and falls
+    back on bad input. json.loads parses the non-standard literals Infinity /
+    -Infinity / NaN by default, so an AS can put a float('inf') into expires_in /
+    interval — and int(float('inf')) raises OverflowError (NOT ValueError), which
+    would otherwise propagate out of the device flow and crash it. The except
+    tuple must therefore include OverflowError alongside TypeError/ValueError."""
+
+    def test_plain_int_and_numeric_string(self):
+        assert _safe_int(123, 0) == 123
+        assert _safe_int("123", 0) == 123
+        assert _safe_int(45.9, 0) == 45  # int(float()) truncates toward zero
+
+    def test_none_and_non_numeric_string_fall_back(self):
+        assert _safe_int(None, 7) == 7
+        assert _safe_int("abc", 9) == 9
+        assert _safe_int({}, 11) == 11  # a JSON object is not coercible
+
+    def test_infinity_falls_back_not_overflowerror(self):
+        # int(float('inf')) raises OverflowError, not ValueError — the regression
+        # this finding guards. Without OverflowError in the except tuple these
+        # would propagate and crash the device flow.
+        assert _safe_int(float("inf"), 1800) == 1800
+        assert _safe_int(float("-inf"), 1800) == 1800
+
+    def test_nan_falls_back(self):
+        # int(float('nan')) raises ValueError — already covered, asserted for
+        # completeness alongside the Infinity cases.
+        assert _safe_int(float("nan"), 5) == 5
 
 
 # --- _authorization_base_url ---
@@ -902,6 +937,59 @@ class TestDiscoverMetadata:
         meta = discover_oauth_metadata("https://api.example.com/mcp", client)
         assert meta.authorization_endpoint == "https://auth.example.com/authorize"
 
+    @pytest.mark.parametrize("body", [[], ["https://evil"], 42, "a string"])
+    def test_non_object_prm_body_skipped(self, httpx_mock, body):
+        """#L2(round38): a PRM document whose body is not an OBJECT (a bare array
+        or scalar — the PRM is fully MCP-server-controlled) would make
+        prm_data.get(...) raise AttributeError and abort discovery. It must be
+        skipped so the host-root PRM candidate (and Phase 2/3) still run."""
+        server_url = "https://api.example.com/mcp"
+        # Path-aware PRM: 200 but a non-object body → skipped.
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource/mcp",
+            json=body,
+        )
+        # Host-root PRM: 200 with a valid AS → discovery recovers.
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource",
+            json={
+                "resource": server_url,
+                "authorization_servers": ["https://auth.example.com"],
+            },
+        )
+        httpx_mock.add_response(
+            url="https://auth.example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://auth.example.com/authorize",
+                "token_endpoint": "https://auth.example.com/token",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata(server_url, client)
+        assert meta.authorization_endpoint == "https://auth.example.com/authorize"
+
+    def test_non_string_prm_resource_does_not_crash(self, httpx_mock):
+        """#L2(round38): a non-string PRM `resource` (e.g. an integer) must not
+        crash the §3.3 mismatch check on `.rstrip` — the isinstance(str) guard
+        skips the warning and discovery proceeds using authorization_servers."""
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource/mcp",
+            json={
+                "resource": 123,  # non-string — would crash .rstrip without guard
+                "authorization_servers": ["https://auth.example.com"],
+            },
+        )
+        httpx_mock.add_response(
+            url="https://auth.example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://auth.example.com/authorize",
+                "token_endpoint": "https://auth.example.com/token",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata("https://api.example.com/mcp", client)
+        assert meta.authorization_endpoint == "https://auth.example.com/authorize"
+
     def test_path_scoped_issuer_keycloak_style(self, httpx_mock):
         """#53: Keycloak/Cognito path-scoped issuers advertise metadata at RFC 8414 §3
         path-insertion URL (/.well-known/oauth-authorization-server/<path>).
@@ -1522,6 +1610,38 @@ class TestRefreshCachedToken:
         client = httpx.Client()
         assert refresh_cached_token("https://api.example.com/mcp", client) is None
 
+    def test_unsafe_cached_token_endpoint_aborts_refresh(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """#L4(round38): defence-in-depth. A cached token_endpoint that fails the
+        #13 policy (here a non-loopback cleartext HTTP URL) must be re-validated
+        before the refresh re-POSTs credentials to it. refresh_cached_token must
+        abort (return None → re-auth) and make NO request to the unsafe URL."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        from mcp_stdio.token_store import save_token
+
+        save_token(
+            "https://api.example.com/mcp",
+            TokenData(
+                access_token="old_at",
+                refresh_token="rt123",
+                expires_at=time.time() - 10,
+                client_id="cid",
+                # Non-loopback cleartext HTTP — would leak the refresh_token and
+                # client_secret in the clear if followed.
+                token_endpoint="http://evil.example.com/token",
+                authorization_endpoint="https://auth.example.com/authorize",
+            ),
+        )
+        client = httpx.Client()
+        # No response mocked: a credential POST would raise in strict mode. The
+        # validation must short-circuit before any request is made.
+        assert refresh_cached_token("https://api.example.com/mcp", client) is None
+        assert httpx_mock.get_requests() == []
+
     def test_refresh_preserves_persisted_issuer(
         self, tmp_path, monkeypatch, httpx_mock
     ):
@@ -1929,6 +2049,19 @@ class TestParseTokenResponse:
         resp = client.post("https://example.com/token")
         result = _parse_token_response(resp)
         assert result["access_token"] == "at"
+
+    @pytest.mark.parametrize("body", [[], [1, 2], "a string", 42, True])
+    def test_non_object_json_body_raises_clear_error(self, httpx_mock, body):
+        """#L3(round38): a 200 whose JSON body is not an OBJECT (a bare array,
+        scalar, bool) is non-compliant (RFC 6749 §5.1 mandates a JSON object).
+        Surface a clear RuntimeError naming the type, not the opaque TypeError
+        that _raise_for_body_error's `"error" in result` raises on a non-iterable
+        — nor the misleading substring/membership behaviour on a str/list."""
+        httpx_mock.add_response(url="https://example.com/token", json=body)
+        client = httpx.Client()
+        resp = client.post("https://example.com/token")
+        with pytest.raises(RuntimeError, match="non-object JSON body"):
+            _parse_token_response(resp)
 
     def test_form_urlencoded_response(self, httpx_mock):
         """TypeScript SDK #759: GitHub returns form-urlencoded."""
@@ -3480,6 +3613,65 @@ class TestStepUpAuthorize:
         data = step_up_authorize(self.SERVER_URL, client, "hr:read", timeout=5)
         assert data.access_token == "upgraded_at"
 
+    def test_unsafe_cached_endpoint_falls_through_to_discovery(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """#L4(round38): defence-in-depth. If the cached token_endpoint fails the
+        #13 policy (here a non-loopback cleartext HTTP URL), the step-up cache-hit
+        branch must be skipped and fresh discovery run instead — so the credential
+        flow goes to the freshly DISCOVERED safe endpoint, never the unsafe cached
+        one."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+        from mcp_stdio.token_store import save_token
+
+        save_token(
+            self.SERVER_URL,
+            TokenData(
+                access_token="old_at",
+                expires_at=time.time() + 3600,
+                refresh_token="rt",
+                client_id="cached_cid",  # reused → DCR skipped, no REG mock
+                scope="mcp:connect",
+                # Unsafe: non-loopback cleartext HTTP — must NOT be reused.
+                token_endpoint="http://evil.example.com/token",
+                authorization_endpoint="http://evil.example.com/authorize",
+            ),
+        )
+        self._drive_callback(monkeypatch)
+
+        # The cache-hit branch is skipped, so step-up re-discovers. Mirror the
+        # cache-empty discovery chain (WWW-Authenticate probe → PRM 404s → 8414).
+        httpx_mock.add_response(url=self.SERVER_URL, method="POST", status_code=401)
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource/mcp",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://example.com/authorize",
+                "token_endpoint": "https://example.com/token",
+            },
+        )
+        httpx_mock.add_response(
+            url="https://example.com/token",
+            json={"access_token": "upgraded_at", "expires_in": 3600},
+        )
+
+        client = httpx.Client()
+        data = step_up_authorize(self.SERVER_URL, client, "hr:read", timeout=5)
+        assert data.access_token == "upgraded_at"
+        # Definitively: nothing was ever sent to the unsafe cached host.
+        assert all(
+            "evil.example.com" not in str(r.url) for r in httpx_mock.get_requests()
+        )
+
 
 # --- RFC 9728 authorization_server validation (SSRF hardening, #13) ---
 
@@ -4773,6 +4965,57 @@ class TestDeviceAuthorizationFlow:
         assert data.access_token == "acc"
         assert data.refresh_token == "ref"
         assert data.client_id == "cid"
+
+    @pytest.mark.parametrize("body", [[], "nope", 7])
+    def test_non_object_device_auth_body_raises(
+        self, httpx_mock, tmp_path, monkeypatch, body
+    ):
+        """#L3(round38): a non-object device-authorization body (a bare array /
+        scalar) would make da.get('device_code') raise AttributeError. Surface a
+        clear RuntimeError naming the type instead."""
+        self._patch_store(tmp_path, monkeypatch)
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=body)
+        client = httpx.Client()
+        with pytest.raises(RuntimeError, match="non-object JSON body"):
+            _run_device_authorization_flow(
+                MCP_URL, client, metadata=_device_meta(), cached=None
+            )
+
+    def test_infinity_expires_in_does_not_crash(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """#M1(round38): the client's json.loads parses the non-standard literal
+        `Infinity` into float('inf') (parse_constant defaults to it). A device-
+        authorization response carrying expires_in=Infinity must NOT crash the
+        flow — _safe_int catches the int(inf) OverflowError and clamps to the
+        default, so the flow completes normally."""
+        self._patch_store(tmp_path, monkeypatch)
+        monkeypatch.setattr(time, "sleep", lambda _s: None)
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        # Hand-write the raw JSON body: httpx's json= encoder is allow_nan=False
+        # and would reject inf at mock-construction time. The realistic vector is
+        # an AS that emits a literal `Infinity` on the wire, which the CLIENT's
+        # json.loads (allow_nan=True) then parses back into float('inf').
+        da_body = (
+            '{"device_code": "DEV_CODE", "user_code": "ABCD-1234", '
+            '"verification_uri": "https://example.com/activate", '
+            '"expires_in": Infinity, "interval": Infinity}'
+        )
+        httpx_mock.add_response(
+            url=DEVICE_AUTH_URL,
+            text=da_body,
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={"access_token": "acc", "token_type": "Bearer"},
+        )
+        client = httpx.Client()
+        data = _run_device_authorization_flow(
+            MCP_URL, client, metadata=_device_meta(), cached=None
+        )
+        assert data.access_token == "acc"
 
     def test_preserves_requested_scope_when_omitted(
         self, httpx_mock, tmp_path, monkeypatch

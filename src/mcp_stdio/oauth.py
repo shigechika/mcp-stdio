@@ -45,7 +45,14 @@ def _safe_int(value: Any, default: int) -> int:
     """Coerce an AS-supplied JSON value to int, falling back on bad input."""
     try:
         return int(float(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError (#M1 round38): json.loads parses the non-standard literal
+        # Infinity / -Infinity by default, and int(float('inf')) raises
+        # OverflowError (not ValueError). Without this, a hostile / misconfigured
+        # AS returning {"expires_in": Infinity} would crash the device flow with
+        # an opaque traceback and DEFEAT the _DEVICE_FLOW_MAX_LIFETIME_SECS clamp
+        # this very helper feeds. (NaN already lands in ValueError.) Mirrors the
+        # math.isfinite guard token_store applies to cached expiries.
         return default
 
 
@@ -607,6 +614,14 @@ def discover_oauth_metadata(
             prm_data = resp.json()
         except Exception:
             continue
+        # The PRM document is fully MCP-server-controlled. A non-object body
+        # (e.g. a bare array or scalar) would make prm_data.get(...) raise
+        # AttributeError and abort the whole flow — skip to the next candidate
+        # (host-root PRM / Phase 2/3) instead of crashing the multi-candidate
+        # fallback. Symmetric with the isinstance(candidate, str) guard on the
+        # authorization_servers walk below. (#L2 round38)
+        if not isinstance(prm_data, dict):
+            continue
         # RFC 9728 §3.3 actually says the `resource` value MUST be identical to
         # the protected-resource identifier and, if it is not, "the data
         # contained in the response MUST NOT be used" (an impersonation guard).
@@ -619,7 +634,13 @@ def discover_oauth_metadata(
         # PRM URL itself derives from the operator-trusted server_url — so the
         # softening does not widen the trust boundary, only the citation's letter.
         prm_resource = prm_data.get("resource")
-        if prm_resource and prm_resource.rstrip("/") != server_url.rstrip("/"):
+        # Guard the type too (#L2 round38): a non-string `resource` (e.g. 123)
+        # would make .rstrip raise. A non-string is simply not a usable
+        # identifier — skip the mismatch warning rather than crash.
+        if (
+            isinstance(prm_resource, str)
+            and prm_resource.rstrip("/") != server_url.rstrip("/")
+        ):
             log(
                 f"warning: RFC 9728 §3.3 resource mismatch — "
                 f"expected {server_url!r}, got {prm_resource!r}"
@@ -1050,6 +1071,17 @@ def _parse_token_response(resp: httpx.Response) -> dict[str, Any]:
             f"token endpoint returned a non-JSON, non-form-urlencoded body "
             f"(content-type {ct!r})"
         ) from exc
+    # A 200 whose JSON body is not an OBJECT (a scalar / bool / null / array) is
+    # non-compliant (RFC 6749 §5.1 mandates a JSON object). Surface a clear error
+    # rather than the opaque TypeError that `_raise_for_body_error`'s
+    # `"error" in result` would raise on a non-iterable — or the misleading
+    # substring/list behaviour, or a later AttributeError on result.get. (#L3
+    # round38)
+    if not isinstance(result, dict):
+        raise RuntimeError(
+            f"token endpoint returned a non-object JSON body "
+            f"({type(result).__name__})"
+        )
     _raise_for_body_error(result)
     return result
 
@@ -1275,6 +1307,13 @@ def refresh_cached_token(
         log("OAuth client_secret expired (RFC 7591 §3.2.1) — cannot refresh")
         return None
     log("access token expired, attempting refresh")
+    # Defence-in-depth (#L4 round38): the cached token_endpoint was validated at
+    # persist time, but re-validate before re-POSTing credentials to it. The
+    # store is 0o600, so this is not an exploitable path today — but it mirrors
+    # the discovery-path validation so a tampered/legacy store cannot redirect
+    # the refresh to a cleartext or userinfo-bearing URL. See #13.
+    if not _validate_endpoint_url(cached.token_endpoint, label="cached token_endpoint"):
+        return None
     auth_method = cached.token_endpoint_auth_method
     no_resource_indicator = cached.no_resource_indicator
     try:
@@ -1627,6 +1666,13 @@ def _run_device_authorization_flow(
     )
     da_resp.raise_for_status()
     da = da_resp.json()
+    # A non-object device-authorization body would make da.get(...) below raise
+    # AttributeError; surface a clear error instead (#L3 round38).
+    if not isinstance(da, dict):
+        raise RuntimeError(
+            f"device authorization endpoint returned a non-object JSON body "
+            f"({type(da).__name__})"
+        )
 
     # RFC 8628 §3.2 REQUIRED fields. Use .get() with an explicit error so a
     # malformed AS response yields an actionable message, not a bare KeyError.
@@ -1952,11 +1998,31 @@ def step_up_authorize(
     merged_scope = " ".join(sorted(scope_parts))
     log(f"step-up authorization requested with scope: {merged_scope}")
 
-    if cached and cached.token_endpoint and cached.authorization_endpoint:
+    # Defence-in-depth (#L4 round38): re-validate the cached endpoints before
+    # reusing them for the full browser+callback flow + token exchange. They were
+    # validated at persist time and the store is 0o600 (not an exploitable path
+    # today), but a tampered/legacy store must not redirect this credential-
+    # bearing flow to a cleartext or userinfo-bearing URL. On failure both come
+    # back falsy and we fall through to fresh discovery below. See #13.
+    cached_authz_ep = (
+        _validate_endpoint_url(
+            cached.authorization_endpoint, label="cached authorization_endpoint"
+        )
+        if cached
+        else None
+    )
+    cached_token_ep = (
+        _validate_endpoint_url(cached.token_endpoint, label="cached token_endpoint")
+        if cached
+        else None
+    )
+    if cached and cached_token_ep and cached_authz_ep:
         metadata = OAuthMetadata(
-            authorization_endpoint=cached.authorization_endpoint,
-            token_endpoint=cached.token_endpoint,
-            registration_endpoint=cached.registration_endpoint,
+            authorization_endpoint=cached_authz_ep,
+            token_endpoint=cached_token_ep,
+            registration_endpoint=_validate_endpoint_url(
+                cached.registration_endpoint, label="cached registration_endpoint"
+            ),
             # Rehydrate the persisted issuer AND the RFC 9207 §3 iss-support flag
             # so BOTH halves of the §2.4 mix-up defence stay active on this
             # cache-hit path — step-up runs a full browser+callback flow, the case
