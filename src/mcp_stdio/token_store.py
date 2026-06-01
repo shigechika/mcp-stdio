@@ -32,17 +32,30 @@ _LEGACY_STORE_FILE = _LEGACY_STORE_DIR / "tokens.json"
 # Default ports folded out when normalising a server URL into a store key.
 _DEFAULT_PORTS = {"https": 443, "http": 80}
 
+# O_NOFOLLOW (POSIX) makes os.open refuse a symlink at the final path component,
+# so a symlink swapped in for the store/temp/lock file cannot redirect a write
+# of secrets to an attacker-chosen target. 0 on platforms without it (Windows),
+# where the parent dir's 0o700 mode is the primary guard anyway.
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
 
 def _normalize_key(server_url: str) -> str:
     """Normalise a server URL into a stable token-store key.
 
     Folds cosmetically-different spellings of the same endpoint — host case,
-    an explicit default port (``:443`` / ``:80``), and a single trailing
-    slash — to one key so they share a cached token instead of triggering a
+    an explicit default port (``:443`` / ``:80``), and trailing slashes on the
+    path — to one key so they share a cached token instead of triggering a
     redundant OAuth flow. Only the *store key* is normalised; oauth.py still
     uses the operator-supplied URL verbatim for the RFC 8707 resource
     indicator, so end-to-end behaviour is unchanged. Anything that does not
     parse as http(s) with a host is returned unchanged.
+
+    The query string is preserved (``/mcp?a=1`` and ``/mcp?a=2`` are distinct
+    servers); userinfo is dropped (``.hostname``). Note that a server URL
+    carrying secrets in its query would therefore place them in the store key
+    inside ``tokens.json`` — that file is 0o600 and MCP endpoints normally have
+    no query secrets, so this is not a disclosure vector beyond the tokens it
+    already holds.
     """
     # ``urlsplit`` is lazy: ``.hostname`` / ``.port`` are what actually raise
     # ValueError on a malformed authority (e.g. a non-numeric or out-of-range
@@ -168,8 +181,10 @@ def _read_store() -> dict[str, Any]:
     # backup that lost mode bits, copied under a permissive umask, or written by
     # a third-party tool) and is only ever read would otherwise keep its mode,
     # leaving the secrets readable.
+    # Don't chmod through a symlink (would alter the link target's mode).
     try:
-        os.chmod(_STORE_FILE, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
+        if not _STORE_FILE.is_symlink():
+            os.chmod(_STORE_FILE, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
     except OSError:
         pass
     try:
@@ -188,7 +203,7 @@ def _write_store(data: dict[str, Any]) -> None:
     _ensure_store_dir()
     payload = json.dumps(data, indent=2).encode("utf-8")
     tmp_path = _STORE_FILE.with_suffix(_STORE_FILE.suffix + f".tmp.{os.getpid()}")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW
     fd = os.open(tmp_path, flags, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
     try:
         with os.fdopen(fd, "wb") as f:
@@ -219,7 +234,11 @@ def _store_lock() -> Iterator[None]:
     # so test monkeypatching of _STORE_DIR redirects the lock file too.
     lock_path = _STORE_DIR / "tokens.json.lock"
     try:
-        fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, stat.S_IRUSR | stat.S_IWUSR)
+        fd = os.open(
+            lock_path,
+            os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
     except OSError:
         yield
         return
