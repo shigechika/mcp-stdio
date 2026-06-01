@@ -417,7 +417,17 @@ def _extract_cancel_id(line: str) -> Any:
     params = msg.get("params")
     if not isinstance(params, dict):
         return None
-    return params.get("requestId")
+    rid = params.get("requestId")
+    # A JSON-RPC id is a String or Number (or null). A NON-SCALAR requestId
+    # (object / array) is malformed AND unhashable, so the caller's
+    # ``tracker.add(rid)`` would raise ``TypeError: unhashable type`` on the
+    # stdin hot path — and such an id can never match a real response id anyway.
+    # Drop it (return None) so a malformed cancellation is a clean no-op rather
+    # than an exception. ``null`` already returns None here and is filtered by
+    # the caller's ``cid is not None`` guard. (#9 round42)
+    if rid is not None and not isinstance(rid, (str, int, float)):
+        return None
+    return rid
 
 
 def _error_response(message: str, req_id: Any = None, data: Any = None) -> str:
@@ -1236,7 +1246,13 @@ def _paginate_and_stream(
 
     merged_response: dict[str, Any] = {
         "jsonrpc": request.get("jsonrpc", "2.0"),
-        "id": request.get("id"),
+        # Reuse the id run() already parsed (and tracks/discards in the cancel
+        # filter) rather than re-deriving it from this second parse (#1 round42).
+        # They are provably identical today, but keying the emitted id off req_id
+        # removes a latent divergence point — _emit's cancel filter matches on the
+        # BODY id, so any future drift would both mis-correlate the response and
+        # defeat cancellation filtering for paginated responses.
+        "id": req_id,
         "result": merged_result,
     }
     _emit(json.dumps(merged_response), tracker)
@@ -1786,20 +1802,27 @@ def run(
                     # different version is adopted so the injected
                     # MCP-Protocol-Version header stays equal to the version in
                     # force (the 2025-06-18 spec requires the header to match the
-                    # negotiated version). The added per-line cost is one cheap
-                    # `_looks_like_initialize` regex; the heavier
-                    # `_extract_protocol_version` still runs only inside
-                    # `_post_and_stream` for lines that are actually initializes.
+                    # negotiated version). The heavier `_extract_protocol_version`
+                    # still runs only inside `_post_and_stream` for lines that are
+                    # actually initializes.
                     #
                     # Response-only: the version comes from the server's
                     # InitializeResult, not the client's requested version. If a
                     # (non-compliant) server omits result.protocolVersion, no
                     # header is sent rather than guessing — a server that both
                     # omits it and enforces the header would be self-contradictory.
-                    capture_init = _looks_like_initialize(content)
-                    if protocol_version is not None and _is_initialize_request(
-                        content
-                    ):
+                    #
+                    # Classify the line ONCE, PARSE-authoritatively. Gating the
+                    # protocol-version CAPTURE on _is_initialize_request (not the
+                    # _looks_like_initialize substring) stops a tools/call whose
+                    # `arguments` merely contains a "method":"initialize" key from
+                    # capturing a spurious result.protocolVersion out of its tool
+                    # response and then injecting a never-negotiated version on
+                    # every later request (#3 round42). The cheap
+                    # _INITIALIZE_METHOD_RE inside _is_initialize_request still
+                    # short-circuits the common non-matching line without a parse.
+                    capture_init = _is_initialize_request(content)
+                    if protocol_version is not None and capture_init:
                         # An initialize request IS the (re)negotiation and predates a
                         # known version, so it must not advertise the prior one
                         # (2025-06-18: the header carries the negotiated version and
@@ -1808,10 +1831,10 @@ def run(
                         # on ``protocol_version is not None`` means we only drop the
                         # relay's OWN injected header — on a cold-start initialize
                         # (no version yet) a user-pinned ``-H MCP-Protocol-Version``
-                        # is left intact. Mcp-Session-Id is untouched. The strip is
-                        # gated on the PARSE-authoritative check (not the regex
-                        # capture_init) so a tools/call whose arguments contains a
-                        # "method":"initialize" key keeps its header. See #3 (round18).
+                        # is left intact. Mcp-Session-Id is untouched. Both capture
+                        # and strip now share the parse-authoritative gate, so a
+                        # tools/call whose arguments contains a "method":"initialize"
+                        # key keeps its header. See #3 (round18), #3 (round42).
                         h = {
                             k: v
                             for k, v in h.items()

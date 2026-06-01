@@ -2394,6 +2394,37 @@ class TestProtocolVersionHeader:
         # The tools/call is a post-init request → carries the negotiated header.
         assert reqs[1].headers["mcp-protocol-version"] == "2025-06-18"
 
+    def test_tools_call_with_nested_method_initialize_does_not_capture_version(
+        self, httpx_mock
+    ):
+        """#3(round42): the CAPTURE counterpart of the strip test above. A
+        tools/call whose nested ``arguments`` contains a ``"method":"initialize"``
+        key must NOT capture ``result.protocolVersion`` from its tool response —
+        capture is now gated on the parse-authoritative check, not the substring
+        regex. Otherwise a never-negotiated version would be injected as
+        MCP-Protocol-Version on every later request."""
+        # The tool response happens to carry a string protocolVersion in its
+        # result (e.g. a tool that proxies an MCP server / returns version info).
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"protocolVersion":"9999-spoof"},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":2}',
+            headers={"content-type": "application/json"},
+        )
+        # No real initialize precedes this; both lines are top-level tools/call.
+        self._run_with_stdin(
+            [
+                '{"jsonrpc":"2.0","method":"tools/call","id":1,"params":'
+                '{"name":"http","arguments":{"method":"initialize"}}}',
+                '{"jsonrpc":"2.0","method":"tools/call","id":2}',
+            ]
+        )
+        reqs = httpx_mock.get_requests()
+        # The spurious protocolVersion was NOT captured → no injected header.
+        assert "mcp-protocol-version" not in reqs[1].headers
+
     def test_initialized_notification_carries_header(self, httpx_mock):
         """notifications/initialized is the first subsequent request — must carry it."""
         httpx_mock.add_response(
@@ -6192,6 +6223,53 @@ class TestExtractCancelId:
             '"params":["requestId",1]}'
         )
         assert _extract_cancel_id(line) is None
+
+    def test_null_request_id_returns_none(self):
+        """An explicit requestId:null yields None — the caller's `cid is not None`
+        guard then skips tracking, a clean no-op."""
+        line = (
+            '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+            '"params":{"requestId":null}}'
+        )
+        assert _extract_cancel_id(line) is None
+
+    @pytest.mark.parametrize(
+        "request_id", ['{"a":1}', "[1,2]", "{}", "[]"]
+    )
+    def test_non_scalar_request_id_returns_none_not_unhashable_crash(
+        self, request_id
+    ):
+        """#9(round42): a non-scalar requestId (object/array) is malformed AND
+        unhashable, so returning it verbatim would make the caller's
+        tracker.add(rid) raise TypeError on the stdin hot path. _extract_cancel_id
+        must drop it (return None) so a malformed cancellation is a clean no-op.
+        Guard the full path: the extracted value must be safe to add to a tracker."""
+        line = (
+            '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+            f'"params":{{"requestId":{request_id}}}}}'
+        )
+        cid = _extract_cancel_id(line)
+        assert cid is None
+        # End-to-end: the value (None → skipped) never reaches an unhashable add.
+        tracker = _CancelTracker()
+        if cid is not None:  # mirrors the relay's guard
+            tracker.add(cid)  # would raise TypeError if a dict/list slipped through
+
+    def test_scalar_request_ids_pass_through(self):
+        """A valid scalar requestId (int / float / string) is returned verbatim
+        and is hashable, so the tracker accepts it."""
+        for body, expected in [
+            ('"requestId":5', 5),
+            ('"requestId":1.5', 1.5),
+            ('"requestId":"r-1"', "r-1"),
+        ]:
+            line = (
+                '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+                f'"params":{{{body}}}}}'
+            )
+            cid = _extract_cancel_id(line)
+            assert cid == expected
+            _CancelTracker().add(cid)  # hashable → no crash
 
     def test_substring_false_positive_guard(self):
         # The regex matches on any '"method":"notifications/cancelled"'
