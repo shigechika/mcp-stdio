@@ -519,7 +519,16 @@ def _write_store(data: dict[str, Any]) -> None:
     # sort_keys for stable, diff-friendly on-disk output (#8 round17): without it
     # the per-server key order follows dict-insertion order and churns across the
     # read-modify-write saves, complicating inspection/diffing for no benefit.
-    payload = json.dumps(data, indent=2, sort_keys=True).encode("utf-8")
+    # allow_nan=False (#7 round31): Python's default would serialise a non-finite
+    # expires_at (inf/nan) as the non-standard literal `Infinity`/`NaN`, which a
+    # strict JSON parser rejects and which only the load-side math.isfinite guard
+    # catches. Raise ValueError instead so the bad value never reaches disk — the
+    # save_token / delete_token / migration callers already catch Exception and
+    # degrade to a soft-fail warning (token simply not cached), keeping the store
+    # standards-compliant rather than relying on the read-side backstop.
+    payload = json.dumps(data, indent=2, sort_keys=True, allow_nan=False).encode(
+        "utf-8"
+    )
     # Per-write unique temp name. PID alone is not enough: when the advisory
     # lock degrades to a no-op (lock fs unavailable), two THREADS in one process
     # share the PID and would otherwise pick the same temp path and clobber each
