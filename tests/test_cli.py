@@ -484,6 +484,25 @@ class TestMain:
             main()
         assert "ignored without --oauth" not in capsys.readouterr().err
 
+    def test_check_with_oauth_skips_relay_callbacks(self, monkeypatch):
+        """#15(round13): on the one-shot --check probe the relay 401/403
+        recovery callbacks are not built (check_connection never uses them)."""
+        with (
+            patch(
+                "sys.argv",
+                ["mcp-stdio", "--oauth", "--check", "https://example.com/mcp"],
+            ),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.check_connection", return_value=True),
+            patch("mcp_stdio.cli._build_token_refresher") as mock_refresher,
+            patch("mcp_stdio.cli._build_scope_upgrader") as mock_upgrader,
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            with pytest.raises(SystemExit):
+                main()
+        assert not mock_refresher.called
+        assert not mock_upgrader.called
+
     def test_explicit_client_id_without_oauth_warns(self, monkeypatch, capsys):
         monkeypatch.delenv("MCP_OAUTH_CLIENT_ID", raising=False)
         with (
