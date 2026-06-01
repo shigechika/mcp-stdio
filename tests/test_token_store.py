@@ -474,6 +474,10 @@ class TestLoadSaveDelete:
         assert stat.S_ISFIFO(os.stat(store_file).st_mode)
         assert "could not be read" in capsys.readouterr().err
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="O_NOFOLLOW is 0 on Windows, so the symlink is not refused (ELOOP)",
+    )
     def test_lock_symlink_emits_one_warning_and_proceeds(
         self, tmp_path, monkeypatch, capsys
     ):
