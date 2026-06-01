@@ -25,7 +25,7 @@ from mcp_stdio.relay import (
     _error_response,
     _escape_js_line_separators,
     _extract_cancel_id,
-    _extract_id,
+    _extract_id_and_presence,
     _extract_protocol_version,
     _handle_rate_limit,
     _iter_sse_events,
@@ -182,40 +182,45 @@ class TestEnforceLfStdio:
         assert stdin_stream.checked and stdout_stream.checked
 
 
-# --- _extract_id ---
+# --- _extract_id_and_presence ---
 
 
-class TestExtractId:
+class TestExtractIdAndPresence:
+    """The hot-path helper returns (id_value, has_id) from one parse, crucially
+    distinguishing a PRESENT id:null (a request) from an ABSENT id (a
+    notification) — the distinction req_has_id gating relies on."""
+
     def test_numeric_id(self):
         line = json.dumps({"jsonrpc": "2.0", "method": "init", "id": 1})
-        assert _extract_id(line) == 1
+        assert _extract_id_and_presence(line) == (1, True)
 
     def test_string_id(self):
         line = json.dumps({"jsonrpc": "2.0", "method": "init", "id": "abc"})
-        assert _extract_id(line) == "abc"
+        assert _extract_id_and_presence(line) == ("abc", True)
 
     def test_zero_id(self):
-        # id 0 is a VALID JSON-RPC id but falsy — the helper must return the int
-        # 0, not None, so the falsy-id regression class stays pinned at the leaf.
+        # id 0 is a VALID JSON-RPC id but falsy — the helper must return int 0
+        # with has_id True, not collapse it to a notification.
         line = json.dumps({"jsonrpc": "2.0", "method": "init", "id": 0})
-        assert _extract_id(line) == 0
+        assert _extract_id_and_presence(line) == (0, True)
 
-    def test_null_id(self):
+    def test_null_id_is_present(self):
+        # A present id:null IS a request → (None, True), NOT a notification.
         line = json.dumps({"jsonrpc": "2.0", "method": "init", "id": None})
-        assert _extract_id(line) is None
+        assert _extract_id_and_presence(line) == (None, True)
 
-    def test_missing_id(self):
+    def test_missing_id_is_notification(self):
         line = json.dumps({"jsonrpc": "2.0", "method": "notify"})
-        assert _extract_id(line) is None
+        assert _extract_id_and_presence(line) == (None, False)
 
     def test_invalid_json(self):
-        assert _extract_id("not json") is None
+        assert _extract_id_and_presence("not json") == (None, False)
 
     def test_empty_string(self):
-        assert _extract_id("") is None
+        assert _extract_id_and_presence("") == (None, False)
 
     def test_json_array(self):
-        assert _extract_id("[1, 2, 3]") is None
+        assert _extract_id_and_presence("[1, 2, 3]") == (None, False)
 
 
 # --- _error_response ---
@@ -3861,6 +3866,26 @@ class TestCheckConnection:
         )
         assert check_connection(self.URL, dict(self.HEADERS)) is True
 
+    def test_sse_skips_leading_notification_and_captures_result(
+        self, httpx_mock, capsys
+    ):
+        """#1(round36): a compliant server MAY interleave a notification on the
+        POST's SSE stream BEFORE the initialize result. --check must keep reading
+        until a message carries result/error, not break on the first message —
+        otherwise it mis-reports a valid server as 'could not parse initialize
+        result' and loses the server/protocol/capabilities lines."""
+        body = (
+            'data: {"jsonrpc":"2.0","method":"notifications/progress","params":{}}\n\n'
+            'data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05",'
+            '"serverInfo":{"name":"demo","version":"1"}}}\n\n'
+        )
+        httpx_mock.add_response(
+            text=body, headers={"content-type": "text/event-stream"}
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+        # The REAL initialize result was captured (not the leading notification).
+        assert "server=demo" in capsys.readouterr().err
+
     def test_non_200_returns_false(self, httpx_mock):
         httpx_mock.add_response(status_code=500, text="oops")
         assert check_connection(self.URL, dict(self.HEADERS)) is False
@@ -5964,24 +5989,29 @@ class TestCancelTracker:
         assert not t.contains(None)
 
     def test_gc_bounds_memory(self):
+        """#5(round36): pin the production GC bound AND prove GC actually prunes
+        the internal map. The old version hardcoded 200/256/300 and asserted only
+        via contains() (which lazy-expires), so it passed even if the threshold
+        were widened. Derive counts from _CANCEL_GC_THRESHOLD and assert the
+        internal _seen map shrank, so a silent widening is caught."""
+        from mcp_stdio.relay import _CANCEL_GC_THRESHOLD
+
+        assert _CANCEL_GC_THRESHOLD == 256  # pin the documented bound
         clock = _FakeClock()
         t = _CancelTracker(ttl=10.0, now=clock)
-        # Insert 200 ids at t=0, all will have expired by t=20
-        for i in range(200):
+        # Fill PAST the threshold with ids that all expire by t=20.
+        n_old = _CANCEL_GC_THRESHOLD + 1
+        for i in range(n_old):
             t.add(i)
         clock.advance(20)
-        # Trigger GC by pushing past threshold with fresh entries
-        # (threshold is 256; we add 100 more at t=20 → _seen briefly holds
-        # 300 before _gc_locked prunes the 200 expired ones.)
-        for i in range(200, 300):
-            t.add(i)
-        # Access internals to verify GC ran (all old ids should be gone)
-        # We can only check indirectly via contains(): old ids must not
-        # be tracked any more.
-        for i in range(200):
+        # One more add crosses the threshold again, now with expired entries →
+        # _gc_locked sweeps them. _seen must shrink to just the fresh id, proving
+        # GC ran (not merely contains()'s lazy per-key expiry).
+        t.add(n_old)
+        assert len(t._seen) == 1, "GC did not prune the internal map"
+        assert t.contains(n_old)
+        for i in range(n_old):
             assert not t.contains(i), f"old id {i} still tracked after GC"
-        for i in range(200, 300):
-            assert t.contains(i), f"fresh id {i} lost to GC"
 
     def test_thread_safety(self):
         t = _CancelTracker()
@@ -6058,6 +6088,19 @@ class TestExtractCancelId:
             '"params":{"requestId":"req-42"}}'
         )
         assert _extract_cancel_id(line) == "req-42"
+
+    def test_ignores_batched_cancel(self):
+        """#6(round36): a notifications/cancelled buried in a JSON-RPC BATCH array
+        is intentionally NOT extracted (the regex pre-check matches the substring,
+        but the isinstance(msg, dict) gate fails on a list → None). Pins the
+        documented batch exclusion so a future refactor that iterates batch
+        elements before the dict check cannot start tracking batched cancel ids
+        and collateral-drop batch responses. Symmetric with test_forwards_json_batch."""
+        line = (
+            '[{"jsonrpc":"2.0","method":"notifications/cancelled",'
+            '"params":{"requestId":7}}]'
+        )
+        assert _extract_cancel_id(line) is None
 
     def test_ignores_other_notifications(self):
         line = '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'

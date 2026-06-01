@@ -177,14 +177,6 @@ def _write_line(line: str) -> None:
         sys.stdout.flush()
 
 
-def _extract_id(line: str) -> Any:
-    """Extract JSON-RPC id from request line."""
-    try:
-        return json.loads(line).get("id")
-    except (json.JSONDecodeError, AttributeError):
-        return None
-
-
 def _extract_id_and_presence(line: str) -> tuple[Any, bool]:
     """Return ``(id_value, has_id)`` from a SINGLE JSON parse of a line.
 
@@ -1578,10 +1570,21 @@ def check_connection(
                 if event_type != "message":
                     continue
                 try:
-                    result_data = json.loads(payload)
-                    break
+                    parsed = json.loads(payload)
                 except json.JSONDecodeError:
                     continue
+                # A compliant server MAY interleave notifications / server-
+                # initiated requests on the POST's SSE stream BEFORE the JSON-RPC
+                # response, so keep reading until a message carries result/error —
+                # matching the keep-reading gate in _post_parsed /
+                # _check_connection_sse. Breaking on the first message would
+                # mis-report a server that sends a notification frame first as
+                # "could not parse initialize result". (#1 round36)
+                if isinstance(parsed, dict) and (
+                    "result" in parsed or "error" in parsed
+                ):
+                    result_data = parsed
+                    break
         else:
             try:
                 result_data = json.loads(resp.text)
