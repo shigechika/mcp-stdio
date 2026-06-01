@@ -610,6 +610,17 @@ class TestIterSseEvents:
             ("message", "a")
         ]
 
+    def test_id_and_retry_fields_ignored(self):
+        """#10(round17): relay deliberately forgoes Last-Event-ID resumption and
+        server-driven retry timing, so the WHATWG decoder must ignore `id:` and
+        `retry:` lines (fall through the field dispatch) without disturbing the
+        surrounding event — pins the documented ignore-and-continue behaviour."""
+        lines = ["id: 5", "retry: 1000", "data: hi", ""]
+        assert list(_iter_sse_events(lines)) == [("message", "hi")]
+        # interleaved between data lines too — the data buffer is unaffected
+        lines = ["data:a", "id: 7", "data:b", "retry: 200", ""]
+        assert list(_iter_sse_events(lines)) == [("message", "a\nb")]
+
     def test_trailing_event_without_blank_line_flushed(self):
         # httpx may not surface a final empty line; a complete event must still
         # be dispatched at end of input.
@@ -1526,6 +1537,64 @@ class TestRun:
         assert result["id"] == 7
         assert "202" in result["error"]["message"]
 
+    def test_unexpected_exception_degrades_to_error_not_crash(
+        self, httpx_mock, monkeypatch
+    ):
+        """#1(round17): an unexpected non-httpx exception escaping dispatch must
+        degrade THIS request to a JSON-RPC error and keep the stdin loop alive —
+        the 'never crash the gateway' contract is structural, not per-helper."""
+        import mcp_stdio.relay as relay_mod
+
+        real = relay_mod._post_and_stream
+        calls = {"n": 0}
+
+        def flaky(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("simulated unexpected bug in dispatch")
+            return real(*a, **k)
+
+        monkeypatch.setattr("mcp_stdio.relay._post_and_stream", flaky)
+        # Only the SECOND line reaches the network (the first raises before it).
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"ok":true},"id":2}',
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","method":"tools/call","id":1}',
+                '{"jsonrpc":"2.0","method":"tools/call","id":2}',
+            ],
+        )
+        msgs = [json.loads(x) for x in output.strip().splitlines() if x]
+        # First request degraded to an internal error (not an uncaught crash).
+        assert any(
+            m.get("id") == 1
+            and "internal relay error" in m.get("error", {}).get("message", "")
+            for m in msgs
+        ), f"expected an internal-error response for id 1, got {msgs!r}"
+        # The loop survived: the second request was still processed normally.
+        assert any(
+            m.get("id") == 2 and m.get("result", {}).get("ok") for m in msgs
+        ), f"loop did not survive to process id 2, got {msgs!r}"
+
+    def test_unexpected_exception_on_notification_stays_silent(
+        self, httpx_mock, monkeypatch
+    ):
+        """#1(round17): the same guard must NOT synthesize an id:null response
+        for a notification (no id) that triggers an unexpected error — it logs
+        and continues silently."""
+        monkeypatch.setattr(
+            "mcp_stdio.relay._post_and_stream",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","method":"notifications/initialized"}'],
+        )
+        assert output.strip() == ""
+
     def test_401_without_refresher_emits_error(self, httpx_mock):
         """#11: unhandled non-2xx must never produce a silent stdin hang."""
         httpx_mock.add_response(
@@ -2073,6 +2142,24 @@ class TestNormalizeNullArguments:
         line = '{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"t"}}'
         out = json.loads(_normalize_null_arguments(line))
         assert "arguments" not in out["params"]
+
+    def test_rewrites_null_arguments_with_id_zero(self):
+        """#11(round17): the id-0 falsy-id regression class is pinned at every
+        other transform layer (_emit, run, _CancelTracker); complete the symmetry
+        here. Normalization keys off method/params, never the id, so id:0 must
+        rewrite arguments to {} and preserve id:0 exactly."""
+        line = '{"jsonrpc":"2.0","method":"tools/call","id":0,"params":{"name":"t","arguments":null}}'
+        out = json.loads(_normalize_null_arguments(line))
+        assert out["params"]["arguments"] == {}
+        assert out["id"] == 0
+
+    def test_rewrites_null_arguments_for_notification(self):
+        """A tools/call NOTIFICATION (no id) carrying arguments:null is still
+        rewritten — normalization is id-agnostic."""
+        line = '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"t","arguments":null}}'
+        out = json.loads(_normalize_null_arguments(line))
+        assert out["params"]["arguments"] == {}
+        assert "id" not in out
 
     def test_empty_object_arguments_untouched(self):
         line = '{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"t","arguments":{}}}'
