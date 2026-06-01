@@ -208,6 +208,8 @@ mcp-stdio [OPTIONS] URL
   -h, --help             ヘルプ表示
 ```
 
+各フラグの詳細（プラットフォーム注記や issue 参照を含む）は `mcp-stdio --help` を実行してください。この表より詳しい説明が表示されます。
+
 ## ワークアラウンド
 
 Claude Code・mcp-remote・Windows の既知の問題については [WORKAROUNDS.md](WORKAROUNDS.md) を参照してください。
