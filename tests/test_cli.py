@@ -141,6 +141,22 @@ class TestMain:
             assert kwargs.kwargs["timeout_connect"] == 5.0
             assert kwargs.kwargs["timeout_read"] == 60.0
 
+    def test_default_timeouts_are_floats(self):
+        """#6(round18): with the timeout flags omitted the defaults must be
+        floats — argparse applies ``type`` only to argv strings, not to the
+        default object, so an int default would leak through. Keep the attribute
+        type consistent with the _positive_float validator."""
+        with (
+            patch("sys.argv", ["mcp-stdio", "https://example.com/mcp"]),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+            kwargs = mock_run.call_args
+            assert kwargs.kwargs["timeout_connect"] == 10.0
+            assert isinstance(kwargs.kwargs["timeout_connect"], float)
+            assert kwargs.kwargs["timeout_read"] == 120.0
+            assert isinstance(kwargs.kwargs["timeout_read"], float)
+
     def test_oauth_refresh_leeway_default(self, monkeypatch):
         """#56: --oauth-refresh-leeway defaults to 60 s when env var unset and flag absent."""
         monkeypatch.delenv("MCP_OAUTH_REFRESH_LEEWAY", raising=False)

@@ -264,13 +264,17 @@ def main() -> None:
     parser.add_argument(
         "--timeout-connect",
         type=_positive_float,
-        default=10,
+        # Float defaults (#6 round18): argparse applies ``type`` only to argv
+        # strings, never to the default object, so an int default would leave
+        # args.timeout_connect an int when the flag is omitted. httpx tolerates
+        # both, but keep the attribute's type consistent with the validator.
+        default=10.0,
         help="Connection timeout in seconds, > 0 (default: 10)",
     )
     parser.add_argument(
         "--timeout-read",
         type=_positive_float,
-        default=120,
+        default=120.0,
         help="Read timeout in seconds, > 0 (default: 120)",
     )
     parser.add_argument(
