@@ -124,7 +124,18 @@ def _ensure_store_dir() -> None:
 
 
 def _migrate_legacy_store() -> None:
-    """Migrate tokens from ~/.mcp-stdio/ to ~/.config/mcp-stdio/ if needed."""
+    """Migrate tokens from ~/.mcp-stdio/ to ~/.config/mcp-stdio/ if needed.
+
+    NOTE: this runs from ``_read_store`` and therefore from ``load_token``,
+    which is UNLOCKED (documented read-only). The EXDEV/ENOENT copy-through
+    branch below performs a real ``_write_store`` *without* ``_store_lock``,
+    so the module's lock-serialised RMW contract has one exception: during the
+    one-time legacy-migration window a load-side copy-through can race a
+    concurrent ``save_token`` and one ``os.replace`` wins (each write is still
+    atomic — no torn file — and the existence guard prevents the empty-dict
+    clobber). After migration completes the legacy file is gone and this path
+    is never taken again.
+    """
     if not _LEGACY_STORE_FILE.exists():
         return
     if _STORE_FILE.exists():
@@ -202,14 +213,27 @@ def _read_store() -> dict[str, Any]:
     # backup that lost mode bits, copied under a permissive umask, or written by
     # a third-party tool) and is only ever read would otherwise keep its mode,
     # leaving the secrets readable.
-    # Don't chmod through a symlink (would alter the link target's mode).
+    #
+    # Open with O_NOFOLLOW first: it refuses a symlink atomically (ELOOP), and
+    # the resulting fd anchors BOTH the chmod (via fchmod) and the read to the
+    # same inode — eliminating the stat-then-chmod-then-read TOCTOU window of a
+    # path-based sequence. _O_NOFOLLOW is 0 where unsupported (Windows), where
+    # NTFS ACLs govern access anyway.
     try:
-        if not _STORE_FILE.is_symlink():
-            os.chmod(_STORE_FILE, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
+        fd = os.open(_STORE_FILE, os.O_RDONLY | _O_NOFOLLOW)
     except OSError:
-        pass
+        # ELOOP (a symlink was swapped in — refused), ENOENT (race), or a
+        # permission error: treat as no readable store.
+        return {}
     try:
-        return json.loads(_STORE_FILE.read_text())
+        _fchmod = getattr(os, "fchmod", None)
+        if _fchmod is not None:
+            try:
+                _fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)  # 0o600, fd-anchored
+            except OSError:
+                pass  # best-effort tighten
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            return json.loads(f.read())
     except (json.JSONDecodeError, OSError):
         return {}
 
@@ -317,9 +341,26 @@ def load_token(server_url: str) -> TokenData | None:
     if entry is None:
         return None
     try:
-        return TokenData(**entry)
+        td = TokenData(**entry)
     except TypeError:
+        # Unexpected / missing keyword names (schema-shape drift, e.g. a field
+        # added by a newer version). Degrade to None → re-auth.
         return None
+    # A dataclass __init__ does NO value-type checking, so a corrupted store
+    # (partially overwritten, truncated-then-rewritten by another tool, or a
+    # bad backup restore) can yield a structurally-valid-but-type-broken entry.
+    # The comparison-critical numerics would then crash ensure_token (e.g.
+    # `expires_at > time.time()` on a str). Validate the load-bearing fields and
+    # degrade to None rather than propagate a TypeError up the OAuth path.
+    if not isinstance(td.access_token, str) or not td.access_token:
+        return None
+    if td.expires_at is not None and not isinstance(td.expires_at, (int, float)):
+        return None
+    if td.client_secret_expires_at is not None and not isinstance(
+        td.client_secret_expires_at, (int, float)
+    ):
+        return None
+    return td
 
 
 def save_token(server_url: str, data: TokenData) -> None:

@@ -152,6 +152,31 @@ class TestLoadSaveDelete:
         )
         assert load_token("https://example.com/mcp") is None
 
+    def test_load_value_type_corruption_returns_none(self, tmp_path, monkeypatch):
+        """#6: a structurally-valid entry with wrong VALUE types (e.g. a string
+        expires_at from a truncated/overwritten store) must degrade to None, not
+        crash ensure_token's `expires_at > time.time()` comparison later."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        store_file.write_text(
+            '{"https://example.com/mcp": '
+            '{"access_token": "t", "expires_at": "soon"}}'
+        )
+        assert load_token("https://example.com/mcp") is None
+
+    def test_load_non_string_access_token_returns_none(self, tmp_path, monkeypatch):
+        """A corrupted access_token (wrong type) must not produce a usable token."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        store_file.write_text(
+            '{"https://example.com/mcp": {"access_token": ["x"]}}'
+        )
+        assert load_token("https://example.com/mcp") is None
+
     def test_save_over_corrupt_store_succeeds(self, tmp_path, monkeypatch):
         """A corrupt store file is replaced (not appended to) on the next save."""
         store_file = tmp_path / "tokens.json"
@@ -204,9 +229,10 @@ class TestLoadSaveDelete:
         sys.platform == "win32",
         reason="POSIX symlink semantics; NTFS differs",
     )
-    def test_read_does_not_chmod_through_a_symlink(self, tmp_path, monkeypatch):
-        """A symlinked tokens.json must NOT have its target's mode altered on
-        read — guards against a symlink-swap chmod of an attacker-chosen file."""
+    def test_read_refuses_symlinked_store(self, tmp_path, monkeypatch):
+        """A symlinked tokens.json is refused on read (O_NOFOLLOW), consistent
+        with the O_NOFOLLOW write path — and crucially its target's mode is NOT
+        altered, so a symlink-swap cannot chmod an attacker-chosen file."""
         target = tmp_path / "real.json"
         target.write_text('{"https://example.com/mcp": {"access_token": "t"}}')
         os.chmod(target, 0o644)
@@ -216,9 +242,10 @@ class TestLoadSaveDelete:
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
         monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", link)
 
+        # O_NOFOLLOW refuses to open through the link → loads as absent.
         loaded = load_token("https://example.com/mcp")
-        assert loaded is not None and loaded.access_token == "t"
-        # The symlink target's mode must be untouched (chmod skipped on symlink).
+        assert loaded is None
+        # The symlink target's mode must be untouched (never opened/chmod'd).
         assert os.stat(target).st_mode & stat.S_IRWXO == stat.S_IROTH
 
     def test_concurrent_saves_of_distinct_keys_both_persist(
