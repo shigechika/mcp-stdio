@@ -2261,6 +2261,30 @@ class TestRun:
         assert result["error"]["message"] == "HTTP 401"
         assert result["id"] == 1
 
+    def test_explicit_null_id_request_error_is_emitted_not_suppressed(
+        self, httpx_mock
+    ):
+        """#L4(round40): a request with an EXPLICIT "id": null is a request, not a
+        notification, so an unhandled non-2xx must still synthesize an error
+        echoing "id": null — never silently drop it as if it were a notification.
+        The contract was asserted only at the helper level (TestErrorResponse),
+        never end-to-end through run()'s id extraction from a real stdin line."""
+        httpx_mock.add_response(
+            status_code=401,
+            text="",
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","method":"init","id":null}'],
+        )
+        line = output.strip()
+        assert line, "an explicit-null-id request must get a response, not silence"
+        result = json.loads(line)
+        # "id": null is echoed (key present, value None), not dropped.
+        assert "id" in result and result["id"] is None
+        assert result["error"]["message"] == "HTTP 401"
+
 
 # --- MCP-Protocol-Version header (spec rev 2025-06-18, issue #69) ---
 
