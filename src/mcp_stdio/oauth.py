@@ -518,9 +518,17 @@ def discover_oauth_metadata(
             prm_data = resp.json()
         except Exception:
             continue
-        # RFC 9728 §3.3: the `resource` field in the PRM response should match
-        # the server URL. Log a warning on mismatch but continue — strict
-        # rejection would break servers that normalise URLs differently.
+        # RFC 9728 §3.3 actually says the `resource` value MUST be identical to
+        # the protected-resource identifier and, if it is not, "the data
+        # contained in the response MUST NOT be used" (an impersonation guard).
+        # We deliberately downgrade that to warn-and-continue: strict rejection
+        # would break servers that normalise the identifier differently (trailing
+        # slash, case, default port) than the operator-supplied server_url. The
+        # impersonation risk the MUST guards against is independently closed
+        # downstream — every `authorization_servers` candidate is re-checked by
+        # _validate_auth_server_url (#13) before any credential is sent, and the
+        # PRM URL itself derives from the operator-trusted server_url — so the
+        # softening does not widen the trust boundary, only the citation's letter.
         prm_resource = prm_data.get("resource")
         if prm_resource and prm_resource.rstrip("/") != server_url.rstrip("/"):
             log(
@@ -828,8 +836,18 @@ def _make_callback_handler(
             if result.error:
                 msg = html.escape(result.error)
                 body = f"<h1>Authorization failed</h1><p>{msg}</p>"
-            else:
+            elif result.auth_code is not None:
                 body = "<h1>Authorization successful</h1><p>You can close this tab.</p>"
+            else:
+                # #2 (round21): a bare /callback hit with neither code nor error
+                # (a browser prefetch, a manual GET) captured nothing — the main
+                # loop is still waiting. Don't render "successful": a misleading
+                # success page could let an attacker convince a victim that a
+                # stray request "worked". Show a neutral waiting page instead.
+                body = (
+                    "<h1>Waiting for authorization...</h1>"
+                    "<p>No authorization response was received on this request.</p>"
+                )
             self.wfile.write(body.encode())
 
         def log_message(self, format: str, *args: Any) -> None:
