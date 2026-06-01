@@ -510,6 +510,70 @@ class TestLegacyMigration:
         assert loaded.access_token == "new"
         assert not legacy_file.exists()
 
+    def test_legacy_unlink_failure_when_new_exists_does_not_crash(
+        self, tmp_path, monkeypatch
+    ):
+        """If the new store already exists, a failure to remove the redundant
+        legacy file (read-only FS, or a TOCTOU race that already unlinked it)
+        must NOT crash load_token — the migrated store is still readable."""
+        legacy_dir = tmp_path / "legacy"
+        legacy_file = legacy_dir / "tokens.json"
+        new_dir = tmp_path / "new"
+        new_file = new_dir / "tokens.json"
+
+        legacy_dir.mkdir()
+        legacy_file.write_text('{"https://example.com/mcp": {"access_token": "old"}}')
+        new_dir.mkdir()
+        new_file.write_text('{"https://example.com/mcp": {"access_token": "new"}}')
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", new_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", new_file)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_DIR", legacy_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
+
+        real_unlink = os.unlink
+
+        def failing_unlink(path, *a, **k):
+            if os.fspath(path) == os.fspath(legacy_file):
+                raise PermissionError(13, "read-only legacy fs")
+            return real_unlink(path, *a, **k)
+
+        monkeypatch.setattr("mcp_stdio.token_store.os.unlink", failing_unlink)
+
+        # Must not raise — the already-migrated store is returned intact.
+        loaded = load_token("https://example.com/mcp")
+        assert loaded is not None and loaded.access_token == "new"
+
+    def test_post_rename_chmod_failure_completes_migration(
+        self, tmp_path, monkeypatch
+    ):
+        """A chmod failure after a successful rename must not abort or divert the
+        migration into the copy-through recovery — the moved file stands."""
+        if sys.platform == "win32":
+            pytest.skip("POSIX mode bits don't model NTFS ACLs")
+        legacy_dir = tmp_path / "legacy"
+        legacy_file = legacy_dir / "tokens.json"
+        new_dir = tmp_path / "new"
+        new_file = new_dir / "tokens.json"
+
+        legacy_dir.mkdir()
+        legacy_file.write_text('{"https://example.com/mcp": {"access_token": "old"}}')
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", new_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", new_file)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_DIR", legacy_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
+
+        def failing_chmod(*a, **k):
+            raise PermissionError(1, "operation not permitted")
+
+        monkeypatch.setattr("mcp_stdio.token_store.os.chmod", failing_chmod)
+
+        loaded = load_token("https://example.com/mcp")
+        assert loaded is not None and loaded.access_token == "old"
+        assert new_file.exists()
+        assert not legacy_file.exists()  # genuinely renamed, not copy-through
+
     def test_no_migration_if_no_legacy(self, tmp_path, monkeypatch):
         """No error when legacy path does not exist."""
         new_dir = tmp_path / "new"
