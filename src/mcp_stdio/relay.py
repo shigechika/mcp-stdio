@@ -839,6 +839,14 @@ def _post_and_stream(
                     # left hanging, mirroring the >=400 fall-through in run().
                     # Notifications (has_id False) stay silent.
                     _write_line(_error_response("empty response from server", req_id))
+                # pv is intentionally None here: no InitializeResult was
+                # delivered, so an empty-200 to an `initialize` request leaves
+                # the relay's protocol_version unset rather than guessing a
+                # version it never negotiated (#6 round27). The client received
+                # the synthesized error above and will re-initialize; the server
+                # that answered initialize with an empty 200 is already
+                # non-compliant. Contrast the partial-delivery path below, which
+                # deliberately PRESERVES a pv captured before the stream broke.
                 return _StreamResult(session, 200, protocol_version=pv)
         except httpx.HTTPError as e:
             # httpx.HTTPError is the broadest request-level supertype: every
@@ -1669,11 +1677,23 @@ def run(
     )
 
     def _prepare_headers() -> dict[str, str]:
-        """Build per-request headers with the current session + protocol version."""
+        """Build per-request headers with the current session + protocol version.
+
+        When the relay injects a value, it first drops any case-variant the
+        operator pinned via ``-H`` (e.g. ``-H 'mcp-protocol-version: x'``), so
+        httpx never serialises TWO ``MCP-Protocol-Version`` / ``Mcp-Session-Id``
+        header lines — a strict 2025-06-18 server treats these as singleton
+        fields and would reject or mis-select. Mirrors the initialize-path strip
+        in ``_dispatch`` / ``_reinitialize``. The strip is gated on the relay
+        actually having a value, so an operator pin still rides through on the
+        paths where the relay manages no value of its own. See #3 (round27).
+        """
         h = dict(headers)
         if session_id:
+            h = {k: v for k, v in h.items() if k.lower() != "mcp-session-id"}
             h["Mcp-Session-Id"] = session_id
         if protocol_version:
+            h = {k: v for k, v in h.items() if k.lower() != "mcp-protocol-version"}
             h["MCP-Protocol-Version"] = protocol_version
         return h
 

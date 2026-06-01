@@ -1742,6 +1742,54 @@ class TestRun:
         # The step-up retry (req 3) must carry the id rotated on the 401 retry.
         assert reqs[3].headers.get("mcp-session-id") == "sess-2"
 
+    def test_successful_403_stepup_adopts_rotated_session_id(self, httpx_mock):
+        """#7(round27): a 403 step-up retry that SUCCEEDS (200) while rotating the
+        mcp-session-id must adopt that rotated id for the next stdin line —
+        symmetric with the 401 branch. Pins the post-step-up adoption at
+        relay.py ~1904 (`if result.session_id and result.status_code < 400`),
+        which the existing 403 tests leave uncovered (their retry 200 carries no
+        rotated id)."""
+        # 1: init -> sess-1
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json", "mcp-session-id": "sess-1"},
+        )
+        # 2: call -> 403 insufficient_scope (triggers step-up)
+        httpx_mock.add_response(
+            status_code=403,
+            text="",
+            headers={
+                "content-type": "application/json",
+                "www-authenticate": 'Bearer error="insufficient_scope", scope="extra"',
+            },
+        )
+        # 3: step-up retry -> 200 AND rotates the session id to sess-rotated
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"ok":true},"id":2}',
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "sess-rotated",
+            },
+        )
+        # 4: a later call -> 200 (must carry the rotated id)
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":3}',
+            headers={"content-type": "application/json"},
+        )
+
+        self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","method":"init","id":1}',
+                '{"jsonrpc":"2.0","method":"call","id":2}',
+                '{"jsonrpc":"2.0","method":"call","id":3}',
+            ],
+            scope_upgrader=lambda _s: {"Authorization": "Bearer broader"},
+        )
+        reqs = httpx_mock.get_requests()
+        # Line 3's request (index 3) carries the id rotated on the step-up 200.
+        assert reqs[3].headers.get("mcp-session-id") == "sess-rotated"
+
     def test_chained_403_stepup_then_404_reinitializes_and_replays(self, httpx_mock):
         """#6(round21): a 403 whose step-up retry returns 404 must cascade into
         the 404 reinitialize branch — initialize a fresh session, then replay the
