@@ -50,6 +50,22 @@ _HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _HEADER_VALUE_FORBIDDEN = ("\r", "\n", "\0")
 
 
+def _bearer_header_value(token: str) -> str:
+    """Build a ``Bearer <token>`` Authorization value, rejecting CR/LF/NUL.
+
+    An OAuth authorization server is LESS trusted than the operator, so an
+    AS-supplied access token gets the same control-character ban as ``-H``
+    values and ``--bearer-token`` (#14): a token carrying CR/LF could otherwise
+    inject / split request headers on the wire. Raises ValueError on a forbidden
+    character so the caller can fail the relevant flow. See #5 (round21).
+    """
+    if any(c in token for c in _HEADER_VALUE_FORBIDDEN):
+        raise ValueError(
+            "OAuth access token contains a forbidden control character (CR/LF/NUL)"
+        )
+    return f"Bearer {token}"
+
+
 def _parse_header(header: str) -> tuple[str, str]:
     """Parse a header string 'Key: Value' into a tuple.
 
@@ -115,7 +131,7 @@ def _build_token_refresher(
             if data is None:
                 return None
             new_headers = dict(headers)
-            new_headers["Authorization"] = f"Bearer {data.access_token}"
+            new_headers["Authorization"] = _bearer_header_value(data.access_token)
             return new_headers
         except Exception as e:
             # Mirror upgrader(): a refresh failure beyond the network call
@@ -160,13 +176,13 @@ def _build_scope_upgrader(
         )
         try:
             data = step_up_authorize(server_url, client, required_scope)
+            new_headers = dict(headers)
+            new_headers["Authorization"] = _bearer_header_value(data.access_token)
         except Exception as e:
             print(f"error: step-up authorization failed: {e}", file=sys.stderr)
             return None
         finally:
             client.close()
-        new_headers = dict(headers)
-        new_headers["Authorization"] = f"Bearer {data.access_token}"
         return new_headers
 
     return upgrader
@@ -481,7 +497,15 @@ def main() -> None:
                 )
             for existing in overridden:
                 del headers[existing]
-            headers["Authorization"] = f"Bearer {token_data.access_token}"
+            try:
+                headers["Authorization"] = _bearer_header_value(
+                    token_data.access_token
+                )
+            except ValueError as e:
+                # The AS handed us a token with CR/LF/NUL — fail startup clearly
+                # rather than splitting headers on the wire (#5 round21).
+                print(f"error: {e}", file=sys.stderr)
+                sys.exit(1)
             # The relay-loop 401/403 recovery callbacks are unused by the
             # one-shot --check / --test probe (check_connection never refreshes
             # or steps up), so only build them on the real relay path. See #15.
