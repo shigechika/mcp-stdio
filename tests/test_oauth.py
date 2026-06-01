@@ -3297,6 +3297,38 @@ class TestAuthorizationFlowFailurePaths:
             )
         assert closed, "callback server was not closed on the DCR error path"
 
+    def test_webbrowser_open_failure_closes_callback_server(self, monkeypatch):
+        """#4(round13): a failure AFTER the callback server is bound but before
+        the success-path close (here webbrowser.open raising) must still close
+        the server — the try/finally covers the whole listening window, not just
+        DCR."""
+        import mcp_stdio.oauth as oauth_mod
+
+        closed: list[bool] = []
+        real_server_close = oauth_mod.HTTPServer.server_close
+
+        def spying_close(self) -> None:
+            closed.append(True)
+            real_server_close(self)
+
+        monkeypatch.setattr(oauth_mod.HTTPServer, "server_close", spying_close)
+
+        def boom(_url):
+            raise RuntimeError("no browser available")
+
+        monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", boom)
+        client = httpx.Client()
+        with pytest.raises(RuntimeError, match="no browser available"):
+            _run_authorization_flow(
+                "https://ex.com/mcp",
+                client,
+                metadata=self.META,
+                cached=None,
+                client_id_override="cid",  # skip DCR; reach the webbrowser step
+                timeout=5,
+            )
+        assert closed, "callback server was not closed on the webbrowser failure"
+
 
 class TestRfc9207IssValidation:
     """RFC 9207: validate the authorization-response `iss` parameter against the
@@ -3494,6 +3526,17 @@ class TestValidatePrmHintUrl:
 
     def test_malformed_url_rejected(self):
         assert _validate_prm_hint_url("not a url !!!", self.SERVER) is False
+
+    def test_userinfo_rejected(self, capsys):
+        """#3(round13): an embedded userinfo hint is refused, parity with the
+        sibling #13 validators (so HTTP Basic creds aren't sent on the GET)."""
+        assert (
+            _validate_prm_hint_url(
+                "https://attacker:secret@api.example.com/prm", self.SERVER
+            )
+            is False
+        )
+        assert "userinfo" in capsys.readouterr().err
 
 
 # --- discover_oauth_metadata with www_authenticate hint ---
