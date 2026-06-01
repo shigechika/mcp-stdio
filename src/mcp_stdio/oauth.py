@@ -1403,6 +1403,10 @@ def _run_device_authorization_flow(
                 metadata,
                 cid,
                 csecret,
+                # Preserve the requested scope when the AS omits it from the
+                # token response (RFC 6749 §5.1) — mirrors the auth-code and
+                # refresh paths so a device-flow token's scope is not wiped.
+                previous_scope=scope,
                 client_secret_expires_at=cse_at,
                 auth_method=auth_method,
                 no_resource_indicator=not resource_indicator,
