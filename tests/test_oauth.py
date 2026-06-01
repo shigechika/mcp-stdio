@@ -2952,6 +2952,13 @@ class TestValidateAuthServerUrl:
                 "authorization_servers": ["http://evil.example.net/authorize"],
             },
         )
+        # The path-aware PRM yielded no USABLE auth server (the only entry was a
+        # rejected plaintext URL), so discovery now falls through to the
+        # host-root PRM candidate before the base AS-metadata fetch. See #7.
+        httpx_mock.add_response(
+            url="https://mcp.example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
         httpx_mock.add_response(
             url="https://mcp.example.com/.well-known/oauth-authorization-server",
             json={
