@@ -1256,8 +1256,9 @@ def _token_response_to_data(
 ) -> TokenData:
     """Convert a raw token response to TokenData.
 
-    If the response omits refresh_token (allowed per RFC 6749 Section 6),
-    the previous_refresh_token is preserved so subsequent refreshes work.
+    If the response omits refresh_token (it is OPTIONAL per RFC 6749 §5.1;
+    §6 only covers how an issued refresh_token is later used), the
+    previous_refresh_token is preserved so subsequent refreshes work.
     Likewise ``scope`` is OPTIONAL in a token response (RFC 6749 §5.1: it
     may be omitted when identical to the requested scope, which refreshes
     routinely do), so ``previous_scope`` is preserved — otherwise a refresh
@@ -1623,6 +1624,15 @@ def _run_authorization_flow(
         metadata,
         cid,
         csecret,
+        # RFC 6749 §5.1 makes refresh_token OPTIONAL in a token response, so a
+        # step-up (which reuses this auth-code path for a full re-authorization)
+        # against an AS that omits it would otherwise overwrite the cached
+        # TokenData's still-valid refresh_token with None — breaking every future
+        # silent refresh until the next interactive flow. Carry the cached token
+        # through, mirroring the refresh path (refresh_cached_token). Harmless on
+        # initial auth, where `cached` is None or carries no refresh_token. (#L2
+        # round41)
+        previous_refresh_token=cached.refresh_token if cached else None,
         # RFC 6749 §5.1 lets the AS omit `scope` when it equals the requested
         # scope — exactly what a step-up does (requested == merged union). Fall
         # back to the requested `scope` so the stored TokenData.scope is not

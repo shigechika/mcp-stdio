@@ -4619,6 +4619,48 @@ class TestRfc9207IssValidation:
         )
         assert data.scope == "read write admin"
 
+    def test_stepup_preserves_cached_refresh_token_when_response_omits_it(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """#L2(round41): a step-up token response that OMITS refresh_token (RFC
+        6749 §5.1, OPTIONAL) must keep the CACHED refresh_token in the stored
+        TokenData — not overwrite it with None, which would break every future
+        silent refresh until the next interactive flow. Mirrors the scope
+        preservation above and the refresh path."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+        # Token response deliberately omits "refresh_token".
+        httpx_mock.add_response(
+            url="https://ex.com/token",
+            json={"access_token": "new_at", "token_type": "Bearer"},
+        )
+        monkeypatch.setattr(
+            "mcp_stdio.oauth.webbrowser.open", self._driver("iss=https://ex.com")
+        )
+        cached = TokenData(
+            access_token="old_at",
+            refresh_token="cached_rt",
+            client_id="cid",  # reused → no DCR
+            token_endpoint="https://ex.com/token",
+            authorization_endpoint="https://ex.com/authorize",
+        )
+        client = httpx.Client()
+        data = _run_authorization_flow(
+            "https://ex.com/mcp",
+            client,
+            metadata=self.META,
+            cached=cached,
+            scope="read write",
+            timeout=5,
+        )
+        assert data.access_token == "new_at"
+        assert data.refresh_token == "cached_rt"  # preserved, not wiped to None
+        # And it survives the round-trip to disk.
+        from mcp_stdio.token_store import load_token
+
+        assert load_token("https://ex.com/mcp").refresh_token == "cached_rt"
+
     def test_no_iss_skips_validation(self, httpx_mock, tmp_path, monkeypatch):
         store_file = tmp_path / "tokens.json"
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
