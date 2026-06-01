@@ -235,9 +235,10 @@ def _validate_endpoint_url(endpoint_url: str | None, *, label: str) -> str | Non
     hostile or compromised authorization server could declare
     ``token_endpoint="http://evil/token"`` and exfiltrate the authorization
     code, client_secret, and refresh_token in cleartext. Apply the same policy
-    here — reject non-http(s) schemes and reject plain HTTP for non-loopback
-    hosts — returning ``None`` (with a warning) so the caller drops the unsafe
-    endpoint rather than POSTing credentials to it. See #13.
+    here — reject non-http(s) schemes, reject plain HTTP for non-loopback
+    hosts, and reject embedded userinfo — returning ``None`` (with a warning) so
+    the caller drops the unsafe endpoint rather than POSTing credentials to it.
+    See #13.
     """
     if not endpoint_url:
         return None
@@ -245,6 +246,12 @@ def _validate_endpoint_url(endpoint_url: str | None, *, label: str) -> str | Non
         parsed = urlparse(endpoint_url)
     except Exception:
         log(f"warning: malformed {label} URL {endpoint_url!r}, ignoring")
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        # Legitimate AS metadata never embeds credentials in its declared
+        # endpoints; userinfo (``user:pass@host``) is an exfiltration / parser-
+        # confusion vector, so refuse it outright.
+        log(f"warning: refusing {label} URL with embedded userinfo, ignoring")
         return None
     if parsed.scheme not in ("https", "http"):
         log(

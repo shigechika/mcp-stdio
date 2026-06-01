@@ -2776,6 +2776,13 @@ class TestValidateEndpointUrl:
         assert _validate_endpoint_url("javascript:alert(1)", label="token") is None
         assert "unsupported" in capsys.readouterr().err
 
+    def test_userinfo_rejected(self, capsys):
+        assert (
+            _validate_endpoint_url("https://user:pass@as.example/token", label="token")
+            is None
+        )
+        assert "userinfo" in capsys.readouterr().err
+
     def test_empty_and_none_pass_through_silently(self, capsys):
         assert _validate_endpoint_url(None, label="token") is None
         assert _validate_endpoint_url("", label="token") is None
@@ -3671,6 +3678,47 @@ class TestDeviceAuthorizationFlow:
         ]
         assert len(da_reqs) == 1
         assert b"resource=" not in da_reqs[0].content
+
+    def test_client_secret_post_carries_secret_in_body_and_scope(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """With client_secret_post auth, the device-auth POST and each poll POST
+        carry client_id + client_secret in the body (not a Basic header), and a
+        requested scope appears in the device-auth body."""
+        from urllib.parse import parse_qs
+
+        self._patch_store(tmp_path, monkeypatch)
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(
+            url=TOKEN_URL, json={"access_token": "acc", "token_type": "Bearer"}
+        )
+        cached = TokenData(
+            access_token="",
+            token_type="Bearer",
+            token_endpoint=TOKEN_URL,
+            authorization_endpoint=AUTH_URL,
+            client_id="cid",
+            client_secret="sshh",
+            token_endpoint_auth_method="client_secret_post",
+        )
+        client = httpx.Client()
+        data = _run_device_authorization_flow(
+            MCP_URL, client, metadata=_device_meta(), cached=cached, scope="hr:read"
+        )
+        assert data.access_token == "acc"
+
+        reqs = httpx_mock.get_requests()
+        da = next(r for r in reqs if str(r.url) == DEVICE_AUTH_URL)
+        da_body = parse_qs(da.content.decode())
+        assert da_body.get("client_id") == ["cid"]
+        assert da_body.get("client_secret") == ["sshh"]
+        assert da_body.get("scope") == ["hr:read"]
+        assert "authorization" not in da.headers  # not Basic auth
+
+        poll = next(r for r in reqs if str(r.url) == TOKEN_URL)
+        poll_body = parse_qs(poll.content.decode())
+        assert poll_body.get("client_id") == ["cid"]
+        assert poll_body.get("client_secret") == ["sshh"]
 
     def test_google_verification_url_fallback(
         self, httpx_mock, tmp_path, monkeypatch, capsys
