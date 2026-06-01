@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import json
+import math
 import os
 import stat
 import sys
@@ -39,6 +40,12 @@ _DEFAULT_PORTS = {"https": 443, "http": 80}
 # of secrets to an attacker-chosen target. 0 on platforms without it (Windows),
 # where the parent dir's 0o700 mode is the primary guard anyway.
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+# O_NONBLOCK so opening the store path can never BLOCK if a FIFO was pre-planted
+# there (an O_RDONLY open of a pipe blocks until a writer appears). It is a no-op
+# for the regular file we expect; combined with the post-open fstat regular-file
+# check it turns a special-file DoS into a clean refusal. 0 where unsupported.
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 # Set once if a server URL carrying embedded userinfo is normalized into a key,
 # so the credential-sharing warning is emitted only once per process.
@@ -358,7 +365,7 @@ def _read_store(*, for_write: bool = False) -> dict[str, Any]:
     # path-based sequence. _O_NOFOLLOW is 0 where unsupported (Windows), where
     # NTFS ACLs govern access anyway.
     try:
-        fd = os.open(_STORE_FILE, os.O_RDONLY | _O_NOFOLLOW)
+        fd = os.open(_STORE_FILE, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK)
     except OSError as e:
         # The file EXISTS but we could not open it: ELOOP (a symlink swapped
         # in — refused), EACCES, or a transient I/O error. On the write path
@@ -373,6 +380,24 @@ def _read_store(*, for_write: bool = False) -> dict[str, Any]:
         # read" warning. There is nothing to clobber.
         if for_write and e.errno != errno.ENOENT:
             raise _StoreUnreadable(str(e)) from e
+        return {}
+    # #10 (round25): O_NOFOLLOW refuses a SYMLINK but not a FIFO / device node /
+    # other special file pre-planted at the store path. A named pipe would make
+    # the f.read() below BLOCK forever (no writer), hanging every load/save and
+    # the relay startup. Refuse a non-regular file via the fd we already hold:
+    # absent-like on read ({}), and _StoreUnreadable on write so a save never
+    # clobbers (or hangs on) an unread special file.
+    try:
+        is_regular = stat.S_ISREG(os.fstat(fd).st_mode)
+    except OSError as e:
+        os.close(fd)
+        if for_write:
+            raise _StoreUnreadable(str(e)) from e
+        return {}
+    if not is_regular:
+        os.close(fd)
+        if for_write:
+            raise _StoreUnreadable("token store path is not a regular file")
         return {}
     try:
         _fchmod = getattr(os, "fchmod", None)
@@ -551,14 +576,22 @@ def load_token(server_url: str) -> TokenData | None:
     # ``true``/``false`` in the JSON would pass an isinstance(..., (int, float))
     # check and reach ensure_token as 1/0 — a nonsensical 1970-epoch expiry.
     # Reject bool explicitly so it degrades to re-auth instead of a bogus expiry.
+    # #11 (round25): json.loads parses the literals NaN / Infinity / -Infinity by
+    # default, which pass isinstance(..., float) but poison the `expires_at >
+    # time.time()` comparison — inf reads as never-expiring (the token is trusted
+    # forever and refresh never fires), NaN as always-expired. Reject non-finite
+    # values via math.isfinite so a hand-edited / third-party-written store
+    # degrades to a clean re-auth.
     if td.expires_at is not None and (
         isinstance(td.expires_at, bool)
         or not isinstance(td.expires_at, (int, float))
+        or not math.isfinite(td.expires_at)
     ):
         return None
     if td.client_secret_expires_at is not None and (
         isinstance(td.client_secret_expires_at, bool)
         or not isinstance(td.client_secret_expires_at, (int, float))
+        or not math.isfinite(td.client_secret_expires_at)
     ):
         return None
     # The string fields are consumed via .split() (scope) or sent verbatim in
