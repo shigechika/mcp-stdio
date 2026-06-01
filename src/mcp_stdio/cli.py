@@ -451,6 +451,7 @@ def main() -> None:
             headers=headers,
             timeout_connect=args.timeout_connect,
             timeout_read=args.timeout_read,
+            transport=args.transport,
         )
         sys.exit(0 if ok else 1)
 

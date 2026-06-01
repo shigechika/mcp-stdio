@@ -467,6 +467,37 @@ class TestMain:
             assert exc_info.value.code == 0
             assert mock_check.called
 
+    def test_check_forwards_transport_streamable_default(self):
+        """--check without --transport probes via the default streamable-http."""
+        with (
+            patch("sys.argv", ["mcp-stdio", "https://example.com/mcp", "--check"]),
+            patch("mcp_stdio.cli.check_connection", return_value=True) as mock_check,
+        ):
+            with pytest.raises(SystemExit):
+                main()
+            assert mock_check.call_args.kwargs["transport"] == "streamable-http"
+
+    def test_check_forwards_transport_sse(self):
+        """#11: --check --transport sse must run the SSE-aware probe, not the
+        default streamable-http POST."""
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "https://example.com/sse",
+                    "--check",
+                    "--transport",
+                    "sse",
+                ],
+            ),
+            patch("mcp_stdio.cli.check_connection", return_value=True) as mock_check,
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 0
+            assert mock_check.call_args.kwargs["transport"] == "sse"
+
     def test_test_flag_deprecated_alias_works(self, capsys):
         """--test still works for backward compatibility but emits a deprecation warning."""
         with (

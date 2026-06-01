@@ -2039,6 +2039,51 @@ class TestCheckConnection:
         )
         assert check_connection(self.URL, dict(self.HEADERS)) is True
 
+    def test_empty_capability_object_reports_yes(self, httpx_mock, capsys):
+        """MCP capabilities are presence-based: ``"tools": {}`` means supported,
+        so the probe reports tools=yes even though the object is empty."""
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}, "resources": {}},
+                },
+            }
+        )
+        httpx_mock.add_response(
+            text=body, headers={"content-type": "application/json"}
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+        err = capsys.readouterr().err
+        assert "tools=yes" in err
+        assert "resources=yes" in err
+        assert "prompts=no" in err  # absent → no
+
+    def test_null_capabilities_does_not_crash(self, httpx_mock):
+        """A server sending ``"capabilities": null`` must not crash the probe."""
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"protocolVersion": "2024-11-05", "capabilities": None},
+            }
+        )
+        httpx_mock.add_response(
+            text=body, headers={"content-type": "application/json"}
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+
+    def test_non_object_result_does_not_crash(self, httpx_mock):
+        """A malformed server returning a scalar ``result`` is reported as
+        reachable rather than crashing on attribute access."""
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "result": "ok"})
+        httpx_mock.add_response(
+            text=body, headers={"content-type": "application/json"}
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+
     def test_connect_error_returns_false(self, httpx_mock):
         httpx_mock.add_exception(httpx.ConnectError("refused"))
         assert check_connection(self.URL, dict(self.HEADERS)) is False
@@ -2058,6 +2103,165 @@ class TestCheckConnection:
         assert check_connection(self.URL, dict(self.HEADERS)) is True
         captured = capsys.readouterr()
         assert "sess-xyz" in captured.err
+
+
+class TestCheckConnectionSse:
+    """``check_connection(transport="sse")`` runs the legacy GET/endpoint/POST
+    handshake instead of POSTing initialize directly (round-7 #11)."""
+
+    SSE_URL = "https://example.com/sse"
+    HEADERS = {"Content-Type": "application/json"}
+
+    _INIT_RESULT = (
+        '{"jsonrpc":"2.0","id":1,"result":'
+        '{"protocolVersion":"2024-11-05",'
+        '"serverInfo":{"name":"sse-demo","version":"9.9"},'
+        '"capabilities":{"tools":{}}}}'
+    )
+
+    def test_sse_handshake_success(self, httpx_mock):
+        """endpoint event → POST initialize → response on the stream → True."""
+        # The GET stream carries the endpoint bootstrap and then the
+        # initialize response (legacy SSE delivers POST responses on the
+        # stream, not in the POST body).
+        httpx_mock.add_response(
+            url=self.SSE_URL,
+            method="GET",
+            stream=IteratorStream(
+                [
+                    b"event: endpoint\ndata: /messages?sid=xyz\n\n",
+                    f"event: message\ndata: {self._INIT_RESULT}\n\n".encode(),
+                ]
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url="https://example.com/messages?sid=xyz",
+            method="POST",
+            status_code=202,
+        )
+        assert (
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
+            is True
+        )
+        # The probe actually POSTed initialize to the resolved endpoint.
+        posts = [r for r in httpx_mock.get_requests() if r.method == "POST"]
+        assert len(posts) == 1
+        assert str(posts[0].url) == "https://example.com/messages?sid=xyz"
+        assert b'"method":"initialize"' in posts[0].read().replace(b" ", b"")
+
+    def test_sse_reports_server_info(self, httpx_mock, capsys):
+        """serverInfo / capabilities from the streamed response reach the log."""
+        httpx_mock.add_response(
+            url=self.SSE_URL,
+            method="GET",
+            stream=IteratorStream(
+                [
+                    b"event: endpoint\ndata: /messages\n\n",
+                    f"event: message\ndata: {self._INIT_RESULT}\n\n".encode(),
+                ]
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url="https://example.com/messages", method="POST", status_code=202
+        )
+        assert (
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
+            is True
+        )
+        err = capsys.readouterr().err
+        assert "sse-demo" in err
+        assert "tools=yes" in err
+
+    def test_sse_get_non_200_returns_false(self, httpx_mock):
+        """The GET stream itself failing (e.g. 401) → False, no POST attempted."""
+        httpx_mock.add_response(url=self.SSE_URL, method="GET", status_code=401)
+        assert (
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
+            is False
+        )
+        assert not [r for r in httpx_mock.get_requests() if r.method == "POST"]
+
+    def test_sse_mcp_error_returns_false(self, httpx_mock):
+        """A JSON-RPC error delivered on the stream → False."""
+        err_body = '{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"boom"}}'
+        httpx_mock.add_response(
+            url=self.SSE_URL,
+            method="GET",
+            stream=IteratorStream(
+                [
+                    b"event: endpoint\ndata: /messages\n\n",
+                    f"event: message\ndata: {err_body}\n\n".encode(),
+                ]
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url="https://example.com/messages", method="POST", status_code=202
+        )
+        assert (
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
+            is False
+        )
+
+    def test_sse_stream_ends_before_response_returns_false(self, httpx_mock):
+        """endpoint arrives but no initialize response before EOF → False."""
+        httpx_mock.add_response(
+            url=self.SSE_URL,
+            method="GET",
+            stream=IteratorStream([b"event: endpoint\ndata: /messages\n\n"]),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url="https://example.com/messages", method="POST", status_code=202
+        )
+        assert (
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
+            is False
+        )
+
+    def test_sse_cross_origin_endpoint_refused_with_credentials(
+        self, httpx_mock, capsys
+    ):
+        """A cross-origin endpoint event is refused (no credential leak) → False,
+        and the probe never POSTs the Authorization header off-origin."""
+        httpx_mock.add_response(
+            url=self.SSE_URL,
+            method="GET",
+            stream=IteratorStream(
+                [b"event: endpoint\ndata: https://evil.example/steal\n\n"]
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+        headers = {"Content-Type": "application/json", "Authorization": "Bearer s3cr3t"}
+        assert check_connection(self.SSE_URL, headers, transport="sse") is False
+        assert "cross-origin" in capsys.readouterr().err
+        assert not [r for r in httpx_mock.get_requests() if r.method == "POST"]
+
+    def test_sse_server_notification_before_response_is_skipped(self, httpx_mock):
+        """A server-initiated notification on the stream is not mistaken for the
+        initialize response — the probe keeps reading until the real result."""
+        notif = '{"jsonrpc":"2.0","method":"notifications/message","params":{}}'
+        httpx_mock.add_response(
+            url=self.SSE_URL,
+            method="GET",
+            stream=IteratorStream(
+                [
+                    b"event: endpoint\ndata: /messages\n\n",
+                    f"event: message\ndata: {notif}\n\n".encode(),
+                    f"event: message\ndata: {self._INIT_RESULT}\n\n".encode(),
+                ]
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url="https://example.com/messages", method="POST", status_code=202
+        )
+        assert (
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
+            is True
+        )
 
 
 # --- SSE transport ---

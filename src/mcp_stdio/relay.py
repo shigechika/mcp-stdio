@@ -1071,17 +1071,178 @@ def _reinitialize(
     return new_session_id, negotiated
 
 
+def _report_initialize(result_data: dict[str, Any] | None) -> bool:
+    """Log a parsed ``initialize`` response and return the probe verdict.
+
+    Shared by the Streamable HTTP and SSE ``--check`` paths. Returns False
+    only when the response is a JSON-RPC error; an unparseable / missing
+    result still counts as "the server responded" (True).
+    """
+    if result_data and "result" in result_data:
+        result = result_data["result"]
+        if not isinstance(result, dict):
+            # Spec guarantees an object, but a malformed server could send a
+            # scalar/array — treat as "responded" rather than crashing on .get.
+            log("✓ Server responded (initialize result is not an object)")
+            return True
+        server_info = result.get("serverInfo") or {}
+        name = server_info.get("name", "unknown")
+        version = server_info.get("version", "?")
+        protocol = result.get("protocolVersion", "?")
+        log(f"✓ MCP initialize: server={name} v{version}, protocol={protocol}")
+
+        caps = result.get("capabilities") or {}
+        # MCP capabilities are presence-based: ``"tools": {}`` means tools ARE
+        # supported (an empty object, not "disabled"). Test membership, not
+        # truthiness, so an empty-but-present capability reports "yes".
+        tools = "yes" if "tools" in caps else "no"
+        resources = "yes" if "resources" in caps else "no"
+        prompts = "yes" if "prompts" in caps else "no"
+        log(f"✓ Capabilities: tools={tools}, resources={resources}, prompts={prompts}")
+        return True
+    if result_data and "error" in result_data:
+        err = result_data["error"]
+        log(f"✗ MCP error: {err.get('message', err)}")
+        return False
+    log("✓ Server responded (could not parse initialize result)")
+    return True
+
+
+def _check_connection_sse(
+    url: str,
+    headers: dict[str, str],
+    *,
+    timeout_connect: float,
+    timeout_read: float,
+) -> bool:
+    """Check legacy SSE (2024-11-05) connectivity via the full handshake.
+
+    Streamable HTTP can be probed with a single POST, but the legacy SSE
+    transport delivers JSON-RPC responses asynchronously over the long-lived
+    GET stream — a bare POST to the SSE URL would not work. This mirrors
+    ``run_sse``'s bootstrap as a one-shot: open the GET stream, wait for the
+    ``endpoint`` event, POST ``initialize`` to that endpoint, and read the
+    response off the stream. Returns True if the server completes the
+    handshake.
+    """
+    initialize_msg = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "mcp-stdio", "version": __version__},
+            },
+        }
+    )
+
+    client = httpx.Client(
+        timeout=httpx.Timeout(connect=timeout_connect, read=timeout_read, write=30, pool=10)
+    )
+
+    # The GET stream read blocks in the main thread; the POST runs in a helper
+    # thread. On a POST failure the helper closes the stream so the probe fails
+    # fast instead of hanging until the read timeout for a response that will
+    # never arrive.
+    holder: dict[str, Any] = {"resp": None, "post_error": None}
+
+    def do_post(endpoint: str) -> None:
+        try:
+            r = client.post(endpoint, content=initialize_msg, headers=headers)
+            if r.status_code not in (200, 202):
+                holder["post_error"] = f"HTTP {r.status_code}"
+        except Exception as e:  # noqa: BLE001 — surfaced via holder below
+            holder["post_error"] = str(e)
+        if holder["post_error"] is not None:
+            stream = holder["resp"]
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    try:
+        log(f"testing SSE connection to {url}")
+        with client.stream("GET", url, headers=headers) as resp:
+            holder["resp"] = resp
+            if resp.status_code != 200:
+                log(f"✗ HTTP {resp.status_code}")
+                return False
+            log(f"✓ SSE stream open (HTTP {resp.status_code})")
+
+            endpoint_seen = False
+            for event_type, data in _iter_sse_events(_iter_sse_lines(resp.iter_text())):
+                if event_type == "endpoint":
+                    resolved = urljoin(url, data)
+                    # Same cross-origin credential guard as the relay reader:
+                    # never POST an Authorization header to a different origin.
+                    has_auth = any(k.lower() == "authorization" for k in headers)
+                    if has_auth and not _same_origin(resolved, url):
+                        log(
+                            f"✗ refusing cross-origin SSE endpoint {resolved!r} "
+                            f"(differs from {url!r})"
+                        )
+                        return False
+                    log(f"✓ SSE endpoint: {resolved}")
+                    endpoint_seen = True
+                    threading.Thread(
+                        target=do_post, args=(resolved,), daemon=True
+                    ).start()
+                elif event_type == "message":
+                    if not endpoint_seen:
+                        continue
+                    try:
+                        result_data = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(result_data, dict) and (
+                        "result" in result_data or "error" in result_data
+                    ):
+                        return _report_initialize(result_data)
+                    # A server-initiated notification, not our response — keep
+                    # reading until the initialize result arrives.
+
+            # Stream ended (or was closed by the POST helper) before a response.
+            if holder["post_error"] is not None:
+                log(f"✗ POST to SSE endpoint failed: {holder['post_error']}")
+            else:
+                log("✗ SSE stream ended before initialize response")
+            return False
+    except Exception as e:  # noqa: BLE001
+        if holder["post_error"] is not None:
+            log(f"✗ POST to SSE endpoint failed: {holder['post_error']}")
+        else:
+            log(f"✗ Connection failed: {e}")
+        return False
+    finally:
+        client.close()
+
+
 def check_connection(
     url: str,
     headers: dict[str, str],
     *,
     timeout_connect: float = 10,
     timeout_read: float = 120,
+    transport: str = "streamable-http",
 ) -> bool:
     """Check MCP server connectivity by sending an initialize request.
 
-    Returns True if the server responds successfully.
+    Returns True if the server responds successfully. ``transport`` selects
+    the probe: ``"streamable-http"`` (default) POSTs ``initialize`` directly,
+    while ``"sse"`` runs the legacy GET/endpoint/POST handshake so the probe
+    matches what ``run_sse`` would actually do.
     """
+    if transport == "sse":
+        return _check_connection_sse(
+            url,
+            headers,
+            timeout_connect=timeout_connect,
+            timeout_read=timeout_read,
+        )
+
     initialize_msg = json.dumps(
         {
             "jsonrpc": "2.0",
@@ -1132,30 +1293,12 @@ def check_connection(
             except json.JSONDecodeError:
                 pass
 
-        if result_data and "result" in result_data:
-            result = result_data["result"]
-            server_info = result.get("serverInfo", {})
-            name = server_info.get("name", "unknown")
-            version = server_info.get("version", "?")
-            protocol = result.get("protocolVersion", "?")
-            log(f"✓ MCP initialize: server={name} v{version}, protocol={protocol}")
-
-            caps = result.get("capabilities", {})
-            tools = "yes" if caps.get("tools") else "no"
-            resources = "yes" if caps.get("resources") else "no"
-            prompts = "yes" if caps.get("prompts") else "no"
-            log(f"✓ Capabilities: tools={tools}, resources={resources}, prompts={prompts}")
-        elif result_data and "error" in result_data:
-            err = result_data["error"]
-            log(f"✗ MCP error: {err.get('message', err)}")
-            return False
-        else:
-            log("✓ Server responded (could not parse initialize result)")
+        ok = _report_initialize(result_data)
 
         if "mcp-session-id" in resp.headers:
             log(f"✓ Session ID: {resp.headers['mcp-session-id']}")
 
-        return True
+        return ok
     except Exception as e:
         log(f"✗ Connection failed: {e}")
         return False
