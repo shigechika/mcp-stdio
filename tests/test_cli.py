@@ -579,6 +579,21 @@ class TestMain:
             assert exc_info.value.code == 1
         assert "forbidden control character" in capsys.readouterr().err
 
+    def test_oauth_token_with_control_char_exits(self, monkeypatch, capsys):
+        """#12(round23): an OAuth-acquired access_token carrying CR/LF/NUL (a
+        compromised/malicious AS smuggling control chars) must fail startup
+        (exit 1), not split request headers on the wire. Covers the initial-flow
+        header-build guard, distinct from the --bearer-token and refresher paths."""
+        monkeypatch.setattr(
+            "mcp_stdio.oauth.ensure_token",
+            lambda *a, **k: TokenData(access_token="tok\nInjected: x"),
+        )
+        with patch("sys.argv", ["mcp-stdio", "--oauth", "https://example.com/mcp"]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+        assert exc_info.value.code == 1
+        assert "forbidden control character" in capsys.readouterr().err
+
     def test_dash_h_overrides_default_content_type_case_insensitively(self):
         with (
             patch(

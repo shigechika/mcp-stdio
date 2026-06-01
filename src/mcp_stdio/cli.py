@@ -296,7 +296,11 @@ def main() -> None:
     parser.add_argument(
         "--sse-read-timeout",
         type=_non_negative_float,
-        default=300,
+        # Float default (#11 round23): argparse applies ``type`` only to argv
+        # strings, never to the default object, so an int default would leave the
+        # attribute an int when the flag is omitted — keep it consistent with the
+        # _non_negative_float validator and the --timeout-* float defaults.
+        default=300.0,
         help=(
             "Idle read timeout (seconds) on the SSE GET stream "
             "(default: 300). A silent half-open TCP connection will "
