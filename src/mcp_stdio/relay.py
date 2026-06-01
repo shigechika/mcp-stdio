@@ -794,13 +794,17 @@ def _post_and_stream(
                     # Notifications (has_id False) stay silent.
                     _write_line(_error_response("empty response from server", req_id))
                 return _StreamResult(session, 200, protocol_version=pv)
-        except httpx.TransportError as e:
-            # TransportError is the supertype of every transient network/timeout/
-            # protocol failure: ConnectError/ReadError/Write*, ConnectTimeout/
-            # ReadTimeout/PoolTimeout, and RemoteProtocolError (mid-response
-            # server disconnect — common during half-open recovery). Catching
-            # the narrow leaf list missed several of these and let them crash the
-            # whole gateway. Non-transport (programming) errors still propagate.
+        except httpx.HTTPError as e:
+            # httpx.HTTPError is the broadest request-level supertype: every
+            # transient transport failure (TransportError — ConnectError/
+            # ReadError/Write*/timeouts/RemoteProtocolError) AND DecodingError,
+            # which is a SIBLING of TransportError (not a subclass) raised when a
+            # response body's Content-Encoding/charset is malformed or truncated.
+            # A buggy/hostile server (e.g. ``Content-Encoding: gzip`` on a
+            # non-gzip body) would otherwise propagate DecodingError out of the
+            # for-line loop and crash the whole gateway mid-session, violating
+            # the #11 "never crash the stdio connection" contract. Non-HTTP
+            # (programming) errors still propagate.
             last_error = e
             log(f"attempt {attempt}/{MAX_RETRIES} failed: {e}")
             if emitted:
@@ -908,13 +912,14 @@ def _post_parsed(
                 return json.loads(text), _StreamResult(session, 200)
             except json.JSONDecodeError:
                 return None, _StreamResult(session, 200)
-        except httpx.TransportError as e:
-            # TransportError is the supertype of every transient network/timeout/
-            # protocol failure: ConnectError/ReadError/Write*, ConnectTimeout/
-            # ReadTimeout/PoolTimeout, and RemoteProtocolError (mid-response
-            # server disconnect — common during half-open recovery). Catching
-            # the narrow leaf list missed several of these and let them crash the
-            # whole gateway. Non-transport (programming) errors still propagate.
+        except httpx.HTTPError as e:
+            # Broadest request-level supertype: covers every transient transport
+            # failure AND DecodingError (a SIBLING of TransportError, not a
+            # subclass) raised on a malformed/truncated Content-Encoding or
+            # charset. Catching only TransportError let a DecodingError propagate
+            # out of the run() loop and crash the gateway mid-session — see the
+            # matching note in _post_and_stream and #11. Non-HTTP errors still
+            # propagate.
             last_error = e
             log(f"attempt {attempt}/{MAX_RETRIES} failed: {e}")
             if attempt < MAX_RETRIES:
