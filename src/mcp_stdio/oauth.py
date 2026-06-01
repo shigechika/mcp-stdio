@@ -553,7 +553,18 @@ def discover_oauth_metadata(
     if meta:
         return meta
 
-    # If auth server differs from base, also try base as fallback
+    # If auth server differs from base, also try base as fallback.
+    #
+    # #4 (round20): when PRM advertised a CROSS-ORIGIN AS whose own RFC 8414
+    # metadata fetch failed, this fetches metadata from the MCP-host base — the
+    # endpoints returned then derive from the MCP host, not the PRM-advertised
+    # AS. This is a deliberate tradeoff, NOT the Phase-3 default-endpoint pinning
+    # below: the overwhelmingly common "AS == resource server" self-hosting
+    # deployment relies on this base fallback to find the co-located metadata,
+    # and any endpoints returned still pass _validate_endpoint_url (no cleartext
+    # leak). Phase 3, by contrast, has no live metadata to anchor on and so pins
+    # synthesized defaults to the PRM-advertised AS. The fallback is bounded to
+    # the operator-trusted MCP host, so it does not widen the trust boundary.
     if auth_server_url != base:
         meta = _fetch_authorization_server_metadata(base, client)
         if meta:
@@ -1044,6 +1055,10 @@ def _token_response_to_data(
         issuer=metadata.issuer,
         token_endpoint_auth_method=auth_method,
         no_resource_indicator=no_resource_indicator,
+        # Persist the RFC 9207 §3 flag so a later step-up that reconstructs
+        # metadata from this cached entry keeps the §2.4 missing-iss MUST-reject
+        # active (otherwise it silently defaults off). See #3 (round20).
+        iss_parameter_supported=metadata.iss_parameter_supported,
     )
 
 
@@ -1093,6 +1108,11 @@ def refresh_cached_token(
         # Carry the persisted issuer through so a refresh does not wipe it
         # (_token_response_to_data now writes metadata.issuer into TokenData).
         issuer=cached.issuer,
+        # Carry the RFC 9207 §3 flag through too so a refresh round-trip does not
+        # reset it to False in the re-persisted TokenData (#3 round20). Refresh
+        # has no authorization callback, so it is not load-bearing here — but it
+        # keeps the cached flag intact for the next step-up.
+        iss_parameter_supported=cached.iss_parameter_supported,
     )
     data = _token_response_to_data(
         raw,
@@ -1661,11 +1681,14 @@ def step_up_authorize(
             authorization_endpoint=cached.authorization_endpoint,
             token_endpoint=cached.token_endpoint,
             registration_endpoint=cached.registration_endpoint,
-            # Rehydrate the persisted issuer so the RFC 9207 `iss` mix-up check
-            # in _run_authorization_flow stays active on this cache-hit path —
-            # step-up runs a full browser+callback flow, the case most exposed
-            # to AS mix-up, so the defence must not silently no-op here.
+            # Rehydrate the persisted issuer AND the RFC 9207 §3 iss-support flag
+            # so BOTH halves of the §2.4 mix-up defence stay active on this
+            # cache-hit path — step-up runs a full browser+callback flow, the case
+            # most exposed to AS mix-up. Without the flag the missing-iss
+            # MUST-reject would silently no-op precisely here (#3 round20); the
+            # iss MISMATCH check needs only the rehydrated issuer.
             issuer=cached.issuer,
+            iss_parameter_supported=cached.iss_parameter_supported,
         )
     else:
         # Mirror ensure_token's discovery (the _probe_www_authenticate call

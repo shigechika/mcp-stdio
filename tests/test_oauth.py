@@ -1467,6 +1467,23 @@ class TestTokenResponseToData:
         with pytest.raises(RuntimeError, match="access_token"):
             _token_response_to_data({"token_type": "Bearer"}, self.META, "cid", None)
 
+    def test_persists_iss_parameter_supported_from_metadata(self):
+        """#3(round20): the RFC 9207 §3 flag from the discovered metadata is
+        written into TokenData so a later step-up can rehydrate it. A round-trip
+        through save/load preserves it."""
+        meta = OAuthMetadata(
+            authorization_endpoint="https://ex.com/auth",
+            token_endpoint="https://ex.com/token",
+            iss_parameter_supported=True,
+        )
+        data = _token_response_to_data({"access_token": "at"}, meta, "cid", None)
+        assert data.iss_parameter_supported is True
+        # Default (metadata flag absent) stays False.
+        plain = _token_response_to_data(
+            {"access_token": "at"}, self.META, "cid", None
+        )
+        assert plain.iss_parameter_supported is False
+
     def test_full_response(self):
         raw = {
             "access_token": "at",
@@ -2725,7 +2742,12 @@ class TestStepUpAuthorize:
         monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", fake_open)
 
     def _cached_token(
-        self, tmp_path, monkeypatch, *, scope: str | None = None
+        self,
+        tmp_path,
+        monkeypatch,
+        *,
+        scope: str | None = None,
+        iss_parameter_supported: bool = False,
     ) -> None:
         store_file = tmp_path / "tokens.json"
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
@@ -2743,8 +2765,43 @@ class TestStepUpAuthorize:
                 token_endpoint="https://example.com/token",
                 authorization_endpoint="https://example.com/authorize",
                 registration_endpoint="https://example.com/register",
+                issuer="https://example.com",
+                iss_parameter_supported=iss_parameter_supported,
             ),
         )
+
+    def test_cache_hit_rehydrates_iss_support_and_rejects_missing_iss(
+        self, tmp_path, monkeypatch
+    ):
+        """#3(round20): when the cached token records iss_parameter_supported,
+        the step-up cache-hit path rehydrates the RFC 9207 §3 flag so the §2.4
+        missing-iss MUST-reject fires. The callback omits iss, so step-up must
+        abort with 'issuer missing' rather than silently accepting it."""
+        self._cached_token(
+            tmp_path, monkeypatch, scope="mcp:connect", iss_parameter_supported=True
+        )
+        self._drive_callback(monkeypatch)  # the callback omits the iss parameter
+        client = httpx.Client()
+        with pytest.raises(RuntimeError, match="issuer missing"):
+            step_up_authorize(self.SERVER_URL, client, "hr:read", timeout=5)
+
+    def test_cache_hit_without_iss_support_accepts_missing_iss(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """The counterpart: a cached token that did NOT record iss support still
+        accepts a callback without iss (present-only check) — the flag defaults
+        False and the step-up proceeds."""
+        self._cached_token(
+            tmp_path, monkeypatch, scope="mcp:connect", iss_parameter_supported=False
+        )
+        httpx_mock.add_response(
+            url="https://example.com/token",
+            json={"access_token": "upgraded_at", "expires_in": 3600},
+        )
+        self._drive_callback(monkeypatch)
+        client = httpx.Client()
+        data = step_up_authorize(self.SERVER_URL, client, "hr:read", timeout=5)
+        assert data.access_token == "upgraded_at"
 
     def test_scope_is_union_of_cached_and_required(
         self, tmp_path, monkeypatch, httpx_mock
