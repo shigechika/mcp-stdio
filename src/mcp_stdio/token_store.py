@@ -559,7 +559,11 @@ def _write_store(data: dict[str, Any]) -> None:
     # directory fsync, and opening a directory fails on Windows — neither should
     # fail the write.
     try:
-        dir_fd = os.open(str(_STORE_DIR), os.O_RDONLY | _O_NOFOLLOW)
+        # _O_NONBLOCK for consistency with every other os.open in this file
+        # (#5 round33). Harmless on a directory (a dir open never blocks), but
+        # it keeps the defensive open discipline uniform so a future copy of
+        # this pattern does not omit it where it DOES matter (FIFO at a path).
+        dir_fd = os.open(str(_STORE_DIR), os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK)
         try:
             os.fsync(dir_fd)
         finally:
