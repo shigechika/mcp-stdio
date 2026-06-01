@@ -3853,6 +3853,51 @@ class TestDeviceAuthorizationFlow:
         assert data.refresh_token == "ref"
         assert data.client_id == "cid"
 
+    def test_preserves_requested_scope_when_omitted(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """#4(round15): a device-flow token response that OMITS scope (RFC 6749
+        §5.1) must keep the requested scope in the stored TokenData — mirrors the
+        auth-code / refresh paths."""
+        self._patch_store(tmp_path, monkeypatch)
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        # Token response deliberately omits "scope".
+        httpx_mock.add_response(
+            url=TOKEN_URL, json={"access_token": "acc", "token_type": "Bearer"}
+        )
+
+        client = httpx.Client()
+        data = _run_device_authorization_flow(
+            MCP_URL,
+            client,
+            metadata=_device_meta(),
+            cached=None,
+            scope="read write",
+        )
+        assert data.scope == "read write"
+
+    def test_poll_non_json_error_body_raises_http_error(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """#7(round15): a poll response with a non-JSON error body must surface a
+        clean HTTP error via raise_for_status, not crash on .json()."""
+        self._patch_store(tmp_path, monkeypatch)
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        # Poll → 400 with an HTML (non-JSON) body.
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            status_code=400,
+            headers={"content-type": "text/html"},
+            text="<html><body>Bad Request</body></html>",
+        )
+        client = httpx.Client()
+        with pytest.raises(httpx.HTTPStatusError):
+            _run_device_authorization_flow(
+                MCP_URL, client, metadata=_device_meta(), cached=None
+            )
+
     def test_explicit_client_id_skips_dcr(self, httpx_mock, tmp_path, monkeypatch):
         """#7(round14): with an explicit --client-id (client_id_override) the
         device flow uses it directly — no DCR /register POST — and the
