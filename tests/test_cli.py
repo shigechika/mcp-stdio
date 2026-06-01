@@ -206,6 +206,37 @@ class TestMain:
             main()
         assert mock_ensure.call_args.kwargs["refresh_leeway"] == 300.0
 
+    def test_oauth_timeout_default_and_flag(self):
+        """#13(round25): the interactive-OAuth wait is configurable via
+        --oauth-timeout (default 120) and propagated to ensure_token(timeout=)."""
+        # Default.
+        with (
+            patch("sys.argv", ["mcp-stdio", "--oauth", "https://example.com/mcp"]),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        assert mock_ensure.call_args.kwargs["timeout"] == 120.0
+        # Custom flag.
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--oauth",
+                    "--oauth-timeout",
+                    "300",
+                    "https://example.com/mcp",
+                ],
+            ),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        assert mock_ensure.call_args.kwargs["timeout"] == 300.0
+
     def test_oauth_refresh_leeway_env_var(self, monkeypatch):
         """#56: MCP_OAUTH_REFRESH_LEEWAY env var is respected when flag absent."""
         monkeypatch.setenv("MCP_OAUTH_REFRESH_LEEWAY", "120")

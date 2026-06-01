@@ -31,8 +31,8 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
     - §3.3 `resource` field validation — warn on mismatch, continue
     - §5.1 `WWW-Authenticate: Bearer resource_metadata=` hint — probes the server before discovery so servers that publish PRM at a non-standard URL are found without well-known path guessing
   - [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) Authorization Server Metadata
-    - §3 well-known URL construction, including path insertion for issuers with path components
-    - §3 `issuer` validation — warn on mismatch, continue
+    - §3.1 well-known URL construction, including path insertion for issuers with path components
+    - §3.3 `issuer` validation — warn on mismatch, continue
   - [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) Resource Indicators
     - §2 `resource` parameter in authorization, token exchange, **and refresh** requests
   - [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) PKCE
