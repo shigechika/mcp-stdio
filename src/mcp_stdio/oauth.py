@@ -908,6 +908,12 @@ def _make_callback_handler(
 
             if "error" in params:
                 result.error = params["error"][0]
+                # Capture state on the error branch too (#1 round35) so the flow
+                # can bind an error response to the CSRF state before acting on
+                # it. RFC 6749 §4.1.2.1 requires a compliant AS to echo `state`
+                # on error responses; an error callback WITHOUT the matching
+                # state is an unauthenticated abort attempt, not a real AS error.
+                result.state = params.get("state", [None])[0]
             elif "code" in params:
                 result.auth_code = params["code"][0]
                 result.state = params.get("state", [None])[0]
@@ -1406,16 +1412,23 @@ def _run_authorization_flow(
         done.set()
         callback_server.server_close()
 
-    if cb_result.error:
-        raise RuntimeError(f"OAuth error: {_sanitize_oauth_error(cb_result.error)}")
-
+    # Validate state BEFORE acting on EITHER a code or an error (#1 round35).
     # Use a constant-time comparison so the rejection path does not leak the
-    # common-prefix length of the two state tokens via timing. Over a
-    # loopback callback the attack is theoretical, but every mainstream
-    # OAuth client does this and the line carries a CSRF-facing comment —
-    # we want it to hold up to scrutiny without caveats. See #26.
+    # common-prefix length of the two state tokens via timing. Over a loopback
+    # callback the attack is theoretical, but every mainstream OAuth client does
+    # this and the line carries a CSRF-facing comment — we want it to hold up to
+    # scrutiny without caveats. See #26. Checking state FIRST also binds the
+    # ERROR path: an unauthenticated local process (or a port-guessing page) that
+    # hits /callback?error=... during the auth window to GRIEF the flow does not
+    # carry the matching state, so it is rejected here as a CSRF mismatch instead
+    # of aborting the flow with an attacker-chosen error. A compliant AS echoes
+    # `state` on error responses (RFC 6749 §4.1.2.1), so a legitimate error still
+    # passes this and surfaces just below.
     if not secrets.compare_digest(cb_result.state or "", state):
         raise RuntimeError("OAuth state mismatch — possible CSRF attack")
+
+    if cb_result.error:
+        raise RuntimeError(f"OAuth error: {_sanitize_oauth_error(cb_result.error)}")
 
     # RFC 9207 §2.4: if the authorization response carries an `iss` parameter,
     # the client MUST validate it against the issuer the metadata was fetched
