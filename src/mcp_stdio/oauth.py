@@ -876,6 +876,13 @@ def _make_callback_handler(
             if result.auth_code is not None or result.error is not None:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html")
+                # #6 (round32): the callback URL carries the auth code/state, so
+                # no-store keeps the browser from caching the response and
+                # no-referrer keeps any (future) sub-resource from leaking the
+                # URL via the Referer header. The page has no sub-resources
+                # today, so this is defense-in-depth / standard callback hygiene.
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Referrer-Policy", "no-referrer")
                 self.end_headers()
                 self.wfile.write(
                     b"<h1>Already received</h1><p>You can close this tab.</p>"
@@ -891,6 +898,8 @@ def _make_callback_handler(
 
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
+            self.send_header("Cache-Control", "no-store")  # #6 (round32)
+            self.send_header("Referrer-Policy", "no-referrer")
             self.end_headers()
 
             if result.error:

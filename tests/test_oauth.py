@@ -1913,6 +1913,35 @@ class TestCallbackServer:
         assert cb_result.auth_code == "test_code_123"
         assert cb_result.state == "test_state"
 
+    def test_callback_response_has_security_headers(self):
+        """#6(round32): the callback page sets Cache-Control: no-store and
+        Referrer-Policy: no-referrer — defense-in-depth, since the callback URL
+        carries the auth code/state."""
+        cb_result = CallbackResult()
+        handler_cls = _make_callback_handler(cb_result)
+
+        from http.server import HTTPServer
+
+        server = HTTPServer(("127.0.0.1", 0), handler_cls)
+        port = server.server_address[1]
+        done = threading.Event()
+
+        def serve():
+            while not done.is_set():
+                server.handle_request()
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        time.sleep(0.3)
+
+        resp = httpx.get(f"http://127.0.0.1:{port}/callback?code=c&state=s")
+
+        done.set()
+        server.server_close()
+
+        assert resp.headers.get("cache-control") == "no-store"
+        assert resp.headers.get("referrer-policy") == "no-referrer"
+
     def test_bare_callback_hit_does_not_render_success(self):
         """#2(round21): a /callback hit carrying neither code nor error (a
         browser prefetch, a manual GET) captured nothing — the page must NOT say
