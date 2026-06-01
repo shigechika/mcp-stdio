@@ -32,7 +32,7 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
     - §5.1 `WWW-Authenticate: Bearer resource_metadata=` hint — probes the server before discovery so servers that publish PRM at a non-standard URL are found without well-known path guessing
   - [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) Authorization Server Metadata
     - §3.1 well-known URL construction, including path insertion for issuers with path components
-    - §3.3 `issuer` validation — warn on mismatch, continue
+    - §3.3 `issuer` validation — reject a cross-origin issuer (AS mix-up guard), warn on a same-origin mismatch (trailing slash / path / case) and continue
   - [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) Resource Indicators
     - §2 `resource` parameter in authorization, token exchange, **and refresh** requests
   - [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) PKCE
@@ -190,6 +190,10 @@ Options:
   --oauth-refresh-leeway SECONDS
                          Proactively refresh tokens this many seconds before
                          expiry (default: 60, or MCP_OAUTH_REFRESH_LEEWAY)
+  --oauth-timeout SECONDS
+                         Seconds to wait for the interactive OAuth flow (browser
+                         callback / device-code confirmation) before giving up
+                         (default: 120; OAuth only)
   --no-resource-indicator
                          Omit the RFC 8707 resource parameter from all OAuth
                          requests. Required for AS that reject it, such as
