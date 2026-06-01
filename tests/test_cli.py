@@ -877,6 +877,11 @@ class TestBuildScopeUpgrader:
         assert out["Authorization"] == "Bearer upgraded"
         assert out["X-Base"] == "1"
         assert _SpyClient.instances[-1].closed
+        # #11(round19): the RFC 9470 step-up path carries the same credential-leak
+        # exposure as refresh, so its client must pin follow_redirects=False too
+        # (an AS-controlled token endpoint could otherwise 302 the credential POST
+        # to a cleartext / cross-origin host). Symmetric with the refresher test.
+        assert _SpyClient.instances[-1].kwargs.get("follow_redirects") is False
 
     def test_returns_none_when_step_up_raises_and_closes(self, monkeypatch, capsys):
         _SpyClient.instances.clear()
