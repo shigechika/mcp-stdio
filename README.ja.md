@@ -47,7 +47,7 @@ Bearer token、カスタムヘッダー、OAuth 2.1 認証情報をリモート�
   - [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) Bearer Token の利用
     - §2.1 `Authorization: Bearer <token>` リクエストヘッダー
 - **バックオフ付きリトライ** — 接続エラー時に最大3回リトライ
-- **HTTP 429 対応** — `Retry-After`（delta-seconds または HTTP-date）を 60 秒上限で尊重し、上限超過時は 429 をクライアントに返して判断を委ねる（cf. modelcontextprotocol/typescript-sdk#1892）
+- **HTTP 429 / 503 対応** — `Retry-After`（delta-seconds または HTTP-date）を 60 秒上限で尊重する。対象は仕様上 `Retry-After` を伴う 429（Too Many Requests）と 503（Service Unavailable）の 2 つ（RFC 9110 §10.2.3）。上限超過時はステータスをクライアントに返して判断を委ねる（cf. modelcontextprotocol/typescript-sdk#1892）
 - **自動ページネーション** — `tools/list` / `resources/list` / `resources/templates/list` / `prompts/list` の `nextCursor` を透過的に追従して 1 つのレスポンスにマージ。先頭以降のページを取りこぼすクライアントでも全件を受け取れる（cf. anthropics/claude-code#39586）
 - **ストリーミング耐性** — SSE レスポンスをリアルタイムで転送、ストリーム切断時に自動再接続
 - **行区切り文字の安全化** — 上流レスポンス中の生の `U+2028` / `U+2029`（JSON では合法だが JavaScript の行終端文字）をエスケープし、これらを改行として扱うクライアントによるフレーム崩れを防止。ロスレス（cf. modelcontextprotocol/typescript-sdk#2155）

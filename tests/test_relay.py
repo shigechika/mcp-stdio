@@ -1437,7 +1437,9 @@ class TestRun:
         assert result["error"]["message"] == "authentication failed"
         assert result["id"] == 1
 
-    @pytest.mark.parametrize("status_code", [400, 404, 409, 422, 500, 502, 503, 504])
+    # 429 and 503 are excluded: both are Retry-After carriers the relay
+    # retries (see the dedicated 503 tests below), not unrecoverable codes.
+    @pytest.mark.parametrize("status_code", [400, 404, 409, 422, 500, 502, 504])
     def test_unhandled_error_status_surfaces_jsonrpc_error(
         self, httpx_mock, status_code
     ):
@@ -2964,6 +2966,73 @@ class TestCheckConnectionSse:
             check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
             is False
         )
+
+    def test_sse_post_non_2xx_reports_post_failure(self, httpx_mock, capsys):
+        """#6(round15): the endpoint POST returning a non-2xx sets post_error,
+        the helper closes the stream, and the probe reports the POST failure
+        (not a generic 'stream ended') and returns False."""
+        post_attempted = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sid=abc\n\n"
+            # Hold the stream open until the POST has been attempted, then give
+            # the helper a beat to record post_error before the stream ends.
+            post_attempted.wait(timeout=3)
+            time.sleep(0.1)
+
+        httpx_mock.add_response(
+            url=self.SSE_URL,
+            method="GET",
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        def on_post(request: httpx.Request) -> httpx.Response:
+            post_attempted.set()
+            return httpx.Response(status_code=500)
+
+        httpx_mock.add_callback(
+            on_post, url="https://example.com/messages?sid=abc"
+        )
+
+        assert (
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
+            is False
+        )
+        err = capsys.readouterr().err
+        assert "POST to SSE endpoint failed" in err
+        assert "HTTP 500" in err
+
+    def test_sse_post_raises_reports_post_failure(self, httpx_mock, capsys):
+        """#6(round15): the endpoint POST raising a transport error is caught in
+        the helper (str(e) → post_error) and surfaced as a POST failure → False."""
+        post_attempted = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sid=abc\n\n"
+            post_attempted.wait(timeout=3)
+            time.sleep(0.1)
+
+        httpx_mock.add_response(
+            url=self.SSE_URL,
+            method="GET",
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        def on_post(request: httpx.Request) -> httpx.Response:
+            post_attempted.set()
+            raise httpx.ConnectError("connection refused", request=request)
+
+        httpx_mock.add_callback(
+            on_post, url="https://example.com/messages?sid=abc"
+        )
+
+        assert (
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
+            is False
+        )
+        assert "POST to SSE endpoint failed" in capsys.readouterr().err
 
     def test_sse_cross_origin_endpoint_refused_with_credentials(
         self, httpx_mock, capsys
@@ -4950,6 +5019,54 @@ class TestRunSseCancelFilter:
 
         assert "kept" in stdout.getvalue()
 
+    def test_sse_reader_escapes_raw_line_separators_end_to_end(self, httpx_mock):
+        """#13(round15): a message event whose JSON payload contains a RAW
+        U+2028/U+2029 must reach stdout in escaped \\uXXXX form. Proves the
+        reader-thread reply path runs through _emit's escape, not just the
+        unit-tested _emit — a client framing on these chars can't mis-split."""
+        # Raw separators sit inside a JSON string value (legal unescaped per
+        # RFC 8259) — the gateway must escape them on the wire regardless.
+        payload = '{"jsonrpc":"2.0","result":{"t":"a\u2028b\u2029c"},"id":31}'
+        post_received = threading.Event()
+        release_stdin = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=abc\n\n"
+            post_received.wait(timeout=3)
+            yield f"event: message\ndata: {payload}\n\n".encode()
+            time.sleep(0.1)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        def on_post(request: httpx.Request) -> httpx.Response:
+            post_received.set()
+            return httpx.Response(status_code=202)
+
+        httpx_mock.add_callback(
+            on_post,
+            url="https://example.com/messages?sessionId=abc",
+        )
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"tools/call","id":31}',
+            release_stdin,
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {"Content-Type": "application/json"})
+
+        out = stdout.getvalue()
+        assert "\u2028" not in out and "\u2029" not in out
+        assert "\\u2028" in out and "\\u2029" in out
+        # Lossless: the escaped line still parses back to the original value.
+        line = next(x for x in out.splitlines() if x and "31" in x)
+        assert json.loads(line)["result"]["t"] == "a\u2028b\u2029c"
+
     def test_sse_id_reuse_supersedes_cancel(self, httpx_mock):
         """#19: a request REUSING a previously-cancelled id supersedes the
         cancel (tracker.discard), so its later SSE response is DELIVERED, not
@@ -5218,6 +5335,81 @@ class TestRun429Retry:
         assert len(httpx_mock.get_requests()) == 3
 
 
+class TestRun503Retry:
+    """503 Service Unavailable is a Retry-After carrier (RFC 9110 §10.2.3 /
+    §15.6.4), so the relay backs-off-and-retries it exactly like 429 — a 503
+    means the request was not processed, so replaying the POST is safe."""
+
+    URL = "https://example.com/mcp"
+
+    def _run_with_stdin(self, httpx_mock, stdin_lines, **kwargs):
+        stdin_data = "\n".join(stdin_lines) + "\n"
+        stdout = StringIO()
+        with patch("sys.stdin", StringIO(stdin_data)), patch("sys.stdout", stdout):
+            run(self.URL, {"Content-Type": "application/json"}, **kwargs)
+        return stdout.getvalue()
+
+    def test_503_with_retry_after_then_200(self, httpx_mock, monkeypatch):
+        """#2(round15): a 503 with Retry-After sleeps that long, then the
+        retried POST's 200 is delivered normally."""
+        slept: list[float] = []
+        monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
+
+        httpx_mock.add_response(
+            status_code=503, headers={"retry-after": "2"}, text=""
+        )
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"ok":true},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+
+        output = self._run_with_stdin(
+            httpx_mock, ['{"jsonrpc":"2.0","method":"tools/call","id":1}']
+        )
+        assert '"ok":true' in output
+        assert 2.0 in slept, f"expected a 2.0-second sleep, got {slept!r}"
+
+    def test_503_without_retry_after_uses_backoff_then_200(
+        self, httpx_mock, monkeypatch
+    ):
+        """A 503 with no Retry-After falls back to the same linear backoff as
+        429 / transient errors, then succeeds on retry."""
+        slept: list[float] = []
+        monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
+
+        httpx_mock.add_response(status_code=503, text="")  # no retry-after
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"ok":true},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+
+        output = self._run_with_stdin(
+            httpx_mock, ['{"jsonrpc":"2.0","method":"tools/call","id":1}']
+        )
+        assert '"ok":true' in output
+        assert 1.0 in slept  # RETRY_DELAY * 1
+
+    def test_503_over_cap_surfaces_retry_after_in_error_data(
+        self, httpx_mock, monkeypatch
+    ):
+        """A 503 whose Retry-After exceeds the cap gives up immediately and
+        surfaces HTTP 503 with error.data.retryAfter — mirroring 429."""
+        slept: list[float] = []
+        monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
+
+        httpx_mock.add_response(
+            status_code=503, headers={"retry-after": "120"}, text=""
+        )
+        output = self._run_with_stdin(
+            httpx_mock, ['{"jsonrpc":"2.0","method":"tools/call","id":1}']
+        )
+        err = json.loads(output.strip())
+        assert err["id"] == 1 and "503" in err["error"]["message"]
+        assert err["error"]["data"]["retryAfter"] == 120.0
+        assert slept == [], f"expected no sleep for over-cap, got {slept!r}"
+        assert len(httpx_mock.get_requests()) == 1
+
+
 class TestRunSse429Retry:
     URL = "https://example.com/sse"
 
@@ -5374,6 +5566,104 @@ class TestRunSse429Retry:
         )
 
 
+class TestRunSse503Retry:
+    """The legacy SSE POST path treats 503 like 429 too (#2 round15)."""
+
+    URL = "https://example.com/sse"
+
+    def test_503_with_retry_after_then_202(self, httpx_mock, monkeypatch):
+        slept: list[float] = []
+        monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
+
+        release_stdin = threading.Event()
+        post_done = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=abc\n\n"
+            post_done.wait(timeout=3)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        posts: list[int] = []
+
+        def on_post(request: httpx.Request) -> httpx.Response:
+            posts.append(len(posts) + 1)
+            if len(posts) == 1:
+                return httpx.Response(status_code=503, headers={"retry-after": "3"})
+            post_done.set()
+            return httpx.Response(status_code=202)
+
+        httpx_mock.add_callback(
+            on_post,
+            url="https://example.com/messages?sessionId=abc",
+            is_reusable=True,
+        )
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}',
+            release_stdin,
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {"Content-Type": "application/json"})
+
+        assert 3.0 in slept, f"expected a 3.0-second sleep, got {slept!r}"
+        assert len(posts) == 2
+
+    def test_503_over_cap_surfaces_retry_after_in_error_data(
+        self, httpx_mock, monkeypatch
+    ):
+        slept: list[float] = []
+        monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
+
+        release_stdin = threading.Event()
+        post_seen = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=abc\n\n"
+            post_seen.wait(timeout=3)
+            release_stdin.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        posts: list[int] = []
+
+        def on_post(request: httpx.Request) -> httpx.Response:
+            posts.append(len(posts) + 1)
+            post_seen.set()
+            return httpx.Response(status_code=503, headers={"retry-after": "120"})
+
+        httpx_mock.add_callback(
+            on_post,
+            url="https://example.com/messages?sessionId=abc",
+            is_reusable=True,
+        )
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"tools/call","id":9}',
+            release_stdin,
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {"Content-Type": "application/json"})
+
+        assert slept == [], f"expected no sleep for over-cap, got {slept!r}"
+        assert len(posts) == 1
+        decoded = [json.loads(x) for x in stdout.getvalue().splitlines() if x]
+        match = [d for d in decoded if d.get("id") == 9 and "error" in d]
+        assert match and "503" in match[0]["error"]["message"]
+        assert match[0]["error"]["data"]["retryAfter"] == 120.0
+
+
 class TestPaginate429Retry:
     """_post_parsed (pagination path) honours Retry-After on 429 too."""
 
@@ -5432,3 +5722,49 @@ class TestPaginate429Retry:
         names = [t["name"] for t in merged["result"]["tools"]]
         assert names == ["t1", "t2"]
         assert "nextCursor" not in merged["result"]
+
+    def test_paginated_list_429_over_cap_surfaces_error_data(
+        self, httpx_mock, monkeypatch
+    ):
+        """#12(round15): a page-1 429 whose Retry-After exceeds the cap gives
+        up in _post_parsed and the pagination caller surfaces one JSON-RPC
+        error carrying error.data.retryAfter (the over-cap give-up branch)."""
+        slept: list[float] = []
+        monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
+
+        httpx_mock.add_response(
+            status_code=429, headers={"retry-after": "999999"}, text=""
+        )
+        output = self._run_with_stdin(
+            httpx_mock, ['{"jsonrpc":"2.0","id":1,"method":"tools/list"}']
+        )
+        err = json.loads(output.strip())
+        assert err["id"] == 1 and "429" in err["error"]["message"]
+        assert err["error"]["data"]["retryAfter"] == 999999.0
+        assert slept == [], f"expected no sleep for over-cap, got {slept!r}"
+        assert len(httpx_mock.get_requests()) == 1
+
+    def test_paginated_list_503_then_200(self, httpx_mock, monkeypatch):
+        """The pagination path honours 503 Retry-After too (#2 round15)."""
+        slept: list[float] = []
+        monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
+
+        httpx_mock.add_response(
+            status_code=503, headers={"retry-after": "2"}, text=""
+        )
+        httpx_mock.add_response(
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"tools": [{"name": "t1"}]},
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock, ['{"jsonrpc":"2.0","id":1,"method":"tools/list"}']
+        )
+        assert 2.0 in slept, f"expected a 2.0-second sleep, got {slept!r}"
+        merged = json.loads(output.strip())
+        assert [t["name"] for t in merged["result"]["tools"]] == ["t1"]
