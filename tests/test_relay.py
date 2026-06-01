@@ -35,6 +35,7 @@ from mcp_stdio.relay import (
     _parse_retry_after,
     _parse_www_authenticate_scope,
     _post_and_stream,
+    _reinitialize,
     _same_origin,
     _split_sse_text,
     _sse_reader_loop,
@@ -181,6 +182,12 @@ class TestExtractId:
         line = json.dumps({"jsonrpc": "2.0", "method": "init", "id": "abc"})
         assert _extract_id(line) == "abc"
 
+    def test_zero_id(self):
+        # id 0 is a VALID JSON-RPC id but falsy — the helper must return the int
+        # 0, not None, so the falsy-id regression class stays pinned at the leaf.
+        line = json.dumps({"jsonrpc": "2.0", "method": "init", "id": 0})
+        assert _extract_id(line) == 0
+
     def test_null_id(self):
         line = json.dumps({"jsonrpc": "2.0", "method": "init", "id": None})
         assert _extract_id(line) is None
@@ -209,6 +216,12 @@ class TestErrorResponse:
         assert result["error"]["code"] == -32000
         assert result["error"]["message"] == "something failed"
         assert result["id"] == 1
+
+    def test_zero_id(self):
+        # A 4xx error synthesized for a request with id 0 must echo 0, not null,
+        # so the client can correlate the response (falsy-id regression class).
+        result = json.loads(_error_response("err", req_id=0))
+        assert result["id"] == 0
 
     def test_null_id(self):
         result = json.loads(_error_response("err"))
@@ -908,6 +921,48 @@ class TestRun:
         # The 500's "bad-rotated" was NOT adopted — request 3 still sends "good".
         assert reqs[2].headers.get("mcp-session-id") == "good"
 
+    def test_unparseable_403_session_id_not_adopted_with_scope_upgrader(
+        self, httpx_mock
+    ):
+        """#1(round26): the pre-recovery 403 adoption gate must require a PARSEABLE
+        insufficient_scope challenge. A generic 403 (no scope param) that echoes a
+        rotated session id, while a scope_upgrader exists, must NOT adopt that id —
+        the step-up branch will not consume it, so adopting would poison the next
+        stdin line for nothing."""
+        # Line 1: 200 establishes session "good".
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json", "mcp-session-id": "good"},
+        )
+        # Line 2: 403 with a NON-insufficient_scope challenge (unparseable scope)
+        # that rotates the session id — must be ignored. No step-up retry fires.
+        httpx_mock.add_response(
+            status_code=403,
+            text="",
+            headers={
+                "content-type": "application/json",
+                "www-authenticate": 'Bearer error="invalid_token"',
+                "mcp-session-id": "bad-rotated",
+            },
+        )
+        # Line 3: 200 — must still carry "good", not "bad-rotated".
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":3}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","method":"init","id":1}',
+                '{"jsonrpc":"2.0","method":"call","id":2}',
+                '{"jsonrpc":"2.0","method":"call","id":3}',
+            ],
+            scope_upgrader=lambda _s: {"Authorization": "Bearer broader"},
+        )
+        reqs = httpx_mock.get_requests()
+        # The 403's "bad-rotated" was NOT adopted — request 3 still sends "good".
+        assert reqs[2].headers.get("mcp-session-id") == "good"
+
     def test_post_refresh_retry_terminal_error_session_id_not_adopted(
         self, httpx_mock
     ):
@@ -1153,6 +1208,48 @@ class TestRun:
         assert len(lines) == 2
         err = json.loads(lines[1])
         assert err["id"] == 2 and "error" in err
+
+    def test_reinitialize_strips_pinned_protocol_version_from_initialize(
+        self, httpx_mock
+    ):
+        """#3(round26): an operator-pinned `-H MCP-Protocol-Version` must NOT ride
+        the re-initialize's initialize POST (initialize IS the renegotiation),
+        mirroring the dispatch path's strip. The post-initialize
+        notifications/initialized DOES carry the freshly negotiated version."""
+        # initialize -> 200, negotiates a NEW version and assigns a session.
+        httpx_mock.add_response(
+            text=(
+                '{"jsonrpc":"2.0","id":0,"result":'
+                '{"protocolVersion":"2025-06-18"}}'
+            ),
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "sess-new",
+            },
+        )
+        # notifications/initialized -> 202.
+        httpx_mock.add_response(status_code=202, text="")
+
+        with httpx.Client() as client:
+            new_session_id, negotiated = _reinitialize(
+                client,
+                "https://example.com/mcp",
+                {
+                    "Content-Type": "application/json",
+                    "MCP-Protocol-Version": "2024-11-05",
+                },
+                "2024-11-05",
+            )
+
+        assert new_session_id == "sess-new"
+        assert negotiated == "2025-06-18"
+        reqs = httpx_mock.get_requests()
+        # The initialize POST (req 0) dropped the pinned header...
+        assert "mcp-protocol-version" not in {
+            k.lower() for k in reqs[0].headers.keys()
+        }
+        # ...while notifications/initialized (req 1) carries the negotiated value.
+        assert reqs[1].headers.get("mcp-protocol-version") == "2025-06-18"
 
     def test_reinitialize_failure_returns_error(self, httpx_mock):
         """If the post-404 re-initialize fails, we surface a JSON-RPC error
