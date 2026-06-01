@@ -586,6 +586,19 @@ class TestIterSseEvents:
     def test_event_without_data_not_dispatched(self):
         assert list(_iter_sse_events(["event:message", ""])) == []
 
+    def test_empty_data_value_not_dispatched(self):
+        """#2(round14): WHATWG suppresses dispatch when the data buffer is the
+        empty string — a bare `data:` must not yield a ('message', '') event."""
+        assert list(_iter_sse_events(["data:", ""])) == []
+        # event type set but only an empty data line → still suppressed.
+        assert list(_iter_sse_events(["event: endpoint", "data:", ""])) == []
+        # A trailing unterminated empty-data event is likewise not dispatched.
+        assert list(_iter_sse_events(["data:"])) == []
+
+    def test_nonempty_after_empty_data_lines_dispatched(self):
+        """Mixed empty + non-empty data lines still dispatch (buffer non-empty)."""
+        assert list(_iter_sse_events(["data:", "data:x", ""])) == [("message", "\nx")]
+
     def test_leading_bom_stripped(self):
         """#2(round13): WHATWG SSE stream-decode removes ONE leading U+FEFF BOM.
         A BOM-prefixed first line must still parse as its real field, so the

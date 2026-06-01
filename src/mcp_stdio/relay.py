@@ -641,8 +641,13 @@ def _iter_sse_events(lines: Iterable[str]) -> Iterator[tuple[str, str]]:
             if line[:1] == "\ufeff":
                 line = line[1:]
         if line == "":
-            if data_lines:
-                yield event_type, "\n".join(data_lines)
+            # WHATWG "dispatch the event": if the data buffer is the empty
+            # string the event is NOT dispatched. Gate on the joined buffer, not
+            # list non-emptiness — a bare ``data:`` appends "" yet must not
+            # produce a ('message', '') event a strict decoder never would.
+            data = "\n".join(data_lines)
+            if data:
+                yield event_type, data
             event_type = "message"
             data_lines = []
             continue
@@ -655,8 +660,9 @@ def _iter_sse_events(lines: Iterable[str]) -> Iterator[tuple[str, str]]:
             event_type = value
         elif field == "data":
             data_lines.append(value)
-    if data_lines:
-        yield event_type, "\n".join(data_lines)
+    data = "\n".join(data_lines)
+    if data:
+        yield event_type, data
 
 
 def _post_and_stream(
