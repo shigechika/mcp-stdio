@@ -238,6 +238,23 @@ class TestLoadSaveDelete:
         # One-shot: the warning line appears exactly once across both reads.
         assert err.count("corrupt JSON") == 1
 
+    @pytest.mark.parametrize("body", ["[]", "42", '"foo"', "null", "[1, 2, 3]"])
+    def test_non_object_store_warns_and_degrades_to_empty(
+        self, tmp_path, monkeypatch, capsys, body
+    ):
+        """#L3(round40): a token store whose top-level JSON is valid but NOT an
+        object (a bare array / number / string / null) is unusable as a store and
+        overwrite-safe — it must surface the SAME one-shot warning as corrupt
+        JSON, not silently degrade to {} with only an unexplained re-auth."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+        monkeypatch.setattr("mcp_stdio.token_store._warned_corrupt_store", False)
+
+        store_file.write_text(body)
+        assert load_token("https://example.com/mcp") is None
+        assert "non-object JSON top level" in capsys.readouterr().err
+
     @pytest.mark.skipif(
         sys.platform == "win32" or not hasattr(os, "mkfifo"),
         reason="os.mkfifo is POSIX-only",

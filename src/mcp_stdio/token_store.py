@@ -459,6 +459,27 @@ class _StoreUnreadable(Exception):
     """
 
 
+def _warn_unusable_store_once(detail: str) -> None:
+    """Emit a one-shot stderr warning that the token store is unusable.
+
+    Covers both genuinely corrupt JSON and a valid-but-non-object top level
+    (e.g. ``[]`` / ``42`` / ``null``) — both are equally unusable as a token
+    store and overwrite-safe (the next save replaces them), so they must surface
+    the SAME operator signal instead of one silently degrading to ``{}`` (#L3
+    round40). The ``_warned_corrupt_store`` flag keeps it to one line per process
+    across repeated reads; ``detail`` names the specific cause.
+    """
+    global _warned_corrupt_store
+    if not _warned_corrupt_store:
+        _warned_corrupt_store = True
+        print(
+            f"mcp-stdio: warning: token store {_STORE_FILE} {detail}; treating "
+            f"it as empty (cached tokens, if any, are unrecoverable and need "
+            f"re-auth). It is replaced on the next save.",
+            file=sys.stderr,
+        )
+
+
 def _read_store(*, for_write: bool = False) -> dict[str, Any]:
     """Read the token store file.
 
@@ -551,21 +572,21 @@ def _read_store(*, for_write: bool = False) -> dict[str, Any]:
         # Fire on BOTH paths now (#L8 round39): a read-only invocation
         # (load_token -> _read_store with for_write=False) otherwise gives the
         # operator zero signal — just an unexplained re-auth — until some later
-        # save happens to reach the write path. The one-shot _warned_corrupt_store
-        # flag keeps it to a single line per process, and the wording covers both
-        # outcomes (read-as-empty now, replaced on the next save).
-        global _warned_corrupt_store
-        if not _warned_corrupt_store:
-            _warned_corrupt_store = True
-            print(
-                f"mcp-stdio: warning: token store {_STORE_FILE} contains "
-                f"corrupt JSON; treating it as empty (cached tokens, if any, were "
-                f"already unparseable and need re-auth). It is replaced on the "
-                f"next save.",
-                file=sys.stderr,
-            )
+        # save happens to reach the write path.
+        _warn_unusable_store_once("contains corrupt JSON")
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        # Valid JSON but NOT an object (e.g. a bare array / number / string /
+        # null) is just as unusable as a token store as corrupt JSON, and the
+        # next save clobbers it the same overwrite-safe way — so surface it with
+        # the SAME one-shot warning instead of the silent {} that left the
+        # operator with only an unexplained re-auth (#L3 round40, completing the
+        # read-path visibility of #L8 round39).
+        _warn_unusable_store_once(
+            f"holds a non-object JSON top level ({type(data).__name__})"
+        )
+        return {}
+    return data
 
 
 def _write_store(data: dict[str, Any]) -> None:
