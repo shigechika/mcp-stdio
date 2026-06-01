@@ -175,10 +175,20 @@ def _migrate_legacy_store() -> None:
             if _STORE_FILE.exists() or not _LEGACY_STORE_FILE.exists():
                 pass  # another process won the migration race — leave it intact
             else:
+                # Read the legacy file via O_NOFOLLOW like every other read in
+                # this module, so a symlink swapped in at the legacy path cannot
+                # redirect the copy-through to read an attacker-chosen file.
+                data = None
                 try:
-                    data = json.loads(_LEGACY_STORE_FILE.read_text())
-                except (json.JSONDecodeError, OSError):
-                    data = None
+                    fd = os.open(_LEGACY_STORE_FILE, os.O_RDONLY | _O_NOFOLLOW)
+                except OSError:
+                    fd = None
+                if fd is not None:
+                    try:
+                        with os.fdopen(fd, "r", encoding="utf-8") as f:
+                            data = json.loads(f.read())
+                    except (json.JSONDecodeError, OSError):
+                        data = None
                 # Never write an empty/failed read over the target.
                 if isinstance(data, dict) and data:
                     _write_store(data)
@@ -290,7 +300,12 @@ def _write_store(data: dict[str, Any]) -> None:
     # leaving only the documented os.replace last-writer-wins on the final file.
     uniq = f"{os.getpid()}.{threading.get_ident()}.{os.urandom(4).hex()}"
     tmp_path = _STORE_FILE.with_suffix(_STORE_FILE.suffix + f".tmp.{uniq}")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW
+    # O_EXCL: the random temp name should never pre-exist; if it somehow does
+    # (a stale temp or a planted file/symlink), fail rather than open/truncate
+    # it. With O_EXCL the kernel also refuses a symlink at the path, so the temp
+    # write can never be redirected. (O_NOFOLLOW is kept for platforms where it
+    # adds protection independent of O_EXCL.)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW
     fd = os.open(tmp_path, flags, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
     try:
         with os.fdopen(fd, "wb") as f:
@@ -399,6 +414,27 @@ def load_token(server_url: str) -> TokenData | None:
     if td.client_secret_expires_at is not None and not isinstance(
         td.client_secret_expires_at, (int, float)
     ):
+        return None
+    # The string fields are consumed via .split() (scope) or sent verbatim in
+    # request bodies / headers; a non-string value from a corrupted store would
+    # crash the OAuth path (e.g. cached.scope.split() on an int). Reject a
+    # type-broken value rather than propagate the crash.
+    for field in (
+        "token_type",
+        "refresh_token",
+        "scope",
+        "client_id",
+        "client_secret",
+        "token_endpoint",
+        "authorization_endpoint",
+        "registration_endpoint",
+        "issuer",
+        "token_endpoint_auth_method",
+    ):
+        value = getattr(td, field)
+        if value is not None and not isinstance(value, str):
+            return None
+    if not isinstance(td.no_resource_indicator, bool):
         return None
     return td
 

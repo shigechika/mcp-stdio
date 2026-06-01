@@ -201,6 +201,30 @@ class TestLoadSaveDelete:
         )
         assert load_token("https://example.com/mcp") is None
 
+    def test_load_non_string_scope_returns_none(self, tmp_path, monkeypatch):
+        """#6(round13): a non-string scope (corrupted store) must degrade to None
+        — otherwise cached.scope.split() crashes the step-up path."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        store_file.write_text(
+            '{"https://example.com/mcp": {"access_token": "t", "scope": 123}}'
+        )
+        assert load_token("https://example.com/mcp") is None
+
+    def test_load_non_string_token_endpoint_returns_none(self, tmp_path, monkeypatch):
+        """A non-string endpoint/credential field likewise degrades to None."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        store_file.write_text(
+            '{"https://example.com/mcp": '
+            '{"access_token": "t", "token_endpoint": ["x"]}}'
+        )
+        assert load_token("https://example.com/mcp") is None
+
     def test_save_over_corrupt_store_succeeds(self, tmp_path, monkeypatch):
         """A corrupt store file is replaced (not appended to) on the next save."""
         store_file = tmp_path / "tokens.json"
