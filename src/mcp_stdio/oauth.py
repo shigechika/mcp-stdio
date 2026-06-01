@@ -6,6 +6,7 @@ import base64
 import hashlib
 import html
 import ipaddress
+import math
 import re
 import secrets
 import sys
@@ -980,6 +981,25 @@ def _make_callback_handler(
                 self.end_headers()
                 return
 
+            # Reject a Host header that is not the loopback callback (#5 round42):
+            # DNS-rebinding defense-in-depth (RFC 8252 §8.x native-app guidance).
+            # The server binds 127.0.0.1, so a legitimate browser redirect carries
+            # ``Host: 127.0.0.1:<port>`` (or localhost). A hostile page that rebound
+            # a hostname it controls to 127.0.0.1 to reach this callback would carry
+            # that hostname in Host; refuse it. The captured code is single-use and
+            # useless without the in-process PKCE verifier, so this only closes the
+            # class at negligible cost. Parse via urlparse("//host") so an IPv6
+            # ``[::1]:port`` / a portless Host / case are handled uniformly.
+            host_header = self.headers.get("Host", "")
+            try:
+                host_only = urlparse(f"//{host_header}").hostname
+            except ValueError:
+                host_only = None
+            if host_only not in ("127.0.0.1", "localhost", "::1"):
+                self.send_response(404)
+                self.end_headers()
+                return
+
             params = parse_qs(parsed.query)
 
             # Single-shot capture: once the first authorization response is
@@ -1002,18 +1022,27 @@ def _make_callback_handler(
                 )
                 return
 
+            # Write ordering matters (#4 round42): the main loop gates on
+            # ``cb_result.auth_code or cb_result.error`` and, the instant it
+            # observes either, breaks out and reads ``cb_result.state`` for the
+            # CSRF compare. CallbackResult is lock-free, so the CSRF-relevant
+            # fields (state / iss) MUST be stored BEFORE the gating field —
+            # otherwise a GIL switch between two separate attribute stores lets
+            # the main thread observe auth_code set while state is still None and
+            # spuriously fail the state compare (fails closed, but wrongly). Set
+            # the gating field LAST in each branch.
             if "error" in params:
-                result.error = params["error"][0]
                 # Capture state on the error branch too (#1 round35) so the flow
                 # can bind an error response to the CSRF state before acting on
                 # it. RFC 6749 §4.1.2.1 requires a compliant AS to echo `state`
                 # on error responses; an error callback WITHOUT the matching
                 # state is an unauthenticated abort attempt, not a real AS error.
                 result.state = params.get("state", [None])[0]
+                result.error = params["error"][0]  # gating field — set LAST
             elif "code" in params:
-                result.auth_code = params["code"][0]
                 result.state = params.get("state", [None])[0]
                 result.iss = params.get("iss", [None])[0]
+                result.auth_code = params["code"][0]  # gating field — set LAST
 
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -1284,12 +1313,22 @@ def _token_response_to_data(
         # FRESHLY obtained token as already expired and immediately re-refresh /
         # re-run the whole flow instead of using it once. Treat it as "no expiry
         # advertised" (expires_at = None) and warn, rather than burning the token.
-        if expires_in is not None and expires_in > 0:
+        # #6 (round42): also reject a NON-FINITE expires_in. json.loads parses the
+        # non-standard literals Infinity / NaN by default, and `float("inf") > 0`
+        # is True — so without isfinite a hostile/buggy AS sending
+        # `"expires_in": Infinity` would set expires_at = now + inf = inf, and
+        # ensure_token's `expires_at > now + leeway` would then ALWAYS be True,
+        # pinning the token as eternally fresh and suppressing every future
+        # refresh. Mirrors _safe_int's finiteness defence on the device-flow path
+        # (which catches the OverflowError int(inf) raises) and token_store's
+        # cached-expiry isfinite check.
+        if expires_in is not None and math.isfinite(expires_in) and expires_in > 0:
             expires_at = time.time() + expires_in
         elif expires_in is not None:
             log(
-                f"warning: ignoring non-positive expires_in ({expires_in!r}); "
-                f"treating the token as having no advertised expiry"
+                f"warning: ignoring non-finite/non-positive expires_in "
+                f"({expires_in!r}); treating the token as having no advertised "
+                f"expiry"
             )
 
     # `.get(default)` only substitutes when the key is ABSENT; a provider that

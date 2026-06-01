@@ -2044,6 +2044,22 @@ class TestTokenResponseToData:
         data = _token_response_to_data(raw, meta, "cid", None)
         assert data.expires_at is None
 
+    @pytest.mark.parametrize(
+        "bad", [float("inf"), float("-inf"), float("nan"), "Infinity", "NaN"]
+    )
+    def test_non_finite_expires_in_degrades_to_none(self, bad):
+        """#6(round42): a non-finite expires_in (json.loads parses Infinity/NaN by
+        default) must be treated as 'no expiry advertised', NOT set expires_at to
+        inf/nan. float('inf') > 0 is True, so without the isfinite guard a hostile
+        AS could pin a token as eternally fresh and suppress every future refresh."""
+        raw = {"access_token": "at", "expires_in": bad}
+        meta = OAuthMetadata(
+            authorization_endpoint="https://ex.com/auth",
+            token_endpoint="https://ex.com/token",
+        )
+        data = _token_response_to_data(raw, meta, "cid", None)
+        assert data.expires_at is None
+
     def test_non_bearer_token_type_warns(self, capsys):
         """A non-Bearer token_type (DPoP/mac) is stored but warned about, since
         mcp-stdio always presents it as a Bearer credential."""
@@ -2477,6 +2493,86 @@ class TestCallbackServer:
         # The bogus codes must not have been captured
         assert cb_result.auth_code == "good_code"
         assert cb_result.state == "good_state"
+
+    def test_rejects_non_loopback_host_header(self):
+        """#5(round42): a request carrying a non-loopback Host header (a DNS-
+        rebinding attempt) is rejected 404 and captures nothing, even though it
+        reaches the loopback-bound server with a valid-looking code+state."""
+        cb_result = CallbackResult()
+        handler_cls = _make_callback_handler(cb_result)
+
+        from http.server import HTTPServer
+
+        server = HTTPServer(("127.0.0.1", 0), handler_cls)
+        port = server.server_address[1]
+        done = threading.Event()
+
+        def serve():
+            while not done.is_set():
+                server.handle_request()
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        time.sleep(0.3)
+
+        try:
+            resp = httpx.get(
+                f"http://127.0.0.1:{port}/callback?code=c&state=s",
+                headers={"Host": "evil.example.com"},
+            )
+            assert resp.status_code == 404
+            # A loopback Host is still accepted (allowlist includes localhost).
+            ok = httpx.get(
+                f"http://127.0.0.1:{port}/callback?code=good&state=s",
+                headers={"Host": f"localhost:{port}"},
+            )
+            assert ok.status_code == 200
+        finally:
+            done.set()
+            server.server_close()
+
+        # The rebinding attempt captured nothing; only the loopback hit did.
+        assert cb_result.auth_code == "good"
+
+    def test_callback_sets_csrf_fields_before_gating_auth_code(self):
+        """#4(round42): the handler must assign the CSRF fields (state/iss) BEFORE
+        the gating auth_code so the lock-free main loop never observes auth_code
+        set while state is still None — which would spuriously fail the constant-
+        time state compare. Verified by recording attribute-assignment order."""
+        order: list[str] = []
+
+        class RecordingResult(CallbackResult):
+            def __setattr__(self, name, value):
+                if name in ("state", "iss", "auth_code", "error"):
+                    order.append(name)
+                object.__setattr__(self, name, value)
+
+        cb_result = RecordingResult()
+        order.clear()  # ignore the dataclass __init__ default assignments
+        handler_cls = _make_callback_handler(cb_result)
+
+        from http.server import HTTPServer
+
+        server = HTTPServer(("127.0.0.1", 0), handler_cls)
+        port = server.server_address[1]
+        done = threading.Event()
+
+        def serve():
+            while not done.is_set():
+                server.handle_request()
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        time.sleep(0.3)
+
+        try:
+            httpx.get(f"http://127.0.0.1:{port}/callback?code=c&state=s&iss=https://x")
+        finally:
+            done.set()
+            server.server_close()
+
+        # The gating field (auth_code) is assigned LAST, after state and iss.
+        assert order == ["state", "iss", "auth_code"]
 
     def test_concurrent_flows_isolated(self):
         """Two callback handlers with separate result objects don't interfere."""
