@@ -216,23 +216,25 @@ def _ensure_store_dir() -> None:
                 pass
 
 
-def _read_legacy_data() -> dict[str, Any] | None:
-    """Read the legacy token file via ``O_NOFOLLOW``.
+def _read_json_object_file(path: Path) -> dict[str, Any] | None:
+    """Read a JSON-object file via ``O_NOFOLLOW``, with no side effects.
 
     Returns the parsed dict, or ``None`` if the file is absent, unreadable,
-    not valid JSON, or not a JSON object — so callers never write garbage (or
-    an attacker-redirected symlink target) over the XDG store.
+    not valid JSON, or not a JSON object. Shared by the legacy reader and the
+    migration's XDG-store probe so neither re-enters ``_read_store`` (which would
+    recurse through ``_migrate_legacy_store``). Unlike ``_read_store`` this does
+    NOT chmod the fd or emit the corrupt-store warning — it is a pure probe.
     """
     try:
-        fd = os.open(_LEGACY_STORE_FILE, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK)
     except OSError:
         return None
-    # Refuse a non-regular legacy file the same way _read_store does (#2
-    # round27): O_NOFOLLOW blocks a symlink, but an O_RDONLY read of a
-    # writer-less FIFO planted at the legacy path would block forever and hang
-    # every token load / relay startup. O_NONBLOCK makes the open return at
-    # once (a no-op for the regular file we expect); fstat then rejects the
-    # special file before f.read() can hang on it.
+    # Refuse a non-regular file the same way _read_store does (#2 round27):
+    # O_NOFOLLOW blocks a symlink, but an O_RDONLY read of a writer-less FIFO
+    # planted at the path would block forever and hang every token load / relay
+    # startup. O_NONBLOCK makes the open return at once (a no-op for the regular
+    # file we expect); fstat then rejects the special file before f.read() can
+    # hang on it.
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             os.close(fd)
@@ -246,6 +248,16 @@ def _read_legacy_data() -> dict[str, Any] | None:
     except (json.JSONDecodeError, OSError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def _read_legacy_data() -> dict[str, Any] | None:
+    """Read the legacy token file via ``O_NOFOLLOW``.
+
+    Returns the parsed dict, or ``None`` if the file is absent, unreadable,
+    not valid JSON, or not a JSON object — so callers never write garbage (or
+    an attacker-redirected symlink target) over the XDG store.
+    """
+    return _read_json_object_file(_LEGACY_STORE_FILE)
 
 
 def _migrate_legacy_store() -> None:
@@ -269,10 +281,24 @@ def _migrate_legacy_store() -> None:
         # interrupted external write, a stray `touch`, a backup restore that
         # left an empty placeholder) is NOT proof the migration completed;
         # unlinking the legacy file then would silently lose still-real tokens.
-        try:
-            xdg_has_data = _STORE_FILE.stat().st_size > 0
-        except OSError:
-            xdg_has_data = False
+        #
+        # Probe the CONTENT, not the byte size (#L7 round39): an empty-dict store
+        # (`{}`, 2 bytes — all tokens were deleted) has st_size > 0 yet holds NO
+        # tokens, so the old size test wrongly treated it as "migration complete"
+        # and unlinked still-real legacy tokens. Mirror the empty-placeholder
+        # branch below, which already uses dict truthiness. Use the side-effect-
+        # free probe (NOT _read_store, which re-enters this function). A genuinely
+        # corrupt / unreadable store returns None — there fall back to the byte-
+        # size heuristic, since an unparseable non-empty file is still evidence
+        # the migration likely ran and must not loop re-copying over it.
+        xdg_data = _read_json_object_file(_STORE_FILE)
+        if xdg_data is None:
+            try:
+                xdg_has_data = _STORE_FILE.stat().st_size > 0
+            except OSError:
+                xdg_has_data = False
+        else:
+            xdg_has_data = bool(xdg_data)
         if xdg_has_data:
             # Best-effort removal of the now-redundant legacy file. This runs
             # UNLOCKED from load_token, so the unlink can lose a TOCTOU race
@@ -285,17 +311,19 @@ def _migrate_legacy_store() -> None:
                 pass
         else:
             # #8 (round16): the XDG store is an EMPTY placeholder (a stray
-            # `touch`, an interrupted external write, a backup restore) that
-            # otherwise shadows still-valid legacy tokens forever — _read_store
-            # would read {} and load_token would force a needless re-auth. Copy
+            # `touch`, an interrupted external write, a backup restore) OR an
+            # empty-dict `{}` store with all tokens deleted (#L7 round39) — both
+            # otherwise shadow still-valid legacy tokens forever (_read_store
+            # would read {} and load_token would force a needless re-auth). Copy
             # the legacy data through into the placeholder instead of stranding
-            # it. Re-stat under the same call so a placeholder that CONCURRENTLY
+            # it. Re-PROBE the content under the same call (not just st_size==0,
+            # so the `{}` case is covered too) so a placeholder that CONCURRENTLY
             # gained real data (a locked save_token) is never clobbered; the
             # residual TOCTOU is the documented one-time migration race above.
             data = _read_legacy_data()
             if data:
                 try:
-                    if _STORE_FILE.stat().st_size == 0:
+                    if not _read_json_object_file(_STORE_FILE):
                         _write_store(data)
                         try:
                             _LEGACY_STORE_FILE.unlink()
@@ -517,19 +545,25 @@ def _read_store(*, for_write: bool = False) -> dict[str, Any]:
         # (aborting would leave it broken AND fail to cache the new token). Both
         # paths therefore treat it as an empty store. But the silent replacement
         # previously hid a real event from the operator (a 3rd-party tool / disk
-        # corrupting tokens.json), so the WRITE path warns ONCE that the corrupt
-        # store is being replaced — visibility without changing the recovery
-        # behaviour (#L2 round37).
-        if for_write:
-            global _warned_corrupt_store
-            if not _warned_corrupt_store:
-                _warned_corrupt_store = True
-                print(
-                    f"mcp-stdio: warning: token store {_STORE_FILE} contains "
-                    f"corrupt JSON; replacing it (other servers' cached tokens, "
-                    f"if any, were already unparseable and need re-auth).",
-                    file=sys.stderr,
-                )
+        # corrupting tokens.json), so warn ONCE that the store is corrupt —
+        # visibility without changing the recovery behaviour (#L2 round37).
+        #
+        # Fire on BOTH paths now (#L8 round39): a read-only invocation
+        # (load_token -> _read_store with for_write=False) otherwise gives the
+        # operator zero signal — just an unexplained re-auth — until some later
+        # save happens to reach the write path. The one-shot _warned_corrupt_store
+        # flag keeps it to a single line per process, and the wording covers both
+        # outcomes (read-as-empty now, replaced on the next save).
+        global _warned_corrupt_store
+        if not _warned_corrupt_store:
+            _warned_corrupt_store = True
+            print(
+                f"mcp-stdio: warning: token store {_STORE_FILE} contains "
+                f"corrupt JSON; treating it as empty (cached tokens, if any, were "
+                f"already unparseable and need re-auth). It is replaced on the "
+                f"next save.",
+                file=sys.stderr,
+            )
         return {}
     return data if isinstance(data, dict) else {}
 

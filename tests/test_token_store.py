@@ -210,9 +210,33 @@ class TestLoadSaveDelete:
         store_file = tmp_path / "tokens.json"
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
         monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+        # Reset the one-shot flag so this test does not depend on / leak the
+        # cross-process warning state (load now warns on the read path too).
+        monkeypatch.setattr("mcp_stdio.token_store._warned_corrupt_store", False)
 
         store_file.write_text("not json")
         assert load_token("https://example.com/mcp") is None
+
+    def test_corrupt_file_warns_once_on_read_path(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """#L8(round39): a corrupt store surfaces a one-time stderr warning on the
+        pure READ path too (load_token), not only when a later save reaches the
+        write path — otherwise a read-only invocation gives the operator zero
+        signal beyond an unexplained re-auth. The one-shot flag keeps it to a
+        single line even across repeated loads."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+        monkeypatch.setattr("mcp_stdio.token_store._warned_corrupt_store", False)
+
+        store_file.write_text("not json")
+        assert load_token("https://example.com/mcp") is None
+        assert load_token("https://example.com/other") is None  # second read
+        err = capsys.readouterr().err
+        assert "corrupt JSON" in err
+        # One-shot: the warning line appears exactly once across both reads.
+        assert err.count("corrupt JSON") == 1
 
     @pytest.mark.skipif(
         sys.platform == "win32" or not hasattr(os, "mkfifo"),
@@ -1274,6 +1298,68 @@ class TestLegacyMigration:
         assert "old" in new_file.read_text()
         # The legacy file is unlinked only because its data was safely migrated.
         assert not legacy_file.exists()
+
+    def test_empty_dict_xdg_store_does_not_strand_or_lose_legacy(
+        self, tmp_path, monkeypatch
+    ):
+        """#L7(round39): an XDG store of `{}` (2 bytes — all tokens were deleted)
+        is NOT proof the migration completed. The old `st_size > 0` test treated
+        it as "has data" and unlinked still-real legacy tokens (data loss). The
+        content-based probe routes `{}` into the copy-through branch instead: the
+        legacy tokens are merged in (reachable via load_token) and the redundant
+        legacy file is then removed — never stranded, never lost."""
+        legacy_dir = tmp_path / "legacy"
+        legacy_file = legacy_dir / "tokens.json"
+        new_dir = tmp_path / "new"
+        new_file = new_dir / "tokens.json"
+
+        legacy_dir.mkdir()
+        legacy_file.write_text('{"https://example.com/mcp": {"access_token": "old"}}')
+        new_dir.mkdir()
+        new_file.write_text("{}")  # empty-dict store, size 2 — NOT a completed migration
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", new_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", new_file)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_DIR", legacy_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
+
+        loaded = load_token("https://example.com/mcp")
+        # Legacy token is merged through, not lost behind the `{}` placeholder.
+        assert loaded is not None and loaded.access_token == "old"
+        assert "old" in new_file.read_text()
+        # Legacy file unlinked only because its data was safely migrated.
+        assert not legacy_file.exists()
+
+    def test_empty_dict_xdg_preserves_legacy_when_copy_through_fails(
+        self, tmp_path, monkeypatch
+    ):
+        """#L7(round39): the data-loss guard — if the copy-through write fails for
+        a `{}` XDG store, the legacy file must be PRESERVED (not unlinked), so a
+        later run can retry. The old size-based path would have unlinked it."""
+        legacy_dir = tmp_path / "legacy"
+        legacy_file = legacy_dir / "tokens.json"
+        new_dir = tmp_path / "new"
+        new_file = new_dir / "tokens.json"
+
+        legacy_dir.mkdir()
+        legacy_file.write_text('{"https://example.com/mcp": {"access_token": "old"}}')
+        new_dir.mkdir()
+        new_file.write_text("{}")
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", new_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", new_file)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_DIR", legacy_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
+
+        def failing_write(_data):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr("mcp_stdio.token_store._write_store", failing_write)
+
+        loaded = load_token("https://example.com/mcp")  # must not raise
+        assert loaded is None  # `{}` still shadows → no token this run
+        assert legacy_file.exists()  # but legacy is preserved for a retry
+        assert "old" in legacy_file.read_text()
 
     def test_empty_xdg_copy_through_write_failure_preserves_legacy(
         self, tmp_path, monkeypatch
