@@ -674,6 +674,17 @@ class TestSameOrigin:
     def test_different_explicit_port_is_cross_origin(self):
         assert not _same_origin("https://h.example:8443/x", "https://h.example/x")
 
+    def test_malformed_url_returns_not_same_origin(self):
+        """#4(round32): a malformed URL (urlsplit/.port raises ValueError, e.g. a
+        non-numeric port) must be treated as NOT same-origin — the conservative,
+        fail-closed answer for the SSE cross-origin credential guard."""
+        assert not _same_origin(
+            "https://h.example:notaport/a", "https://h.example/b"
+        )
+        assert not _same_origin(
+            "https://h.example/a", "https://h.example:99999/b"
+        )
+
 
 class TestExtractProtocolVersion:
     """_extract_protocol_version reads result.protocolVersion from an
@@ -3448,6 +3459,31 @@ class TestPagination:
         )
         merged = json.loads(output.strip())
         assert [t["name"] for t in merged["result"]["tools"]] == ["a"]
+
+    def test_empty_string_next_cursor_is_terminal(self, httpx_mock):
+        """#2(round32): an empty-string nextCursor is treated as terminal (like
+        null / absent) — an empty cursor cannot be round-tripped, so it is a
+        degenerate end, not another page. Exactly one upstream POST, and the
+        merged result carries no nextCursor. Pins the documented `if not
+        next_cursor` contract distinctly from the null/absent case."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "a"}], "nextCursor": ""},
+        }
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(page1),
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())
+        assert merged["result"]["tools"] == [{"name": "a"}]
+        assert "nextCursor" not in merged["result"]  # empty cursor not re-exposed
+        assert len(httpx_mock.get_requests()) == 1  # no second-page fetch
 
     def test_page2_nonlist_result_key_keeps_page1_and_merges_late_field(
         self, httpx_mock
@@ -6590,6 +6626,35 @@ class TestRun429Retry:
         )
         assert '"ok":true' in output
         assert 2.0 in slept, f"expected a 2.0-second sleep, got {slept!r}"
+
+    def test_429_http_date_retry_after_then_200(self, httpx_mock, monkeypatch):
+        """#5(round32): an HTTP-date Retry-After flows end-to-end through
+        _handle_rate_limit into the run() retry sleep — the integration analogue
+        of the parser unit test. The date->delta conversion is exercised on the
+        real path, not just in isolation."""
+        slept: list[float] = []
+        monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
+
+        # Retry-After as an HTTP-date 10 s in the future (RFC 9110 §10.2.3).
+        future = datetime.now(timezone.utc) + timedelta(seconds=10)
+        http_date = email.utils.format_datetime(future, usegmt=True)
+        httpx_mock.add_response(
+            status_code=429, headers={"retry-after": http_date}, text=""
+        )
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"ok":true},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","method":"tools/call","id":1}'],
+        )
+        assert '"ok":true' in output
+        # The date was parsed to a ~10 s delta and slept on, NOT the 1 s
+        # no-hint backoff fallback (which would be the value if parsing failed).
+        assert slept, "expected a retry sleep"
+        assert max(slept) >= 5.0, f"expected a date-derived sleep, got {slept!r}"
 
     def test_429_without_retry_after_uses_backoff_then_200(
         self, httpx_mock, monkeypatch

@@ -185,28 +185,16 @@ def _extract_id(line: str) -> Any:
         return None
 
 
-def _has_id(line: str) -> bool:
-    """Return True if the line is a JSON-RPC request (carries an ``id`` key).
-
-    A notification has no ``id`` and must never receive a response, so the relay
-    suppresses synthesized error responses for it. Distinguishes a present
-    ``id:null`` (a request) from an absent id (a notification). Unparseable input
-    is treated as id-less (no response synthesized).
-    """
-    try:
-        msg = json.loads(line)
-    except (json.JSONDecodeError, TypeError):
-        return False
-    return isinstance(msg, dict) and "id" in msg
-
-
 def _extract_id_and_presence(line: str) -> tuple[Any, bool]:
     """Return ``(id_value, has_id)`` from a SINGLE JSON parse of a line.
 
-    Equivalent to ``(_extract_id(line), _has_id(line))`` but parses once — the
-    relay's per-stdin-line hot path needs both facts, and re-walking the JSON
-    twice is wasteful under load. A notification (no id) → ``(None, False)``; a
-    request → ``(id, True)``; a non-object / malformed line → ``(None, False)``.
+    The relay's per-stdin-line hot path needs both the id value AND whether an
+    ``id`` key is present (a notification has none and must never receive a
+    response), so this parses once rather than re-walking the JSON twice under
+    load. A present ``id:null`` (a request) is distinguished from an absent id
+    (a notification). A notification (no id) → ``(None, False)``; a request →
+    ``(id, True)``; a non-object / unparseable line → ``(None, False)`` (no
+    response synthesized).
     """
     try:
         msg = json.loads(line)
