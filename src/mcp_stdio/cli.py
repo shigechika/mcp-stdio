@@ -338,9 +338,12 @@ def main() -> None:
         else os.environ.get("MCP_BEARER_TOKEN", "")
     )
 
-    n_auth = sum(
-        [args.oauth, args.oauth_device, bool(bearer_from_flag and bearer_token)]
-    )
+    # Count an explicit --bearer-token by its PRESENCE, not its truthiness, so
+    # `--bearer-token '' --oauth` errors out the same as a non-empty token
+    # rather than silently slipping past the mutual-exclusion check (an empty
+    # bearer is still an explicit, contradictory auth choice). An ambient
+    # MCP_BEARER_TOKEN (bearer_from_flag False) still does not participate.
+    n_auth = sum([args.oauth, args.oauth_device, bearer_from_flag])
     if n_auth > 1:
         print(
             "error: --oauth, --oauth-device, and --bearer-token are mutually exclusive",
@@ -434,7 +437,17 @@ def main() -> None:
             # Drop any differently-cased 'authorization' header a -H supplied
             # earlier (the -H loop ran before this block), so the OAuth token is
             # the single Authorization sent rather than a duplicate header pair.
-            for existing in [k for k in headers if k.lower() == "authorization"]:
+            overridden = [k for k in headers if k.lower() == "authorization"]
+            if overridden:
+                # The user explicitly supplied -H 'Authorization: ...' AND an
+                # OAuth flow — warn that the OAuth token wins, instead of
+                # silently discarding their header.
+                print(
+                    "warning: explicit -H 'Authorization' header is overridden "
+                    "by the OAuth-acquired token",
+                    file=sys.stderr,
+                )
+            for existing in overridden:
                 del headers[existing]
             headers["Authorization"] = f"Bearer {token_data.access_token}"
             token_refresher = _build_token_refresher(
