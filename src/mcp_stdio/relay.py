@@ -487,11 +487,13 @@ def _handle_rate_limit(
     resp_headers: Any,
     attempt: int,
 ) -> float | None:
-    """Decide how long to sleep for a 429 before retrying.
+    """Decide how long to sleep for a 429/503 before retrying.
 
-    Returns the seconds to sleep if a retry should be attempted, or
-    ``None`` if the caller should give up (wait exceeds the cap, or this
-    was the last allowed attempt — caller must then surface the 429).
+    Status-agnostic: callers gate on ``_RETRYABLE_RATE_LIMIT_STATUSES``
+    (429, 503), the two spec-sanctioned ``Retry-After`` carriers, and pass
+    the response here. Returns the seconds to sleep if a retry should be
+    attempted, or ``None`` if the caller should give up (wait exceeds the cap,
+    or this was the last allowed attempt — caller must then surface the status).
 
     ``resp_headers`` accepts anything with ``.get("retry-after")``.
     ``attempt`` is the 1-based retry counter shared with the surrounding
@@ -1284,9 +1286,14 @@ def _reinitialize(
     # output), but an operator who pinned `-H MCP-Protocol-Version: <x>` would
     # otherwise have it ride this initialize POST — inconsistent with the
     # dispatch path, which strips it from a real initialize (see #3 round18).
-    # Mirror that strip so both initialize paths behave identically.
+    # Mirror that strip so both initialize paths behave identically. Also drop a
+    # pinned case-variant Mcp-Session-Id: an initialize POST establishes a FRESH
+    # session, so a stale operator-pinned session id must not ride it (#B-1
+    # round28).
     init_headers = {
-        k: v for k, v in headers.items() if k.lower() != "mcp-protocol-version"
+        k: v
+        for k, v in headers.items()
+        if k.lower() not in ("mcp-protocol-version", "mcp-session-id")
     }
     try:
         resp = client.post(url, content=initialize_msg, headers=init_headers)
@@ -1320,9 +1327,22 @@ def _reinitialize(
     initialized_msg = json.dumps(
         {"jsonrpc": "2.0", "method": "notifications/initialized"}
     )
-    initialized_headers = dict(headers)
+    # Drop any operator-pinned case-variant before injecting, mirroring
+    # _prepare_headers' strip discipline, so the notifications/initialized POST
+    # never serialises two Mcp-Session-Id / MCP-Protocol-Version lines that a
+    # strict 2025-06-18 server treats as a singleton field (#B-1 round28). The
+    # protocol-version strip is gated on `negotiated` (only stripped when set),
+    # so an operator pin still rides through if the relay negotiated none.
+    initialized_headers = {
+        k: v for k, v in headers.items() if k.lower() != "mcp-session-id"
+    }
     initialized_headers["Mcp-Session-Id"] = new_session_id
     if negotiated:
+        initialized_headers = {
+            k: v
+            for k, v in initialized_headers.items()
+            if k.lower() != "mcp-protocol-version"
+        }
         initialized_headers["MCP-Protocol-Version"] = negotiated
     try:
         resp = client.post(url, content=initialized_msg, headers=initialized_headers)
@@ -1873,19 +1893,26 @@ def run(
                         # Re-adopt a session id the server rotated alongside this 401
                         # retry's response, so a chained 403 step-up below rebuilds
                         # its retry headers from the fresh id, not the stale one.
-                        # Gate it like the pre-recovery adoption (#1 round24): adopt
+                        # Gate it like the pre-recovery adoption (#1 round24/26): adopt
                         # only when the retry SUCCEEDED, or returned a 403 that the
-                        # step-up branch below will actually consume. A TERMINAL
-                        # status (bare 500/400, or a 403 with no scope_upgrader) that
-                        # merely echoes a session id must NOT poison session_id for
-                        # the next stdin line — that id was just rejected. (A 404 is
-                        # excluded: its branch reinitializes from scratch, ignoring
-                        # any rotated id, and a cold 404 must stay a terminal error.)
+                        # step-up branch below will actually CONSUME — i.e. a PARSEABLE
+                        # insufficient_scope challenge. A terminal status (bare 500/400,
+                        # a 403 with no scope_upgrader, or a 403 whose challenge does
+                        # not parse so step-up never fires) that merely echoes a session
+                        # id must NOT poison session_id for the next stdin line — that
+                        # id was just rejected. The parseable-scope conjunct mirrors the
+                        # top-level feeds_recovery gate exactly (#1 round28). (A 404 is
+                        # excluded: its branch reinitializes from scratch, ignoring any
+                        # rotated id, and a cold 404 must stay a terminal error.)
                         if result.session_id and (
                             result.status_code < 400
                             or (
                                 result.status_code == 403
                                 and scope_upgrader is not None
+                                and _parse_www_authenticate_scope(
+                                    result.www_authenticate
+                                )
+                                is not None
                             )
                         ):
                             session_id = result.session_id
