@@ -385,6 +385,11 @@ def main() -> None:
                 refresh_leeway=args.oauth_refresh_leeway,
                 resource_indicator=not args.no_resource_indicator,
             )
+            # Drop any differently-cased 'authorization' header a -H supplied
+            # earlier (the -H loop ran before this block), so the OAuth token is
+            # the single Authorization sent rather than a duplicate header pair.
+            for existing in [k for k in headers if k.lower() == "authorization"]:
+                del headers[existing]
             headers["Authorization"] = f"Bearer {token_data.access_token}"
             token_refresher = _build_token_refresher(
                 args.url, headers, args.timeout_connect, args.timeout_read

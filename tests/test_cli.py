@@ -337,6 +337,30 @@ class TestMain:
             assert auth_keys == ["authorization"]
             assert headers["authorization"] == "Bearer override"
 
+    def test_oauth_authorization_dedups_case_variant_dash_h(self, monkeypatch):
+        """--oauth together with a differently-cased -H authorization must not
+        send two Authorization headers — the OAuth token is the only one."""
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--oauth",
+                    "-H",
+                    "authorization: custom",
+                    "https://example.com/mcp",
+                ],
+            ),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            mock_ensure.return_value.access_token = "oauth-tok"
+            main()
+        headers = mock_run.call_args.kwargs["headers"]
+        auth_keys = [k for k in headers if k.lower() == "authorization"]
+        assert auth_keys == ["Authorization"]
+        assert headers["Authorization"] == "Bearer oauth-tok"
+
     def test_dash_h_overrides_default_content_type_case_insensitively(self):
         with (
             patch(
