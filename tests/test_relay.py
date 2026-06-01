@@ -401,6 +401,38 @@ class TestPostAndStream:
         emitted = json.loads(stdout.getvalue().strip())
         assert emitted["result"] == {"ok": True}
 
+    def test_decoding_error_is_caught_not_crashed(self, httpx_mock):
+        """#1(round15) HIGH: a 200 whose body fails to decode (bad
+        Content-Encoding) raises httpx.DecodingError — a SIBLING of
+        TransportError, not a subclass. It must be caught (now via HTTPError) and
+        retried/surfaced, never propagate out and crash the gateway."""
+        import httpx as _httpx
+
+        # Sanity: DecodingError is an HTTPError but NOT a TransportError.
+        assert issubclass(_httpx.DecodingError, _httpx.HTTPError)
+        assert not issubclass(_httpx.DecodingError, _httpx.TransportError)
+
+        for _ in range(MAX_RETRIES):
+            httpx_mock.add_response(
+                status_code=200,
+                headers={
+                    "content-type": "application/json",
+                    "content-encoding": "gzip",  # body is NOT gzip → DecodingError
+                },
+                content=b"this is not valid gzip",
+            )
+        client = httpx.Client()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout), patch("mcp_stdio.relay.time.sleep"):
+            result = _post_and_stream(
+                client, "https://example.com/mcp", '{"id":1}', {}, 1, has_id=True
+            )
+        # Retried to exhaustion (not crashed) and a JSON-RPC error was synthesized.
+        assert result is None
+        assert len(httpx_mock.get_requests()) == MAX_RETRIES
+        err = json.loads(stdout.getvalue().strip())
+        assert err["id"] == 1 and "error" in err
+
     def test_notification_retry_exhaustion_emits_no_error(self, httpx_mock):
         """has_id=False (a notification): retry exhaustion must NOT synthesize an
         id:null error — a notification can never receive a response."""
@@ -1113,6 +1145,38 @@ class TestRun:
             ['{"jsonrpc":"2.0","method":"notifications/progress","params":{}}'],
         )
         assert output.strip() == ""
+
+    def test_decoding_error_does_not_crash_loop(self, httpx_mock):
+        """#1(round15) HIGH end-to-end: a request whose body fails to decode
+        (bad Content-Encoding) must NOT crash run() — the client gets an error
+        and the loop survives to process the next stdin line."""
+        for _ in range(MAX_RETRIES):  # bad-gzip request 1 → DecodingError ×3
+            httpx_mock.add_response(
+                status_code=200,
+                headers={
+                    "content-type": "application/json",
+                    "content-encoding": "gzip",
+                },
+                content=b"not gzip",
+            )
+        # request 2 succeeds — proves the loop kept going after the crash-y line.
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"ok":true},"id":2}',
+            headers={"content-type": "application/json"},
+        )
+        with patch("mcp_stdio.relay.time.sleep"):
+            output = self._run_with_stdin(
+                httpx_mock,
+                [
+                    '{"jsonrpc":"2.0","method":"tools/call","id":1}',
+                    '{"jsonrpc":"2.0","method":"tools/call","id":2}',
+                ],
+            )
+        lines = [json.loads(x) for x in output.strip().splitlines() if x]
+        ids = {m.get("id") for m in lines}
+        assert 1 in ids and 2 in ids  # both answered; id=1 an error, id=2 a result
+        assert any(m.get("id") == 1 and "error" in m for m in lines)
+        assert any(m.get("id") == 2 and "result" in m for m in lines)
 
     def test_notification_404_reinit_failure_gets_no_response(self, httpx_mock):
         """#5(round14): a notification whose POST 404s (with a prior session) and
