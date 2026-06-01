@@ -734,10 +734,13 @@ class TestLegacyMigration:
         assert loaded.access_token == "new"
         assert not legacy_file.exists()
 
-    def test_empty_xdg_store_does_not_delete_legacy(self, tmp_path, monkeypatch):
-        """#4(round14): if the XDG store exists but is EMPTY (e.g. a 0-byte
-        placeholder from an interrupted write / backup restore), the legacy file
-        must NOT be unlinked — that would silently lose still-real tokens."""
+    def test_empty_xdg_store_copies_legacy_through(self, tmp_path, monkeypatch):
+        """#8(round16): if the XDG store exists but is EMPTY (a 0-byte
+        placeholder from an interrupted write / backup restore), the legacy
+        tokens must not be stranded behind it — they are copied through into the
+        placeholder (and load_token returns them), then the now-redundant legacy
+        file is removed. Earlier behaviour merely preserved the legacy file,
+        leaving the tokens permanently unreachable on the read path."""
         legacy_dir = tmp_path / "legacy"
         legacy_file = legacy_dir / "tokens.json"
         new_dir = tmp_path / "new"
@@ -753,10 +756,113 @@ class TestLegacyMigration:
         monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_DIR", legacy_dir)
         monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
 
-        load_token("https://example.com/mcp")
-        # The legacy tokens survive (not deleted by the bogus empty XDG store).
-        assert legacy_file.exists()
+        loaded = load_token("https://example.com/mcp")
+        # The legacy token is now reachable (copied through into the placeholder).
+        assert loaded is not None and loaded.access_token == "old"
+        assert "old" in new_file.read_text()
+        # The legacy file is unlinked only because its data was safely migrated.
+        assert not legacy_file.exists()
+
+    def test_empty_xdg_copy_through_write_failure_preserves_legacy(
+        self, tmp_path, monkeypatch
+    ):
+        """#8(round16): if the empty-placeholder copy-through write FAILS (disk
+        full / read-only FS), load_token must not crash and the legacy file must
+        be preserved (not unlinked) for a later run to retry."""
+        legacy_dir = tmp_path / "legacy"
+        legacy_file = legacy_dir / "tokens.json"
+        new_dir = tmp_path / "new"
+        new_file = new_dir / "tokens.json"
+
+        legacy_dir.mkdir()
+        legacy_file.write_text('{"https://example.com/mcp": {"access_token": "old"}}')
+        new_dir.mkdir()
+        new_file.write_text("")
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", new_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", new_file)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_DIR", legacy_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
+
+        def failing_write(_data):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr("mcp_stdio.token_store._write_store", failing_write)
+
+        loaded = load_token("https://example.com/mcp")  # must not raise
+        assert loaded is None  # placeholder still empty → no token
+        assert legacy_file.exists()  # legacy preserved for a later retry
         assert "old" in legacy_file.read_text()
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX mode bits don't model the NTFS ACL Windows uses",
+    )
+    def test_migration_tightens_legacy_dir_permissions(self, tmp_path, monkeypatch):
+        """#9(round16): the legacy DIR is re-chmod'd to 0o700 before its secrets
+        are exposed to a rename/copy-through, mirroring _ensure_store_dir's
+        defensive re-chmod of the XDG dir."""
+        legacy_dir = tmp_path / "legacy"
+        legacy_file = legacy_dir / "tokens.json"
+        new_dir = tmp_path / "new"
+        new_file = new_dir / "tokens.json"
+
+        legacy_dir.mkdir(mode=0o755)
+        legacy_file.write_text('{"https://example.com/mcp": {"access_token": "old"}}')
+        # new_dir absent → migration takes the rename branch (chmods dir first)
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", new_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", new_file)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_DIR", legacy_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
+
+        chmodded: list[tuple[str, int]] = []
+        real_chmod = os.chmod
+
+        def spy_chmod(path, mode, *a, **k):
+            chmodded.append((os.fspath(path), mode))
+            return real_chmod(path, mode, *a, **k)
+
+        monkeypatch.setattr("mcp_stdio.token_store.os.chmod", spy_chmod)
+        load_token("https://example.com/mcp")
+
+        assert any(
+            p == str(legacy_dir) and m == stat.S_IRWXU for p, m in chmodded
+        ), f"legacy dir was not tightened to 0o700; chmod calls: {chmodded!r}"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX mode bits don't model the NTFS ACL Windows uses",
+    )
+    def test_ensure_store_dir_warns_once_on_unfixable_loose_perms(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """#10(round16): if the store dir cannot be tightened and stays group/
+        other-accessible, emit a single operator warning instead of failing
+        silently — and only once, not on every call."""
+        from mcp_stdio.token_store import _ensure_store_dir
+
+        store_dir = tmp_path / "store"
+        store_file = store_dir / "tokens.json"
+        store_dir.mkdir()
+        real_chmod = os.chmod
+        real_chmod(store_dir, 0o755)  # genuinely loose before we block chmod
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", store_dir)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+        monkeypatch.setattr("mcp_stdio.token_store._warned_loose_store_dir", False)
+
+        def refuse_dir_chmod(path, mode, *a, **k):
+            if os.path.isdir(path):
+                raise OSError("cannot tighten dir on this filesystem")
+            return real_chmod(path, mode, *a, **k)
+
+        monkeypatch.setattr("mcp_stdio.token_store.os.chmod", refuse_dir_chmod)
+
+        _ensure_store_dir()
+        _ensure_store_dir()  # second call must NOT warn again
+        err = capsys.readouterr().err
+        assert err.count("group/other-accessible") == 1, err
 
     def test_legacy_unlink_failure_when_new_exists_does_not_crash(
         self, tmp_path, monkeypatch
