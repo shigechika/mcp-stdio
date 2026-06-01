@@ -139,6 +139,30 @@ class TestLoadSaveDelete:
         monkeypatch.setattr("mcp_stdio.token_store.os.open", real_open)
         assert load_token("https://example.com/mcp").access_token == "t"
 
+    def test_temp_file_name_is_unique_per_write(self, tmp_path, monkeypatch):
+        """#8: each write uses a distinct temp file name so two writers sharing a
+        PID (the unlocked-lock fallback) cannot collide on the same temp path."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        temp_names: list[str] = []
+        real_open = os.open
+
+        def spy_open(path, flags, *a, **k):
+            p = os.fspath(path)
+            if ".tmp." in p:
+                temp_names.append(p)
+            return real_open(path, flags, *a, **k)
+
+        monkeypatch.setattr("mcp_stdio.token_store.os.open", spy_open)
+        save_token("https://a.com/mcp", TokenData(access_token="a"))
+        save_token("https://b.com/mcp", TokenData(access_token="b"))
+        monkeypatch.setattr("mcp_stdio.token_store.os.open", real_open)
+
+        assert len(temp_names) == 2
+        assert temp_names[0] != temp_names[1]  # distinct temp path per write
+
     def test_load_unknown_future_field_returns_none(self, tmp_path, monkeypatch):
         """Forward-compat: an entry written by a newer version carrying a field
         this version doesn't know must degrade to None, not raise."""
