@@ -137,6 +137,43 @@ class TestLoadSaveDelete:
         assert load_token("https://a.com/mcp").access_token == "tok-a"
         assert load_token("https://b.com/mcp").access_token == "tok-b"
 
+    def test_save_token_write_failure_is_fail_soft(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """#4(round21): a _write_store OSError (full / read-only FS) must NOT
+        propagate out of save_token — it warns and returns, so a refresh whose
+        cache-write fails still yields a usable token instead of crashing the
+        OAuth/relay path. Symmetric with the _StoreUnreadable read path."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        def failing_write(_data):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr("mcp_stdio.token_store._write_store", failing_write)
+        # Must NOT raise.
+        save_token("https://a.com/mcp", TokenData(access_token="a"))
+        assert "could not write token store" in capsys.readouterr().err
+
+    def test_delete_token_write_failure_is_fail_soft(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A failed delete write must also fail soft (leaves the stale entry)."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        save_token("https://a.com/mcp", TokenData(access_token="a"))
+
+        def failing_write(_data):
+            raise OSError(30, "Read-only file system")
+
+        monkeypatch.setattr("mcp_stdio.token_store._write_store", failing_write)
+        # Must NOT raise.
+        delete_token("https://a.com/mcp")
+        assert "could not write token store" in capsys.readouterr().err
+
     def test_corrupt_file(self, tmp_path, monkeypatch):
         store_file = tmp_path / "tokens.json"
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
