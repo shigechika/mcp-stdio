@@ -43,6 +43,33 @@ from mcp_stdio.token_store import TokenData
 # --- _authorization_base_url ---
 
 
+class TestResourceIndicator:
+    """#L1(round37): the RFC 8707 resource value strips userinfo (it is not part
+    of the resource identity and would otherwise reach the AS / its logs / the
+    browser address bar) while keeping path+query and dropping any fragment."""
+
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            # userinfo stripped
+            ("https://user:pass@api.example.com/mcp", "https://api.example.com/mcp"),
+            ("https://user@api.example.com/mcp", "https://api.example.com/mcp"),
+            # idempotent when there is no userinfo
+            ("https://api.example.com/mcp", "https://api.example.com/mcp"),
+            # port + query kept; userinfo stripped
+            ("https://u:p@host:8443/mcp?a=1", "https://host:8443/mcp?a=1"),
+            # fragment dropped (RFC 8707 §2 MUST NOT)
+            ("https://api.example.com/mcp#frag", "https://api.example.com/mcp"),
+            # unparseable / non-http stays unchanged
+            ("not-a-url", "not-a-url"),
+        ],
+    )
+    def test_strips_userinfo(self, url, expected):
+        from mcp_stdio.oauth import _resource_indicator
+
+        assert _resource_indicator(url) == expected
+
+
 class TestAuthorizationBaseUrl:
     def test_strips_path(self):
         assert (
@@ -1463,6 +1490,38 @@ class TestRefreshCachedToken:
         req = httpx_mock.get_requests()[0]
         assert b"resource=https%3A%2F%2Fapi.example.com%2Fmcp" in req.content
 
+    def test_refresh_200_missing_access_token_returns_none(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """#M2(round37): a non-compliant 200 token response with NO access_token
+        (and no `error`) makes _token_response_to_data raise. refresh_cached_token
+        must degrade to None per its contract — not propagate a RuntimeError that
+        aborts ensure_token's clear-and-re-auth recovery (and exits cli.py with
+        1). The _token_response_to_data call was outside the refresh try/except."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        from mcp_stdio.token_store import save_token
+
+        save_token(
+            "https://api.example.com/mcp",
+            TokenData(
+                access_token="old_at",
+                refresh_token="rt123",
+                expires_at=time.time() - 10,
+                client_id="cid",
+                token_endpoint="https://auth.example.com/token",
+                authorization_endpoint="https://auth.example.com/authorize",
+            ),
+        )
+        # 200 but no access_token and no error → _token_response_to_data raises.
+        httpx_mock.add_response(
+            url="https://auth.example.com/token", json={"token_type": "Bearer"}
+        )
+        client = httpx.Client()
+        assert refresh_cached_token("https://api.example.com/mcp", client) is None
+
     def test_refresh_preserves_persisted_issuer(
         self, tmp_path, monkeypatch, httpx_mock
     ):
@@ -1953,6 +2012,22 @@ class TestParseTokenResponse:
         client = httpx.Client()
         resp = client.post("https://example.com/token")
         with pytest.raises(RuntimeError, match="Code expired"):
+            _parse_token_response(resp)
+
+    def test_form_urlencoded_4xx_error_body_raises_clear_error(self, httpx_mock):
+        """#L5(round37): a 4xx with a form-urlencoded RFC 6749 §5.2 error body
+        surfaces the error as a RuntimeError before raise_for_status — the
+        form-urlencoded 4xx branch, sibling of the JSON 4xx and form-urlencoded
+        200-error cases that were already covered."""
+        httpx_mock.add_response(
+            url="https://example.com/token",
+            status_code=400,
+            text="error=invalid_grant&error_description=Refresh+expired",
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        )
+        client = httpx.Client()
+        resp = client.post("https://example.com/token")
+        with pytest.raises(RuntimeError, match="Refresh expired"):
             _parse_token_response(resp)
 
 
