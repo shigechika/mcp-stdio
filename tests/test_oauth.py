@@ -205,6 +205,9 @@ class TestDiscoverMetadata:
         assert meta.authorization_endpoint == "https://api.example.com/authorize"
         assert meta.token_endpoint == "https://api.example.com/token"
         assert meta.registration_endpoint == "https://api.example.com/register"
+        # #3: the default-path fallback must still pin an issuer (the base it
+        # synthesised endpoints from) so the RFC 9207 iss check stays active.
+        assert meta.issuer == "https://api.example.com"
 
     def test_fallback_on_connection_error(self, httpx_mock):
         # ConnectError for: path-aware PRM, host-root PRM, host-root AS, path-scoped AS
@@ -783,6 +786,27 @@ class TestRegisterClient:
         reg = register_client(meta, "http://127.0.0.1:9999/callback", client)
         assert reg.client_secret_expires_at is None
 
+    def test_client_secret_expires_at_string_zero_means_never(self, httpx_mock):
+        """A non-conformant AS sending the STRING "0" must still be read as
+        'never expires' — not as already-expired (which would force a needless
+        re-DCR on every refresh/step-up)."""
+        httpx_mock.add_response(
+            url="https://api.example.com/register",
+            json={
+                "client_id": "cid",
+                "client_secret": "csec",
+                "client_secret_expires_at": "0",
+            },
+        )
+        meta = OAuthMetadata(
+            authorization_endpoint="https://api.example.com/authorize",
+            token_endpoint="https://api.example.com/token",
+            registration_endpoint="https://api.example.com/register",
+        )
+        client = httpx.Client()
+        reg = register_client(meta, "http://127.0.0.1:9999/callback", client)
+        assert reg.client_secret_expires_at is None
+
     def test_client_secret_expires_at_missing(self, httpx_mock):
         """Field absent → None (treated as no expiry)."""
         httpx_mock.add_response(
@@ -1129,6 +1153,39 @@ class TestRefreshCachedToken:
             "https://auth.example.com"
         )
 
+    def test_refresh_preserves_scope_when_response_omits_it(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """#1: RFC 6749 §5.1 lets a refresh response OMIT scope. The cached scope
+        must be preserved, else a later step-up cannot union the granted scopes."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        from mcp_stdio.token_store import load_token, save_token
+
+        save_token(
+            "https://api.example.com/mcp",
+            TokenData(
+                access_token="old_at",
+                refresh_token="rt123",
+                expires_at=time.time() - 10,
+                scope="read write admin",
+                client_id="cid",
+                token_endpoint="https://auth.example.com/token",
+                authorization_endpoint="https://auth.example.com/authorize",
+            ),
+        )
+        # Refresh response omits "scope" entirely.
+        httpx_mock.add_response(
+            url="https://auth.example.com/token",
+            json={"access_token": "new_at", "expires_in": 3600},
+        )
+        client = httpx.Client()
+        data = refresh_cached_token("https://api.example.com/mcp", client)
+        assert data is not None and data.scope == "read write admin"
+        assert load_token("https://api.example.com/mcp").scope == "read write admin"
+
     def test_returns_none_when_no_cached_token(self, tmp_path, monkeypatch):
         store_file = tmp_path / "tokens.json"
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
@@ -1235,6 +1292,33 @@ class TestRefreshCachedToken:
 
 
 class TestTokenResponseToData:
+    META = OAuthMetadata(
+        authorization_endpoint="https://ex.com/auth",
+        token_endpoint="https://ex.com/token",
+    )
+
+    def test_preserves_previous_scope_when_omitted(self):
+        """#1: scope omitted from the response falls back to previous_scope."""
+        raw = {"access_token": "at", "expires_in": 3600}
+        data = _token_response_to_data(
+            raw, self.META, "cid", None, previous_scope="read write"
+        )
+        assert data.scope == "read write"
+
+    def test_response_scope_overrides_previous_scope(self):
+        """A scope present in the response wins over the previous one."""
+        raw = {"access_token": "at", "scope": "read"}
+        data = _token_response_to_data(
+            raw, self.META, "cid", None, previous_scope="read write"
+        )
+        assert data.scope == "read"
+
+    def test_missing_access_token_raises(self):
+        """#15: a token response without access_token (RFC 6749 §5.1 REQUIRED)
+        must fail loudly, not build a credential-less TokenData."""
+        with pytest.raises(RuntimeError, match="access_token"):
+            _token_response_to_data({"token_type": "Bearer"}, self.META, "cid", None)
+
     def test_full_response(self):
         raw = {
             "access_token": "at",
@@ -3020,6 +3104,35 @@ class TestAuthorizationFlowFailurePaths:
                 client_id_override="cid",
                 timeout=0.3,
             )
+
+    def test_authorize_url_log_redacts_state(self, monkeypatch, capsys):
+        """#4: the authorize URL logged to stderr must REDACT the single-use
+        CSRF state nonce (stderr persists to shareable host logs), while the
+        browser still receives the full URL with the real state."""
+        from urllib.parse import parse_qs, urlparse
+
+        opened: dict[str, str] = {}
+
+        def fake_open(url: str) -> bool:
+            opened["url"] = url
+            return True
+
+        monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", fake_open)
+        client = httpx.Client()
+        with pytest.raises(TimeoutError):
+            _run_authorization_flow(
+                "https://ex.com/mcp",
+                client,
+                metadata=self.META,
+                cached=None,
+                client_id_override="cid",
+                timeout=0.3,
+            )
+        err = capsys.readouterr().err
+        real_state = parse_qs(urlparse(opened["url"]).query)["state"][0]
+        # Browser got the real nonce; stderr log got a redacted placeholder.
+        assert "state=%3Credacted%3E" in err
+        assert real_state not in err
 
     def test_callback_error_raises_runtime_error(self, monkeypatch):
         """A callback carrying ?error=... → RuntimeError, no code exchange."""

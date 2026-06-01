@@ -476,6 +476,12 @@ def discover_oauth_metadata(
         authorization_endpoint=f"{base}/authorize",
         token_endpoint=f"{base}/token",
         registration_endpoint=f"{base}/register",
+        # No metadata was validated on this fallback, so it is the LEAST
+        # trustworthy discovery outcome — keep the RFC 9207 iss mix-up check
+        # active by pinning the issuer to the base the endpoints derive from.
+        # Otherwise an AS returning `iss` would be compared against None and
+        # the defence would silently no-op precisely here.
+        issuer=base,
     )
 
 
@@ -575,8 +581,15 @@ def register_client(
     # special-case it.
     raw_expiry = data.get("client_secret_expires_at")
     expiry: float | None = None
-    if raw_expiry:
-        expiry = float(raw_expiry)
+    # Coerce defensively and treat 0 as "never expires" regardless of JSON type.
+    # RFC 7591 specifies a number, but a non-conformant AS sending the string
+    # "0" would be truthy here — float("0") == 0.0 would then read as
+    # already-expired and force an unnecessary re-DCR on every refresh/step-up.
+    try:
+        v = float(raw_expiry) if raw_expiry is not None else 0.0
+        expiry = v if v else None
+    except (TypeError, ValueError):
+        expiry = None
     # RFC 7591 §3.2.1 REQUIRES client_id; use .get() with an explicit error so a
     # malformed registration response is actionable, not a bare KeyError.
     client_id = data.get("client_id")
@@ -821,6 +834,7 @@ def _token_response_to_data(
     client_secret: str | None,
     *,
     previous_refresh_token: str | None = None,
+    previous_scope: str | None = None,
     client_secret_expires_at: float | None = None,
     auth_method: str = "none",
     no_resource_indicator: bool = False,
@@ -829,7 +843,17 @@ def _token_response_to_data(
 
     If the response omits refresh_token (allowed per RFC 6749 Section 6),
     the previous_refresh_token is preserved so subsequent refreshes work.
+    Likewise ``scope`` is OPTIONAL in a token response (RFC 6749 §5.1: it
+    may be omitted when identical to the requested scope, which refreshes
+    routinely do), so ``previous_scope`` is preserved — otherwise a refresh
+    would wipe the granted scope and a later step-up could not union it.
     """
+    if not raw.get("access_token"):
+        # RFC 6749 §5.1 makes access_token REQUIRED. A response missing it is
+        # not a usable token; fail loudly here instead of constructing a
+        # TokenData with a None/empty credential that fails opaquely later.
+        raise RuntimeError("token response missing access_token (RFC 6749 §5.1)")
+
     expires_at = None
     if "expires_in" in raw:
         # ``expires_in`` is numeric in JSON responses but a string in
@@ -863,7 +887,7 @@ def _token_response_to_data(
         token_type=token_type,
         expires_at=expires_at,
         refresh_token=raw.get("refresh_token") or previous_refresh_token,
-        scope=raw.get("scope"),
+        scope=raw.get("scope") or previous_scope,
         client_id=client_id,
         client_secret=client_secret,
         client_secret_expires_at=client_secret_expires_at,
@@ -929,6 +953,7 @@ def refresh_cached_token(
         cached.client_id,
         cached.client_secret,
         previous_refresh_token=cached.refresh_token,
+        previous_scope=cached.scope,
         client_secret_expires_at=cached.client_secret_expires_at,
         auth_method=auth_method,
         no_resource_indicator=no_resource_indicator,
@@ -987,7 +1012,8 @@ def _run_authorization_flow(
             cse_at = reg.client_secret_expires_at
             auth_method = reg.auth_method
             log(f"registered client: {cid}")
-    assert cid is not None
+    if cid is None:  # -O-safe invariant (every branch above sets cid)
+        raise RuntimeError("no client_id available for authorization")
 
     code_verifier, code_challenge = generate_pkce()
 
@@ -1007,13 +1033,14 @@ def _run_authorization_flow(
         params["scope"] = scope
 
     auth_url = f"{metadata.authorization_endpoint}?{urlencode(params)}"
-    # The full URL (including the single-use CSRF ``state`` nonce and the
-    # public S256 ``code_challenge``) is logged deliberately so the user can
-    # complete the flow manually when the browser does not auto-open. ``state``
-    # is single-use and timeout-bounded and the PKCE secret (``code_verifier``)
-    # is never logged, so this is an accepted UX-over-defence-in-depth tradeoff
-    # rather than a token leak — authorize URLs do appear in stderr logs.
-    log(f"authorize URL (open in browser if not auto-opened):\n{auth_url}")
+    # Log a STATE-REDACTED URL. The user still needs a clickable URL when the
+    # browser does not auto-open, but the single-use CSRF ``state`` nonce does
+    # not need to land in stderr — MCP host logs (Claude Desktop/Code) persist
+    # to files that may be shared in bug reports. The browser receives the full
+    # URL below; the PKCE secret (``code_verifier``) is never in the URL and the
+    # S256 ``code_challenge`` is public, so only ``state`` is worth redacting.
+    log_url = f"{metadata.authorization_endpoint}?{urlencode({**params, 'state': '<redacted>'})}"
+    log(f"authorize URL (open in browser if not auto-opened):\n{log_url}")
 
     webbrowser.open(auth_url)
 
@@ -1069,7 +1096,8 @@ def _run_authorization_flow(
         )
 
     code = cb_result.auth_code
-    assert code is not None
+    if code is None:  # -O-safe; the callback error path raises before here
+        raise RuntimeError("authorization callback returned no code")
 
     log("exchanging authorization code for token")
     raw = exchange_code(
@@ -1143,7 +1171,8 @@ def _run_device_authorization_flow(
                 "Server does not support dynamic client registration. "
                 "Provide a --client-id instead."
             )
-    assert cid is not None
+    if cid is None:  # -O-safe invariant (every branch above sets cid)
+        raise RuntimeError("no client_id available for device authorization")
 
     # Step 1: Device Authorization Request (RFC 8628 §3.1)
     da_params: dict[str, str] = {}
