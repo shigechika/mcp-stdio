@@ -170,6 +170,21 @@ def _extract_id(line: str) -> Any:
         return None
 
 
+def _has_id(line: str) -> bool:
+    """Return True if the line is a JSON-RPC request (carries an ``id`` key).
+
+    A notification has no ``id`` and must never receive a response, so the relay
+    suppresses synthesized error responses for it. Distinguishes a present
+    ``id:null`` (a request) from an absent id (a notification). Unparseable input
+    is treated as id-less (no response synthesized).
+    """
+    try:
+        msg = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(msg, dict) and "id" in msg
+
+
 _DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
 
 
@@ -1250,6 +1265,11 @@ def run(
                     tracker.add(cid)
 
             req_id = _extract_id(line)
+            # A notification (no id) must never receive a response — even when an
+            # upstream misbehaves and returns a 4xx/5xx to a POSTed notification,
+            # synthesizing an `id:null` error to stdout would be a JSON-RPC
+            # violation. Gate all synthesized error responses on this.
+            req_has_id = _has_id(line)
             if tracker is not None and req_id is not None:
                 # A request reusing a previously-cancelled id supersedes that
                 # cancel — untrack it so its response is delivered, not dropped.
@@ -1330,7 +1350,8 @@ def run(
                         continue
                 else:
                     log("token refresh failed, returning error")
-                    _write_line(_error_response("authentication failed", req_id))
+                    if req_has_id:
+                        _write_line(_error_response("authentication failed", req_id))
                     continue
 
             # Insufficient scope (403) — step-up authorization and retry once
@@ -1355,7 +1376,8 @@ def run(
                             continue
                     else:
                         log("step-up authorization failed, returning error")
-                        _write_line(_error_response("authorization failed", req_id))
+                        if req_has_id:
+                            _write_line(_error_response("authorization failed", req_id))
                         continue
 
             # Session expired (404) — reset, re-initialize, then retry
@@ -1367,7 +1389,8 @@ def run(
                 )
                 if new_session_id is None:
                     log("re-initialize failed, dropping request")
-                    _write_line(_error_response("session lost", req_id))
+                    if req_has_id:
+                        _write_line(_error_response("session lost", req_id))
                     continue
                 session_id = new_session_id
                 # Track the re-negotiated version so the MCP-Protocol-Version
@@ -1386,10 +1409,12 @@ def run(
             # Fall-through error for any unhandled 4xx/5xx so the MCP client
             # never hangs waiting for a response. 200 bodies were already
             # streamed by _post_and_stream; 202 is reserved for notifications
-            # and intentionally produces no stdout. See #11.
+            # and intentionally produces no stdout. A notification (no id) that
+            # draws a 4xx/5xx is logged but gets no synthesized response. See #11.
             if result.status_code >= 400:
                 log(f"upstream returned HTTP {result.status_code}")
-                _write_line(_error_response(f"HTTP {result.status_code}", req_id))
+                if req_has_id:
+                    _write_line(_error_response(f"HTTP {result.status_code}", req_id))
     finally:
         client.close()
 
@@ -1648,6 +1673,11 @@ def run_sse(
                     tracker.add(cid)
 
             req_id = _extract_id(line)
+            # A notification (no id) must never receive a response — even when an
+            # upstream misbehaves and returns a 4xx/5xx to a POSTed notification,
+            # synthesizing an `id:null` error to stdout would be a JSON-RPC
+            # violation. Gate all synthesized error responses on this.
+            req_has_id = _has_id(line)
             if tracker is not None and req_id is not None:
                 # A request reusing a previously-cancelled id supersedes that
                 # cancel — untrack it so its response is delivered, not dropped.
@@ -1663,7 +1693,8 @@ def run_sse(
                 if state.ready.wait(timeout=timeout_read):
                     endpoint = state.endpoint_url
                 if endpoint is None:
-                    _write_line(_error_response("SSE endpoint unavailable", req_id))
+                    if req_has_id:
+                        _write_line(_error_response("SSE endpoint unavailable", req_id))
                     continue
 
             try:
@@ -1714,7 +1745,8 @@ def run_sse(
                         )
                     else:
                         log("token refresh failed, returning error")
-                        _write_line(_error_response("authentication failed", req_id))
+                        if req_has_id:
+                            _write_line(_error_response("authentication failed", req_id))
                         continue
 
                 if resp.status_code == 403 and scope_upgrader:
@@ -1745,15 +1777,18 @@ def run_sse(
                             log(
                                 "step-up authorization failed, returning error"
                             )
-                            _write_line(_error_response("authorization failed", req_id))
+                            if req_has_id:
+                                _write_line(_error_response("authorization failed", req_id))
                             continue
 
                 if resp.status_code not in (200, 202):
                     log(f"POST returned HTTP {resp.status_code}")
-                    _write_line(_error_response(f"HTTP {resp.status_code}", req_id))
+                    if req_has_id:
+                        _write_line(_error_response(f"HTTP {resp.status_code}", req_id))
             except httpx.HTTPError as e:
                 log(f"POST failed: {e}")
-                _write_line(_error_response(str(e), req_id))
+                if req_has_id:
+                    _write_line(_error_response(str(e), req_id))
     finally:
         state.stop.set()
         # Set stop first, then briefly join so the reader can exit its own
