@@ -101,6 +101,31 @@ class TestLoadSaveDelete:
         assert mode & stat.S_IRWXG == 0  # no group access
         assert mode & stat.S_IRWXO == 0  # no other access
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX mode bits don't model the NTFS ACL Windows uses",
+    )
+    def test_lock_file_retightened_to_0600(self, tmp_path, monkeypatch):
+        """#9(round19): a PRE-EXISTING loose-mode lock file is re-tightened to
+        0o600 via fchmod when _store_lock opens it — the O_CREAT mode only
+        applies on creation, so a pre-planted group/other-writable lock file
+        (a local-DoS handle) is closed off, mirroring the store-file re-chmod."""
+        store_file = tmp_path / "tokens.json"
+        lock_file = tmp_path / "tokens.json.lock"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        # Pre-plant a loose-mode lock file (the case the O_CREAT mode misses).
+        lock_file.write_text("")
+        os.chmod(lock_file, 0o666)
+
+        # save_token acquires _store_lock, which re-tightens the lock fd.
+        save_token("https://a.com/mcp", TokenData(access_token="a"))
+
+        mode = stat.S_IMODE(os.stat(lock_file).st_mode)
+        assert mode & stat.S_IRWXG == 0  # no group access
+        assert mode & stat.S_IRWXO == 0  # no other access
+
     def test_multiple_servers(self, tmp_path, monkeypatch):
         store_file = tmp_path / "tokens.json"
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)

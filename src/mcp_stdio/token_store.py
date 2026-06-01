@@ -469,6 +469,18 @@ def _store_lock() -> Iterator[None]:
     except OSError:
         yield
         return
+    # #9 (round19): the 0o600 mode above applies only on CREATION. Re-tighten a
+    # pre-existing lock file via the fd (fchmod, anchored to this inode like
+    # _read_store) so a lock file left group/other-writable — e.g. pre-planted by
+    # a local user once the dir-tightening already failed — cannot become the
+    # handle another user holds LOCK_EX on to stall every save_token. Best-effort:
+    # the dir's 0o700 mode is the primary guard and a chmod failure must not block.
+    _fchmod = getattr(os, "fchmod", None)
+    if _fchmod is not None:
+        try:
+            _fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)  # 0o600, fd-anchored
+        except OSError:
+            pass
     locked = False
     try:
         try:
