@@ -87,9 +87,15 @@ class OAuthMetadata:
 
 
 def _authorization_base_url(server_url: str) -> str:
-    """Derive authorization base URL by stripping the path component.
+    """Derive the authorization-server ORIGIN by stripping the path component.
 
-    Per MCP spec: https://api.example.com/v1/mcp -> https://api.example.com
+    e.g. https://api.example.com/v1/mcp -> https://api.example.com
+
+    This is NOT the PRM discovery rule: current MCP / RFC 9728 discovery is
+    path-aware (``_build_well_known_url(..., keep_query=True)`` preserves the
+    resource path). This helper only derives an http(s) origin used as the AS
+    base and the host-root PRM *fallback* — it deliberately does not influence
+    the path-aware PRM lookup.
 
     Any embedded userinfo (``user:pass@``) is dropped. ``_validate_endpoint_url``
     rejects AS-declared endpoints carrying userinfo as a parser-confusion /
@@ -172,6 +178,16 @@ def _validate_auth_server_url(auth_server_url: str, mcp_server_url: str) -> bool
     the resulting tokens. Cross-origin authorization servers are permitted
     by RFC 9728 §2 for federated setups; they produce a prominent warning
     so the user can abort before the browser opens. See #13.
+
+    Reachability of internal / private-network HTTPS hosts is intentional and
+    not filtered: mcp-stdio is built to serve MCP servers (and their federated
+    authorization servers) on private networks, so applying an RFC 1918 address
+    block would break that supported case. The operator's choice to trust this
+    MCP server URL is the trust anchor, and the discovery requests these
+    validators gate are GETs that carry NO caller credential (the bearer token
+    is dropped before the OAuth client is built) and do not follow redirects —
+    a host reached here is probed for metadata, never handed a secret, and every
+    candidate endpoint is independently re-validated before any token exchange.
     """
     try:
         parsed = urlparse(auth_server_url)
@@ -1381,6 +1397,15 @@ def _run_device_authorization_flow(
             ).decode()
             poll_headers["Authorization"] = f"Basic {creds}"
         else:
+            # #5 (round17): a registered client_secret is always sent as a body
+            # credential here even when auth_method is "none" (the AS advertised
+            # no token_endpoint_auth_methods_supported but DCR still issued a
+            # secret). That is effectively client_secret_post and is the
+            # more-likely-to-succeed choice — a confidential client that holds a
+            # secret should present it — so the "none" label and the wire
+            # behaviour diverge deliberately. Consistent with exchange_code /
+            # refresh_access_token. A truly public client gets no csecret, so
+            # this branch then sends client_id alone.
             poll_data["client_id"] = cid
             if csecret:
                 poll_data["client_secret"] = csecret
