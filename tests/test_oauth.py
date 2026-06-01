@@ -189,6 +189,36 @@ class TestDiscoverMetadata:
         assert meta.token_endpoint == "https://as.example.com/token"
         assert "//authorize" not in meta.authorization_endpoint
 
+    def test_path_prm_without_as_falls_through_to_host_root(self, httpx_mock):
+        """#7(round11): a path-aware PRM that returns 200 but yields no usable
+        authorization_servers must NOT end discovery — fall through to the
+        host-root PRM candidate instead of giving up."""
+        server_url = "https://api.example.com/mcp"
+        # Path-aware PRM: 200 but empty authorization_servers (nothing usable).
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource/mcp",
+            json={"resource": server_url, "authorization_servers": []},
+        )
+        # Host-root PRM: 200 with a valid AS.
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource",
+            json={
+                "resource": server_url,
+                "authorization_servers": ["https://as.example.com"],
+            },
+        )
+        httpx_mock.add_response(
+            url="https://as.example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://as.example.com/auth",
+                "token_endpoint": "https://as.example.com/tok",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata(server_url, client)
+        assert meta.authorization_endpoint == "https://as.example.com/auth"
+        assert meta.token_endpoint == "https://as.example.com/tok"
+
     def test_fallback_on_404(self, httpx_mock):
         self._mock_no_prm(httpx_mock)
         httpx_mock.add_response(
@@ -1616,6 +1646,39 @@ class TestCallbackServer:
 
         assert cb_result.error == "access_denied"
         assert cb_result.auth_code is None
+
+    def test_callback_is_single_shot(self):
+        """#6(round11): once the first authorization response is captured, a
+        second /callback hit (refresh / prefetch / double-submit) must NOT
+        overwrite it."""
+        cb_result = CallbackResult()
+        handler_cls = _make_callback_handler(cb_result)
+
+        from http.server import HTTPServer
+
+        server = HTTPServer(("127.0.0.1", 0), handler_cls)
+        port = server.server_address[1]
+        done = threading.Event()
+
+        def serve():
+            while not done.is_set():
+                server.handle_request()
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        time.sleep(0.3)
+
+        r1 = httpx.get(f"http://127.0.0.1:{port}/callback?code=FIRST&state=s1")
+        r2 = httpx.get(f"http://127.0.0.1:{port}/callback?code=SECOND&state=s2")
+
+        done.set()
+        server.server_close()
+
+        assert "Authorization successful" in r1.text
+        assert "Already received" in r2.text  # second hit ignored
+        # The first capture stands; the second did not overwrite it.
+        assert cb_result.auth_code == "FIRST"
+        assert cb_result.state == "s1"
 
     def test_non_callback_path_returns_404_and_does_not_capture(self):
         """#15: favicon / prefetch / stray tabs must not deliver a code.
