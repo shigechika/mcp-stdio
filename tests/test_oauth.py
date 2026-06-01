@@ -168,6 +168,39 @@ class TestPKCE:
 # --- discover_oauth_metadata ---
 
 
+class TestFetchAuthServerMetadataIssuer:
+    """#7(round23): the issuer comparison and synthesized defaults must use the
+    query-stripped base — the path-scoped fallback passes the full server_url."""
+
+    def test_query_in_url_no_spurious_mismatch_and_clean_defaults(
+        self, httpx_mock, capsys
+    ):
+        from mcp_stdio.oauth import (
+            _build_well_known_url,
+            _fetch_authorization_server_metadata,
+        )
+
+        server_url = "https://ex.com/mcp?tenant=x"
+        well_known = _build_well_known_url(
+            server_url, "oauth-authorization-server"
+        )
+        # Metadata advertises the query-stripped issuer (the conformant value)
+        # and no endpoints, so they are synthesized from the base.
+        httpx_mock.add_response(
+            url=well_known, json={"issuer": "https://ex.com/mcp"}
+        )
+        client = httpx.Client()
+        meta = _fetch_authorization_server_metadata(server_url, client)
+
+        assert meta is not None
+        # Synthesized defaults derive from the query-stripped base — no '?tenant=x'.
+        assert meta.token_endpoint == "https://ex.com/mcp/token"
+        assert meta.authorization_endpoint == "https://ex.com/mcp/authorize"
+        assert meta.issuer == "https://ex.com/mcp"
+        # No spurious RFC 8414 §3.3 mismatch warning.
+        assert "issuer mismatch" not in capsys.readouterr().err
+
+
 class TestDiscoverMetadata:
     def _mock_no_prm(self, httpx_mock, base="https://api.example.com", path="/mcp"):
         """Mock RFC 9728 endpoints returning 404 (no protected resource metadata).
@@ -474,6 +507,33 @@ class TestDiscoverMetadata:
         client = httpx.Client()
         meta = discover_oauth_metadata("https://api.example.com/mcp", client)
         # Falls through to defaults
+        assert meta.token_endpoint == "https://api.example.com/token"
+
+    def test_rfc9728_non_json_200_falls_through(self, httpx_mock):
+        """#15(round23): a PRM candidate returning HTTP 200 with a NON-JSON body
+        must be skipped (continue to the next candidate / defaults), not crash on
+        the json() parse — closes the 200-non-JSON branch (the test above only
+        covers the 404-non-JSON case)."""
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource/mcp",
+            status_code=200,
+            text="<html>oops</html>",
+            headers={"content-type": "text/html"},
+        )
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-authorization-server",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-authorization-server/mcp",
+            status_code=404,
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata("https://api.example.com/mcp", client)
         assert meta.token_endpoint == "https://api.example.com/token"
 
     def test_separate_auth_server_rfc8414_fails_tries_base(self, httpx_mock):
@@ -944,6 +1004,27 @@ class TestRegisterClient:
                 "client_id": "cid",
                 "client_secret": "csec",
                 "client_secret_expires_at": "0",
+            },
+        )
+        meta = OAuthMetadata(
+            authorization_endpoint="https://api.example.com/authorize",
+            token_endpoint="https://api.example.com/token",
+            registration_endpoint="https://api.example.com/register",
+        )
+        client = httpx.Client()
+        reg = register_client(meta, "http://127.0.0.1:9999/callback", client)
+        assert reg.client_secret_expires_at is None
+
+    def test_client_secret_expires_at_garbage_coerced_to_none(self, httpx_mock):
+        """#15(round23): a non-numeric client_secret_expires_at (e.g. 'never')
+        that fails float() must coerce to None (no expiry), not crash DCR — closes
+        the uncovered garbage-value branch alongside the 0 / '0' / missing cases."""
+        httpx_mock.add_response(
+            url="https://api.example.com/register",
+            json={
+                "client_id": "cid",
+                "client_secret": "csec",
+                "client_secret_expires_at": "never",
             },
         )
         meta = OAuthMetadata(

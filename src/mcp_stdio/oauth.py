@@ -407,6 +407,15 @@ def _fetch_authorization_server_metadata(
     """
     # RFC 8414 issuer has no query component, so do not carry one through.
     well_known = _build_well_known_url(auth_server_url, "oauth-authorization-server")
+    # #7 (round23): on the Phase-2 path-scoped fallback this function is called
+    # with the full operator server_url, which may carry a query. _build_well_known_url
+    # already strips the query when forming the discovery URL, so the issuer
+    # comparison and the synthesized default endpoints must use the SAME
+    # query/fragment-stripped base — otherwise a server_url like
+    # ``https://host/mcp?tenant=x`` produces a spurious §3.3 mismatch warning and
+    # malformed ``.../mcp?tenant=x/authorize`` defaults.
+    _asp = urlsplit(auth_server_url)
+    auth_server_base = urlunsplit((_asp.scheme, _asp.netloc, _asp.path, "", ""))
     try:
         resp = client.get(well_known)
         if resp.status_code == 200:
@@ -416,15 +425,15 @@ def _fetch_authorization_server_metadata(
             # (the spec says reject) — real servers may be slightly misconfigured
             # (trailing slash, etc.) and rejecting would be too strict.
             issuer = data.get("issuer")
-            if issuer and issuer.rstrip("/") != auth_server_url.rstrip("/"):
+            if issuer and issuer.rstrip("/") != auth_server_base.rstrip("/"):
                 log(
                     f"warning: RFC 8414 §3.3 issuer mismatch — "
-                    f"expected {auth_server_url!r}, got {issuer!r}"
+                    f"expected {auth_server_base!r}, got {issuer!r}"
                 )
             methods = data.get("token_endpoint_auth_methods_supported")
             # Strip a trailing slash before building default endpoints so an AS
             # URL like "https://as/" does not yield "https://as//authorize".
-            base = auth_server_url.rstrip("/")
+            base = auth_server_base.rstrip("/")
             # Validate every endpoint the metadata declares against the #13
             # cleartext-leak policy before it can receive a secret. An unsafe
             # authorization/token endpoint falls back to the default path on
@@ -447,7 +456,7 @@ def _fetch_authorization_server_metadata(
                     label="device_authorization_endpoint",
                 ),
                 token_endpoint_auth_methods_supported=methods if isinstance(methods, list) else None,
-                issuer=issuer or auth_server_url,
+                issuer=issuer or auth_server_base,
                 # RFC 9207 §3: a true value makes a missing `iss` on the
                 # authorization response a MUST-reject (§2.4). Coerce strictly to
                 # bool so a non-bool JSON value cannot accidentally enable the
