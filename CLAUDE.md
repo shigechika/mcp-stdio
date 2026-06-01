@@ -38,8 +38,8 @@ Four modules under `src/mcp_stdio/`:
   - `run_sse()` — SSE transport (MCP 2024-11-05 legacy). Spawns a daemon reader thread that maintains a long-lived `GET /sse` connection, parses `endpoint`/`message` events per the WHATWG SSE spec, and resolves the POST endpoint URL (possibly relative). The main thread reads stdin and POSTs to that endpoint. Auto-reconnects on stream disconnect.
   - Both paths enforce the MCP cancellation spec's canceller-side SHOULD via a shared `_CancelTracker` + `_emit` gate: ids seen in `notifications/cancelled` on stdin are tracked with a 60 s TTL, and any late JSON-RPC response for a tracked id is dropped before it reaches stdout. Disable with `--no-cancel-filter`.
   - Signal handlers (`signal.signal`) are set from the main thread only — the SSE reader runs in a daemon thread so pytest tests must drive `run_sse` from the main thread.
-- **`cli.py`** — argparse-based CLI. Builds headers, resolves `MCP_BEARER_TOKEN` / `MCP_OAUTH_CLIENT_ID` env vars, runs OAuth flow before relay if `--oauth` is set, and dispatches to `run()` or `run_sse()` based on `--transport`.
-- **`oauth.py`** — OAuth 2.1 client: RFC 9728/8414 discovery, RFC 7591 dynamic client registration, RFC 7636 PKCE, RFC 8707 resource indicators, authorization code flow with localhost callback server, token exchange and refresh.
+- **`cli.py`** — argparse-based CLI. Builds headers, resolves `MCP_BEARER_TOKEN` / `MCP_OAUTH_CLIENT_ID` env vars, runs the OAuth flow before relay if `--oauth` or `--oauth-device` is set, and dispatches to `run()` or `run_sse()` based on `--transport`.
+- **`oauth.py`** — OAuth 2.1 client: RFC 9728/8414 discovery, RFC 7591 dynamic client registration, RFC 7636 PKCE, RFC 8707 resource indicators, authorization code flow with localhost callback server, RFC 8628 device authorization grant, RFC 9470 step-up authorization, token exchange and refresh.
 - **`token_store.py`** — Token persistence in `~/.config/mcp-stdio/tokens.json` (0o600). Stores per-server-URL tokens with client credentials and endpoint URLs for refresh. Migrates legacy `~/.mcp-stdio/` tokens on first read.
 
 Entry point: `mcp-stdio` command → `mcp_stdio.cli:main`.
