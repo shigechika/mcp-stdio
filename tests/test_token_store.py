@@ -182,6 +182,44 @@ class TestLoadSaveDelete:
         store_file.write_text("not json")
         assert load_token("https://example.com/mcp") is None
 
+    @pytest.mark.skipif(
+        sys.platform == "win32" or not hasattr(os, "mkfifo"),
+        reason="os.mkfifo is POSIX-only",
+    )
+    def test_load_fifo_store_returns_none_without_hanging(
+        self, tmp_path, monkeypatch
+    ):
+        """#10(round25): a FIFO (or other non-regular file) pre-planted at the
+        store path must be refused (O_NONBLOCK open + fstat regular-file check),
+        not read — an O_RDONLY read of a writer-less pipe would block forever and
+        hang load/save and the relay startup. load_token returns None, no hang."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        os.mkfifo(store_file)
+        # If the regular-file guard regressed, this would hang the test forever.
+        assert load_token("https://example.com/mcp") is None
+
+    @pytest.mark.parametrize("literal", ["Infinity", "-Infinity", "NaN"])
+    def test_load_non_finite_expires_at_returns_none(
+        self, tmp_path, monkeypatch, literal
+    ):
+        """#11(round25): json.loads parses the NaN / Infinity literals, which pass
+        an isinstance(float) check but poison the expiry comparison (inf = never
+        expires, NaN = always expired). A non-finite expires_at must degrade to
+        None (clean re-auth)."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        store_file.write_text(
+            '{"https://example.com/mcp": {"access_token": "t", "expires_at": '
+            + literal
+            + "}}"
+        )
+        assert load_token("https://example.com/mcp") is None
+
     def test_save_survives_unavailable_dir_fsync(self, tmp_path, monkeypatch):
         """The post-rename parent-dir fsync is best-effort — a platform that
         rejects it (e.g. Windows) must not fail the save."""
