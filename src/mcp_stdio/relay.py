@@ -566,7 +566,13 @@ def _emit(line: str, tracker: "_CancelTracker | None") -> None:
         _write_line(line)
         return
     rid = msg.get("id")
-    if rid is not None and ("result" in msg or "error" in msg):
+    # Drop only a pure JSON-RPC RESPONSE (id + result/error, NO method). A
+    # message carrying `method` is by definition a request / notification, not
+    # a response — so a malformed peer that sends `method` alongside
+    # result/error under a (coincidentally cancelled) id must still pass
+    # through, matching this function's documented scope ("server-initiated
+    # requests ... pass through"). See #1 (round30).
+    if rid is not None and "method" not in msg and ("result" in msg or "error" in msg):
         if tracker.consume(rid):
             log(f"dropped late response for cancelled id {rid!r}")
             return

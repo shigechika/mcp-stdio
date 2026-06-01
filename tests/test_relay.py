@@ -3203,6 +3203,87 @@ class TestPagination:
         requests = httpx_mock.get_requests()
         assert requests[1].headers["authorization"] == "Bearer new-token"
 
+    def test_page2_401_does_not_trigger_recovery_returns_partial(self, httpx_mock):
+        """#L(round30): a 401 on page>=2 must NOT reach run()'s token-refresh
+        recovery — _paginate_and_stream flushes the accumulated partial (status
+        coerced to 200) and re-exposes the cursor so the client can resume. The
+        refresher is never called and exactly one response is emitted. Pins the
+        page-1-only-recovery asymmetry."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "a"}], "nextCursor": "p2"},
+        }
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(page1),
+            headers={"content-type": "application/json"},
+        )
+        # Page 2 -> 401 (would trigger refresh on page 1, but not on page>=2).
+        httpx_mock.add_response(
+            url=self.URL,
+            status_code=401,
+            text="",
+            headers={"content-type": "application/json"},
+        )
+
+        called = {"refresh": False}
+
+        def spy_refresher():
+            called["refresh"] = True
+            return {"Content-Type": "application/json", "Authorization": "Bearer new"}
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+            token_refresher=spy_refresher,
+        )
+        lines = [x for x in output.strip().splitlines() if x]
+        assert len(lines) == 1  # one merged response, no duplicate error
+        merged = json.loads(lines[0])
+        assert merged["result"]["tools"] == [{"name": "a"}]  # page-1 partial
+        assert merged["result"]["nextCursor"] == "p2"  # resumable tail re-exposed
+        assert called["refresh"] is False  # page-2 401 stayed inside pagination
+
+    def test_pagination_adopts_last_page_session_id(self, httpx_mock):
+        """#1142(round30): when the server rotates Mcp-Session-Id across pages,
+        the LAST page's session is adopted (last-write-wins), so the NEXT stdin
+        request carries it — preserving session continuity for the 404
+        self-heal."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "a"}], "nextCursor": "p2"},
+        }
+        page2 = {"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "b"}]}}
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(page1),
+            headers={"content-type": "application/json", "mcp-session-id": "sess-1"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(page2),
+            headers={"content-type": "application/json", "mcp-session-id": "sess-2"},
+        )
+        # A later call on the next stdin line must carry sess-2 (last page's).
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","result":{},"id":2}',
+            headers={"content-type": "application/json"},
+        )
+
+        self._run_with_stdin(
+            httpx_mock,
+            [
+                json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call"}),
+            ],
+        )
+        reqs = httpx_mock.get_requests()
+        # reqs[2] is the line-2 tools/call; it carries the LAST page's session.
+        assert reqs[2].headers.get("mcp-session-id") == "sess-2"
+
     def test_first_page_retry_exhaustion_emits_single_error(self, httpx_mock):
         """When page 1 exhausts all retries (repeated ConnectError), the
         buffered ``_post_parsed`` path writes exactly one JSON-RPC error for
@@ -5849,6 +5930,17 @@ class TestEmit:
         t = _CancelTracker()
         t.add(1)
         line = '{"jsonrpc":"2.0","method":"sampling/createMessage","id":1,"params":{}}'
+        _emit(line, t)
+        assert capsys.readouterr().out.strip() == line
+
+    def test_forwards_malformed_message_with_method_and_result(self, capsys):
+        # #1(round30): a malformed peer message carrying BOTH `method` and
+        # `result` under a cancelled id is a request by JSON-RPC definition
+        # (method present), not a response — the filter must pass it through,
+        # not eat a server-initiated request on a torn-frame technicality.
+        t = _CancelTracker()
+        t.add(1)
+        line = '{"jsonrpc":"2.0","method":"sampling/createMessage","id":1,"result":{}}'
         _emit(line, t)
         assert capsys.readouterr().out.strip() == line
 
