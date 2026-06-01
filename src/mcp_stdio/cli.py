@@ -266,6 +266,22 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--oauth-timeout",
+        type=_positive_float,
+        # #13 (round25): how long the interactive OAuth flow waits for the user —
+        # the browser-callback redirect (auth-code flow) or the device-code
+        # confirmation. Was a hardcoded 120 s; expose it so a user who needs
+        # longer (slow device-code entry) is not cut off. Distinct from the HTTP
+        # --timeout-* (those bound network reads, not human interaction).
+        default=120.0,
+        metavar="SECONDS",
+        help=(
+            "Seconds to wait for the interactive OAuth flow (browser callback / "
+            "device-code confirmation) before giving up (default: 120). Only "
+            "used with --oauth / --oauth-device"
+        ),
+    )
+    parser.add_argument(
         "-H",
         "--header",
         action="append",
@@ -495,6 +511,7 @@ def main() -> None:
                 device_flow=args.oauth_device,
                 refresh_leeway=args.oauth_refresh_leeway,
                 resource_indicator=not args.no_resource_indicator,
+                timeout=args.oauth_timeout,
             )
             # Drop any differently-cased 'authorization' header a -H supplied
             # earlier (the -H loop ran before this block), so the OAuth token is
