@@ -152,12 +152,16 @@ def _build_scope_upgrader(
     headers: dict[str, str],
     timeout_connect: float,
     timeout_read: float,
+    oauth_timeout: float,
 ) -> Callable[[str], dict[str, str] | None]:
     """Build a scope-upgrade callback for the relay loop.
 
     Returns a callable that triggers an RFC 9470 / MCP step-up
     authorization flow for a given challenge scope and returns updated
-    headers on success, or None on failure.
+    headers on success, or None on failure. ``oauth_timeout`` bounds the
+    interactive wait (browser callback / device-code) the same way the
+    cold-start ``ensure_token`` does, so ``--oauth-timeout`` applies to a
+    mid-session step-up too, not just the initial authorization.
     """
 
     def upgrader(required_scope: str) -> dict[str, str] | None:
@@ -175,7 +179,9 @@ def _build_scope_upgrader(
             follow_redirects=False,
         )
         try:
-            data = step_up_authorize(server_url, client, required_scope)
+            data = step_up_authorize(
+                server_url, client, required_scope, timeout=oauth_timeout
+            )
             new_headers = dict(headers)
             new_headers["Authorization"] = _bearer_header_value(data.access_token)
         except Exception as e:
@@ -545,7 +551,11 @@ def main() -> None:
                     args.url, headers, args.timeout_connect, args.timeout_read
                 )
                 scope_upgrader = _build_scope_upgrader(
-                    args.url, headers, args.timeout_connect, args.timeout_read
+                    args.url,
+                    headers,
+                    args.timeout_connect,
+                    args.timeout_read,
+                    args.oauth_timeout,
                 )
         except Exception as e:
             print(f"error: OAuth authentication failed: {e}", file=sys.stderr)
