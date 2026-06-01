@@ -204,8 +204,8 @@ def _build_scope_upgrader(
     return upgrader
 
 
-def main() -> None:
-    """Entry point for mcp-stdio CLI."""
+def _main() -> None:
+    """CLI body. Wrapped by ``main`` for top-level interrupt handling."""
     parser = argparse.ArgumentParser(
         prog="mcp-stdio",
         description="Stdio-to-HTTP gateway for MCP servers. "
@@ -656,3 +656,20 @@ def main() -> None:
             token_refresher=token_refresher,
             scope_upgrader=scope_upgrader,
         )
+
+
+def main() -> None:
+    """Entry point for mcp-stdio CLI.
+
+    #2 (round35): run() / run_sse() install their own SIGINT/SIGTERM handlers,
+    but the pre-relay work — argument parsing and especially the blocking
+    interactive OAuth flow (browser callback / device-code wait, up to
+    --oauth-timeout) — runs before that. A Ctrl-C there would otherwise dump a
+    raw KeyboardInterrupt traceback (BaseException, so the OAuth block's
+    `except Exception` does not catch it). Exit cleanly with 130 instead.
+    """
+    try:
+        _main()
+    except KeyboardInterrupt:
+        print("\nmcp-stdio: interrupted", file=sys.stderr)
+        sys.exit(130)
