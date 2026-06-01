@@ -158,7 +158,7 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
-def _origin(parsed: ParseResult) -> tuple[str, str, int | None]:
+def _origin(parsed: ParseResult) -> tuple[str, str, int | str | None]:
     """Normalise a parsed URL to an RFC 6454 origin tuple for comparison.
 
     ``parsed.hostname`` already lowercases and strips userinfo; ``parsed.port``
@@ -168,7 +168,18 @@ def _origin(parsed: ParseResult) -> tuple[str, str, int | None]:
     or userinfo therefore compare equal.
     """
     host = (parsed.hostname or "").lower()
-    port = parsed.port
+    try:
+        port = parsed.port
+    except ValueError:
+        # #1 (round31): urllib parses the port LAZILY and raises ValueError on a
+        # non-numeric / out-of-range port (e.g. ``host:999999``) only on access.
+        # Guard it like _authorization_base_url / _build_well_known_url so a
+        # malformed-port URL never crashes a caller mid-discovery; return a
+        # string sentinel that can never equal a valid (scheme, host, int|None)
+        # origin, so such a URL reads as a distinct, non-matching origin. The
+        # #13 validators reject malformed-port URLs up front, so this is
+        # defense-in-depth for any other _origin caller.
+        return (parsed.scheme, host, "invalid-port")
     if port is None:
         port = _DEFAULT_PORTS.get(parsed.scheme)
     return (parsed.scheme, host, port)
@@ -220,6 +231,19 @@ def _validate_auth_server_url(auth_server_url: str, mcp_server_url: str) -> bool
             f"warning: authorization_server URL {auth_server_url!r} embeds "
             f"userinfo (user:pass@); refusing as a credential-exfiltration / "
             f"parser-confusion vector. See #13."
+        )
+        return False
+
+    try:
+        parsed.port  # force the lazy port parse; raises on out-of-range/non-numeric
+    except ValueError:
+        # #1 (round31): a malformed port makes this URL unusable AND would crash
+        # the _origin() comparison below. Skip the candidate (return False) so the
+        # discovery walk advances to the next authorization_server instead of
+        # letting a single bad entry abort the whole OAuth flow with a ValueError.
+        log(
+            f"warning: authorization_server URL {auth_server_url!r} has an "
+            f"invalid port, ignoring"
         )
         return False
 
@@ -348,6 +372,15 @@ def _validate_endpoint_url(endpoint_url: str | None, *, label: str) -> str | Non
         # endpoints; userinfo (``user:pass@host``) is an exfiltration / parser-
         # confusion vector, so refuse it outright.
         log(f"warning: refusing {label} URL with embedded userinfo, ignoring")
+        return None
+    try:
+        parsed.port  # force the lazy port parse; raises on out-of-range/non-numeric
+    except ValueError:
+        # #2 (round31): a malformed port (e.g. ``host:999999``) is unusable and
+        # must be dropped here — otherwise this attacker-influenced endpoint
+        # passes validation and a credential POST surfaces an opaque httpx error
+        # deep in exchange_code / refresh instead of a clean validation drop.
+        log(f"warning: malformed {label} URL {endpoint_url!r} (invalid port), ignoring")
         return None
     if parsed.scheme not in ("https", "http"):
         log(

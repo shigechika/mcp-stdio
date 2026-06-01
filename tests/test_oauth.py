@@ -3455,6 +3455,15 @@ class TestValidateAuthServerUrl:
     def test_malformed_url_rejected(self):
         assert _validate_auth_server_url("", self.SERVER_URL) is False
 
+    @pytest.mark.parametrize(
+        "bad", ["https://host:999999/as", "https://host:notaport/as"]
+    )
+    def test_malformed_port_rejected_not_raised(self, bad):
+        """#1(round31): an out-of-range / non-numeric port makes urllib raise on
+        lazy .port access — the validator must REJECT (False), not let the
+        ValueError escape and abort the discovery walk."""
+        assert _validate_auth_server_url(bad, self.SERVER_URL) is False
+
     def test_discover_skips_plaintext_auth_server_and_tries_fallback(
         self, httpx_mock
     ):
@@ -3514,6 +3523,34 @@ class TestValidateAuthServerUrl:
         meta = discover_oauth_metadata(server_url, client)
         assert meta.authorization_endpoint == "https://auth.example.com/authorize"
 
+    def test_discover_skips_malformed_port_auth_server(self, httpx_mock):
+        """#1(round31): a malformed-port AS candidate must be SKIPPED, not crash
+        the discovery walk. urllib parses the port lazily and raises ValueError
+        on .port access, which previously propagated out of the whole OAuth flow
+        — a single bad authorization_servers entry would DoS discovery."""
+        server_url = "https://mcp.example.com/mcp"
+        httpx_mock.add_response(
+            url="https://mcp.example.com/.well-known/oauth-protected-resource/mcp",
+            json={
+                "resource": server_url,
+                "authorization_servers": [
+                    "https://evil.example.net:999999/authorize",  # out-of-range port
+                    "https://auth.example.com",
+                ],
+            },
+        )
+        httpx_mock.add_response(
+            url="https://auth.example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://auth.example.com/authorize",
+                "token_endpoint": "https://auth.example.com/token",
+            },
+        )
+        client = httpx.Client()
+        # Without the fix this raises ValueError instead of returning metadata.
+        meta = discover_oauth_metadata(server_url, client)
+        assert meta.authorization_endpoint == "https://auth.example.com/authorize"
+
 
 class TestValidateEndpointUrl:
     """AS-metadata endpoint URLs must pass the #13 cleartext-leak policy
@@ -3550,6 +3587,16 @@ class TestValidateEndpointUrl:
         assert _validate_endpoint_url(None, label="token") is None
         assert _validate_endpoint_url("", label="token") is None
         assert capsys.readouterr().err == ""
+
+    @pytest.mark.parametrize(
+        "bad", ["https://evil:999999/token", "https://evil:notaport/token"]
+    )
+    def test_malformed_port_returns_none(self, bad, capsys):
+        """#2(round31): a malformed port must be dropped (None), not returned as
+        a 'valid' endpoint that later receives a credential POST and surfaces an
+        opaque httpx error deep in exchange_code / refresh."""
+        assert _validate_endpoint_url(bad, label="token_endpoint") is None
+        assert "invalid port" in capsys.readouterr().err
 
     def test_discover_drops_cleartext_token_endpoint_and_uses_default(
         self, httpx_mock, capsys
