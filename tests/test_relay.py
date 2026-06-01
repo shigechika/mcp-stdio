@@ -769,6 +769,74 @@ class TestRun:
         assert len(requests) == 2
         assert requests[1].headers["authorization"] == "Bearer new-token"
 
+    def test_notification_drawing_4xx_gets_no_synthesized_response(self, httpx_mock):
+        """A notification (no id) that a misbehaving server answers with 4xx must
+        NOT receive a synthesized id:null error — notifications expect no reply."""
+        httpx_mock.add_response(
+            status_code=400, text="", headers={"content-type": "application/json"}
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","method":"notifications/progress","params":{}}'],
+        )
+        assert output.strip() == ""
+
+    def test_request_drawing_4xx_still_gets_error(self, httpx_mock):
+        """A request (with id) that draws a 4xx still gets a JSON-RPC error."""
+        httpx_mock.add_response(
+            status_code=400, text="", headers={"content-type": "application/json"}
+        )
+        output = self._run_with_stdin(
+            httpx_mock, ['{"jsonrpc":"2.0","method":"tools/call","id":5}']
+        )
+        parsed = json.loads(output.strip())
+        assert parsed["id"] == 5 and "error" in parsed
+
+    def test_401_retry_returns_404_cascades_into_reinitialize(self, httpx_mock):
+        """The documented cross-branch cascade: a 401 whose refreshed retry
+        returns 404 flows into the 404 re-initialize branch and recovers."""
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json", "mcp-session-id": "sess-1"},
+        )
+        # tools/call -> 401
+        httpx_mock.add_response(
+            status_code=401, text="", headers={"content-type": "application/json"}
+        )
+        # refreshed retry -> 404 (session expired)
+        httpx_mock.add_response(
+            status_code=404, text="", headers={"content-type": "application/json"}
+        )
+        # reinit initialize -> sess-2
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":0}',
+            headers={"content-type": "application/json", "mcp-session-id": "sess-2"},
+        )
+        httpx_mock.add_response(status_code=202, text="")  # reinit initialized
+        # final retry -> 200
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"ok":true},"id":2}',
+            headers={"content-type": "application/json"},
+        )
+
+        def refresher():
+            return {"Authorization": "Bearer new"}
+
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","method":"init","id":1}',
+                '{"jsonrpc":"2.0","method":"tools/call","id":2}',
+            ],
+            token_refresher=refresher,
+        )
+        lines = [json.loads(x) for x in output.strip().splitlines() if x]
+        # The cascade must deliver the final result, not a synthesized error.
+        assert any(m.get("result") == {"ok": True} for m in lines)
+        # The retried call after reinit carried the recovered session id.
+        reqs = httpx_mock.get_requests()
+        assert reqs[-1].headers.get("mcp-session-id") == "sess-2"
+
     def test_401_response_rotated_session_id_used_on_retry(self, httpx_mock):
         """If the server assigns a NEW Mcp-Session-Id on the 401 response, the
         refreshed retry must carry it, not the stale/absent one."""
