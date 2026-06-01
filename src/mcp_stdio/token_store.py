@@ -547,10 +547,18 @@ def load_token(server_url: str) -> TokenData | None:
     # degrade to None rather than propagate a TypeError up the OAuth path.
     if not isinstance(td.access_token, str) or not td.access_token:
         return None
-    if td.expires_at is not None and not isinstance(td.expires_at, (int, float)):
+    # #9 (round23): bool is an int SUBCLASS in Python, so a corrupted
+    # ``true``/``false`` in the JSON would pass an isinstance(..., (int, float))
+    # check and reach ensure_token as 1/0 — a nonsensical 1970-epoch expiry.
+    # Reject bool explicitly so it degrades to re-auth instead of a bogus expiry.
+    if td.expires_at is not None and (
+        isinstance(td.expires_at, bool)
+        or not isinstance(td.expires_at, (int, float))
+    ):
         return None
-    if td.client_secret_expires_at is not None and not isinstance(
-        td.client_secret_expires_at, (int, float)
+    if td.client_secret_expires_at is not None and (
+        isinstance(td.client_secret_expires_at, bool)
+        or not isinstance(td.client_secret_expires_at, (int, float))
     ):
         return None
     # The string fields are consumed via .split() (scope) or sent verbatim in
