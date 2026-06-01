@@ -3868,6 +3868,35 @@ class TestRfc9207IssValidation:
         )
         assert data.access_token == "at"
 
+    def test_trailing_slash_iss_does_not_false_mismatch(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """#7(round25): the iss compare is trailing-slash tolerant, so a Phase-3
+        synthesized issuer ('https://ex.com', no slash) does NOT false-mismatch an
+        AS whose real iss is 'https://ex.com/' — the flow proceeds. A genuine
+        mix-up (different host) is still caught (test_iss_mismatch_raises)."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+        httpx_mock.add_response(
+            url="https://ex.com/token",
+            json={"access_token": "at", "token_type": "Bearer"},
+        )
+        monkeypatch.setattr(
+            "mcp_stdio.oauth.webbrowser.open",
+            self._driver("iss=https://ex.com/"),
+        )
+        client = httpx.Client()
+        data = _run_authorization_flow(
+            "https://ex.com/mcp",
+            client,
+            metadata=self.META,
+            cached=None,
+            client_id_override="cid",
+            timeout=5,
+        )
+        assert data.access_token == "at"
+
     def test_stepup_preserves_requested_scope_when_response_omits_it(
         self, httpx_mock, tmp_path, monkeypatch
     ):
