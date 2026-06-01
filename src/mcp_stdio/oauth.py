@@ -516,8 +516,9 @@ def discover_oauth_metadata(
 
     # Path-scoped issuers (Keycloak realm URLs, AWS Cognito user pools, etc.)
     # publish metadata at /.well-known/oauth-authorization-server/<path> per
-    # RFC 8414 §3 path-insertion. Try the original server_url when it has a
-    # path component that neither the PRM-discovered AS nor the base URL tried.
+    # RFC 8414 §3.1 (the well-known string is inserted between the host and the
+    # issuer's path component). Try the original server_url when it has a path
+    # component that neither the PRM-discovered AS nor the base URL tried.
     if server_url not in (auth_server_url, base):
         meta = _fetch_authorization_server_metadata(server_url, client)
         if meta:
@@ -525,16 +526,23 @@ def discover_oauth_metadata(
 
     # Phase 3: Default paths
     log("OAuth metadata not found, using default endpoints")
+    # Derive the default endpoints from the DISCOVERED authorization server when
+    # PRM advertised one (auth_server_url differs from the MCP-host base). A
+    # cross-origin AS that published no reachable RFC 8414 metadata would
+    # otherwise have its credential/code exchange POSTed to the MCP host — the
+    # wrong origin entirely. When no PRM AS was found, auth_server_url == base,
+    # so this reduces to the previous MCP-host defaults.
+    as_base = auth_server_url.rstrip("/")
     return OAuthMetadata(
-        authorization_endpoint=f"{base}/authorize",
-        token_endpoint=f"{base}/token",
-        registration_endpoint=f"{base}/register",
+        authorization_endpoint=f"{as_base}/authorize",
+        token_endpoint=f"{as_base}/token",
+        registration_endpoint=f"{as_base}/register",
         # No metadata was validated on this fallback, so it is the LEAST
         # trustworthy discovery outcome — keep the RFC 9207 iss mix-up check
         # active by pinning the issuer to the base the endpoints derive from.
         # Otherwise an AS returning `iss` would be compared against None and
         # the defence would silently no-op precisely here.
-        issuer=base,
+        issuer=as_base,
     )
 
 
