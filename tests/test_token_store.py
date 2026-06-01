@@ -288,6 +288,36 @@ class TestLoadSaveDelete:
         )
         assert load_token("https://example.com/mcp") is None
 
+    def test_load_non_bool_iss_parameter_supported_returns_none(
+        self, tmp_path, monkeypatch
+    ):
+        """#10(round22): iss_parameter_supported is security-load-bearing (it
+        gates the RFC 9207 §2.4 missing-iss reject on step-up). A corrupted
+        non-bool value must degrade to None / re-auth, not silently mis-set the
+        defence — validated like no_resource_indicator."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        store_file.write_text(
+            '{"https://example.com/mcp": '
+            '{"access_token": "t", "iss_parameter_supported": "yes"}}'
+        )
+        assert load_token("https://example.com/mcp") is None
+
+    def test_load_bool_iss_parameter_supported_loads(self, tmp_path, monkeypatch):
+        """A proper bool iss_parameter_supported round-trips."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        save_token(
+            "https://example.com/mcp",
+            TokenData(access_token="t", iss_parameter_supported=True),
+        )
+        loaded = load_token("https://example.com/mcp")
+        assert loaded is not None and loaded.iss_parameter_supported is True
+
     def test_save_over_corrupt_store_succeeds(self, tmp_path, monkeypatch):
         """A corrupt store file is replaced (not appended to) on the next save."""
         store_file = tmp_path / "tokens.json"

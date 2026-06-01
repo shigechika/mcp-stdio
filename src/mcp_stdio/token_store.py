@@ -405,6 +405,14 @@ def _write_store(data: dict[str, Any]) -> None:
     cannot corrupt existing tokens. After the rename the parent directory is
     fsynced so the directory entry change is itself durable across a power
     loss (the file data fsync alone does not guarantee the rename survives).
+
+    Note (#11 round22): a HARD kill (SIGKILL / power loss / OOM) between the temp
+    file's creation and the os.replace leaves an orphaned ``tokens.json.tmp.*``
+    sibling (0o600) that is never swept. This is accepted as harmless: the real
+    store is untouched (os.replace is atomic), the unique random suffix prevents
+    any collision with a future write, and the bytes stay 0o600. No per-write
+    directory scan is done to reclaim them — that cost is not worth paying on the
+    hot path for a leak that only a hard crash can produce.
     """
     _ensure_store_dir()
     # sort_keys for stable, diff-friendly on-disk output (#8 round17): without it
@@ -565,6 +573,13 @@ def load_token(server_url: str) -> TokenData | None:
         if value is not None and not isinstance(value, str):
             return None
     if not isinstance(td.no_resource_indicator, bool):
+        return None
+    # #10 (round22): iss_parameter_supported is SECURITY-load-bearing — it gates
+    # the RFC 9207 §2.4 missing-iss MUST-reject on the step-up cache-hit path. A
+    # corrupted store flipping it to a non-bool (or a truthy string that reads as
+    # enabled, or a 0 that reads as disabled) must degrade to None / re-auth, not
+    # silently mis-set the defence. Validate it like no_resource_indicator.
+    if not isinstance(td.iss_parameter_supported, bool):
         return None
     return td
 
