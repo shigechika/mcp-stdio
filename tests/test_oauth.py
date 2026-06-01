@@ -2870,6 +2870,15 @@ class TestStepUpAuthorize:
         monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
         self._drive_callback(monkeypatch)
 
+        # Step-up re-discovery now probes WWW-Authenticate first (#6 round16).
+        # A 401 with no PRM hint makes the probe a no-op so discovery falls
+        # through to the .well-known URLs below — but the request must be mocked
+        # or pytest_httpx's strict assert_all_requests_were_expected fails.
+        httpx_mock.add_response(
+            url=self.SERVER_URL,
+            method="POST",
+            status_code=401,
+        )
         httpx_mock.add_response(
             url="https://example.com/.well-known/oauth-protected-resource/mcp",
             status_code=404,
