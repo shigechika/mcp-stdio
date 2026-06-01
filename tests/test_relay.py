@@ -812,6 +812,50 @@ class TestRun:
         # The 500's "bad-rotated" was NOT adopted — request 3 still sends "good".
         assert reqs[2].headers.get("mcp-session-id") == "good"
 
+    def test_post_refresh_retry_terminal_error_session_id_not_adopted(
+        self, httpx_mock
+    ):
+        """#1(round24): the INLINE 401-retry session-id adoption must be gated
+        too — a refreshed retry that returns a TERMINAL error (500) while echoing
+        a rotated mcp-session-id must NOT carry that rejected id into the next
+        stdin line (the downstream gate declines it, but the inline write must
+        not poison session_id first)."""
+        # Line 1: init -> 200, session "s1".
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json", "mcp-session-id": "s1"},
+        )
+        # Line 2: call -> 401 (no session header → pre-recovery keeps "s1").
+        httpx_mock.add_response(
+            status_code=401, text="", headers={"content-type": "application/json"}
+        )
+        # 401 refresh retry -> 500 echoing a ROTATED id that must be ignored.
+        httpx_mock.add_response(
+            status_code=500,
+            text="",
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "bad-rotated",
+            },
+        )
+        # Line 3: call -> 200.
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":3}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","method":"init","id":1}',
+                '{"jsonrpc":"2.0","method":"call","id":2}',
+                '{"jsonrpc":"2.0","method":"call","id":3}',
+            ],
+            token_refresher=lambda: {"Authorization": "Bearer new"},
+        )
+        reqs = httpx_mock.get_requests()
+        # Line 3's request (index 3) still carries "s1", not the 500's "bad-rotated".
+        assert reqs[3].headers.get("mcp-session-id") == "s1"
+
     def test_session_expired_triggers_reinitialize_then_retry(self, httpx_mock):
         """Reproduces the 404 -> 400 hang from FastMCP StreamableHTTP.
 
@@ -2461,6 +2505,34 @@ class TestPagination:
                 **kwargs,
             )
         return stdout.getvalue()
+
+    def test_page1_nonlist_result_key_coerced_to_empty(self, httpx_mock):
+        """#11(round24): a page-1 result that has a nextCursor but whose
+        result_key (here 'tools') is MISSING/not-a-list (a server bug) must be
+        coerced to [] so the merge starts from an empty list, then page 2's items
+        append normally. Exercises the defensive coercion branch in
+        _paginate_and_stream that no test covered."""
+        # Page 1: nextCursor present but no "tools" key.
+        page1 = {"jsonrpc": "2.0", "id": 1, "result": {"nextCursor": "p2"}}
+        # Page 2: a normal terminal page.
+        page2 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "a"}]},
+        }
+        for page in (page1, page2):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=json.dumps(page),
+                headers={"content-type": "application/json"},
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())
+        # Page 1 contributed an empty list (coerced); page 2 appended its item.
+        assert merged["result"]["tools"] == [{"name": "a"}]
 
     @pytest.mark.parametrize(
         "method,result_key",
