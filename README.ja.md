@@ -225,6 +225,18 @@ mcp-stdio [OPTIONS] URL
 サーバを Streamable HTTP の MCP エンドポイントとして公開します。ローカルに
 インストールしていないクライアントからネットワーク越しに到達できます:
 
+```mermaid
+flowchart LR
+    A["MCP クライアント<br>Claude Code / Desktop<br>(または mcp-stdio --oauth)"]
+    B("mcp-stdio serve<br><b>HTTP → stdio</b> ゲートウェイ<br>認証: なし / 静的トークン /<br>埋め込み OAuth 2.1 AS")
+    C["ローカルの stdio<br>MCP サーバ"]
+    A == "HTTPS · Streamable HTTP<br>Bearer / OAuth 2.1 (PKCE)" ==> B
+    B -- "stdio (子プロセス起動)" --> C
+```
+
+冒頭のクライアント側の図と対になります。あちらは mcp-stdio が **stdio → HTTP**、
+こちらは **HTTP → stdio** です。
+
 ```bash
 mcp-stdio serve --port 8080 -- python -m my_mcp_server
 ```
