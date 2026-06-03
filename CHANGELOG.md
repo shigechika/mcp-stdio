@@ -5,9 +5,9 @@
 
 ### Features
 
-* add `serve` reverse-gateway mode (HTTP -&gt; stdio, M1 no-auth) ([#236](https://github.com/shigechika/mcp-stdio/issues/236)) ([a7eda89](https://github.com/shigechika/mcp-stdio/commit/a7eda897cd0c942dc0309ca2ec7f4013326108fb))
+* add `serve` reverse-gateway mode (HTTP -&gt; stdio, no-auth) ([#236](https://github.com/shigechika/mcp-stdio/issues/236)) ([a7eda89](https://github.com/shigechika/mcp-stdio/commit/a7eda897cd0c942dc0309ca2ec7f4013326108fb))
 * embedded OAuth 2.1 Authorization Server for serve mode ([#239](https://github.com/shigechika/mcp-stdio/issues/239)) ([f992350](https://github.com/shigechika/mcp-stdio/commit/f9923506262e4381d9f11c78a2cd1f1d36dabef8))
-* serve mode optional static-token auth + RFC 9728 metadata (M2) ([#238](https://github.com/shigechika/mcp-stdio/issues/238)) ([0c0ca27](https://github.com/shigechika/mcp-stdio/commit/0c0ca2796924e992787ddda0ddbdc2d84b9f8d59))
+* serve mode optional static-token auth + RFC 9728 metadata ([#238](https://github.com/shigechika/mcp-stdio/issues/238)) ([0c0ca27](https://github.com/shigechika/mcp-stdio/commit/0c0ca2796924e992787ddda0ddbdc2d84b9f8d59))
 
 ## [0.15.0](https://github.com/shigechika/mcp-stdio/compare/v0.14.0...v0.15.0) (2026-06-01)
 
