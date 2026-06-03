@@ -268,6 +268,20 @@ def test_prm_404_when_auth_disabled(gateway):
     assert resp.status_code == 404
 
 
+def test_prm_prefix_overmatch_not_served(auth_gateway):
+    # A path that merely shares the well-known prefix (".../-resource-evil")
+    # must NOT be treated as the metadata endpoint.
+    url, _ = auth_gateway
+    resp = httpx.get(_base(url) + "/.well-known/oauth-protected-resource-evil", timeout=10)
+    assert resp.status_code == 404
+    assert "bearer_methods_supported" not in resp.text
+
+
+def test_serve_main_rejects_path_with_quote():
+    with pytest.raises(SystemExit):
+        server.serve_main(["--path", '/m"cp', "--", "true"])
+
+
 def test_prm_honors_forwarded_headers(auth_gateway):
     url, _ = auth_gateway
     resp = httpx.get(

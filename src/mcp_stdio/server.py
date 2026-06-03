@@ -459,8 +459,12 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         path = self.path.split("?", 1)[0]
         # RFC 9728 metadata is unauthenticated — it is how the client discovers
-        # how to authenticate — so it is checked before the auth gate.
-        if path.startswith(_PRM_WELL_KNOWN_PREFIX):
+        # how to authenticate — so it is checked before the auth gate. Match the
+        # exact well-known path or a path-suffixed form (".../<resource path>"),
+        # NOT a mere prefix (so "...-resource-evil" does not match).
+        if path == _PRM_WELL_KNOWN_PREFIX or path.startswith(
+            _PRM_WELL_KNOWN_PREFIX + "/"
+        ):
             self._serve_prm()
             return
         if self._wrong_path():
@@ -627,6 +631,11 @@ def serve_main(argv: list[str]) -> None:
         parser.error("a backend command is required, e.g. serve -- python -m my_mcp")
     if not args.path.startswith("/"):
         parser.error("--path must start with '/'")
+    # The path is reflected into the quoted WWW-Authenticate resource_metadata
+    # and the PRM JSON; reject characters that would break that quoting or
+    # inject into headers.
+    if any(c in args.path for c in ('"', "\r", "\n", " ")):
+        parser.error("--path must not contain quotes, spaces, or CR/LF")
 
     # Env var is preferred (not visible in `ps`); an explicit flag wins but
     # warns. An empty token (flag or exported-but-empty env var) normalizes to
