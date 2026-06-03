@@ -228,12 +228,12 @@ Streamable HTTP MCP endpoint so clients that cannot spawn it locally can reach
 it over the network:
 
 ```mermaid
-flowchart LR
+flowchart BT
     A["MCP client<br>Claude Code / Desktop<br>(or mcp-stdio --oauth)"]
     B("mcp-stdio serve<br><b>HTTP → stdio</b> gateway<br>auth: none / static token /<br>embedded OAuth 2.1 AS")
     C["local stdio<br>MCP server"]
-    A == "HTTPS · Streamable HTTP<br>Bearer / OAuth 2.1 (PKCE)" ==> B
-    B -- "stdio (spawned child)" --> C
+    A <== "HTTPS · Streamable HTTP<br>Bearer / OAuth 2.1 (PKCE)" ==> B
+    B <-- "stdio (spawned child)" --> C
 ```
 
 This is the mirror of the client-side diagram at the top: there mcp-stdio is
