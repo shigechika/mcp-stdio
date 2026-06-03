@@ -30,7 +30,9 @@ remapping for true multi-client fan-out is a later milestone.
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
+import os
 import queue
 import signal
 import subprocess
@@ -49,6 +51,28 @@ _BACKEND_RESPONSE_TIMEOUT_SECS = 120.0
 # How long a GET SSE stream blocks on the outbound queue before emitting an
 # SSE comment as a keepalive (also the cadence at which it notices shutdown).
 _SSE_KEEPALIVE_SECS = 15.0
+
+# RFC 9728 Protected Resource Metadata well-known prefix. The full metadata URL
+# inserts this between origin and the resource path (RFC 9728 Sec. 3.1), e.g.
+# resource ``https://h/mcp`` -> ``https://h/.well-known/oauth-protected-resource/mcp``.
+_PRM_WELL_KNOWN_PREFIX = "/.well-known/oauth-protected-resource"
+
+# Environment variable carrying the gateway's static bearer token. Preferred
+# over the --auth-token flag, which would expose the token in ``ps`` output.
+_SERVE_TOKEN_ENV = "MCP_STDIO_SERVE_TOKEN"
+
+# Host characters we allow when reflecting a (possibly proxy-supplied) Host /
+# X-Forwarded-Host into an absolute metadata URL. Restricting to this set keeps
+# a hostile Host header from injecting a quote/space into the quoted
+# ``resource_metadata`` challenge parameter or the JSON body.
+_HOST_ALLOWED = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-:[]"
+)
+
+
+def _sanitize_host(host: str) -> str:
+    """Keep only safe host[:port] characters; empty -> caller falls back."""
+    return "".join(c for c in host if c in _HOST_ALLOWED)
 
 
 def _classify(msg: Any) -> str:
@@ -264,6 +288,9 @@ class _Handler(BaseHTTPRequestHandler):
     backend: BackendProcess
     mcp_path: str
     session_id: str
+    # None disables authentication (M1 behavior). A non-None value enables the
+    # static-bearer-token Resource Server gate (M2).
+    auth_token: str | None = None
 
     # Quieter, consistent logging: route BaseHTTPRequestHandler's access log
     # through the project logger instead of stderr's default apache-style line.
@@ -295,6 +322,80 @@ class _Handler(BaseHTTPRequestHandler):
             return True
         return False
 
+    # --- M2: static-bearer-token Resource Server + RFC 9728 metadata ---
+
+    def _origin(self) -> str:
+        """Absolute ``scheme://host`` for building metadata URLs.
+
+        Honors a fronting reverse proxy via ``X-Forwarded-Proto`` /
+        ``X-Forwarded-Host`` (the gateway is designed to run behind one), then
+        the ``Host`` header, then the bound socket. The host is sanitized so a
+        hostile value cannot inject into the quoted challenge / JSON body.
+        """
+        proto = (
+            self.headers.get("X-Forwarded-Proto", "").split(",")[0].strip().lower()
+        )
+        if proto not in ("http", "https"):
+            proto = "http"
+        host = self.headers.get("X-Forwarded-Host", "").split(",")[0].strip()
+        if not host:
+            host = self.headers.get("Host", "").strip()
+        host = _sanitize_host(host)
+        if not host:
+            addr = self.server.server_address
+            host = f"{addr[0]}:{addr[1]}"
+        return f"{proto}://{host}"
+
+    def _resource_url(self) -> str:
+        return self._origin() + self.mcp_path
+
+    def _prm_url(self) -> str:
+        # RFC 9728 Sec. 3.1 path insertion.
+        return self._origin() + _PRM_WELL_KNOWN_PREFIX + self.mcp_path
+
+    def _authorized(self) -> bool:
+        """True when auth is disabled or a valid Bearer token is presented."""
+        if self.auth_token is None:
+            return True
+        auth = self.headers.get("Authorization", "")
+        prefix = "Bearer "
+        token = auth[len(prefix):] if auth.startswith(prefix) else ""
+        # Constant-time compare on bytes (str compare_digest rejects non-ASCII).
+        return bool(token) and hmac.compare_digest(
+            token.encode("utf-8"), self.auth_token.encode("utf-8")
+        )
+
+    def _require_auth(self) -> bool:
+        """Return True if the request may proceed; else send 401 and return False."""
+        if self._authorized():
+            return True
+        body = _error_body("authentication required").encode("utf-8")
+        self.send_response(401)
+        # RFC 9728 Sec. 5.1: point the client at the protected-resource metadata.
+        self.send_header(
+            "WWW-Authenticate", f'Bearer resource_metadata="{self._prm_url()}"'
+        )
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return False
+
+    def _serve_prm(self) -> None:
+        """Serve RFC 9728 Protected Resource Metadata (only when auth is on)."""
+        if self.auth_token is None:
+            self._send_json(404, _error_body("not found"))
+            return
+        body = json.dumps(
+            {
+                "resource": self._resource_url(),
+                # No authorization_servers yet: M2 uses operator-issued static
+                # tokens. M3's embedded AS adds the issuer here.
+                "bearer_methods_supported": ["header"],
+            }
+        )
+        self._send_json(200, body)
+
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         # Read (drain) the request body BEFORE any early return. On HTTP/1.1
         # keep-alive, leaving an unread body in the socket makes the handler
@@ -313,6 +414,8 @@ class _Handler(BaseHTTPRequestHandler):
             return
         raw = self.rfile.read(length) if length > 0 else b""
         if self._wrong_path():
+            return
+        if not self._require_auth():
             return
         try:
             text = raw.decode("utf-8")
@@ -354,7 +457,19 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(400, _error_body("unsupported or invalid message"))
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        path = self.path.split("?", 1)[0]
+        # RFC 9728 metadata is unauthenticated — it is how the client discovers
+        # how to authenticate — so it is checked before the auth gate. Match the
+        # exact well-known path or a path-suffixed form (".../<resource path>"),
+        # NOT a mere prefix (so "...-resource-evil" does not match).
+        if path == _PRM_WELL_KNOWN_PREFIX or path.startswith(
+            _PRM_WELL_KNOWN_PREFIX + "/"
+        ):
+            self._serve_prm()
+            return
         if self._wrong_path():
+            return
+        if not self._require_auth():
             return
         # Open an SSE stream carrying server-initiated messages (notifications
         # and server->client requests) until the client disconnects or the
@@ -390,6 +505,8 @@ class _Handler(BaseHTTPRequestHandler):
         # long-lived backend, so acknowledge without tearing it down.
         if self._wrong_path():
             return
+        if not self._require_auth():
+            return
         self._send_empty(200)
 
 
@@ -399,6 +516,7 @@ def build_server(
     host: str = "127.0.0.1",
     port: int = 8080,
     mcp_path: str = "/mcp",
+    auth_token: str | None = None,
 ) -> tuple[ThreadingHTTPServer, BackendProcess]:
     """Construct the HTTP server and backend without running the loop.
 
@@ -406,6 +524,10 @@ def build_server(
     port (``port=0``) without installing signal handlers or blocking. The
     caller owns the lifecycle: run ``httpd.serve_forever()`` (typically in a
     thread), then ``backend.shutdown()`` + ``httpd.server_close()``.
+
+    ``auth_token`` (when not None) enables the static-bearer-token Resource
+    Server gate (M2): MCP-path requests require ``Authorization: Bearer
+    <auth_token>`` and a 401 advertises RFC 9728 metadata.
     """
     backend = BackendProcess(command)
     handler = type(
@@ -415,6 +537,7 @@ def build_server(
             "backend": backend,
             "mcp_path": mcp_path,
             "session_id": uuid.uuid4().hex,
+            "auth_token": auth_token,
         },
     )
     httpd = ThreadingHTTPServer((host, port), handler)
@@ -429,14 +552,17 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8080,
     mcp_path: str = "/mcp",
+    auth_token: str | None = None,
 ) -> None:
     """Run the reverse gateway until interrupted.
 
     Spawns ``command`` as the backend stdio MCP server and serves it at
     ``http://host:port{mcp_path}``. Blocks until SIGINT/SIGTERM, then tears
-    the backend down.
+    the backend down. ``auth_token`` enables the static-token gate (M2).
     """
-    httpd, backend = build_server(command, host=host, port=port, mcp_path=mcp_path)
+    httpd, backend = build_server(
+        command, host=host, port=port, mcp_path=mcp_path, auth_token=auth_token
+    )
 
     stopping = threading.Event()
 
@@ -451,9 +577,10 @@ def serve(
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
+    auth_state = "static bearer token" if auth_token else "no auth"
     log(
         f"serving {' '.join(command)} at "
-        f"http://{host}:{port}{mcp_path} (no auth — M1)"
+        f"http://{host}:{port}{mcp_path} ({auth_state})"
     )
     try:
         httpd.serve_forever()
@@ -472,13 +599,24 @@ def serve_main(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(
         prog="mcp-stdio serve",
         description=(
-            "Expose a local stdio MCP server as a Streamable HTTP MCP endpoint "
-            "(M1: no authentication). The backend command follows the options."
+            "Expose a local stdio MCP server as a Streamable HTTP MCP endpoint. "
+            "Optionally protect it with a static bearer token. The backend "
+            "command follows the options."
         ),
     )
     parser.add_argument("--host", default="127.0.0.1", help="bind host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8080, help="bind port (default: 8080)")
     parser.add_argument("--path", default="/mcp", help="MCP endpoint path (default: /mcp)")
+    parser.add_argument(
+        "--auth-token",
+        default=None,
+        metavar="TOKEN",
+        help=(
+            "Require this static bearer token on MCP requests "
+            f"(or set {_SERVE_TOKEN_ENV}; the env var is preferred since a flag "
+            "value is visible in `ps`). Omit for no authentication."
+        ),
+    )
     parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
@@ -493,5 +631,28 @@ def serve_main(argv: list[str]) -> None:
         parser.error("a backend command is required, e.g. serve -- python -m my_mcp")
     if not args.path.startswith("/"):
         parser.error("--path must start with '/'")
+    # The path is reflected into the quoted WWW-Authenticate resource_metadata
+    # and the PRM JSON; reject characters that would break that quoting or
+    # inject into headers.
+    if any(c in args.path for c in ('"', "\r", "\n", " ")):
+        parser.error("--path must not contain quotes, spaces, or CR/LF")
 
-    serve(command, host=args.host, port=args.port, mcp_path=args.path)
+    # Env var is preferred (not visible in `ps`); an explicit flag wins but
+    # warns. An empty token (flag or exported-but-empty env var) normalizes to
+    # None = no auth, rather than enabling an impossible-to-satisfy gate.
+    auth_token = args.auth_token
+    if auth_token is not None:
+        log("warning: --auth-token is visible in `ps`; prefer "
+            f"{_SERVE_TOKEN_ENV} for production")
+    else:
+        auth_token = os.environ.get(_SERVE_TOKEN_ENV)
+    if not auth_token:
+        auth_token = None
+
+    serve(
+        command,
+        host=args.host,
+        port=args.port,
+        mcp_path=args.path,
+        auth_token=auth_token,
+    )

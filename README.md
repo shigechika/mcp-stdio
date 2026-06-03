@@ -240,15 +240,26 @@ mcp-stdio --check http://127.0.0.1:8080/mcp
 - Stdlib only (`http.server`) — adds no runtime dependency.
 - Implements the Streamable HTTP request/response and notification semantics
   plus a GET SSE channel for server-initiated messages.
-- **Milestone M1: no authentication.** Run it behind a TLS-terminating reverse
-  proxy. OAuth (Resource Server validation, then an embedded Authorization
-  Server) lands in later milestones — see
-  [#235](https://github.com/shigechika/mcp-stdio/issues/235).
+- **Authentication is optional.** Without a token the endpoint is open (run it
+  behind a TLS-terminating reverse proxy). With a token it acts as an OAuth
+  Resource Server: MCP requests require `Authorization: Bearer <token>`, and a
+  401 advertises [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) Protected
+  Resource Metadata at `/.well-known/oauth-protected-resource`. A full embedded
+  Authorization Server (PKCE, dynamic client registration) is a later milestone
+  — see [#235](https://github.com/shigechika/mcp-stdio/issues/235).
 - Single-client assumption for now: JSON-RPC ids pass through verbatim.
 
+Authenticated example (token via env so it is not visible in `ps`):
+
+```bash
+MCP_STDIO_SERVE_TOKEN=your-secret mcp-stdio serve --port 8080 -- python -m my_mcp_server
+mcp-stdio --bearer-token your-secret --check http://127.0.0.1:8080/mcp
+```
+
 Options: `--host` (default `127.0.0.1`), `--port` (default `8080`), `--path`
-(default `/mcp`). The backend command follows the options (an optional `--`
-separator is supported).
+(default `/mcp`), `--auth-token TOKEN` (or `MCP_STDIO_SERVE_TOKEN`, preferred).
+The backend command follows the options (an optional `--` separator is
+supported).
 
 ## Workarounds
 
