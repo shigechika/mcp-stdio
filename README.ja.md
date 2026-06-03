@@ -218,7 +218,7 @@ mcp-stdio [OPTIONS] URL
 
 各フラグの詳細（プラットフォーム注記や issue 参照を含む）は `mcp-stdio --help` を実行してください。この表より詳しい説明が表示されます。
 
-## 逆ゲートウェイ: `serve` モード（実験的）
+## 逆ゲートウェイ: `serve` モード
 
 通常モードは **stdio → HTTP**（クライアント側）の橋渡しですが、`serve`
 サブコマンドはその逆向き — **HTTP → stdio** — で、ローカルの stdio MCP

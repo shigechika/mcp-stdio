@@ -220,7 +220,7 @@ Options:
 
 Run `mcp-stdio --help` for the full per-flag detail (platform notes and issue references are more verbose than this table).
 
-## Reverse gateway: `serve` mode (experimental)
+## Reverse gateway: `serve` mode
 
 The default mode bridges **stdio → HTTP** (client side). The `serve` subcommand
 is the mirror image — **HTTP → stdio** — exposing a local stdio MCP server as a
