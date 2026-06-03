@@ -238,14 +238,25 @@ mcp-stdio --check http://127.0.0.1:8080/mcp
 - 標準ライブラリのみ（`http.server`）— ランタイム依存は増えません。
 - Streamable HTTP のリクエスト/レスポンス・通知のセマンティクスに加え、
   サーバ起点メッセージ用の GET SSE チャネルを実装。
-- **マイルストーン M1: 認証なし。** TLS 終端のリバースプロキシ背後で運用して
-  ください。OAuth（リソースサーバ検証 → 埋め込み認可サーバ）は後続マイル
-  ストーン — [#235](https://github.com/shigechika/mcp-stdio/issues/235) 参照。
+- **認証は任意。** トークン無しならエンドポイントは素通し（TLS 終端の
+  リバースプロキシ背後で運用）。トークンを設定すると OAuth リソースサーバ
+  として振る舞い、MCP リクエストに `Authorization: Bearer <token>` を要求し、
+  401 で [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) Protected Resource
+  Metadata（`/.well-known/oauth-protected-resource`）を広告します。埋め込み
+  認可サーバ（PKCE・動的クライアント登録）は後続マイルストーン —
+  [#235](https://github.com/shigechika/mcp-stdio/issues/235) 参照。
 - 当面はシングルクライアント前提（JSON-RPC の id はそのまま透過）。
 
+認証付きの例（トークンは env 経由で `ps` に出さない）:
+
+```bash
+MCP_STDIO_SERVE_TOKEN=your-secret mcp-stdio serve --port 8080 -- python -m my_mcp_server
+mcp-stdio --bearer-token your-secret --check http://127.0.0.1:8080/mcp
+```
+
 オプション: `--host`（既定 `127.0.0.1`）、`--port`（既定 `8080`）、`--path`
-（既定 `/mcp`）。バックエンドコマンドはオプションの後に置きます（`--`
-区切りも可）。
+（既定 `/mcp`）、`--auth-token TOKEN`（または `MCP_STDIO_SERVE_TOKEN`、こちらが
+推奨）。バックエンドコマンドはオプションの後に置きます（`--` 区切りも可）。
 
 ## ワークアラウンド
 

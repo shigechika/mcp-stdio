@@ -177,3 +177,130 @@ def test_serve_main_requires_command():
 def test_serve_main_rejects_bad_path():
     with pytest.raises(SystemExit):
         server.serve_main(["--path", "mcp", "--", "true"])  # path missing leading /
+
+
+# --- M2: static-bearer-token Resource Server + RFC 9728 metadata ---
+
+_TOKEN = "s3cr3t-token"
+
+
+@pytest.fixture()
+def auth_gateway():
+    """A gateway protected by a static bearer token."""
+    httpd, backend = server.build_server(
+        _BACKEND, host="127.0.0.1", port=0, auth_token=_TOKEN
+    )
+    host, port = httpd.server_address[0], httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    url = f"http://{host}:{port}/mcp"
+    try:
+        yield url, backend
+    finally:
+        httpd.shutdown()
+        backend.shutdown()
+        httpd.server_close()
+
+
+def _base(url: str) -> str:
+    return url.rsplit("/mcp", 1)[0]
+
+
+def test_auth_missing_token_returns_401_with_metadata_hint(auth_gateway):
+    url, _ = auth_gateway
+    resp = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo"})
+    assert resp.status_code == 401
+    wa = resp.headers.get("www-authenticate", "")
+    assert wa.startswith("Bearer ")
+    assert "resource_metadata=" in wa
+    assert "/.well-known/oauth-protected-resource/mcp" in wa
+
+
+def test_auth_wrong_token_returns_401(auth_gateway):
+    url, _ = auth_gateway
+    resp = httpx.post(
+        url,
+        content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "echo"}),
+        headers={"Authorization": "Bearer nope"},
+        timeout=10,
+    )
+    assert resp.status_code == 401
+
+
+def test_auth_valid_token_returns_200(auth_gateway):
+    url, _ = auth_gateway
+    resp = httpx.post(
+        url,
+        content=json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "echo", "params": {"a": 1}}
+        ),
+        headers={"Authorization": f"Bearer {_TOKEN}"},
+        timeout=10,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["result"]["echoed"] == {"a": 1}
+
+
+def test_get_sse_requires_auth(auth_gateway):
+    url, _ = auth_gateway
+    resp = httpx.get(url, timeout=10)  # no token on the MCP path
+    assert resp.status_code == 401
+
+
+def test_prm_served_without_token(auth_gateway):
+    url, _ = auth_gateway
+    base = _base(url)
+    # Path-specific form (RFC 9728 Sec. 3.1).
+    resp = httpx.get(base + "/.well-known/oauth-protected-resource/mcp", timeout=10)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["resource"].endswith("/mcp")
+    assert body["bearer_methods_supported"] == ["header"]
+    assert "authorization_servers" not in body  # none until M3
+    # Bare form is also served.
+    resp2 = httpx.get(base + "/.well-known/oauth-protected-resource", timeout=10)
+    assert resp2.status_code == 200
+
+
+def test_prm_404_when_auth_disabled(gateway):
+    url, _ = gateway
+    resp = httpx.get(_base(url) + "/.well-known/oauth-protected-resource/mcp", timeout=10)
+    assert resp.status_code == 404
+
+
+def test_prm_honors_forwarded_headers(auth_gateway):
+    url, _ = auth_gateway
+    resp = httpx.get(
+        _base(url) + "/.well-known/oauth-protected-resource/mcp",
+        headers={"X-Forwarded-Proto": "https", "X-Forwarded-Host": "gw.example.org"},
+        timeout=10,
+    )
+    assert resp.json()["resource"] == "https://gw.example.org/mcp"
+
+
+def test_no_auth_fixture_still_open(gateway):
+    # The default fixture has no token: a request without Authorization is 200.
+    url, _ = gateway
+    resp = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo"})
+    assert resp.status_code == 200
+
+
+def test_sanitize_host():
+    assert server._sanitize_host("gw.example.org:8443") == "gw.example.org:8443"
+    # quote / CR / LF / space are stripped (header-injection guard)
+    assert server._sanitize_host('evil"\r\n host') == "evilhost"
+
+
+def test_authorized_constant_time_paths():
+    # Build a handler instance is heavy; exercise the token compare via a
+    # lightweight stand-in object carrying the attributes _authorized reads.
+    class Fake:
+        auth_token = "tok"
+        def __init__(self, hdr):
+            self.headers = {"Authorization": hdr}
+    Fake._authorized = server._Handler._authorized
+    assert Fake("Bearer tok")._authorized() is True
+    assert Fake("Bearer no")._authorized() is False
+    assert Fake("")._authorized() is False
+    Fake.auth_token = None
+    assert Fake("")._authorized() is True
