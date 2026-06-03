@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
 
+from mcp_stdio import oauth as client_oauth
 from mcp_stdio import server
 
 _BACKEND = [sys.executable, os.path.join(os.path.dirname(__file__), "_fake_backend.py")]
@@ -179,7 +183,7 @@ def test_serve_main_rejects_bad_path():
         server.serve_main(["--path", "mcp", "--", "true"])  # path missing leading /
 
 
-# --- M2: static-bearer-token Resource Server + RFC 9728 metadata ---
+# --- static-bearer-token Resource Server + RFC 9728 metadata ---
 
 _TOKEN = "s3cr3t-token"
 
@@ -256,7 +260,7 @@ def test_prm_served_without_token(auth_gateway):
     body = resp.json()
     assert body["resource"].endswith("/mcp")
     assert body["bearer_methods_supported"] == ["header"]
-    assert "authorization_servers" not in body  # none until M3
+    assert "authorization_servers" not in body  # none without the embedded AS
     # Bare form is also served.
     resp2 = httpx.get(base + "/.well-known/oauth-protected-resource", timeout=10)
     assert resp2.status_code == 200
@@ -310,6 +314,7 @@ def test_authorized_constant_time_paths():
     # lightweight stand-in object carrying the attributes _authorized reads.
     class Fake:
         auth_token = "tok"
+        oauth = None
         def __init__(self, hdr):
             self.headers = {"Authorization": hdr}
     Fake._authorized = server._Handler._authorized
@@ -318,3 +323,548 @@ def test_authorized_constant_time_paths():
     assert Fake("")._authorized() is False
     Fake.auth_token = None
     assert Fake("")._authorized() is True
+
+
+# --- embedded OAuth 2.1 Authorization Server ---
+
+_REDIRECT = "http://127.0.0.1:5555/callback"
+
+
+@contextlib.contextmanager
+def _run(*, auth_token=None, oauth=None):
+    """Start a gateway with the given auth config; yield (base_url, backend)."""
+    httpd, backend = server.build_server(
+        _BACKEND, host="127.0.0.1", port=0, auth_token=auth_token, oauth=oauth
+    )
+    host, port = httpd.server_address[0], httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield f"http://{host}:{port}", backend
+    finally:
+        httpd.shutdown()
+        backend.shutdown()
+        httpd.server_close()
+
+
+def _provider(**kw):
+    kw.setdefault("public_url", None)
+    kw.setdefault("trusted_user_header", None)
+    kw.setdefault("dev_user", "alice")
+    return server._OAuthProvider(**kw)
+
+
+@pytest.fixture()
+def oauth_gateway():
+    """A gateway with the embedded AS enabled and --dev-user=alice."""
+    with _run(oauth=_provider()) as (base, backend):
+        yield base, backend
+
+
+def _register(base, redirect=_REDIRECT):
+    return httpx.post(
+        base + "/register",
+        json={
+            "client_name": "test",
+            "redirect_uris": [redirect],
+            "response_types": ["code"],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "token_endpoint_auth_method": "none",
+        },
+        timeout=10,
+    )
+
+
+def _authorize(base, client_id, challenge, *, redirect=_REDIRECT, state="st-123",
+               method="S256", response_type="code", headers=None, drop=None):
+    params = {
+        "client_id": client_id,
+        "response_type": response_type,
+        "redirect_uri": redirect,
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": method,
+        "resource": base + "/mcp",
+    }
+    for k in (drop or []):
+        params.pop(k, None)
+    return httpx.get(base + "/authorize", params=params, headers=headers or {},
+                     follow_redirects=False, timeout=10)
+
+
+def _redirect_params(resp):
+    return {k: v[0] for k, v in parse_qs(urlsplit(resp.headers["location"]).query).items()}
+
+
+def _token(base, data):
+    return httpx.post(base + "/token", data=data, timeout=10)
+
+
+def _full_flow(base, redirect=_REDIRECT, headers=None):
+    cid = _register(base, redirect).json()["client_id"]
+    verifier, challenge = client_oauth.generate_pkce()
+    az = _authorize(base, cid, challenge, redirect=redirect, headers=headers)
+    assert az.status_code == 302, az.text
+    code = _redirect_params(az)["code"]
+    tok = _token(base, {
+        "grant_type": "authorization_code", "code": code,
+        "redirect_uri": redirect, "client_id": cid, "code_verifier": verifier,
+    })
+    return cid, verifier, challenge, code, tok
+
+
+# -- metadata / registration --
+
+def test_pkce_s256_matches_client():
+    # The server transform MUST equal what the client's generate_pkce produced.
+    verifier, challenge = client_oauth.generate_pkce()
+    assert server._pkce_s256_challenge(verifier) == challenge
+
+
+def test_as_metadata(oauth_gateway):
+    base, _ = oauth_gateway
+    md = httpx.get(base + "/.well-known/oauth-authorization-server", timeout=10).json()
+    assert md["issuer"].startswith("http://127.0.0.1:")
+    assert md["authorization_endpoint"] == md["issuer"] + "/authorize"
+    assert md["token_endpoint"] == md["issuer"] + "/token"
+    assert md["registration_endpoint"] == md["issuer"] + "/register"
+    assert md["response_types_supported"] == ["code"]
+    assert md["code_challenge_methods_supported"] == ["S256"]
+    assert md["token_endpoint_auth_methods_supported"] == ["none"]
+
+
+def test_prm_has_authorization_servers_when_oauth(oauth_gateway):
+    base, _ = oauth_gateway
+    prm = httpx.get(base + "/.well-known/oauth-protected-resource/mcp", timeout=10).json()
+    assert prm["authorization_servers"] == [prm["resource"].rsplit("/mcp", 1)[0]]
+
+
+def test_register_public_client(oauth_gateway):
+    base, _ = oauth_gateway
+    r = _register(base)
+    assert r.status_code == 201
+    body = r.json()
+    assert isinstance(body["client_id"], str) and body["client_id"]
+    assert "client_secret" not in body
+    assert body["token_endpoint_auth_method"] == "none"
+
+
+def test_register_rejects_non_loopback(oauth_gateway):
+    base, _ = oauth_gateway
+    r = _register(base, redirect="https://evil.example.com/callback")
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_client_metadata"
+
+
+def test_register_rejects_non_json(oauth_gateway):
+    base, _ = oauth_gateway
+    r = httpx.post(base + "/register", content="not json", timeout=10)
+    assert r.status_code == 400
+
+
+# -- full flow + RS --
+
+def test_full_auth_code_flow_and_use_token(oauth_gateway):
+    base, _ = oauth_gateway
+    cid, verifier, challenge, code, tok = _full_flow(base)
+    assert tok.status_code == 200, tok.text
+    body = tok.json()
+    assert body["token_type"] == "Bearer"
+    assert isinstance(body["access_token"], str) and body["access_token"]
+    assert body["expires_in"] > 0
+    assert body["refresh_token"]
+    assert tok.headers.get("cache-control") == "no-store"
+    # use the issued token on an MCP request
+    r = httpx.post(base + "/mcp",
+                   content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "echo", "params": {"x": 1}}),
+                   headers={"Authorization": f"Bearer {body['access_token']}"}, timeout=10)
+    assert r.status_code == 200
+    assert r.json()["result"]["echoed"] == {"x": 1}
+    # without the token -> 401
+    r2 = httpx.post(base + "/mcp",
+                    content=json.dumps({"jsonrpc": "2.0", "id": 2, "method": "echo"}), timeout=10)
+    assert r2.status_code == 401
+
+
+def test_redirect_uri_port_agnostic(oauth_gateway):
+    # RFC 8252: registered :5555, authorize with :6666 (same scheme/host/path) ok.
+    base, _ = oauth_gateway
+    cid = _register(base, "http://127.0.0.1:5555/callback").json()["client_id"]
+    verifier, challenge = client_oauth.generate_pkce()
+    az = _authorize(base, cid, challenge, redirect="http://127.0.0.1:6666/callback")
+    assert az.status_code == 302
+
+
+# -- authorize negatives --
+
+def test_authorize_unknown_client_400_no_redirect(oauth_gateway):
+    base, _ = oauth_gateway
+    _, challenge = client_oauth.generate_pkce()
+    az = _authorize(base, "nope", challenge)
+    assert az.status_code == 400  # NOT a redirect (RFC 6749 4.1.2.1)
+
+
+def test_authorize_bad_redirect_uri_400(oauth_gateway):
+    base, _ = oauth_gateway
+    cid = _register(base).json()["client_id"]
+    _, challenge = client_oauth.generate_pkce()
+    az = _authorize(base, cid, challenge, redirect="http://127.0.0.1:5555/evil")
+    assert az.status_code == 400
+
+
+def test_authorize_missing_code_challenge_redirects_error(oauth_gateway):
+    base, _ = oauth_gateway
+    cid = _register(base).json()["client_id"]
+    az = _authorize(base, cid, "x", drop=["code_challenge"])
+    assert az.status_code == 302
+    p = _redirect_params(az)
+    assert p["error"] == "invalid_request"
+    assert p["state"] == "st-123"  # state echoed on error
+
+
+def test_authorize_plain_method_rejected(oauth_gateway):
+    base, _ = oauth_gateway
+    cid = _register(base).json()["client_id"]
+    _, challenge = client_oauth.generate_pkce()
+    az = _authorize(base, cid, challenge, method="plain")
+    assert az.status_code == 302
+    assert _redirect_params(az)["error"] == "invalid_request"
+
+
+def test_authorize_unsupported_response_type(oauth_gateway):
+    base, _ = oauth_gateway
+    cid = _register(base).json()["client_id"]
+    _, challenge = client_oauth.generate_pkce()
+    az = _authorize(base, cid, challenge, response_type="token")
+    assert az.status_code == 302
+    assert _redirect_params(az)["error"] == "unsupported_response_type"
+
+
+def test_authorize_fail_closed_without_user():
+    # No dev_user, no trusted header: a client-set X-Forwarded-User must NOT
+    # authenticate -> access_denied (never mint a code for a spoofed user).
+    with _run(oauth=_provider(dev_user=None)) as (base, _):
+        cid = _register(base).json()["client_id"]
+        _, challenge = client_oauth.generate_pkce()
+        az = _authorize(base, cid, challenge, headers={"X-Forwarded-User": "attacker"})
+        assert az.status_code == 302
+        assert _redirect_params(az)["error"] == "access_denied"
+
+
+def test_trusted_header_used_when_configured():
+    with _run(oauth=_provider(dev_user=None, trusted_user_header="X-Forwarded-User")) as (base, _):
+        cid = _register(base).json()["client_id"]
+        _, challenge = client_oauth.generate_pkce()
+        az = _authorize(base, cid, challenge, headers={"X-Forwarded-User": "bob"})
+        assert az.status_code == 302
+        assert "code" in _redirect_params(az)
+
+
+# -- token negatives --
+
+def test_token_pkce_mismatch_invalid_grant(oauth_gateway):
+    base, _ = oauth_gateway
+    cid = _register(base).json()["client_id"]
+    _, challenge = client_oauth.generate_pkce()
+    az = _authorize(base, cid, challenge)
+    code = _redirect_params(az)["code"]
+    bad_verifier = "B" * 64
+    r = _token(base, {"grant_type": "authorization_code", "code": code,
+                      "redirect_uri": _REDIRECT, "client_id": cid, "code_verifier": bad_verifier})
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_grant"
+
+
+def test_token_code_replay_invalid_grant(oauth_gateway):
+    base, _ = oauth_gateway
+    cid, verifier, challenge, code, tok = _full_flow(base)
+    assert tok.status_code == 200
+    # replay the same code
+    r = _token(base, {"grant_type": "authorization_code", "code": code,
+                      "redirect_uri": _REDIRECT, "client_id": cid, "code_verifier": verifier})
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_grant"
+
+
+def test_token_redirect_uri_mismatch(oauth_gateway):
+    base, _ = oauth_gateway
+    cid = _register(base).json()["client_id"]
+    verifier, challenge = client_oauth.generate_pkce()
+    az = _authorize(base, cid, challenge)
+    code = _redirect_params(az)["code"]
+    r = _token(base, {"grant_type": "authorization_code", "code": code,
+                      "redirect_uri": "http://127.0.0.1:9999/callback", "client_id": cid,
+                      "code_verifier": verifier})
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_grant"
+
+
+def test_token_unsupported_grant(oauth_gateway):
+    base, _ = oauth_gateway
+    r = _token(base, {"grant_type": "password", "username": "x"})
+    assert r.status_code == 400
+    assert r.json()["error"] == "unsupported_grant_type"
+
+
+def test_token_missing_grant(oauth_gateway):
+    base, _ = oauth_gateway
+    r = _token(base, {"foo": "bar"})
+    assert r.status_code == 400
+
+
+def test_refresh_rotates(oauth_gateway):
+    base, _ = oauth_gateway
+    cid, verifier, challenge, code, tok = _full_flow(base)
+    rt = tok.json()["refresh_token"]
+    r = _token(base, {"grant_type": "refresh_token", "refresh_token": rt, "client_id": cid})
+    assert r.status_code == 200
+    assert r.json()["access_token"]
+    new_rt = r.json()["refresh_token"]
+    assert new_rt and new_rt != rt
+    # old refresh token is invalidated (rotation)
+    again = _token(base, {"grant_type": "refresh_token", "refresh_token": rt, "client_id": cid})
+    assert again.status_code == 400
+
+
+def test_concurrent_token_single_use(oauth_gateway):
+    base, _ = oauth_gateway
+    cid = _register(base).json()["client_id"]
+    verifier, challenge = client_oauth.generate_pkce()
+    az = _authorize(base, cid, challenge)
+    code = _redirect_params(az)["code"]
+    data = {"grant_type": "authorization_code", "code": code, "redirect_uri": _REDIRECT,
+            "client_id": cid, "code_verifier": verifier}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(lambda _: _token(base, data).status_code, range(8)))
+    assert results.count(200) == 1
+    assert results.count(400) == 7
+
+
+def test_issued_token_expires():
+    clock = [1000.0]
+    prov = _provider(access_ttl=30, now=lambda: clock[0])
+    with _run(oauth=prov) as (base, _):
+        _, _, _, _, tok = _full_flow(base)
+        at = tok.json()["access_token"]
+        ok = httpx.post(base + "/mcp",
+                        content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "echo"}),
+                        headers={"Authorization": f"Bearer {at}"}, timeout=10)
+        assert ok.status_code == 200
+        clock[0] += 100  # advance past TTL
+        expired = httpx.post(base + "/mcp",
+                             content=json.dumps({"jsonrpc": "2.0", "id": 2, "method": "echo"}),
+                             headers={"Authorization": f"Bearer {at}"}, timeout=10)
+        assert expired.status_code == 401
+
+
+# -- coexistence / disabled --
+
+def test_coexistence_static_and_oauth():
+    with _run(auth_token="static-tok", oauth=_provider()) as (base, _):
+        # static token authorizes
+        r1 = httpx.post(base + "/mcp",
+                        content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "echo"}),
+                        headers={"Authorization": "Bearer static-tok"}, timeout=10)
+        assert r1.status_code == 200
+        # issued token authorizes
+        _, _, _, _, tok = _full_flow(base)
+        at = tok.json()["access_token"]
+        r2 = httpx.post(base + "/mcp",
+                        content=json.dumps({"jsonrpc": "2.0", "id": 2, "method": "echo"}),
+                        headers={"Authorization": f"Bearer {at}"}, timeout=10)
+        assert r2.status_code == 200
+        # PRM advertises authorization_servers
+        prm = httpx.get(base + "/.well-known/oauth-protected-resource/mcp", timeout=10).json()
+        assert "authorization_servers" in prm
+
+
+def test_as_endpoints_404_when_disabled(gateway):
+    url, _ = gateway
+    base = _base(url)
+    for p in ("/.well-known/oauth-authorization-server", "/authorize"):
+        assert httpx.get(base + p, timeout=10).status_code == 404
+    for p in ("/register", "/token"):
+        assert httpx.post(base + p, content="{}", timeout=10).status_code == 404
+
+
+# -- issuer pinning --
+
+def test_public_url_pins_issuer():
+    with _run(oauth=_provider(public_url="https://gw.example.org")) as (base, _):
+        md = httpx.get(base + "/.well-known/oauth-authorization-server", timeout=10).json()
+        assert md["issuer"] == "https://gw.example.org"
+        assert md["authorization_endpoint"] == "https://gw.example.org/authorize"
+        prm = httpx.get(base + "/.well-known/oauth-protected-resource/mcp", timeout=10).json()
+        assert prm["authorization_servers"] == ["https://gw.example.org"]
+
+
+def test_normalize_public_url():
+    assert server._normalize_public_url("https://gw.example.org/mcp") == "https://gw.example.org"
+    assert server._normalize_public_url("http://127.0.0.1:8080") == "http://127.0.0.1:8080"
+    # canonicalization: lowercase host, drop explicit default port
+    assert server._normalize_public_url("https://EXAMPLE.com:443/x") == "https://example.com"
+    assert server._normalize_public_url("http://LOCALHOST:80") == "http://localhost"
+    for bad in ("ftp://h", "https://", 'https://h"x', "https://user@h",
+                "http://gw.example.org"):  # non-loopback http is rejected
+        with pytest.raises(ValueError):
+            server._normalize_public_url(bad)
+
+
+# -- CLI flag validation (error paths return before serve() blocks) --
+
+def test_serve_main_dev_user_requires_oauth():
+    with pytest.raises(SystemExit):
+        server.serve_main(["--dev-user", "x", "--", "true"])
+
+
+def test_serve_main_bad_public_url():
+    with pytest.raises(SystemExit):
+        server.serve_main(["--enable-oauth", "--public-url", "ftp://x", "--dev-user", "a", "--", "true"])
+
+
+def test_serve_main_bad_trusted_header():
+    with pytest.raises(SystemExit):
+        server.serve_main(["--enable-oauth", "--trusted-user-header", "bad header", "--", "true"])
+
+
+# -- real-client interop: drive mcp_stdio.oauth.ensure_token end to end --
+
+def test_real_client_ensure_token(monkeypatch, tmp_path):
+    # Point the client token store at a temp dir (no touching real ~/.config).
+    from mcp_stdio import token_store
+    monkeypatch.setattr(token_store, "_STORE_DIR", tmp_path)
+    monkeypatch.setattr(token_store, "_STORE_FILE", tmp_path / "tokens.json")
+    monkeypatch.setattr(token_store, "_LEGACY_STORE_DIR", tmp_path / "legacy")
+    monkeypatch.setattr(token_store, "_LEGACY_STORE_FILE", tmp_path / "legacy" / "tokens.json")
+
+    with _run(oauth=_provider(dev_user="alice")) as (base, _):
+        # The client opens a browser at auth_url then waits for its loopback
+        # callback. Simulate the browser in a BACKGROUND thread (a synchronous
+        # GET would deadlock: the callback server's serve() thread starts only
+        # AFTER webbrowser.open returns).
+        def fake_open(auth_url):
+            def drive():
+                r = httpx.get(auth_url, follow_redirects=False, timeout=10)
+                if r.status_code == 302:
+                    httpx.get(r.headers["location"], timeout=10)
+            threading.Thread(target=drive, daemon=True).start()
+
+        monkeypatch.setattr(client_oauth.webbrowser, "open", fake_open)
+
+        with httpx.Client(timeout=10) as client:
+            td = client_oauth.ensure_token(base + "/mcp", client, timeout=15)
+        assert td.access_token
+        # the obtained token authorizes a real MCP call
+        r = httpx.post(base + "/mcp",
+                       content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "echo"}),
+                       headers={"Authorization": f"Bearer {td.access_token}"}, timeout=10)
+        assert r.status_code == 200
+
+
+# --- adversarial-review fixes ---
+
+def test_store_cap_is_a_hard_bound(monkeypatch):
+    # GC frees only expired entries; the cap must still bound live tokens.
+    monkeypatch.setattr(server, "_STORE_CAP", 5)
+    prov = _provider()
+    for i in range(30):
+        prov._issue(f"u{i}", "c", "", None)
+    assert len(prov._access) <= 5
+    assert len(prov._refresh) <= 5
+
+
+def test_client_cap_recycles_not_bricks(monkeypatch):
+    # /register must never permanently lock out: at the cap the oldest client
+    # is recycled rather than rejected.
+    monkeypatch.setattr(server, "_CLIENT_CAP", 3)
+    prov = _provider()
+    last = None
+    for i in range(8):
+        status, body = prov.register(
+            json.dumps({"redirect_uris": [f"http://127.0.0.1:{1000 + i}/callback"]}).encode()
+        )
+        assert status == 201, body
+        last = body["client_id"]
+    assert len(prov._clients) <= 3
+    assert last in prov._clients  # newest registration survives
+
+
+def test_redirect_key_rejects_query_userinfo_fragment():
+    assert server._redirect_key("http://127.0.0.1:5/cb") == ("http", "127.0.0.1", "/cb")
+    assert server._redirect_key("http://127.0.0.1:5/cb?next=x") is None
+    assert server._redirect_key("http://u:p@127.0.0.1:5/cb") is None
+    assert server._redirect_key("http://127.0.0.1:5/cb#frag") is None
+    assert server._redirect_key("https://127.0.0.1:5/cb") is None
+    assert server._redirect_key("http://evil.example.com/cb") is None
+
+
+def test_register_rejects_query_bearing_redirect(oauth_gateway):
+    base, _ = oauth_gateway
+    r = _register(base, redirect="http://127.0.0.1:5555/callback?next=x")
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_client_metadata"
+
+
+def test_refresh_wrong_client_id_preserves_token(oauth_gateway):
+    base, _ = oauth_gateway
+    cid, _, _, _, tok = _full_flow(base)
+    rt = tok.json()["refresh_token"]
+    # a wrong client_id must be rejected WITHOUT destroying the valid token
+    bad = _token(base, {"grant_type": "refresh_token", "refresh_token": rt, "client_id": "wrong"})
+    assert bad.status_code == 400 and bad.json()["error"] == "invalid_grant"
+    good = _token(base, {"grant_type": "refresh_token", "refresh_token": rt, "client_id": cid})
+    assert good.status_code == 200
+
+
+def test_token_missing_grant_is_invalid_request(oauth_gateway):
+    base, _ = oauth_gateway
+    r = _token(base, {"foo": "bar"})
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_request"
+
+
+def test_401_hint_uses_pinned_issuer():
+    with _run(oauth=_provider(public_url="https://gw.example.org")) as (base, _):
+        r = httpx.post(base + "/mcp",
+                       content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "echo"}), timeout=10)
+        assert r.status_code == 401
+        assert ('resource_metadata="https://gw.example.org/.well-known/'
+                'oauth-protected-resource/mcp"') in r.headers["www-authenticate"]
+
+
+def test_redact_query():
+    out = server._redact_query('"GET /authorize?state=SECRET&x=1 HTTP/1.1" 302 -')
+    assert out == '"GET /authorize?<redacted> HTTP/1.1" 302 -'
+    assert "SECRET" not in out
+    # absolute-form request target (RFC 7230, e.g. via a forwarding proxy) too
+    out2 = server._redact_query(
+        '"GET http://gw.example.org/authorize?state=SECRET&code=ABC HTTP/1.1" 404 -'
+    )
+    assert out2 == '"GET http://gw.example.org/authorize?<redacted> HTTP/1.1" 404 -'
+    assert "SECRET" not in out2 and "ABC" not in out2
+    # a query-less line is unchanged
+    assert server._redact_query('"POST /mcp HTTP/1.1" 200 -') == '"POST /mcp HTTP/1.1" 200 -'
+
+
+def test_concurrent_refresh_single_use(oauth_gateway):
+    # The same refresh token submitted concurrently must rotate exactly once.
+    base, _ = oauth_gateway
+    cid, _, _, _, tok = _full_flow(base)
+    rt = tok.json()["refresh_token"]
+    data = {"grant_type": "refresh_token", "refresh_token": rt, "client_id": cid}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        codes = list(ex.map(lambda _: _token(base, data).status_code, range(8)))
+    assert codes.count(200) == 1
+    assert codes.count(400) == 7
+
+
+def test_refresh_token_expires():
+    clock = [1000.0]
+    prov = _provider(refresh_ttl=50, now=lambda: clock[0])
+    with _run(oauth=prov) as (base, _):
+        cid, _, _, _, tok = _full_flow(base)
+        rt = tok.json()["refresh_token"]
+        clock[0] += 100  # advance past refresh_ttl
+        r = _token(base, {"grant_type": "refresh_token", "refresh_token": rt, "client_id": cid})
+        assert r.status_code == 400
+        assert r.json()["error"] == "invalid_grant"
