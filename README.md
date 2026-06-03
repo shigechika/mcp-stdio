@@ -220,6 +220,36 @@ Options:
 
 Run `mcp-stdio --help` for the full per-flag detail (platform notes and issue references are more verbose than this table).
 
+## Reverse gateway: `serve` mode (experimental)
+
+The default mode bridges **stdio → HTTP** (client side). The `serve` subcommand
+is the mirror image — **HTTP → stdio** — exposing a local stdio MCP server as a
+Streamable HTTP MCP endpoint so clients that cannot spawn it locally can reach
+it over the network:
+
+```bash
+mcp-stdio serve --port 8080 -- python -m my_mcp_server
+```
+
+Then point any MCP client (including mcp-stdio itself) at it:
+
+```bash
+mcp-stdio --check http://127.0.0.1:8080/mcp
+```
+
+- Stdlib only (`http.server`) — adds no runtime dependency.
+- Implements the Streamable HTTP request/response and notification semantics
+  plus a GET SSE channel for server-initiated messages.
+- **Milestone M1: no authentication.** Run it behind a TLS-terminating reverse
+  proxy. OAuth (Resource Server validation, then an embedded Authorization
+  Server) lands in later milestones — see
+  [#235](https://github.com/shigechika/mcp-stdio/issues/235).
+- Single-client assumption for now: JSON-RPC ids pass through verbatim.
+
+Options: `--host` (default `127.0.0.1`), `--port` (default `8080`), `--path`
+(default `/mcp`). The backend command follows the options (an optional `--`
+separator is supported).
+
 ## Workarounds
 
 See [WORKAROUNDS.md](WORKAROUNDS.md) for known issues in Claude Code, mcp-remote, the MCP SDKs, and Windows that mcp-stdio addresses.

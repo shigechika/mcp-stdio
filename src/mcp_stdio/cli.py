@@ -682,6 +682,13 @@ def main() -> None:
     `except Exception` does not catch it). Exit cleanly with 130 instead.
     """
     try:
+        # `mcp-stdio serve ...` is the reverse gateway (HTTP -> stdio); it has
+        # its own argparse surface and never touches the client parser below.
+        if len(sys.argv) > 1 and sys.argv[1] == "serve":
+            from .server import serve_main
+
+            serve_main(sys.argv[2:])
+            return
         _main()
     except KeyboardInterrupt:
         print("\nmcp-stdio: interrupted", file=sys.stderr)

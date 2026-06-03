@@ -218,6 +218,35 @@ mcp-stdio [OPTIONS] URL
 
 各フラグの詳細（プラットフォーム注記や issue 参照を含む）は `mcp-stdio --help` を実行してください。この表より詳しい説明が表示されます。
 
+## 逆ゲートウェイ: `serve` モード（実験的）
+
+通常モードは **stdio → HTTP**（クライアント側）の橋渡しですが、`serve`
+サブコマンドはその逆向き — **HTTP → stdio** — で、ローカルの stdio MCP
+サーバを Streamable HTTP の MCP エンドポイントとして公開します。ローカルに
+インストールしていないクライアントからネットワーク越しに到達できます:
+
+```bash
+mcp-stdio serve --port 8080 -- python -m my_mcp_server
+```
+
+任意の MCP クライアント（mcp-stdio 自身を含む）から接続:
+
+```bash
+mcp-stdio --check http://127.0.0.1:8080/mcp
+```
+
+- 標準ライブラリのみ（`http.server`）— ランタイム依存は増えません。
+- Streamable HTTP のリクエスト/レスポンス・通知のセマンティクスに加え、
+  サーバ起点メッセージ用の GET SSE チャネルを実装。
+- **マイルストーン M1: 認証なし。** TLS 終端のリバースプロキシ背後で運用して
+  ください。OAuth（リソースサーバ検証 → 埋め込み認可サーバ）は後続マイル
+  ストーン — [#235](https://github.com/shigechika/mcp-stdio/issues/235) 参照。
+- 当面はシングルクライアント前提（JSON-RPC の id はそのまま透過）。
+
+オプション: `--host`（既定 `127.0.0.1`）、`--port`（既定 `8080`）、`--path`
+（既定 `/mcp`）。バックエンドコマンドはオプションの後に置きます（`--`
+区切りも可）。
+
 ## ワークアラウンド
 
 Claude Code・mcp-remote・MCP SDK・Windows の既知の問題については [WORKAROUNDS.md](WORKAROUNDS.md) を参照してください。
