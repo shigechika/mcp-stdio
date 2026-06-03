@@ -88,6 +88,14 @@ def test_invalid_json_returns_400(gateway):
     assert resp.status_code == 400
 
 
+def test_non_scalar_id_returns_400(gateway):
+    # A non-scalar (unhashable) JSON-RPC id must not reach the pending-response
+    # dict key (TypeError -> handler crash); the gateway rejects it as 400.
+    url, _ = gateway
+    resp = _post(url, {"jsonrpc": "2.0", "id": [1, 2], "method": "echo"})
+    assert resp.status_code == 400
+
+
 def test_wrong_path_returns_404(gateway):
     url, _ = gateway
     base = url.rsplit("/mcp", 1)[0]

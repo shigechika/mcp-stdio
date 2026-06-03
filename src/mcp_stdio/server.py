@@ -324,6 +324,14 @@ class _Handler(BaseHTTPRequestHandler):
         kind = _classify(msg)
         if kind == "request":
             req_id = msg.get("id")
+            # A JSON-RPC id is a String, Number, or null. A non-scalar id
+            # (object / array) is malformed AND unhashable, so using it as the
+            # pending-response dict key would raise TypeError and crash the
+            # handler thread — reject it up front, mirroring relay's
+            # _extract_cancel_id guard and the never-crash invariant.
+            if req_id is not None and not isinstance(req_id, (str, int, float)):
+                self._send_json(400, _error_body("invalid JSON-RPC id"))
+                return
             if self.backend.closed:
                 self._send_json(503, _error_body("backend unavailable", req_id))
                 return
@@ -350,7 +358,10 @@ class _Handler(BaseHTTPRequestHandler):
             return
         # Open an SSE stream carrying server-initiated messages (notifications
         # and server->client requests) until the client disconnects or the
-        # backend dies.
+        # backend dies. The stream has no Content-Length and is not chunked, so
+        # mark the connection close-delimited (unambiguous framing): the body
+        # ends when we close it, never reused for a follow-up request.
+        self.close_connection = True
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-store")
