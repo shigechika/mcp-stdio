@@ -240,26 +240,43 @@ mcp-stdio --check http://127.0.0.1:8080/mcp
 - Stdlib only (`http.server`) — adds no runtime dependency.
 - Implements the Streamable HTTP request/response and notification semantics
   plus a GET SSE channel for server-initiated messages.
-- **Authentication is optional.** Without a token the endpoint is open (run it
-  behind a TLS-terminating reverse proxy). With a token it acts as an OAuth
-  Resource Server: MCP requests require `Authorization: Bearer <token>`, and a
-  401 advertises [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) Protected
-  Resource Metadata at `/.well-known/oauth-protected-resource`. A full embedded
-  Authorization Server (PKCE, dynamic client registration) is a later milestone
-  — see [#235](https://github.com/shigechika/mcp-stdio/issues/235).
+- **Authentication is optional and layered:**
+  - *No token* — the endpoint is open (run it behind a TLS-terminating proxy).
+  - *Static token* (`--auth-token` / `MCP_STDIO_SERVE_TOKEN`) — acts as an OAuth
+    Resource Server: MCP requests require `Authorization: Bearer <token>`, and a
+    401 advertises [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) Protected
+    Resource Metadata at `/.well-known/oauth-protected-resource`.
+  - *Embedded OAuth AS* (`--enable-oauth`) — a minimal OAuth 2.1 Authorization
+    Server (PKCE auth-code, [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591)
+    dynamic client registration, refresh, opaque in-memory tokens, stdlib only).
+    The mcp-stdio client's `--oauth` flow then works against the gateway.
 - Single-client assumption for now: JSON-RPC ids pass through verbatim.
 
-Authenticated example (token via env so it is not visible in `ps`):
+Static-token example (token via env so it is not visible in `ps`):
 
 ```bash
 MCP_STDIO_SERVE_TOKEN=your-secret mcp-stdio serve --port 8080 -- python -m my_mcp_server
 mcp-stdio --bearer-token your-secret --check http://127.0.0.1:8080/mcp
 ```
 
+Embedded-OAuth example. User authentication is **delegated to a fronting
+reverse proxy** that asserts the logged-in user via a header
+(`--trusted-user-header`, only trusted behind a proxy that strips client copies).
+`--dev-user` is an **insecure** loopback-only shortcut for local testing:
+
+```bash
+mcp-stdio serve --enable-oauth --public-url http://127.0.0.1:8080 \
+  --dev-user alice --port 8080 -- python -m my_mcp_server
+mcp-stdio --oauth http://127.0.0.1:8080/mcp
+```
+
 Options: `--host` (default `127.0.0.1`), `--port` (default `8080`), `--path`
-(default `/mcp`), `--auth-token TOKEN` (or `MCP_STDIO_SERVE_TOKEN`, preferred).
-The backend command follows the options (an optional `--` separator is
-supported).
+(default `/mcp`), `--auth-token TOKEN` (or `MCP_STDIO_SERVE_TOKEN`, preferred);
+and for the embedded AS: `--enable-oauth`, `--public-url URL` (pins the issuer;
+recommended behind a proxy), `--trusted-user-header HEADER`, `--dev-user USER`
+(insecure, testing only), `--access-token-ttl SECONDS`. In-memory tokens mean a
+restart invalidates issued tokens (the client re-runs `--oauth`). The backend
+command follows the options (an optional `--` separator is supported).
 
 ## Workarounds
 

@@ -238,25 +238,43 @@ mcp-stdio --check http://127.0.0.1:8080/mcp
 - 標準ライブラリのみ（`http.server`）— ランタイム依存は増えません。
 - Streamable HTTP のリクエスト/レスポンス・通知のセマンティクスに加え、
   サーバ起点メッセージ用の GET SSE チャネルを実装。
-- **認証は任意。** トークン無しならエンドポイントは素通し（TLS 終端の
-  リバースプロキシ背後で運用）。トークンを設定すると OAuth リソースサーバ
-  として振る舞い、MCP リクエストに `Authorization: Bearer <token>` を要求し、
-  401 で [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) Protected Resource
-  Metadata（`/.well-known/oauth-protected-resource`）を広告します。埋め込み
-  認可サーバ（PKCE・動的クライアント登録）は後続マイルストーン —
-  [#235](https://github.com/shigechika/mcp-stdio/issues/235) 参照。
+- **認証は任意・段階的:**
+  - *トークン無し* — エンドポイントは素通し（TLS 終端プロキシ背後で運用）。
+  - *静的トークン*（`--auth-token` / `MCP_STDIO_SERVE_TOKEN`）— OAuth リソース
+    サーバとして `Authorization: Bearer <token>` を要求、401 で
+    [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) Protected Resource
+    Metadata（`/.well-known/oauth-protected-resource`）を広告。
+  - *埋め込み OAuth AS*（`--enable-oauth`）— 最小 OAuth 2.1 認可サーバ
+    （PKCE 認可コード・[RFC 7591](https://www.rfc-editor.org/rfc/rfc7591) 動的
+    クライアント登録・refresh・不透明インメモリトークン・stdlib のみ）。
+    mcp-stdio クライアントの `--oauth` がこのゲートウェイ相手に通ります。
 - 当面はシングルクライアント前提（JSON-RPC の id はそのまま透過）。
 
-認証付きの例（トークンは env 経由で `ps` に出さない）:
+静的トークンの例（トークンは env 経由で `ps` に出さない）:
 
 ```bash
 MCP_STDIO_SERVE_TOKEN=your-secret mcp-stdio serve --port 8080 -- python -m my_mcp_server
 mcp-stdio --bearer-token your-secret --check http://127.0.0.1:8080/mcp
 ```
 
+埋め込み OAuth の例。ユーザ認証は**前段リバースプロキシに委譲**し、ログイン
+済みユーザをヘッダで主張させます（`--trusted-user-header`、クライアント由来の
+同名ヘッダを除去するプロキシ背後でのみ信頼）。`--dev-user` はローカル検証用の
+**非セキュア**な loopback 限定ショートカットです:
+
+```bash
+mcp-stdio serve --enable-oauth --public-url http://127.0.0.1:8080 \
+  --dev-user alice --port 8080 -- python -m my_mcp_server
+mcp-stdio --oauth http://127.0.0.1:8080/mcp
+```
+
 オプション: `--host`（既定 `127.0.0.1`）、`--port`（既定 `8080`）、`--path`
-（既定 `/mcp`）、`--auth-token TOKEN`（または `MCP_STDIO_SERVE_TOKEN`、こちらが
-推奨）。バックエンドコマンドはオプションの後に置きます（`--` 区切りも可）。
+（既定 `/mcp`）、`--auth-token TOKEN`（または `MCP_STDIO_SERVE_TOKEN`、推奨）;
+埋め込み AS 用: `--enable-oauth`、`--public-url URL`（issuer 固定・プロキシ背後
+で推奨）、`--trusted-user-header HEADER`、`--dev-user USER`（非セキュア・検証用）、
+`--access-token-ttl SECONDS`。インメモリなので再起動で発行済みトークンは失効
+（クライアントは `--oauth` を再実行）。バックエンドコマンドはオプションの後に
+置きます（`--` 区切りも可）。
 
 ## ワークアラウンド
 

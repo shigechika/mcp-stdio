@@ -30,16 +30,21 @@ remapping for true multi-client fan-out is a later milestone.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import hmac
 import json
 import os
 import queue
+import secrets
 import signal
 import subprocess
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from .relay import log
 
@@ -278,6 +283,330 @@ class BackendProcess:
             log(f"backend shutdown error: {e}")
 
 
+# --- M3: embedded OAuth 2.1 Authorization Server (stdlib only, opaque tokens) ---
+
+_AS_METADATA_PATH = "/.well-known/oauth-authorization-server"
+_AUTHORIZE_PATH = "/authorize"
+_TOKEN_PATH = "/token"
+_REGISTER_PATH = "/register"
+
+_AUTH_CODE_TTL_SECS = 60.0
+_DEFAULT_ACCESS_TTL_SECS = 3600.0
+_REFRESH_TTL_SECS = 60.0 * 60.0 * 24.0 * 30.0  # 30 days
+_STORE_CAP = 10000  # per-store entry cap (DoS bound); GC runs before the cap
+_CLIENT_CAP = 1000
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+# RFC 7636 Sec. 4.1 code_verifier unreserved set.
+_PKCE_VERIFIER_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+)
+
+
+def _pkce_s256_challenge(verifier: str) -> str:
+    """BASE64URL(SHA256(verifier)) without padding — byte-identical to the
+    client's ``oauth.generate_pkce`` so a correct verifier always matches."""
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _valid_code_verifier(v: str) -> bool:
+    return 43 <= len(v) <= 128 and all(c in _PKCE_VERIFIER_CHARS for c in v)
+
+
+def _redirect_key(uri: str) -> tuple[str, str, str] | None:
+    """RFC 8252 loopback redirect key (scheme, host, path), port-agnostic.
+
+    Returns None for anything that is not an ``http://`` loopback URI, or that
+    carries a fragment or CR/LF (open-redirect / response-splitting guard).
+    Comparing on this key lets a per-run ephemeral callback port still match a
+    registered client_id whose stored port differs (step-up reuse).
+    """
+    if "\r" in uri or "\n" in uri:
+        return None
+    try:
+        p = urlsplit(uri)
+    except ValueError:
+        return None
+    if p.fragment:
+        return None
+    host = (p.hostname or "").lower()
+    if p.scheme != "http" or host not in _LOOPBACK_HOSTS:
+        return None
+    return (p.scheme, host, p.path or "/")
+
+
+def _normalize_public_url(url: str) -> str:
+    """Normalize --public-url to a bare origin ``scheme://host[:port]``.
+
+    Raises ValueError on a non-http(s) URL, a missing host, userinfo, or
+    CR/LF/quote/space. The path/query/fragment are stripped — the OAuth issuer
+    MUST be the bare origin or the client cross-origin-rejects the metadata.
+    """
+    if any(c in url for c in ('"', "\r", "\n", " ")):
+        raise ValueError("public-url contains forbidden characters")
+    p = urlsplit(url)
+    if p.scheme not in ("http", "https") or not p.hostname:
+        raise ValueError("public-url must be an absolute http(s) URL with a host")
+    if "@" in p.netloc:
+        raise ValueError("public-url must not contain userinfo")
+    return f"{p.scheme}://{p.netloc}"
+
+
+class _OAuthProvider:
+    """Minimal OAuth 2.1 Authorization Server: DCR + authorization-code + PKCE
+    + refresh, with opaque in-memory tokens (no crypto dependency).
+
+    All four stores share one lock; ThreadingHTTPServer serves each request on
+    its own thread. ``now`` is injectable so tests can drive TTL expiry without
+    sleeping. ``public_url`` (bare origin) pins the issuer; when None the caller
+    passes a per-request reflected origin into the metadata builders.
+    """
+
+    def __init__(
+        self,
+        *,
+        public_url: str | None,
+        trusted_user_header: str | None,
+        dev_user: str | None,
+        access_ttl: float = _DEFAULT_ACCESS_TTL_SECS,
+        code_ttl: float = _AUTH_CODE_TTL_SECS,
+        refresh_ttl: float = _REFRESH_TTL_SECS,
+        now: Any = time.time,
+    ) -> None:
+        self.public_url = public_url
+        self.trusted_user_header = trusted_user_header
+        self.dev_user = dev_user
+        self.access_ttl = access_ttl
+        self.code_ttl = code_ttl
+        self.refresh_ttl = refresh_ttl
+        self._now = now
+        self._lock = threading.Lock()
+        self._clients: dict[str, dict[str, Any]] = {}
+        self._codes: dict[str, dict[str, Any]] = {}
+        self._access: dict[str, dict[str, Any]] = {}
+        self._refresh: dict[str, dict[str, Any]] = {}
+
+    # -- metadata --------------------------------------------------------
+
+    def metadata(self, issuer: str) -> dict[str, Any]:
+        return {
+            "issuer": issuer,
+            "authorization_endpoint": issuer + _AUTHORIZE_PATH,
+            "token_endpoint": issuer + _TOKEN_PATH,
+            "registration_endpoint": issuer + _REGISTER_PATH,
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": ["none"],
+        }
+
+    # -- dynamic client registration (RFC 7591) --------------------------
+
+    def register(self, raw: bytes) -> tuple[int, dict[str, Any]]:
+        def bad(desc: str) -> tuple[int, dict[str, Any]]:
+            return 400, {"error": "invalid_client_metadata", "error_description": desc}
+
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return bad("body must be JSON")
+        if not isinstance(body, dict):
+            return bad("body must be a JSON object")
+        uris = body.get("redirect_uris")
+        if not isinstance(uris, list) or not uris:
+            return bad("redirect_uris must be a non-empty array")
+        keys = set()
+        for u in uris:
+            if not isinstance(u, str) or _redirect_key(u) is None:
+                return bad("redirect_uris must be loopback http URLs")
+            keys.add(_redirect_key(u))
+        client_id = secrets.token_urlsafe(32)
+        now = self._now()
+        with self._lock:
+            if len(self._clients) >= _CLIENT_CAP:
+                self._gc_locked()
+            if len(self._clients) >= _CLIENT_CAP:
+                return bad("registration limit reached")
+            self._clients[client_id] = {
+                "redirect_keys": keys,
+                "redirect_uris": list(uris),
+                "created_at": now,
+            }
+        return 201, {
+            "client_id": client_id,
+            "redirect_uris": list(uris),
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "client_id_issued_at": int(now),
+        }
+
+    # -- authorization endpoint (RFC 6749 4.1 + RFC 7636) ----------------
+
+    def authorize(self, params: dict[str, str], user: str | None) -> dict[str, str]:
+        """Return an instruction dict for the handler.
+
+        ``{"kind": "bad_request", "message": ...}`` -> direct 400 (NO redirect,
+        per RFC 6749 4.1.2.1 for client_id/redirect_uri errors).
+        ``{"kind": "redirect", "location": ...}`` -> 302 (success, or an in-band
+        error whose Location carries error= + the echoed state).
+        """
+        cid = params.get("client_id", "")
+        redirect_uri = params.get("redirect_uri", "")
+        with self._lock:
+            client = self._clients.get(cid)
+        if not cid or client is None:
+            return {"kind": "bad_request", "message": "unknown or missing client_id"}
+        rk = _redirect_key(redirect_uri)
+        if rk is None or rk not in client["redirect_keys"]:
+            return {"kind": "bad_request", "message": "invalid redirect_uri"}
+
+        state = params.get("state", "")
+
+        def redirect(query: dict[str, str]) -> dict[str, str]:
+            if state:
+                query = {**query, "state": state}
+            return {"kind": "redirect", "location": redirect_uri + "?" + urlencode(query)}
+
+        if params.get("response_type") != "code":
+            return redirect({"error": "unsupported_response_type"})
+        challenge = params.get("code_challenge", "")
+        if not challenge:
+            return redirect(
+                {"error": "invalid_request", "error_description": "code_challenge required"}
+            )
+        if params.get("code_challenge_method") != "S256":
+            return redirect(
+                {"error": "invalid_request", "error_description": "code_challenge_method must be S256"}
+            )
+        if not user:
+            # Fail closed: never mint a code for an empty/anonymous user.
+            return redirect(
+                {"error": "access_denied", "error_description": "no authenticated user"}
+            )
+        code = secrets.token_urlsafe(32)
+        now = self._now()
+        with self._lock:
+            if len(self._codes) >= _STORE_CAP:
+                self._gc_locked()
+            self._codes[code] = {
+                "client_id": cid,
+                "redirect_uri": redirect_uri,
+                "code_challenge": challenge,
+                "user": user,
+                "scope": params.get("scope", ""),
+                "resource": params.get("resource"),
+                "expires_at": now + self.code_ttl,
+            }
+        return redirect({"code": code})
+
+    # -- token endpoint (RFC 6749 + RFC 7636) ----------------------------
+
+    def token(self, form: dict[str, str]) -> tuple[int, dict[str, Any]]:
+        grant = form.get("grant_type")
+        if grant == "authorization_code":
+            return self._token_auth_code(form)
+        if grant == "refresh_token":
+            return self._token_refresh(form)
+        return 400, {"error": "unsupported_grant_type"}
+
+    def _token_auth_code(self, form: dict[str, str]) -> tuple[int, dict[str, Any]]:
+        code = form.get("code", "")
+        if not code:
+            return 400, {"error": "invalid_request", "error_description": "missing code"}
+        now = self._now()
+        with self._lock:
+            # Single-use: POP before validating so a replay / concurrent
+            # double-POST sees None and cannot mint a second token.
+            entry = self._codes.pop(code, None)
+        if entry is None:
+            return 400, {"error": "invalid_grant", "error_description": "unknown or used code"}
+        if entry["expires_at"] < now:
+            return 400, {"error": "invalid_grant", "error_description": "code expired"}
+        if form.get("client_id") != entry["client_id"]:
+            return 400, {"error": "invalid_grant", "error_description": "client_id mismatch"}
+        if form.get("redirect_uri") != entry["redirect_uri"]:
+            return 400, {"error": "invalid_grant", "error_description": "redirect_uri mismatch"}
+        verifier = form.get("code_verifier", "")
+        if not _valid_code_verifier(verifier):
+            return 400, {"error": "invalid_request", "error_description": "invalid code_verifier"}
+        if not hmac.compare_digest(_pkce_s256_challenge(verifier), entry["code_challenge"]):
+            return 400, {"error": "invalid_grant", "error_description": "PKCE verification failed"}
+        return self._issue(entry["user"], entry["client_id"], entry["scope"], entry["resource"])
+
+    def _token_refresh(self, form: dict[str, str]) -> tuple[int, dict[str, Any]]:
+        rt = form.get("refresh_token", "")
+        if not rt:
+            return 400, {"error": "invalid_request", "error_description": "missing refresh_token"}
+        now = self._now()
+        with self._lock:
+            # Rotate: remove the presented refresh token now; a fresh one is
+            # issued by _issue (OAuth 2.1 / RFC 9700 rotation).
+            entry = self._refresh.pop(rt, None)
+        if entry is None:
+            return 400, {"error": "invalid_grant", "error_description": "unknown refresh_token"}
+        if entry["expires_at"] < now:
+            return 400, {"error": "invalid_grant", "error_description": "refresh_token expired"}
+        if form.get("client_id") != entry["client_id"]:
+            return 400, {"error": "invalid_grant", "error_description": "client_id mismatch"}
+        return self._issue(entry["user"], entry["client_id"], entry["scope"], entry["resource"])
+
+    def _issue(
+        self, user: str, client_id: str, scope: str, resource: str | None
+    ) -> tuple[int, dict[str, Any]]:
+        now = self._now()
+        access = secrets.token_urlsafe(32)
+        refresh = secrets.token_urlsafe(32)
+        with self._lock:
+            if len(self._access) >= _STORE_CAP or len(self._refresh) >= _STORE_CAP:
+                self._gc_locked()
+            self._access[access] = {
+                "user": user, "client_id": client_id, "scope": scope,
+                "resource": resource, "expires_at": now + self.access_ttl,
+            }
+            self._refresh[refresh] = {
+                "user": user, "client_id": client_id, "scope": scope,
+                "resource": resource, "expires_at": now + self.refresh_ttl,
+            }
+        body: dict[str, Any] = {
+            "access_token": access,
+            "token_type": "Bearer",
+            # Positive finite int strictly below the server TTL.
+            "expires_in": max(1, int(self.access_ttl) - 1),
+            "refresh_token": refresh,
+        }
+        if scope:
+            body["scope"] = scope
+        return 200, body
+
+    # -- resource-server validation --------------------------------------
+
+    def validate_access_token(self, token: str) -> bool:
+        """True if ``token`` is a live issued access token (lookup + expiry)."""
+        if not token:
+            return False
+        now = self._now()
+        with self._lock:
+            entry = self._access.get(token)
+            if entry is None:
+                return False
+            if entry["expires_at"] < now:
+                del self._access[token]
+                return False
+            return True
+
+    def _gc_locked(self) -> None:
+        now = self._now()
+        for store in (self._codes, self._access, self._refresh):
+            for k in [k for k, v in store.items() if v["expires_at"] < now]:
+                del store[k]
+        if len(self._clients) > _CLIENT_CAP:
+            oldest = sorted(self._clients.items(), key=lambda kv: kv[1]["created_at"])
+            for k, _ in oldest[: len(self._clients) - _CLIENT_CAP]:
+                del self._clients[k]
+
+
 class _Handler(BaseHTTPRequestHandler):
     """Streamable HTTP MCP endpoint backed by a single stdio child.
 
@@ -291,6 +620,9 @@ class _Handler(BaseHTTPRequestHandler):
     # None disables authentication (M1 behavior). A non-None value enables the
     # static-bearer-token Resource Server gate (M2).
     auth_token: str | None = None
+    # None disables the embedded OAuth AS (M1/M2). A provider enables M3:
+    # /authorize /token /register + AS metadata + issued-token RS validation.
+    oauth: _OAuthProvider | None = None
 
     # Quieter, consistent logging: route BaseHTTPRequestHandler's access log
     # through the project logger instead of stderr's default apache-style line.
@@ -313,6 +645,32 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.send_header("Mcp-Session-Id", self.session_id)
         self.end_headers()
+
+    def _send_oauth_json(self, status: int, body: str, *, no_store: bool = False) -> None:
+        """JSON response for OAuth endpoints (no Mcp-Session-Id header).
+
+        ``no_store`` adds the RFC 6749 Sec. 5.1/5.2 cache headers required on
+        token-endpoint responses.
+        """
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        if no_store:
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Pragma", "no-cache")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _effective_issuer(self) -> str:
+        """The pinned --public-url origin, else the (reflected) request origin.
+
+        Drives the AS metadata issuer + endpoint URLs and the PRM
+        authorization_servers/resource so all three are byte-stable per request.
+        """
+        if self.oauth is not None and self.oauth.public_url:
+            return self.oauth.public_url
+        return self._origin()
 
     def _wrong_path(self) -> bool:
         # Compare only the path component; ignore any query string.
@@ -347,23 +705,31 @@ class _Handler(BaseHTTPRequestHandler):
         return f"{proto}://{host}"
 
     def _resource_url(self) -> str:
-        return self._origin() + self.mcp_path
+        return self._effective_issuer() + self.mcp_path
 
     def _prm_url(self) -> str:
         # RFC 9728 Sec. 3.1 path insertion.
         return self._origin() + _PRM_WELL_KNOWN_PREFIX + self.mcp_path
 
     def _authorized(self) -> bool:
-        """True when auth is disabled or a valid Bearer token is presented."""
-        if self.auth_token is None:
-            return True
+        """True when no auth is configured, or a valid Bearer token is presented.
+
+        Precedence: the M2 static token is checked first (constant-time, exempt
+        from expiry), then an M3 issued access token (lookup + expiry). The
+        endpoint is open only when NEITHER mechanism is configured.
+        """
         auth = self.headers.get("Authorization", "")
         prefix = "Bearer "
         token = auth[len(prefix):] if auth.startswith(prefix) else ""
-        # Constant-time compare on bytes (str compare_digest rejects non-ASCII).
-        return bool(token) and hmac.compare_digest(
-            token.encode("utf-8"), self.auth_token.encode("utf-8")
-        )
+        if (
+            self.auth_token is not None
+            and token
+            and hmac.compare_digest(token.encode("utf-8"), self.auth_token.encode("utf-8"))
+        ):
+            return True
+        if self.oauth is not None and token and self.oauth.validate_access_token(token):
+            return True
+        return self.auth_token is None and self.oauth is None
 
     def _require_auth(self) -> bool:
         """Return True if the request may proceed; else send 401 and return False."""
@@ -382,19 +748,78 @@ class _Handler(BaseHTTPRequestHandler):
         return False
 
     def _serve_prm(self) -> None:
-        """Serve RFC 9728 Protected Resource Metadata (only when auth is on)."""
-        if self.auth_token is None:
+        """Serve RFC 9728 Protected Resource Metadata when any auth is enabled.
+
+        ``authorization_servers`` is added ONLY when the embedded AS is on (M3);
+        a static-token-only deployment (M2) omits it.
+        """
+        if self.auth_token is None and self.oauth is None:
             self._send_json(404, _error_body("not found"))
             return
-        body = json.dumps(
-            {
-                "resource": self._resource_url(),
-                # No authorization_servers yet: M2 uses operator-issued static
-                # tokens. M3's embedded AS adds the issuer here.
-                "bearer_methods_supported": ["header"],
-            }
-        )
-        self._send_json(200, body)
+        body: dict[str, Any] = {"resource": self._resource_url()}
+        if self.oauth is not None:
+            body["authorization_servers"] = [self._effective_issuer()]
+        body["bearer_methods_supported"] = ["header"]
+        self._send_json(200, json.dumps(body))
+
+    # --- M3: embedded OAuth AS endpoint handlers ---
+
+    def _serve_as_metadata(self) -> None:
+        """RFC 8414 Authorization Server Metadata."""
+        self._send_oauth_json(200, json.dumps(self.oauth.metadata(self._effective_issuer())))
+
+    def _resolve_user(self) -> str | None:
+        """Identify the end user for /authorize. Fails closed.
+
+        Reads the operator-opted-in trusted header (set by a fronting proxy that
+        performed the real login), else falls back to --dev-user. With neither,
+        returns None and /authorize denies — never an anonymous user. The header
+        is trusted ONLY when --trusted-user-header is explicitly configured.
+        """
+        prov = self.oauth
+        if prov.trusted_user_header:
+            val = self.headers.get(prov.trusted_user_header, "")
+            val = val.strip()
+            if val and "\r" not in val and "\n" not in val and len(val) <= 256:
+                return val
+        return prov.dev_user or None
+
+    def _handle_register(self, raw: bytes) -> None:
+        status, body = self.oauth.register(raw)
+        self._send_oauth_json(status, json.dumps(body))
+
+    def _handle_token(self, raw: bytes) -> None:
+        try:
+            parsed = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+            form = {k: v[0] for k, v in parsed.items()}
+        except (UnicodeDecodeError, ValueError):
+            self._send_oauth_json(
+                400, json.dumps({"error": "invalid_request"}), no_store=True
+            )
+            return
+        status, body = self.oauth.token(form)
+        self._send_oauth_json(status, json.dumps(body), no_store=True)
+
+    def _handle_authorize(self) -> None:
+        query = urlsplit(self.path).query
+        parsed = parse_qs(query, keep_blank_values=True)
+        params = {k: v[0] for k, v in parsed.items()}
+        user = self._resolve_user()
+        result = self.oauth.authorize(params, user)
+        if result["kind"] == "bad_request":
+            self._send_oauth_json(
+                400,
+                json.dumps(
+                    {"error": "invalid_request", "error_description": result["message"]}
+                ),
+            )
+            return
+        # 302 to the validated redirect_uri (Location built via urlencode and a
+        # CR/LF-free, registered loopback redirect_uri — no injection surface).
+        self.send_response(302)
+        self.send_header("Location", result["location"])
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         # Read (drain) the request body BEFORE any early return. On HTTP/1.1
@@ -413,6 +838,16 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(400, _error_body("invalid Content-Length"))
             return
         raw = self.rfile.read(length) if length > 0 else b""
+        if self.oauth is not None:
+            # AS POST endpoints (DCR + token) bootstrap the token, exempt from
+            # the RS gate. Match by EXACT path. Body already drained above.
+            path = self.path.split("?", 1)[0]
+            if path == _REGISTER_PATH:
+                self._handle_register(raw)
+                return
+            if path == _TOKEN_PATH:
+                self._handle_token(raw)
+                return
         if self._wrong_path():
             return
         if not self._require_auth():
@@ -467,6 +902,15 @@ class _Handler(BaseHTTPRequestHandler):
         ):
             self._serve_prm()
             return
+        if self.oauth is not None:
+            # AS endpoints bootstrap the token, so they are exempt from the RS
+            # gate. Match by EXACT path (never prefix).
+            if path == _AS_METADATA_PATH:
+                self._serve_as_metadata()
+                return
+            if path == _AUTHORIZE_PATH:
+                self._handle_authorize()
+                return
         if self._wrong_path():
             return
         if not self._require_auth():
@@ -517,6 +961,7 @@ def build_server(
     port: int = 8080,
     mcp_path: str = "/mcp",
     auth_token: str | None = None,
+    oauth: _OAuthProvider | None = None,
 ) -> tuple[ThreadingHTTPServer, BackendProcess]:
     """Construct the HTTP server and backend without running the loop.
 
@@ -526,8 +971,9 @@ def build_server(
     thread), then ``backend.shutdown()`` + ``httpd.server_close()``.
 
     ``auth_token`` (when not None) enables the static-bearer-token Resource
-    Server gate (M2): MCP-path requests require ``Authorization: Bearer
-    <auth_token>`` and a 401 advertises RFC 9728 metadata.
+    Server gate (M2). ``oauth`` (when not None) enables the embedded OAuth
+    Authorization Server (M3): /authorize /token /register + AS metadata, and
+    the RS gate then also accepts issued access tokens.
     """
     backend = BackendProcess(command)
     handler = type(
@@ -538,6 +984,7 @@ def build_server(
             "mcp_path": mcp_path,
             "session_id": uuid.uuid4().hex,
             "auth_token": auth_token,
+            "oauth": oauth,
         },
     )
     httpd = ThreadingHTTPServer((host, port), handler)
@@ -553,15 +1000,22 @@ def serve(
     port: int = 8080,
     mcp_path: str = "/mcp",
     auth_token: str | None = None,
+    oauth: _OAuthProvider | None = None,
 ) -> None:
     """Run the reverse gateway until interrupted.
 
     Spawns ``command`` as the backend stdio MCP server and serves it at
     ``http://host:port{mcp_path}``. Blocks until SIGINT/SIGTERM, then tears
-    the backend down. ``auth_token`` enables the static-token gate (M2).
+    the backend down. ``auth_token`` enables the static-token gate (M2);
+    ``oauth`` enables the embedded Authorization Server (M3).
     """
     httpd, backend = build_server(
-        command, host=host, port=port, mcp_path=mcp_path, auth_token=auth_token
+        command,
+        host=host,
+        port=port,
+        mcp_path=mcp_path,
+        auth_token=auth_token,
+        oauth=oauth,
     )
 
     stopping = threading.Event()
@@ -577,7 +1031,12 @@ def serve(
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    auth_state = "static bearer token" if auth_token else "no auth"
+    modes = []
+    if auth_token:
+        modes.append("static bearer token")
+    if oauth is not None:
+        modes.append("embedded OAuth AS")
+    auth_state = " + ".join(modes) if modes else "no auth"
     log(
         f"serving {' '.join(command)} at "
         f"http://{host}:{port}{mcp_path} ({auth_state})"
@@ -618,6 +1077,53 @@ def serve_main(argv: list[str]) -> None:
         ),
     )
     parser.add_argument(
+        "--enable-oauth",
+        action="store_true",
+        help=(
+            "Enable the embedded OAuth 2.1 Authorization Server (PKCE auth-code, "
+            "dynamic client registration, refresh). MCP requests then require an "
+            "issued bearer token; the mcp-stdio client's --oauth flow works "
+            "against this gateway."
+        ),
+    )
+    parser.add_argument(
+        "--public-url",
+        default=None,
+        metavar="URL",
+        help=(
+            "Canonical external origin (e.g. https://gw.example.org) used to pin "
+            "the OAuth issuer and all endpoint URLs. Strongly recommended behind "
+            "a reverse proxy; normalized to a bare origin (path stripped)."
+        ),
+    )
+    parser.add_argument(
+        "--trusted-user-header",
+        default=None,
+        metavar="HEADER",
+        help=(
+            "Trust this request header as the authenticated user at /authorize "
+            "(e.g. X-Forwarded-User). ONLY safe behind a reverse proxy that "
+            "STRIPS any client-supplied copy. Off by default (fails closed)."
+        ),
+    )
+    parser.add_argument(
+        "--dev-user",
+        default=None,
+        metavar="USER",
+        help=(
+            "INSECURE local-testing identity for /authorize when no trusted "
+            "header is present. For loopback smoke tests only; never a real "
+            "auth boundary."
+        ),
+    )
+    parser.add_argument(
+        "--access-token-ttl",
+        type=int,
+        default=int(_DEFAULT_ACCESS_TTL_SECS),
+        metavar="SECONDS",
+        help="Issued access-token lifetime in seconds (default: 3600).",
+    )
+    parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
         help="backend stdio MCP server command (after the options)",
@@ -649,10 +1155,49 @@ def serve_main(argv: list[str]) -> None:
     if not auth_token:
         auth_token = None
 
+    # --- embedded OAuth AS (M3) ---
+    oauth = None
+    if args.dev_user is not None and not args.enable_oauth:
+        parser.error("--dev-user requires --enable-oauth")
+    if args.trusted_user_header is not None and any(
+        c in args.trusted_user_header for c in (" ", "\r", "\n", ":")
+    ):
+        parser.error("--trusted-user-header must be a valid header name")
+    if args.access_token_ttl <= 0:
+        parser.error("--access-token-ttl must be > 0")
+    if args.enable_oauth:
+        public_url = None
+        if args.public_url is not None:
+            try:
+                public_url = _normalize_public_url(args.public_url)
+            except ValueError as e:
+                parser.error(f"--public-url invalid: {e}")
+            if public_url != args.public_url.rstrip("/"):
+                log(f"note: --public-url normalized to origin {public_url}")
+        else:
+            log(
+                "warning: --enable-oauth without --public-url; the issuer is "
+                "reflected from the request Host. Set --public-url behind a proxy."
+            )
+        if args.trusted_user_header is None and args.dev_user is None:
+            log(
+                "warning: --enable-oauth without --trusted-user-header or "
+                "--dev-user; /authorize will deny all users (no identity source)."
+            )
+        if args.dev_user is not None:
+            log("warning: --dev-user is INSECURE; for loopback testing only")
+        oauth = _OAuthProvider(
+            public_url=public_url,
+            trusted_user_header=args.trusted_user_header,
+            dev_user=args.dev_user,
+            access_ttl=float(args.access_token_ttl),
+        )
+
     serve(
         command,
         host=args.host,
         port=args.port,
         mcp_path=args.path,
         auth_token=auth_token,
+        oauth=oauth,
     )
