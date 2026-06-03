@@ -700,8 +700,12 @@ def test_public_url_pins_issuer():
 
 def test_normalize_public_url():
     assert server._normalize_public_url("https://gw.example.org/mcp") == "https://gw.example.org"
-    assert server._normalize_public_url("http://h:8080") == "http://h:8080"
-    for bad in ("ftp://h", "https://", 'https://h"x', "https://user@h"):
+    assert server._normalize_public_url("http://127.0.0.1:8080") == "http://127.0.0.1:8080"
+    # canonicalization: lowercase host, drop explicit default port
+    assert server._normalize_public_url("https://EXAMPLE.com:443/x") == "https://example.com"
+    assert server._normalize_public_url("http://LOCALHOST:80") == "http://localhost"
+    for bad in ("ftp://h", "https://", 'https://h"x', "https://user@h",
+                "http://gw.example.org"):  # non-loopback http is rejected
         with pytest.raises(ValueError):
             server._normalize_public_url(bad)
 
@@ -755,3 +759,82 @@ def test_real_client_ensure_token(monkeypatch, tmp_path):
                        content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "echo"}),
                        headers={"Authorization": f"Bearer {td.access_token}"}, timeout=10)
         assert r.status_code == 200
+
+
+# --- M3 adversarial-review fixes ---
+
+def test_store_cap_is_a_hard_bound(monkeypatch):
+    # GC frees only expired entries; the cap must still bound live tokens.
+    monkeypatch.setattr(server, "_STORE_CAP", 5)
+    prov = _provider()
+    for i in range(30):
+        prov._issue(f"u{i}", "c", "", None)
+    assert len(prov._access) <= 5
+    assert len(prov._refresh) <= 5
+
+
+def test_client_cap_recycles_not_bricks(monkeypatch):
+    # /register must never permanently lock out: at the cap the oldest client
+    # is recycled rather than rejected.
+    monkeypatch.setattr(server, "_CLIENT_CAP", 3)
+    prov = _provider()
+    last = None
+    for i in range(8):
+        status, body = prov.register(
+            json.dumps({"redirect_uris": [f"http://127.0.0.1:{1000 + i}/callback"]}).encode()
+        )
+        assert status == 201, body
+        last = body["client_id"]
+    assert len(prov._clients) <= 3
+    assert last in prov._clients  # newest registration survives
+
+
+def test_redirect_key_rejects_query_userinfo_fragment():
+    assert server._redirect_key("http://127.0.0.1:5/cb") == ("http", "127.0.0.1", "/cb")
+    assert server._redirect_key("http://127.0.0.1:5/cb?next=x") is None
+    assert server._redirect_key("http://u:p@127.0.0.1:5/cb") is None
+    assert server._redirect_key("http://127.0.0.1:5/cb#frag") is None
+    assert server._redirect_key("https://127.0.0.1:5/cb") is None
+    assert server._redirect_key("http://evil.example.com/cb") is None
+
+
+def test_register_rejects_query_bearing_redirect(oauth_gateway):
+    base, _ = oauth_gateway
+    r = _register(base, redirect="http://127.0.0.1:5555/callback?next=x")
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_client_metadata"
+
+
+def test_refresh_wrong_client_id_preserves_token(oauth_gateway):
+    base, _ = oauth_gateway
+    cid, _, _, _, tok = _full_flow(base)
+    rt = tok.json()["refresh_token"]
+    # a wrong client_id must be rejected WITHOUT destroying the valid token
+    bad = _token(base, {"grant_type": "refresh_token", "refresh_token": rt, "client_id": "wrong"})
+    assert bad.status_code == 400 and bad.json()["error"] == "invalid_grant"
+    good = _token(base, {"grant_type": "refresh_token", "refresh_token": rt, "client_id": cid})
+    assert good.status_code == 200
+
+
+def test_token_missing_grant_is_invalid_request(oauth_gateway):
+    base, _ = oauth_gateway
+    r = _token(base, {"foo": "bar"})
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_request"
+
+
+def test_401_hint_uses_pinned_issuer():
+    with _run(oauth=_provider(public_url="https://gw.example.org")) as (base, _):
+        r = httpx.post(base + "/mcp",
+                       content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "echo"}), timeout=10)
+        assert r.status_code == 401
+        assert ('resource_metadata="https://gw.example.org/.well-known/'
+                'oauth-protected-resource/mcp"') in r.headers["www-authenticate"]
+
+
+def test_redact_query():
+    out = server._redact_query('"GET /authorize?state=SECRET&x=1 HTTP/1.1" 302 -')
+    assert out == '"GET /authorize?<redacted> HTTP/1.1" 302 -'
+    assert "SECRET" not in out
+    # a query-less line is unchanged
+    assert server._redact_query('"POST /mcp HTTP/1.1" 200 -') == '"POST /mcp HTTP/1.1" 200 -'

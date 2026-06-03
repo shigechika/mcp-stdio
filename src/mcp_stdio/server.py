@@ -36,6 +36,7 @@ import hmac
 import json
 import os
 import queue
+import re
 import secrets
 import signal
 import subprocess
@@ -318,9 +319,12 @@ def _redirect_key(uri: str) -> tuple[str, str, str] | None:
     """RFC 8252 loopback redirect key (scheme, host, path), port-agnostic.
 
     Returns None for anything that is not an ``http://`` loopback URI, or that
-    carries a fragment or CR/LF (open-redirect / response-splitting guard).
-    Comparing on this key lets a per-run ephemeral callback port still match a
-    registered client_id whose stored port differs (step-up reuse).
+    carries a fragment, query, userinfo, or CR/LF. Comparing on this key lets a
+    per-run ephemeral callback port still match a registered client_id whose
+    stored port differs (step-up reuse). The query is rejected (not just
+    ignored): the key drops it, so accepting it would let the raw redirect_uri
+    be reflected into a malformed double-``?`` Location and smuggle a second
+    identity behind one registered (scheme, host, path).
     """
     if "\r" in uri or "\n" in uri:
         return None
@@ -328,7 +332,7 @@ def _redirect_key(uri: str) -> tuple[str, str, str] | None:
         p = urlsplit(uri)
     except ValueError:
         return None
-    if p.fragment:
+    if p.fragment or p.query or p.username or p.password or "@" in p.netloc:
         return None
     host = (p.hostname or "").lower()
     if p.scheme != "http" or host not in _LOOPBACK_HOSTS:
@@ -337,20 +341,45 @@ def _redirect_key(uri: str) -> tuple[str, str, str] | None:
 
 
 def _normalize_public_url(url: str) -> str:
-    """Normalize --public-url to a bare origin ``scheme://host[:port]``.
+    """Normalize --public-url to a canonical bare origin ``scheme://host[:port]``.
 
-    Raises ValueError on a non-http(s) URL, a missing host, userinfo, or
-    CR/LF/quote/space. The path/query/fragment are stripped — the OAuth issuer
-    MUST be the bare origin or the client cross-origin-rejects the metadata.
+    Raises ValueError on a non-http(s) URL, a missing host, userinfo,
+    CR/LF/quote/space, or a non-loopback ``http://`` (a compliant client refuses
+    cleartext non-loopback endpoints). The host is lowercased, an explicit
+    default port is dropped, and an IPv6 literal is re-bracketed, so the issuer
+    is byte-identical to what a client derives (RFC 8414 Sec. 3.3). The
+    path/query/fragment are stripped — the OAuth issuer MUST be the bare origin
+    or the client cross-origin-rejects the metadata.
     """
     if any(c in url for c in ('"', "\r", "\n", " ")):
         raise ValueError("public-url contains forbidden characters")
     p = urlsplit(url)
     if p.scheme not in ("http", "https") or not p.hostname:
         raise ValueError("public-url must be an absolute http(s) URL with a host")
-    if "@" in p.netloc:
+    if p.username or p.password or "@" in p.netloc:
         raise ValueError("public-url must not contain userinfo")
-    return f"{p.scheme}://{p.netloc}"
+    host = p.hostname.lower()
+    if p.scheme == "http" and host not in _LOOPBACK_HOSTS:
+        raise ValueError("a non-loopback public-url must use https")
+    try:
+        port = p.port
+    except ValueError as e:
+        raise ValueError("public-url has an invalid port") from e
+    hostpart = f"[{host}]" if ":" in host else host
+    default_port = 80 if p.scheme == "http" else 443
+    netloc = hostpart if (port is None or port == default_port) else f"{hostpart}:{port}"
+    return f"{p.scheme}://{netloc}"
+
+
+def _redact_query(line: str) -> str:
+    """Redact query strings from an access-log line.
+
+    OAuth /authorize requests carry the client's single-use CSRF ``state`` (and
+    error redirects can echo it); the bundled client deliberately keeps that
+    nonce out of its own logs, so the gateway must not reintroduce it. MCP
+    requests carry no query, so blanket redaction is lossless here.
+    """
+    return re.sub(r"(\s/[^\s?]*)\?\S*", r"\1?<redacted>", line)
 
 
 class _OAuthProvider:
@@ -490,6 +519,7 @@ class _OAuthProvider:
         with self._lock:
             if len(self._codes) >= _STORE_CAP:
                 self._gc_locked()
+                self._evict_to_capacity_locked(self._codes, _STORE_CAP)
             self._codes[code] = {
                 "client_id": cid,
                 "redirect_uri": redirect_uri,
@@ -509,6 +539,10 @@ class _OAuthProvider:
             return self._token_auth_code(form)
         if grant == "refresh_token":
             return self._token_refresh(form)
+        if not grant:
+            # RFC 6749 Sec. 5.2: a missing required parameter is invalid_request,
+            # not unsupported_grant_type (which is for an unrecognized value).
+            return 400, {"error": "invalid_request", "error_description": "missing grant_type"}
         return 400, {"error": "unsupported_grant_type"}
 
     def _token_auth_code(self, form: dict[str, str]) -> tuple[int, dict[str, Any]]:
@@ -541,15 +575,20 @@ class _OAuthProvider:
             return 400, {"error": "invalid_request", "error_description": "missing refresh_token"}
         now = self._now()
         with self._lock:
-            # Rotate: remove the presented refresh token now; a fresh one is
-            # issued by _issue (OAuth 2.1 / RFC 9700 rotation).
-            entry = self._refresh.pop(rt, None)
-        if entry is None:
-            return 400, {"error": "invalid_grant", "error_description": "unknown refresh_token"}
-        if entry["expires_at"] < now:
-            return 400, {"error": "invalid_grant", "error_description": "refresh_token expired"}
-        if form.get("client_id") != entry["client_id"]:
-            return 400, {"error": "invalid_grant", "error_description": "client_id mismatch"}
+            # Validate BEFORE mutating: only consume (rotate) the token once it
+            # passes. A wrong/blank client_id must NOT destroy an otherwise-valid
+            # 30-day token. Single-use still holds because the successful delete
+            # happens under this same lock, so a concurrent double-submit of the
+            # same valid token finds None on the second pass.
+            entry = self._refresh.get(rt)
+            if entry is None:
+                return 400, {"error": "invalid_grant", "error_description": "unknown refresh_token"}
+            if entry["expires_at"] < now:
+                del self._refresh[rt]
+                return 400, {"error": "invalid_grant", "error_description": "refresh_token expired"}
+            if form.get("client_id") != entry["client_id"]:
+                return 400, {"error": "invalid_grant", "error_description": "client_id mismatch"}
+            del self._refresh[rt]  # consume on success (RFC 9700 rotation)
         return self._issue(entry["user"], entry["client_id"], entry["scope"], entry["resource"])
 
     def _issue(
@@ -561,6 +600,8 @@ class _OAuthProvider:
         with self._lock:
             if len(self._access) >= _STORE_CAP or len(self._refresh) >= _STORE_CAP:
                 self._gc_locked()
+                self._evict_to_capacity_locked(self._access, _STORE_CAP)
+                self._evict_to_capacity_locked(self._refresh, _STORE_CAP)
             self._access[access] = {
                 "user": user, "client_id": client_id, "scope": scope,
                 "resource": resource, "expires_at": now + self.access_ttl,
@@ -596,14 +637,27 @@ class _OAuthProvider:
                 return False
             return True
 
+    def _evict_to_capacity_locked(self, store: dict[str, dict[str, Any]], cap: int) -> None:
+        """Hard-bound a TTL store: if still at the cap after GC, evict the
+        soonest-expiring entries to make room. GC alone frees nothing when every
+        entry is still live, so without this the cap is not a real bound."""
+        overflow = len(store) - (cap - 1)
+        if overflow <= 0:
+            return
+        victims = sorted(store.items(), key=lambda kv: kv[1]["expires_at"])
+        for k, _ in victims[:overflow]:
+            del store[k]
+
     def _gc_locked(self) -> None:
         now = self._now()
         for store in (self._codes, self._access, self._refresh):
             for k in [k for k, v in store.items() if v["expires_at"] < now]:
                 del store[k]
-        if len(self._clients) > _CLIENT_CAP:
+        # Clients carry no TTL: recycle the oldest at the cap so /register never
+        # permanently bricks (evict down to cap-1 to leave room for one insert).
+        if len(self._clients) >= _CLIENT_CAP:
             oldest = sorted(self._clients.items(), key=lambda kv: kv[1]["created_at"])
-            for k, _ in oldest[: len(self._clients) - _CLIENT_CAP]:
+            for k, _ in oldest[: len(self._clients) - (_CLIENT_CAP - 1)]:
                 del self._clients[k]
 
 
@@ -627,7 +681,8 @@ class _Handler(BaseHTTPRequestHandler):
     # Quieter, consistent logging: route BaseHTTPRequestHandler's access log
     # through the project logger instead of stderr's default apache-style line.
     def log_message(self, fmt: str, *args: Any) -> None:
-        log("http: " + (fmt % args))
+        # Redact query strings (OAuth state / code never belong in shared logs).
+        log("http: " + _redact_query(fmt % args))
 
     protocol_version = "HTTP/1.1"
 
@@ -708,8 +763,10 @@ class _Handler(BaseHTTPRequestHandler):
         return self._effective_issuer() + self.mcp_path
 
     def _prm_url(self) -> str:
-        # RFC 9728 Sec. 3.1 path insertion.
-        return self._origin() + _PRM_WELL_KNOWN_PREFIX + self.mcp_path
+        # RFC 9728 Sec. 3.1 path insertion. Use the effective issuer (pinned
+        # --public-url when set) so the 401 hint, the PRM document, and the AS
+        # metadata all advertise the same origin behind a proxy.
+        return self._effective_issuer() + _PRM_WELL_KNOWN_PREFIX + self.mcp_path
 
     def _authorized(self) -> bool:
         """True when no auth is configured, or a valid Bearer token is presented.
