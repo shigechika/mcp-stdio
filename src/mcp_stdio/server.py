@@ -6,11 +6,11 @@ it spawns a local stdio MCP server as a child process and publishes it as a
 Streamable HTTP MCP endpoint, so clients that cannot spawn the server locally
 (a laptop without it installed, a remote bot) can reach it over the network.
 
-Milestone M1 (this file): a single backend, **no authentication**. The HTTP
+A single backend. Authentication is optional and layered: with no token the
+endpoint is open; ``--auth-token`` adds a static-bearer Resource Server gate;
+``--enable-oauth`` adds an embedded OAuth 2.1 Authorization Server. The HTTP
 surface implements the MCP Streamable HTTP transport's request/response and
 notification semantics plus a GET SSE channel for server-initiated messages.
-Authentication (Bearer/JWT validation as a Resource Server, then an embedded
-Authorization Server) layers on top in later milestones — see issue #235.
 
 Stdlib only (``http.server`` + ``subprocess`` + ``threading``), matching the
 project's httpx-only-runtime constraint: the server path adds no dependency.
@@ -21,10 +21,10 @@ stdout and routes each message — a response (id + result/error, no method)
 wakes the waiting HTTP handler keyed by the JSON-RPC id; anything
 server-initiated (carries ``method``) is queued for the GET SSE stream.
 
-M1 single-client assumption: JSON-RPC ids are passed through verbatim, so two
+Single-client assumption: JSON-RPC ids are passed through verbatim, so two
 distinct clients that happen to reuse the same id while sharing one backend
-could cross responses. M1 targets one logical client (e.g. one Claude); id
-remapping for true multi-client fan-out is a later milestone.
+could cross responses. This targets one logical client (e.g. one Claude); id
+remapping for true multi-client fan-out is left for later.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ def _classify(msg: Any) -> str:
     ``"notification"`` (method, no id), ``"response"`` (id + result/error,
     no method — e.g. a client answering a server-initiated request), or
     ``"invalid"`` (anything else, including non-objects and batches, which
-    M1 does not handle).
+    not handled here).
     """
     if not isinstance(msg, dict):
         return "invalid"
@@ -145,8 +145,8 @@ class BackendProcess:
         # id -> single-slot holder {"event": Event, "line": str|None}
         self._pending: dict[Any, dict[str, Any]] = {}
         # Server-initiated messages (requests/notifications) awaiting an SSE
-        # consumer. Unbounded queue is acceptable for M1's single client; a
-        # later milestone can bound + shed.
+        # consumer. Unbounded queue is acceptable for the single-client model;
+        # a later change can bound + shed.
         self.server_initiated: "queue.Queue[str]" = queue.Queue()
         self._closed = threading.Event()
         self._reader = threading.Thread(
@@ -222,7 +222,7 @@ class BackendProcess:
             if self._closed.is_set():
                 return None
             # Reuse-of-an-in-flight-id is a client bug; last writer wins and the
-            # earlier waiter will time out. Acceptable for M1.
+            # earlier waiter will time out. Acceptable for the single-client model.
             self._pending[req_id] = slot
         if not self._write(line):
             with self._lock:
@@ -284,7 +284,7 @@ class BackendProcess:
             log(f"backend shutdown error: {e}")
 
 
-# --- M3: embedded OAuth 2.1 Authorization Server (stdlib only, opaque tokens) ---
+# --- embedded OAuth 2.1 Authorization Server (stdlib only, opaque tokens) ---
 
 _AS_METADATA_PATH = "/.well-known/oauth-authorization-server"
 _AUTHORIZE_PATH = "/authorize"
@@ -376,10 +376,14 @@ def _redact_query(line: str) -> str:
 
     OAuth /authorize requests carry the client's single-use CSRF ``state`` (and
     error redirects can echo it); the bundled client deliberately keeps that
-    nonce out of its own logs, so the gateway must not reintroduce it. MCP
-    requests carry no query, so blanket redaction is lossless here.
+    nonce out of its own logs, so the gateway must not reintroduce it. Every
+    ``?...`` run (up to whitespace or a quote) is redacted, covering BOTH the
+    origin-form ``/authorize?...`` and the absolute-form
+    ``http://host/authorize?...`` request targets (RFC 7230 allows the latter,
+    e.g. via a forwarding proxy). MCP requests carry no query, so this is
+    lossless here.
     """
-    return re.sub(r"(\s/[^\s?]*)\?\S*", r"\1?<redacted>", line)
+    return re.sub(r'\?[^\s"]*', "?<redacted>", line)
 
 
 class _OAuthProvider:
@@ -453,8 +457,7 @@ class _OAuthProvider:
         client_id = secrets.token_urlsafe(32)
         now = self._now()
         with self._lock:
-            if len(self._clients) >= _CLIENT_CAP:
-                self._gc_locked()
+            self._recycle_clients_locked()
             if len(self._clients) >= _CLIENT_CAP:
                 return bad("registration limit reached")
             self._clients[client_id] = {
@@ -653,8 +656,12 @@ class _OAuthProvider:
         for store in (self._codes, self._access, self._refresh):
             for k in [k for k, v in store.items() if v["expires_at"] < now]:
                 del store[k]
+
+    def _recycle_clients_locked(self) -> None:
         # Clients carry no TTL: recycle the oldest at the cap so /register never
         # permanently bricks (evict down to cap-1 to leave room for one insert).
+        # Called ONLY from register() so token-issuance GC never evicts a client
+        # that is not under registration pressure.
         if len(self._clients) >= _CLIENT_CAP:
             oldest = sorted(self._clients.items(), key=lambda kv: kv[1]["created_at"])
             for k, _ in oldest[: len(self._clients) - (_CLIENT_CAP - 1)]:
@@ -671,10 +678,10 @@ class _Handler(BaseHTTPRequestHandler):
     backend: BackendProcess
     mcp_path: str
     session_id: str
-    # None disables authentication (M1 behavior). A non-None value enables the
-    # static-bearer-token Resource Server gate (M2).
+    # None disables authentication. A non-None value enables the
+    # static-bearer-token Resource Server gate.
     auth_token: str | None = None
-    # None disables the embedded OAuth AS (M1/M2). A provider enables M3:
+    # None disables the embedded OAuth AS. A provider enables it:
     # /authorize /token /register + AS metadata + issued-token RS validation.
     oauth: _OAuthProvider | None = None
 
@@ -735,7 +742,7 @@ class _Handler(BaseHTTPRequestHandler):
             return True
         return False
 
-    # --- M2: static-bearer-token Resource Server + RFC 9728 metadata ---
+    # --- static-bearer-token Resource Server + RFC 9728 metadata ---
 
     def _origin(self) -> str:
         """Absolute ``scheme://host`` for building metadata URLs.
@@ -771,8 +778,8 @@ class _Handler(BaseHTTPRequestHandler):
     def _authorized(self) -> bool:
         """True when no auth is configured, or a valid Bearer token is presented.
 
-        Precedence: the M2 static token is checked first (constant-time, exempt
-        from expiry), then an M3 issued access token (lookup + expiry). The
+        Precedence: the static token is checked first (constant-time, exempt
+        from expiry), then an issued access token (lookup + expiry). The
         endpoint is open only when NEITHER mechanism is configured.
         """
         auth = self.headers.get("Authorization", "")
@@ -807,8 +814,8 @@ class _Handler(BaseHTTPRequestHandler):
     def _serve_prm(self) -> None:
         """Serve RFC 9728 Protected Resource Metadata when any auth is enabled.
 
-        ``authorization_servers`` is added ONLY when the embedded AS is on (M3);
-        a static-token-only deployment (M2) omits it.
+        ``authorization_servers`` is added ONLY when the embedded AS is on;
+        a static-token-only deployment omits it.
         """
         if self.auth_token is None and self.oauth is None:
             self._send_json(404, _error_body("not found"))
@@ -819,7 +826,7 @@ class _Handler(BaseHTTPRequestHandler):
         body["bearer_methods_supported"] = ["header"]
         self._send_json(200, json.dumps(body))
 
-    # --- M3: embedded OAuth AS endpoint handlers ---
+    # --- embedded OAuth AS endpoint handlers ---
 
     def _serve_as_metadata(self) -> None:
         """RFC 8414 Authorization Server Metadata."""
@@ -945,7 +952,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.backend.send_oneway(json.dumps(msg))
             self._send_empty(202)
         else:
-            # Batches and malformed payloads are out of scope for M1.
+            # Batches and malformed payloads are out of scope here.
             self._send_json(400, _error_body("unsupported or invalid message"))
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
@@ -1002,7 +1009,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
     def do_DELETE(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        # MCP clients DELETE the endpoint to end a session. M1 has one
+        # MCP clients DELETE the endpoint to end a session. This gateway has one
         # long-lived backend, so acknowledge without tearing it down.
         if self._wrong_path():
             return
@@ -1028,8 +1035,8 @@ def build_server(
     thread), then ``backend.shutdown()`` + ``httpd.server_close()``.
 
     ``auth_token`` (when not None) enables the static-bearer-token Resource
-    Server gate (M2). ``oauth`` (when not None) enables the embedded OAuth
-    Authorization Server (M3): /authorize /token /register + AS metadata, and
+    Server gate. ``oauth`` (when not None) enables the embedded OAuth
+    Authorization Server: /authorize /token /register + AS metadata, and
     the RS gate then also accepts issued access tokens.
     """
     backend = BackendProcess(command)
@@ -1063,8 +1070,8 @@ def serve(
 
     Spawns ``command`` as the backend stdio MCP server and serves it at
     ``http://host:port{mcp_path}``. Blocks until SIGINT/SIGTERM, then tears
-    the backend down. ``auth_token`` enables the static-token gate (M2);
-    ``oauth`` enables the embedded Authorization Server (M3).
+    the backend down. ``auth_token`` enables the static-token gate;
+    ``oauth`` enables the embedded Authorization Server.
     """
     httpd, backend = build_server(
         command,
@@ -1212,7 +1219,7 @@ def serve_main(argv: list[str]) -> None:
     if not auth_token:
         auth_token = None
 
-    # --- embedded OAuth AS (M3) ---
+    # --- embedded OAuth AS setup ---
     oauth = None
     if args.dev_user is not None and not args.enable_oauth:
         parser.error("--dev-user requires --enable-oauth")

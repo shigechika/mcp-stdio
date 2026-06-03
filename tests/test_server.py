@@ -183,7 +183,7 @@ def test_serve_main_rejects_bad_path():
         server.serve_main(["--path", "mcp", "--", "true"])  # path missing leading /
 
 
-# --- M2: static-bearer-token Resource Server + RFC 9728 metadata ---
+# --- static-bearer-token Resource Server + RFC 9728 metadata ---
 
 _TOKEN = "s3cr3t-token"
 
@@ -260,7 +260,7 @@ def test_prm_served_without_token(auth_gateway):
     body = resp.json()
     assert body["resource"].endswith("/mcp")
     assert body["bearer_methods_supported"] == ["header"]
-    assert "authorization_servers" not in body  # none until M3
+    assert "authorization_servers" not in body  # none without the embedded AS
     # Bare form is also served.
     resp2 = httpx.get(base + "/.well-known/oauth-protected-resource", timeout=10)
     assert resp2.status_code == 200
@@ -325,7 +325,7 @@ def test_authorized_constant_time_paths():
     assert Fake("")._authorized() is True
 
 
-# --- M3: embedded OAuth 2.1 Authorization Server ---
+# --- embedded OAuth 2.1 Authorization Server ---
 
 _REDIRECT = "http://127.0.0.1:5555/callback"
 
@@ -761,7 +761,7 @@ def test_real_client_ensure_token(monkeypatch, tmp_path):
         assert r.status_code == 200
 
 
-# --- M3 adversarial-review fixes ---
+# --- adversarial-review fixes ---
 
 def test_store_cap_is_a_hard_bound(monkeypatch):
     # GC frees only expired entries; the cap must still bound live tokens.
@@ -836,5 +836,35 @@ def test_redact_query():
     out = server._redact_query('"GET /authorize?state=SECRET&x=1 HTTP/1.1" 302 -')
     assert out == '"GET /authorize?<redacted> HTTP/1.1" 302 -'
     assert "SECRET" not in out
+    # absolute-form request target (RFC 7230, e.g. via a forwarding proxy) too
+    out2 = server._redact_query(
+        '"GET http://gw.example.org/authorize?state=SECRET&code=ABC HTTP/1.1" 404 -'
+    )
+    assert out2 == '"GET http://gw.example.org/authorize?<redacted> HTTP/1.1" 404 -'
+    assert "SECRET" not in out2 and "ABC" not in out2
     # a query-less line is unchanged
     assert server._redact_query('"POST /mcp HTTP/1.1" 200 -') == '"POST /mcp HTTP/1.1" 200 -'
+
+
+def test_concurrent_refresh_single_use(oauth_gateway):
+    # The same refresh token submitted concurrently must rotate exactly once.
+    base, _ = oauth_gateway
+    cid, _, _, _, tok = _full_flow(base)
+    rt = tok.json()["refresh_token"]
+    data = {"grant_type": "refresh_token", "refresh_token": rt, "client_id": cid}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        codes = list(ex.map(lambda _: _token(base, data).status_code, range(8)))
+    assert codes.count(200) == 1
+    assert codes.count(400) == 7
+
+
+def test_refresh_token_expires():
+    clock = [1000.0]
+    prov = _provider(refresh_ttl=50, now=lambda: clock[0])
+    with _run(oauth=prov) as (base, _):
+        cid, _, _, _, tok = _full_flow(base)
+        rt = tok.json()["refresh_token"]
+        clock[0] += 100  # advance past refresh_ttl
+        r = _token(base, {"grant_type": "refresh_token", "refresh_token": rt, "client_id": cid})
+        assert r.status_code == 400
+        assert r.json()["error"] == "invalid_grant"
