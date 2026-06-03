@@ -218,12 +218,24 @@ mcp-stdio [OPTIONS] URL
 
 各フラグの詳細（プラットフォーム注記や issue 参照を含む）は `mcp-stdio --help` を実行してください。この表より詳しい説明が表示されます。
 
-## 逆ゲートウェイ: `serve` モード（実験的）
+## 逆ゲートウェイ: `serve` モード
 
 通常モードは **stdio → HTTP**（クライアント側）の橋渡しですが、`serve`
 サブコマンドはその逆向き — **HTTP → stdio** — で、ローカルの stdio MCP
 サーバを Streamable HTTP の MCP エンドポイントとして公開します。ローカルに
 インストールしていないクライアントからネットワーク越しに到達できます:
+
+```mermaid
+flowchart BT
+    A["MCP クライアント<br>Claude Code / Desktop<br>(または mcp-stdio --oauth)"]
+    B("mcp-stdio serve<br><b>HTTP → stdio</b> ゲートウェイ<br>認証: なし / 静的トークン /<br>埋め込み OAuth 2.1 AS")
+    C["ローカルの stdio<br>MCP サーバ"]
+    A <== "Streamable HTTP<br>Bearer / OAuth 2.1 (PKCE)" ==> B
+    B <-- "stdio (子プロセス起動)" --> C
+```
+
+冒頭のクライアント側の図と対になります。あちらは mcp-stdio が **stdio → HTTP**、
+こちらは **HTTP → stdio** です。
 
 ```bash
 mcp-stdio serve --port 8080 -- python -m my_mcp_server

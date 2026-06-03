@@ -220,12 +220,24 @@ Options:
 
 Run `mcp-stdio --help` for the full per-flag detail (platform notes and issue references are more verbose than this table).
 
-## Reverse gateway: `serve` mode (experimental)
+## Reverse gateway: `serve` mode
 
 The default mode bridges **stdio → HTTP** (client side). The `serve` subcommand
 is the mirror image — **HTTP → stdio** — exposing a local stdio MCP server as a
 Streamable HTTP MCP endpoint so clients that cannot spawn it locally can reach
 it over the network:
+
+```mermaid
+flowchart BT
+    A["MCP client<br>Claude Code / Desktop<br>(or mcp-stdio --oauth)"]
+    B("mcp-stdio serve<br><b>HTTP → stdio</b> gateway<br>auth: none / static token /<br>embedded OAuth 2.1 AS")
+    C["local stdio<br>MCP server"]
+    A <== "Streamable HTTP<br>Bearer / OAuth 2.1 (PKCE)" ==> B
+    B <-- "stdio (spawned child)" --> C
+```
+
+This is the mirror of the client-side diagram at the top: there mcp-stdio is
+**stdio → HTTP**; here it is **HTTP → stdio**.
 
 ```bash
 mcp-stdio serve --port 8080 -- python -m my_mcp_server
