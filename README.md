@@ -232,7 +232,7 @@ flowchart BT
     A["MCP client<br>Claude Code / Desktop<br>(or mcp-stdio --oauth)"]
     B("mcp-stdio serve<br><b>HTTP → stdio</b> gateway<br>auth: none / static token /<br>embedded OAuth 2.1 AS")
     C["local stdio<br>MCP server"]
-    A <== "HTTPS · Streamable HTTP<br>Bearer / OAuth 2.1 (PKCE)" ==> B
+    A <== "Streamable HTTP<br>Bearer / OAuth 2.1 (PKCE)" ==> B
     B <-- "stdio (spawned child)" --> C
 ```
 

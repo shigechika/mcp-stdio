@@ -230,7 +230,7 @@ flowchart BT
     A["MCP クライアント<br>Claude Code / Desktop<br>(または mcp-stdio --oauth)"]
     B("mcp-stdio serve<br><b>HTTP → stdio</b> ゲートウェイ<br>認証: なし / 静的トークン /<br>埋め込み OAuth 2.1 AS")
     C["ローカルの stdio<br>MCP サーバ"]
-    A <== "HTTPS · Streamable HTTP<br>Bearer / OAuth 2.1 (PKCE)" ==> B
+    A <== "Streamable HTTP<br>Bearer / OAuth 2.1 (PKCE)" ==> B
     B <-- "stdio (子プロセス起動)" --> C
 ```
 
