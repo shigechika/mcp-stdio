@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.0](https://github.com/shigechika/mcp-stdio/compare/v0.16.0...v0.17.0) (2026-06-28)
+
+
+### Features
+
+* proactive OAuth token refresh timer for HTTP-200 expiry gateways ([#243](https://github.com/shigechika/mcp-stdio/issues/243)) ([a479527](https://github.com/shigechika/mcp-stdio/commit/a479527ef76e45381ea6c35f33f02fdb63c8a82f))
+
 ## [0.16.0](https://github.com/shigechika/mcp-stdio/compare/v0.15.0...v0.16.0) (2026-06-03)
 
 
