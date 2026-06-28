@@ -11,7 +11,7 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -1651,6 +1651,122 @@ def check_connection(
         client.close()
 
 
+# Proactive token refresh — a background timer that refreshes the OAuth access
+# token shortly before it expires, independent of the request flow. Reactive
+# refresh only fires on a transport-level HTTP 401; some gateways (notably
+# Atlassian's MCP gateway) signal an expired token as an HTTP 200 tool-result
+# error (``isError: true``) instead, so neither reactive refresh nor the
+# startup-only proactive ``ensure_token`` ever fires and a long-lived --oauth
+# session cannot recover until the process restarts. The timer closes that gap
+# generically, without ever parsing a tool-result body (#242).
+_PROACTIVE_REFRESH_RECHECK_SECONDS = 60.0
+_PROACTIVE_REFRESH_MAX_SLEEP = 300.0
+
+
+def _proactive_refresh_loop(
+    *,
+    refresher: Callable[[], dict[str, str] | None],
+    expiry_getter: Callable[[], float | None],
+    leeway: float,
+    headers: dict[str, str],
+    headers_lock: threading.Lock,
+    refresh_lock: threading.Lock,
+    stop: threading.Event,
+    now: Any = time.time,
+    recheck: float = _PROACTIVE_REFRESH_RECHECK_SECONDS,
+    max_sleep: float = _PROACTIVE_REFRESH_MAX_SLEEP,
+) -> None:
+    """Refresh the OAuth token shortly before it expires, off the request path.
+
+    Wakes at ``expires_at - leeway`` (the expiry is read fresh each loop via
+    ``expiry_getter``, which the caller backs with ``token_store.load_token``),
+    calls ``refresher`` under ``refresh_lock`` to serialise against the main
+    loop's reactive 401 refresh (a concurrent refresh would race the AS's
+    refresh-token rotation), and merges the returned headers under
+    ``headers_lock``. The thread must never die: any exception is logged and
+    retried after a ``recheck`` backoff (mirrors the structural #11 safety net).
+    A ``None`` expiry (no cached token / non-expiring token) or a ``refresher``
+    that returns ``None`` (no refresh_token, refresh failed) degrades to a quiet
+    ``recheck``-interval poll rather than a hot loop. ``now`` is injectable for
+    deterministic tests, mirroring ``_CancelTracker``.
+    """
+    while not stop.is_set():
+        try:
+            exp = expiry_getter()
+            if exp is None:
+                # No cached token yet, or a token with no expiry — nothing to
+                # schedule against, so poll on the recheck interval and stay idle.
+                wait_for = recheck
+            else:
+                wait_for = exp - leeway - now()
+            if wait_for > 0:
+                # Interruptible sleep, capped at max_sleep so a token whose
+                # expires_at moved out-of-band (another refresher wrote a new
+                # value) is re-evaluated promptly instead of oversleeping to a
+                # stale deadline. stop.wait returns True when signalled.
+                if stop.wait(min(wait_for, max_sleep)):
+                    return
+                continue
+            # Past the refresh deadline — refresh now, serialised with the
+            # reactive 401 path so the two never race the refresh-token rotation.
+            with refresh_lock:
+                new_headers = refresher()
+                if new_headers:
+                    with headers_lock:
+                        headers.update(new_headers)
+            if not new_headers:
+                # Refresh unavailable (no refresh_token) or failed (the refresher
+                # swallows network errors and returns None). Back off before
+                # retrying so a persistently-failing refresh never hot-loops.
+                if stop.wait(recheck):
+                    return
+        except Exception as e:  # noqa: BLE001 — the daemon must never die
+            log(f"proactive token refresh error: {e}")
+            if stop.wait(recheck):
+                return
+
+
+def _start_proactive_refresh(
+    *,
+    refresher: Callable[[], dict[str, str] | None] | None,
+    expiry_getter: Callable[[], float | None] | None,
+    proactive_refresh: bool,
+    leeway: float,
+    headers: dict[str, str],
+    headers_lock: threading.Lock,
+    refresh_lock: threading.Lock,
+) -> tuple[threading.Thread | None, threading.Event | None]:
+    """Start the proactive-refresh daemon, or no-op when not applicable.
+
+    Returns ``(thread, stop_event)`` so the caller can stop and join it in its
+    ``finally``, or ``(None, None)`` when disabled (``--no-proactive-refresh``)
+    or when there is nothing to refresh (no OAuth: the refresher / expiry getter
+    is ``None``).
+    """
+    if not (
+        proactive_refresh
+        and refresher is not None
+        and expiry_getter is not None
+    ):
+        return None, None
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=_proactive_refresh_loop,
+        kwargs={
+            "refresher": refresher,
+            "expiry_getter": expiry_getter,
+            "leeway": leeway,
+            "headers": headers,
+            "headers_lock": headers_lock,
+            "refresh_lock": refresh_lock,
+            "stop": stop,
+        },
+        daemon=True,
+    )
+    thread.start()
+    return thread, stop
+
+
 def run(
     url: str,
     headers: dict[str, str],
@@ -1663,6 +1779,9 @@ def run(
     normalize_arguments: bool = True,
     token_refresher: Any = None,
     scope_upgrader: Any = None,
+    token_expiry_getter: Any = None,
+    proactive_refresh: bool = True,
+    refresh_leeway: float = 60.0,
 ) -> None:
     """Run the stdio-to-HTTP relay loop.
 
@@ -1701,6 +1820,20 @@ def run(
             and returns updated headers containing a broader-scope
             token, or None on failure (RFC 9470 step-up authorization;
             cf. anthropics/claude-code#44652).
+        token_expiry_getter: Optional callable returning the cached
+            token's ``expires_at`` (Unix seconds) or None. Drives the
+            proactive-refresh timer's wake schedule; the caller backs it
+            with ``token_store.load_token`` so each read picks up the
+            latest persisted expiry.
+        proactive_refresh: When True (default), run a background timer
+            that refreshes the token at ``expires_at - refresh_leeway``
+            using ``token_refresher``, independent of request flow. This
+            keeps a long --oauth session alive against gateways that
+            signal expiry as an HTTP 200 tool-error rather than a 401
+            (e.g. Atlassian's MCP gateway; #242). No-op without
+            ``token_refresher`` / ``token_expiry_getter`` (i.e. no OAuth).
+        refresh_leeway: Seconds before ``expires_at`` at which the
+            proactive timer refreshes (default 60).
 
     Limitation — JSON-RPC batches: a top-level array (a batch) is
     treated like a notification for error synthesis. ``_extract_id_and_presence``
@@ -1740,6 +1873,14 @@ def run(
         )
     )
 
+    # ``run`` is otherwise single-threaded, but the proactive-refresh daemon
+    # (when enabled) mutates ``headers`` concurrently. ``headers_lock`` serialises
+    # every read/write of the shared ``headers`` object; ``refresh_lock`` serialises
+    # the timer's refresh against the reactive 401 refresh so the two never race
+    # the AS's refresh-token rotation. Both are uncontended when the timer is off.
+    headers_lock = threading.Lock()
+    refresh_lock = threading.Lock()
+
     def _prepare_headers() -> dict[str, str]:
         """Build per-request headers with the current session + protocol version.
 
@@ -1752,7 +1893,10 @@ def run(
         actually having a value, so an operator pin still rides through on the
         paths where the relay manages no value of its own.
         """
-        h = dict(headers)
+        with headers_lock:
+            h = dict(headers)
+        # session_id / protocol_version are mutated only by this (main) thread,
+        # so they need no lock; only the shared ``headers`` object is contended.
         if session_id:
             h = {k: v for k, v in h.items() if k.lower() != "mcp-session-id"}
             h["Mcp-Session-Id"] = session_id
@@ -1760,6 +1904,16 @@ def run(
             h = {k: v for k, v in h.items() if k.lower() != "mcp-protocol-version"}
             h["MCP-Protocol-Version"] = protocol_version
         return h
+
+    refresh_timer, refresh_stop = _start_proactive_refresh(
+        refresher=token_refresher,
+        expiry_getter=token_expiry_getter,
+        proactive_refresh=proactive_refresh,
+        leeway=refresh_leeway,
+        headers=headers,
+        headers_lock=headers_lock,
+        refresh_lock=refresh_lock,
+    )
 
     try:
         for line in sys.stdin:
@@ -1939,9 +2093,13 @@ def run(
                 # Token expired (401) — refresh and retry once
                 if result.status_code == 401 and token_refresher:
                     log("received 401, attempting token refresh")
-                    new_headers = token_refresher()
+                    # Serialise with the proactive timer's refresh so the two
+                    # never race the AS's refresh-token rotation (#242).
+                    with refresh_lock:
+                        new_headers = token_refresher()
                     if new_headers:
-                        headers.update(new_headers)
+                        with headers_lock:
+                            headers.update(new_headers)
                         req_headers = _prepare_headers()
                         result = _dispatch(line, req_headers)
                         if result is None:
@@ -1999,7 +2157,8 @@ def run(
                         )
                         new_headers = scope_upgrader(required_scope)
                         if new_headers:
-                            headers.update(new_headers)
+                            with headers_lock:
+                                headers.update(new_headers)
                             req_headers = _prepare_headers()
                             result = _dispatch(line, req_headers)
                             if result is None:
@@ -2028,8 +2187,10 @@ def run(
                 if result.status_code == 404 and session_id:
                     log("session expired, re-initializing and retrying")
                     session_id = None
+                    with headers_lock:
+                        headers_snapshot = dict(headers)
                     new_session_id, renegotiated = _reinitialize(
-                        client, url, dict(headers), protocol_version
+                        client, url, headers_snapshot, protocol_version
                     )
                     if new_session_id is None:
                         log("re-initialize failed, dropping request")
@@ -2111,6 +2272,10 @@ def run(
                         pass
                 continue
     finally:
+        if refresh_stop is not None:
+            refresh_stop.set()
+            if refresh_timer is not None:
+                refresh_timer.join(timeout=1.0)
         client.close()
 
 
@@ -2295,6 +2460,9 @@ def run_sse(
     normalize_arguments: bool = True,
     token_refresher: Any = None,
     scope_upgrader: Any = None,
+    token_expiry_getter: Any = None,
+    proactive_refresh: bool = True,
+    refresh_leeway: float = 60.0,
 ) -> None:
     """Run the stdio-to-SSE relay loop (MCP 2024-11-05 legacy transport).
 
@@ -2383,6 +2551,9 @@ def run_sse(
     # main loop below may mutate it on a 401/403 token refresh. Serialise the
     # two so the GET request build never iterates a dict mid-mutation.
     headers_lock = threading.Lock()
+    # Serialises the proactive-refresh timer's refresh against the reactive 401
+    # refresh below so the two never race the AS's refresh-token rotation (#242).
+    refresh_lock = threading.Lock()
     reader = threading.Thread(
         target=_sse_reader_loop,
         args=(client, url, headers, state, tracker, headers_lock),
@@ -2415,6 +2586,16 @@ def run_sse(
         """
         with headers_lock:
             return dict(headers)
+
+    refresh_timer, refresh_stop = _start_proactive_refresh(
+        refresher=token_refresher,
+        expiry_getter=token_expiry_getter,
+        proactive_refresh=proactive_refresh,
+        leeway=refresh_leeway,
+        headers=headers,
+        headers_lock=headers_lock,
+        refresh_lock=refresh_lock,
+    )
 
     try:
         for line in sys.stdin:
@@ -2518,7 +2699,10 @@ def run_sse(
                     # would be heavier than the project's minimalism warrants.
                     if resp.status_code == 401 and token_refresher:
                         log("received 401, attempting token refresh")
-                        new_headers = token_refresher()
+                        # Serialise with the proactive timer's refresh so the two
+                        # never race the AS's refresh-token rotation (#242).
+                        with refresh_lock:
+                            new_headers = token_refresher()
                         if new_headers:
                             with headers_lock:
                                 headers.update(new_headers)
@@ -2633,5 +2817,9 @@ def run_sse(
         # the resulting HTTPError and, because stop is already set, returns
         # without logging a reconnect. The daemon flag guarantees process exit
         # is never blocked regardless.
+        if refresh_stop is not None:
+            refresh_stop.set()
+            if refresh_timer is not None:
+                refresh_timer.join(timeout=1.0)
         reader.join(timeout=1.0)
         client.close()

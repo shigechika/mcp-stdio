@@ -936,6 +936,92 @@ class TestMain:
             main()
         assert mock_run_sse.call_args.kwargs["normalize_arguments"] is False
 
+    def test_proactive_refresh_default_on(self):
+        """#242: proactive refresh is ON by default → run() sees True."""
+        with (
+            patch("sys.argv", ["mcp-stdio", "https://example.com/mcp"]),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+        assert mock_run.call_args.kwargs["proactive_refresh"] is True
+
+    def test_proactive_refresh_opt_out(self):
+        """#242: --no-proactive-refresh flips the flag to False."""
+        with (
+            patch(
+                "sys.argv",
+                ["mcp-stdio", "https://example.com/mcp", "--no-proactive-refresh"],
+            ),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+        assert mock_run.call_args.kwargs["proactive_refresh"] is False
+
+    def test_proactive_refresh_passed_to_run_sse(self):
+        """#242: --no-proactive-refresh reaches run_sse on the sse transport."""
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "https://example.com/mcp",
+                    "--transport",
+                    "sse",
+                    "--no-proactive-refresh",
+                ],
+            ),
+            patch("mcp_stdio.cli.run_sse") as mock_run_sse,
+        ):
+            main()
+        assert mock_run_sse.call_args.kwargs["proactive_refresh"] is False
+
+    def test_refresh_leeway_default_passed_to_run(self):
+        """#242: the default --oauth-refresh-leeway (60) reaches run()."""
+        with (
+            patch("sys.argv", ["mcp-stdio", "https://example.com/mcp"]),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+        assert mock_run.call_args.kwargs["refresh_leeway"] == 60.0
+
+    def test_refresh_leeway_custom_passed_to_run(self):
+        """#242: an explicit --oauth-refresh-leeway value reaches run()."""
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "https://example.com/mcp",
+                    "--oauth-refresh-leeway",
+                    "30",
+                ],
+            ),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+        assert mock_run.call_args.kwargs["refresh_leeway"] == 30.0
+
+    def test_token_expiry_getter_none_without_oauth(self):
+        """#242: without --oauth there is no expiry getter (timer is a no-op)."""
+        with (
+            patch("sys.argv", ["mcp-stdio", "https://example.com/mcp"]),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+        assert mock_run.call_args.kwargs["token_expiry_getter"] is None
+
+    def test_token_expiry_getter_built_with_oauth(self):
+        """#242: --oauth builds an expiry getter and passes it to run()."""
+        with (
+            patch("sys.argv", ["mcp-stdio", "--oauth", "https://example.com/mcp"]),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        getter = mock_run.call_args.kwargs["token_expiry_getter"]
+        assert getter is not None and callable(getter)
+
     def test_no_resource_indicator_default_is_true(self):
         """By default resource_indicator=True is passed to ensure_token."""
         with (

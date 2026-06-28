@@ -58,6 +58,7 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
 - **Session recovery** — resets MCP session ID on 404 and retries
 - **Protocol version header** — captures the negotiated `protocolVersion` from the `initialize` response and injects `MCP-Protocol-Version` on every subsequent Streamable HTTP request (MCP spec rev 2025-06-18); servers that enforce the header would otherwise reject post-initialize requests with `400 Bad Request`
 - **Token refresh on 401** — automatically refreshes expired OAuth tokens mid-session (OAuth mode only)
+- **Proactive token refresh** — a background timer refreshes the OAuth token shortly before it expires (lead time: `--oauth-refresh-leeway`), so a long-lived session survives gateways that signal token expiry as an HTTP 200 tool-error instead of a transport 401 (e.g. Atlassian's MCP gateway); on by default in OAuth mode, opt out with `--no-proactive-refresh` (#242)
 - **Step-up authorization on 403** — on a `Bearer error="insufficient_scope"` challenge, re-authorizes for the union of the granted and required scopes ([RFC 9470](https://www.rfc-editor.org/rfc/rfc9470) / MCP step-up; cf. anthropics/claude-code#44652)
 - **Bearer token auth** — via `--bearer-token` flag or `MCP_BEARER_TOKEN` env var
 - **Custom headers** — pass any header with `-H` / `--header`
@@ -190,6 +191,11 @@ Options:
   --oauth-refresh-leeway SECONDS
                          Proactively refresh tokens this many seconds before
                          expiry (default: 60, or MCP_OAUTH_REFRESH_LEEWAY)
+  --no-proactive-refresh
+                         Disable the background timer that refreshes the OAuth
+                         token before it expires. On by default in OAuth mode;
+                         keeps long sessions alive against gateways that signal
+                         expiry as an HTTP 200 tool-error rather than a 401 (#242)
   --oauth-timeout SECONDS
                          Seconds to wait for the interactive OAuth flow (browser
                          callback / device-code confirmation) before giving up
@@ -301,6 +307,7 @@ See [WORKAROUNDS.md](WORKAROUNDS.md) for known issues in Claude Code, mcp-remote
 3. Relays them over HTTPS to the remote MCP server
 4. Parses responses and writes them to stdout
 5. On 401 (OAuth mode only), refreshes the access token and retries; with static `--bearer-token` / `-H` auth the 401 is surfaced to the client
+6. In OAuth mode a background timer also refreshes the token shortly before it expires (`--oauth-refresh-leeway`), independent of request flow — this keeps long sessions alive against gateways that report token expiry as an HTTP 200 tool-error rather than a 401 (opt out with `--no-proactive-refresh`)
 
 Transport details:
 

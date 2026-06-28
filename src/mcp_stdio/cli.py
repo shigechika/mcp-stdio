@@ -217,6 +217,32 @@ def _build_scope_upgrader(
     return upgrader
 
 
+def _build_token_expiry_getter(
+    server_url: str,
+) -> Callable[[], float | None]:
+    """Build an ``expires_at`` getter for the proactive-refresh timer.
+
+    Returns a callable that reads the cached token's ``expires_at`` (Unix
+    seconds) via ``token_store.load_token``, or None when there is no cached
+    token / no expiry. Read fresh on each call so the timer always schedules
+    against the latest persisted expiry (the refresher's ``save_token`` writes
+    a new one). Exceptions degrade to None — the timer treats that as "nothing
+    to schedule" and quietly re-polls, never crashing the daemon thread.
+    """
+
+    def getter() -> float | None:
+        from .token_store import load_token
+
+        try:
+            data = load_token(server_url)
+        except Exception as e:
+            print(f"error: reading cached token expiry failed: {e}", file=sys.stderr)
+            return None
+        return data.expires_at if data else None
+
+    return getter
+
+
 def _main() -> None:
     """CLI body. Wrapped by ``main`` for top-level interrupt handling."""
     parser = argparse.ArgumentParser(
@@ -292,6 +318,20 @@ def _main() -> None:
             "malformed MCP_OAUTH_REFRESH_LEEWAY value aborts startup at argument "
             "parsing even on a non-OAuth run (the env default is validated eagerly "
             "so a bad value surfaces clearly rather than silently)"
+        ),
+    )
+    parser.add_argument(
+        "--no-proactive-refresh",
+        action="store_true",
+        help=(
+            "Disable the background timer that proactively refreshes the OAuth "
+            "access token shortly before it expires (lead time: "
+            "--oauth-refresh-leeway, default 60 s). Enabled by default in OAuth "
+            "mode. Without it, a long-lived session against a gateway that "
+            "signals token expiry as an HTTP 200 tool-error (e.g. Atlassian's "
+            "MCP gateway) rather than a transport 401 cannot recover until the "
+            "process restarts (#242). Only meaningful with --oauth / "
+            "--oauth-device; a no-op otherwise."
         ),
     )
     parser.add_argument(
@@ -542,6 +582,7 @@ def _main() -> None:
     # OAuth flow (before relay starts)
     token_refresher: Callable[[], dict[str, str] | None] | None = None
     scope_upgrader: Callable[[str], dict[str, str] | None] | None = None
+    token_expiry_getter: Callable[[], float | None] | None = None
     if args.oauth or args.oauth_device:
         # NOTE: this runs BEFORE the --check branch below, and
         # ensure_token only short-circuits on a valid cached/refreshable token.
@@ -614,6 +655,7 @@ def _main() -> None:
                     args.timeout_read,
                     args.oauth_timeout,
                 )
+                token_expiry_getter = _build_token_expiry_getter(args.url)
         except Exception as e:
             print(f"error: OAuth authentication failed: {e}", file=sys.stderr)
             sys.exit(1)
@@ -644,6 +686,7 @@ def _main() -> None:
     tcp_keepalive = not args.no_tcp_keepalive
     cancel_filter = not args.no_cancel_filter
     normalize_arguments = not args.no_normalize_arguments
+    proactive_refresh = not args.no_proactive_refresh
     if args.transport == "sse":
         run_sse(
             url=args.url,
@@ -656,6 +699,9 @@ def _main() -> None:
             normalize_arguments=normalize_arguments,
             token_refresher=token_refresher,
             scope_upgrader=scope_upgrader,
+            token_expiry_getter=token_expiry_getter,
+            proactive_refresh=proactive_refresh,
+            refresh_leeway=args.oauth_refresh_leeway,
         )
     else:
         run(
@@ -668,6 +714,9 @@ def _main() -> None:
             normalize_arguments=normalize_arguments,
             token_refresher=token_refresher,
             scope_upgrader=scope_upgrader,
+            token_expiry_getter=token_expiry_getter,
+            proactive_refresh=proactive_refresh,
+            refresh_leeway=args.oauth_refresh_leeway,
         )
 
 
