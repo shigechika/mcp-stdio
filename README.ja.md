@@ -56,6 +56,7 @@ Bearer token、カスタムヘッダー、OAuth 2.1 認証情報をリモート�
 - **セッション回復** — 404 でセッション ID をリセットして再試行
 - **プロトコルバージョンヘッダー** — `initialize` 応答から交渉済みの `protocolVersion` を捕捉し、以降の Streamable HTTP リクエストすべてに `MCP-Protocol-Version` を付与（MCP 仕様 rev 2025-06-18）。このヘッダーを強制するサーバーは未送信時に初期化後リクエストを `400 Bad Request` で拒否する
 - **401 時の自動トークンリフレッシュ** — セッション中に OAuth トークンが失効しても自動更新（OAuth モード時のみ）
+- **プロアクティブなトークンリフレッシュ** — バックグラウンドタイマーが OAuth トークンを失効直前にリフレッシュ（リード時間は `--oauth-refresh-leeway`）。トークン失効をトランスポート層の 401 ではなく HTTP 200 のツールエラーとして返すゲートウェイ（例: Atlassian の MCP ゲートウェイ）でも長時間セッションが生き残る。OAuth モードではデフォルト有効、`--no-proactive-refresh` で無効化（#242）
 - **403 時のステップアップ認可** — `Bearer error="insufficient_scope"` チャレンジを受けると、付与済みスコープと要求スコープの和集合で再認可（[RFC 9470](https://www.rfc-editor.org/rfc/rfc9470) / MCP step-up、cf. anthropics/claude-code#44652）
 - **Bearer token 認証** — `--bearer-token` フラグまたは `MCP_BEARER_TOKEN` 環境変数
 - **カスタムヘッダー** — `-H` / `--header` で任意のヘッダーを送信
@@ -188,6 +189,11 @@ mcp-stdio [OPTIONS] URL
   --oauth-refresh-leeway SECONDS
                          アクセストークンを expire の何秒前に proactive refresh
                          するか（デフォルト: 60、または MCP_OAUTH_REFRESH_LEEWAY 環境変数）
+  --no-proactive-refresh
+                         OAuth トークンを失効前にリフレッシュするバックグラウンド
+                         タイマーを無効化する。OAuth モードではデフォルト有効。失効を
+                         401 ではなく HTTP 200 のツールエラーとして返すゲートウェイ
+                         でも長時間セッションを維持する（#242）
   --oauth-timeout SECONDS
                          対話的 OAuth フロー（ブラウザコールバック / デバイス
                          コード確認）の待機秒数（デフォルト: 120、OAuth 時のみ有効）
@@ -299,6 +305,7 @@ Claude Code・mcp-remote・MCP SDK・Windows の既知の問題については [
 3. HTTPS でリモート MCP サーバーへ転送
 4. レスポンスをパースして stdout に書き出し
 5. 401 で（OAuth モードのみ）アクセストークンをリフレッシュしてリトライ。静的な `--bearer-token` / `-H` 認証では 401 をそのままクライアントに返す
+6. OAuth モードではバックグラウンドタイマーも失効直前（`--oauth-refresh-leeway`）にトークンをリフレッシュする。リクエストの流れとは独立して動作し、トークン失効を 401 ではなく HTTP 200 のツールエラーとして返すゲートウェイでも長時間セッションを維持する（`--no-proactive-refresh` で無効化）
 
 トランスポート別の挙動：
 

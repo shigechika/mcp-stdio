@@ -37,7 +37,10 @@ from mcp_stdio.relay import (
     _parse_retry_after,
     _parse_www_authenticate_scope,
     _post_and_stream,
+    _proactive_refresh_loop,
     _reinitialize,
+    _start_proactive_refresh,
+    _stop_proactive_refresh,
     _same_origin,
     _split_sse_text,
     _sse_reader_loop,
@@ -5064,6 +5067,280 @@ class TestRunSseReaderRecovery:
         gets = [r for r in httpx_mock.get_requests() if r.method == "GET"]
         assert len(gets) >= 2, f"expected a reconnect (>=2 GETs), got {len(gets)}"
         assert "recovered" in stdout.getvalue()
+
+
+class TestProactiveRefresh:
+    """Unit + integration tests for the proactive token-refresh timer (#242)."""
+
+    @staticmethod
+    def _loop_kwargs(**overrides):
+        base = {
+            "refresher": lambda: {"Authorization": "Bearer new"},
+            "expiry_getter": lambda: 100.0,
+            "leeway": 0.0,
+            "headers": {"Authorization": "Bearer old"},
+            "headers_lock": threading.Lock(),
+            "refresh_lock": threading.Lock(),
+            "stop": threading.Event(),
+            "now": lambda: 1000.0,  # well past expiry → refresh fires immediately
+            "recheck": 0.001,
+            "max_sleep": 300.0,
+        }
+        base.update(overrides)
+        return base
+
+    def test_refreshes_when_past_deadline(self):
+        """Past expiry → refresher called and headers merged under the lock."""
+        stop = threading.Event()
+        calls = []
+
+        def refresher():
+            calls.append(1)
+            if len(calls) >= 3:
+                stop.set()
+            return {"Authorization": "Bearer new"}
+
+        headers = {"Authorization": "Bearer old"}
+        _proactive_refresh_loop(
+            **self._loop_kwargs(refresher=refresher, headers=headers, stop=stop)
+        )
+        assert len(calls) == 3
+        assert headers["Authorization"] == "Bearer new"
+
+    def test_none_expiry_polls_without_refreshing(self):
+        """A None expiry (no token / non-expiring) idles without refreshing."""
+        stop = threading.Event()
+        polls = []
+        refresher_calls = []
+
+        def expiry_getter():
+            polls.append(1)
+            stop.set()  # stop on the first poll so the recheck wait returns at once
+            return None
+
+        _proactive_refresh_loop(
+            **self._loop_kwargs(
+                expiry_getter=expiry_getter,
+                refresher=lambda: refresher_calls.append(1) or {"x": "y"},
+                stop=stop,
+            )
+        )
+        assert polls == [1]
+        assert refresher_calls == []  # never refreshed: nothing to schedule against
+
+    def test_failed_refresh_backs_off_and_retries(self):
+        """A refresher returning None backs off (recheck) and retries, no crash."""
+        stop = threading.Event()
+        calls = []
+
+        def refresher():
+            calls.append(1)
+            if len(calls) >= 2:
+                stop.set()
+            return None  # refresh unavailable / failed
+
+        _proactive_refresh_loop(
+            **self._loop_kwargs(refresher=refresher, stop=stop)
+        )
+        assert len(calls) == 2
+
+    def test_prestopped_returns_immediately(self):
+        """A pre-set stop event makes the loop a no-op."""
+        stop = threading.Event()
+        stop.set()
+        calls = []
+        _proactive_refresh_loop(
+            **self._loop_kwargs(
+                refresher=lambda: calls.append(1) or {"x": "y"}, stop=stop
+            )
+        )
+        assert calls == []
+
+    def test_exception_does_not_kill_loop(self):
+        """An exception from getter/refresher is logged and retried, never fatal."""
+        stop = threading.Event()
+        calls = []
+
+        def expiry_getter():
+            calls.append(1)
+            if len(calls) >= 3:
+                stop.set()
+            raise RuntimeError("boom")
+
+        # Must return normally (loop survived all three raises), not propagate.
+        _proactive_refresh_loop(
+            **self._loop_kwargs(expiry_getter=expiry_getter, stop=stop)
+        )
+        assert len(calls) == 3
+
+    def test_start_disabled_returns_none(self):
+        """proactive_refresh=False → no thread started."""
+        thread, stop = _start_proactive_refresh(
+            refresher=lambda: None,
+            expiry_getter=lambda: None,
+            proactive_refresh=False,
+            leeway=60.0,
+            headers={},
+            headers_lock=threading.Lock(),
+            refresh_lock=threading.Lock(),
+        )
+        assert thread is None and stop is None
+
+    def test_start_without_oauth_returns_none(self):
+        """No refresher / getter (no OAuth) → no thread started even if enabled."""
+        thread, stop = _start_proactive_refresh(
+            refresher=None,
+            expiry_getter=None,
+            proactive_refresh=True,
+            leeway=60.0,
+            headers={},
+            headers_lock=threading.Lock(),
+            refresh_lock=threading.Lock(),
+        )
+        assert thread is None and stop is None
+
+    def test_start_runs_and_stops(self):
+        """An enabled timer starts, refreshes once, then stops/joins cleanly."""
+        headers = {"Authorization": "Bearer old"}
+        refreshed = threading.Event()
+        calls = []
+
+        def expiry_getter():
+            calls.append(1)
+            # First read is past-due (fire now); afterwards park far in the future.
+            return 0.0 if len(calls) == 1 else time.time() + 3600
+
+        def refresher():
+            refreshed.set()
+            return {"Authorization": "Bearer new"}
+
+        thread, stop = _start_proactive_refresh(
+            refresher=refresher,
+            expiry_getter=expiry_getter,
+            proactive_refresh=True,
+            leeway=0.0,
+            headers=headers,
+            headers_lock=threading.Lock(),
+            refresh_lock=threading.Lock(),
+        )
+        assert thread is not None and stop is not None
+        try:
+            assert refreshed.wait(timeout=2.0), "timer never refreshed"
+        finally:
+            stop.set()
+            thread.join(timeout=2.0)
+        assert not thread.is_alive()
+        assert headers["Authorization"] == "Bearer new"
+
+    def test_stop_none_is_noop(self):
+        """_stop_proactive_refresh((None, None)) — never-started timer — no-op."""
+        _stop_proactive_refresh(None, None)  # must not raise
+
+    def test_stop_signals_and_joins(self):
+        """_stop_proactive_refresh sets the stop event and joins the thread."""
+        thread, stop = _start_proactive_refresh(
+            refresher=lambda: None,
+            expiry_getter=lambda: time.time() + 3600,  # park far out
+            proactive_refresh=True,
+            leeway=0.0,
+            headers={},
+            headers_lock=threading.Lock(),
+            refresh_lock=threading.Lock(),
+        )
+        _stop_proactive_refresh(thread, stop)
+        assert stop.is_set()
+        assert not thread.is_alive()
+
+    def test_run_proactive_timer_fires(self, httpx_mock):
+        """run() starts the timer; it refreshes while the main loop parks on stdin."""
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+        refreshed = threading.Event()
+
+        def refresher():
+            refreshed.set()
+            return {"Authorization": "Bearer refreshed"}
+
+        calls = []
+
+        def expiry_getter():
+            calls.append(1)
+            return 0.0 if len(calls) == 1 else time.time() + 3600
+
+        headers = {"Content-Type": "application/json"}
+        # _BlockingStdin releases (StopIteration) once the timer sets ``refreshed``.
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"init","id":1}', refreshed
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run(
+                "https://example.com/mcp",
+                headers,
+                token_refresher=refresher,
+                token_expiry_getter=expiry_getter,
+                proactive_refresh=True,
+                refresh_leeway=0.0,
+            )
+        assert refreshed.is_set()
+        assert headers["Authorization"] == "Bearer refreshed"
+
+    def test_run_sse_proactive_timer_fires(self, httpx_mock):
+        """run_sse starts the timer; it refreshes while the main loop parks.
+
+        No request line is sent (the stdin yields one empty line, skipped, then
+        blocks): this test only proves the timer fires, so it avoids a POST whose
+        timing would race the reader nulling the endpoint on stream end. The GET
+        gen parks until the timer has fired *and* the main loop has exited, so the
+        reader never reconnects mid-test (which would otherwise leave a mocked GET
+        unrequested at teardown).
+        """
+        url = "https://example.com/sse"
+        refreshed = threading.Event()
+        release_stdin = threading.Event()
+        gen_park = threading.Event()  # never set; bounds the gen's final wait
+
+        def refresher():
+            refreshed.set()
+            return {"Authorization": "Bearer refreshed"}
+
+        calls = []
+
+        def expiry_getter():
+            calls.append(1)
+            return 0.0 if len(calls) == 1 else time.time() + 3600
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sid=abc\n\n"
+            refreshed.wait(timeout=3)  # hold the GET open until the timer fires
+            release_stdin.set()  # then let the main loop exit
+            gen_park.wait(timeout=3)  # stay parked so the stream never reconnects
+
+        httpx_mock.add_response(
+            url=url,
+            method="GET",
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        headers = {"Content-Type": "application/json"}
+        # Empty line → skipped by the main loop (no POST) → then blocks until the
+        # timer fires and the gen releases it.
+        stdin = _BlockingStdin("", release_stdin)
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(
+                url,
+                headers,
+                token_refresher=refresher,
+                token_expiry_getter=expiry_getter,
+                proactive_refresh=True,
+                refresh_leeway=0.0,
+            )
+        assert refreshed.is_set()
+        assert headers["Authorization"] == "Bearer refreshed"
 
 
 class TestRunSse:
