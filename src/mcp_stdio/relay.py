@@ -1767,6 +1767,22 @@ def _start_proactive_refresh(
     return thread, stop
 
 
+def _stop_proactive_refresh(
+    thread: threading.Thread | None, stop: threading.Event | None
+) -> None:
+    """Signal and briefly join the proactive-refresh daemon in a relay finally.
+
+    Mirrors ``_start_proactive_refresh``; a ``(None, None)`` pair (timer never
+    started) is a no-op. The daemon flag guarantees process exit is never blocked
+    even if the join times out (the thread may be parked in ``stop.wait`` for up
+    to its recheck interval).
+    """
+    if stop is not None:
+        stop.set()
+        if thread is not None:
+            thread.join(timeout=1.0)
+
+
 def run(
     url: str,
     headers: dict[str, str],
@@ -2272,10 +2288,7 @@ def run(
                         pass
                 continue
     finally:
-        if refresh_stop is not None:
-            refresh_stop.set()
-            if refresh_timer is not None:
-                refresh_timer.join(timeout=1.0)
+        _stop_proactive_refresh(refresh_timer, refresh_stop)
         client.close()
 
 
@@ -2817,9 +2830,6 @@ def run_sse(
         # the resulting HTTPError and, because stop is already set, returns
         # without logging a reconnect. The daemon flag guarantees process exit
         # is never blocked regardless.
-        if refresh_stop is not None:
-            refresh_stop.set()
-            if refresh_timer is not None:
-                refresh_timer.join(timeout=1.0)
+        _stop_proactive_refresh(refresh_timer, refresh_stop)
         reader.join(timeout=1.0)
         client.close()

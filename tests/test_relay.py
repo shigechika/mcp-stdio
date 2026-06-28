@@ -40,6 +40,7 @@ from mcp_stdio.relay import (
     _proactive_refresh_loop,
     _reinitialize,
     _start_proactive_refresh,
+    _stop_proactive_refresh,
     _same_origin,
     _split_sse_text,
     _sse_reader_loop,
@@ -5231,6 +5232,25 @@ class TestProactiveRefresh:
         assert not thread.is_alive()
         assert headers["Authorization"] == "Bearer new"
 
+    def test_stop_none_is_noop(self):
+        """_stop_proactive_refresh((None, None)) — never-started timer — no-op."""
+        _stop_proactive_refresh(None, None)  # must not raise
+
+    def test_stop_signals_and_joins(self):
+        """_stop_proactive_refresh sets the stop event and joins the thread."""
+        thread, stop = _start_proactive_refresh(
+            refresher=lambda: None,
+            expiry_getter=lambda: time.time() + 3600,  # park far out
+            proactive_refresh=True,
+            leeway=0.0,
+            headers={},
+            headers_lock=threading.Lock(),
+            refresh_lock=threading.Lock(),
+        )
+        _stop_proactive_refresh(thread, stop)
+        assert stop.is_set()
+        assert not thread.is_alive()
+
     def test_run_proactive_timer_fires(self, httpx_mock):
         """run() starts the timer; it refreshes while the main loop parks on stdin."""
         httpx_mock.add_response(
@@ -5268,9 +5288,19 @@ class TestProactiveRefresh:
         assert headers["Authorization"] == "Bearer refreshed"
 
     def test_run_sse_proactive_timer_fires(self, httpx_mock):
-        """run_sse starts the timer; it refreshes while the main loop parks."""
+        """run_sse starts the timer; it refreshes while the main loop parks.
+
+        No request line is sent (the stdin yields one empty line, skipped, then
+        blocks): this test only proves the timer fires, so it avoids a POST whose
+        timing would race the reader nulling the endpoint on stream end. The GET
+        gen parks until the timer has fired *and* the main loop has exited, so the
+        reader never reconnects mid-test (which would otherwise leave a mocked GET
+        unrequested at teardown).
+        """
         url = "https://example.com/sse"
         refreshed = threading.Event()
+        release_stdin = threading.Event()
+        gen_park = threading.Event()  # never set; bounds the gen's final wait
 
         def refresher():
             refreshed.set()
@@ -5284,7 +5314,9 @@ class TestProactiveRefresh:
 
         def sse_gen():
             yield b"event: endpoint\ndata: /messages?sid=abc\n\n"
-            refreshed.wait(timeout=5)  # hold the GET open until the timer fires
+            refreshed.wait(timeout=3)  # hold the GET open until the timer fires
+            release_stdin.set()  # then let the main loop exit
+            gen_park.wait(timeout=3)  # stay parked so the stream never reconnects
 
         httpx_mock.add_response(
             url=url,
@@ -5292,17 +5324,11 @@ class TestProactiveRefresh:
             stream=IteratorStream(sse_gen()),
             headers={"content-type": "text/event-stream"},
         )
-        httpx_mock.add_response(
-            url="https://example.com/messages?sid=abc",
-            method="POST",
-            status_code=202,
-            is_reusable=True,
-        )
 
         headers = {"Content-Type": "application/json"}
-        stdin = _BlockingStdin(
-            '{"jsonrpc":"2.0","method":"notifications/initialized"}', refreshed
-        )
+        # Empty line → skipped by the main loop (no POST) → then blocks until the
+        # timer fires and the gen releases it.
+        stdin = _BlockingStdin("", release_stdin)
         stdout = StringIO()
         with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
             run_sse(
