@@ -41,6 +41,15 @@ from mcp_stdio.oauth import (
 )
 from mcp_stdio.token_store import TokenData
 
+# OAuth discovery probes multiple fallback well-known URLs (RFC 8414, then the
+# OpenID Connect Discovery 1.0 locations) and tolerates a 404 / unmocked probe
+# at each step. Asserting that EVERY request was pre-registered is the wrong
+# strictness for this fallback-probing code: a test only mocks the URLs it
+# cares about, and the extra OIDC probes legitimately miss. Relax that one
+# pytest-httpx check module-wide; the complementary
+# assert_all_responses_were_requested (mocked-but-unused) stays on.
+pytestmark = pytest.mark.httpx_mock(assert_all_requests_were_expected=False)
+
 
 # --- _safe_int ---
 
