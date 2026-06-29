@@ -1140,6 +1140,38 @@ class TestDiscoverMetadata:
         assert meta.token_endpoint == "https://idp.example.com/tenant/token"
         assert meta.issuer == "https://idp.example.com/tenant"
 
+    def test_fetch_as_metadata_strips_userinfo_from_base(self):
+        """A userinfo-bearing AS URL must NOT leak credentials into the OIDC
+        path-append probe or the synthesized default endpoints (#13). Forces the
+        OIDC path-append candidate to be the match so its construction is
+        exercised directly."""
+        from mcp_stdio.oauth import _fetch_authorization_server_metadata
+        captured: dict = {}
+
+        class _CaptureClient:
+            def get(self, url):
+                captured.setdefault("urls", []).append(url)
+                req = httpx.Request("GET", url)
+                # Only the OIDC path-append candidate answers, with metadata that
+                # omits token_endpoint so a default is synthesized from the base.
+                if url.endswith("/oauth/.well-known/openid-configuration"):
+                    return httpx.Response(
+                        200,
+                        json={"issuer": "https://api.example.com/oauth"},
+                        request=req,
+                    )
+                return httpx.Response(404, request=req)
+
+        meta = _fetch_authorization_server_metadata(
+            "https://user:pass@api.example.com/oauth", _CaptureClient()
+        )
+        assert meta is not None
+        # Every probed URL is userinfo-free (incl. the new OIDC path-append one).
+        assert captured["urls"]
+        assert all("@" not in u for u in captured["urls"])
+        # The synthesized default token endpoint is userinfo-free too.
+        assert meta.token_endpoint == "https://api.example.com/oauth/token"
+
 
 # --- register_client ---
 

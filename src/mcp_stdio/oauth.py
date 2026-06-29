@@ -558,14 +558,19 @@ def _fetch_authorization_server_metadata(
     candidate fails (404, invalid JSON, connection error, or a cross-origin
     issuer mix-up signal).
     """
-    # RFC 8414 issuer has no query/fragment; _build_well_known_url already strips
-    # them when forming the discovery URL, so the issuer comparison and the
-    # synthesized default endpoints must use the SAME stripped base — otherwise a
-    # server_url like ``https://host/mcp?tenant=x`` (passed on the Phase-2
-    # path-scoped fallback) produces a spurious §3.3 mismatch warning and a
-    # malformed ``.../mcp?tenant=x/authorize`` default.
+    # RFC 8414 issuer has no query/fragment/userinfo; _build_well_known_url
+    # already strips all three when forming the discovery URL, so the issuer
+    # comparison, the OIDC path-append candidate, and the synthesized default
+    # endpoints must use the SAME stripped base. Otherwise a server_url like
+    # ``https://host/mcp?tenant=x`` (passed on the Phase-2 path-scoped fallback)
+    # produces a spurious §3.3 mismatch warning and a malformed default, and a
+    # ``https://user:pass@host/mcp`` would leak credentials into the OIDC GET and
+    # the default token endpoint (the #13 cleartext/credential-leak policy strips
+    # userinfo everywhere else). Drop any userinfo (everything before the last
+    # ``@``) from the netloc; host[:port] and an IPv6 literal pass through.
     _asp = urlsplit(auth_server_url)
-    auth_server_base = urlunsplit((_asp.scheme, _asp.netloc, _asp.path, "", ""))
+    _netloc = _asp.netloc.rsplit("@", 1)[-1]
+    auth_server_base = urlunsplit((_asp.scheme, _netloc, _asp.path, "", ""))
     base_noslash = auth_server_base.rstrip("/")
     # Most-authoritative first, de-duplicated (the OIDC path-append and
     # path-insertion forms coincide for a bare-origin issuer).
