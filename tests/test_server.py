@@ -439,6 +439,54 @@ def test_prm_has_authorization_servers_when_oauth(oauth_gateway):
     assert prm["authorization_servers"] == [prm["resource"].rsplit("/mcp", 1)[0]]
 
 
+def test_as_metadata_no_iss_flag_for_http_issuer(oauth_gateway):
+    """RFC 9207 Sec. 2 requires an https iss; a loopback http issuer must NOT
+    advertise iss support (it also never emits iss — see authorize tests)."""
+    base, _ = oauth_gateway
+    md = httpx.get(base + "/.well-known/oauth-authorization-server", timeout=10).json()
+    assert "authorization_response_iss_parameter_supported" not in md
+
+
+def test_https_issuer_advertises_and_emits_iss():
+    """RFC 9207: an https issuer advertises iss support AND echoes iss on the
+    authorization redirect (success path), so a multi-AS client can detect
+    a mix-up attack."""
+    issuer = "https://gw.example.org"
+    with _run(oauth=_provider(public_url=issuer)) as (base, _):
+        md = httpx.get(
+            base + "/.well-known/oauth-authorization-server", timeout=10
+        ).json()
+        assert md["authorization_response_iss_parameter_supported"] is True
+        cid = _register(base).json()["client_id"]
+        _, challenge = client_oauth.generate_pkce()
+        az = _authorize(base, cid, challenge)
+        assert az.status_code == 302, az.text
+        params = _redirect_params(az)
+        assert params["iss"] == issuer
+        assert "code" in params  # success response still carries the code
+
+
+def test_https_issuer_emits_iss_on_error_redirect():
+    """RFC 9207 Sec. 2: iss appears on error authorization responses too."""
+    issuer = "https://gw.example.org"
+    with _run(oauth=_provider(public_url=issuer)) as (base, _):
+        cid = _register(base).json()["client_id"]
+        _, challenge = client_oauth.generate_pkce()
+        az = _authorize(base, cid, challenge, response_type="token")
+        assert az.status_code == 302, az.text
+        params = _redirect_params(az)
+        assert params["error"] == "unsupported_response_type"
+        assert params["iss"] == issuer
+
+
+def test_register_response_is_no_store(oauth_gateway):
+    """RFC 7591 Sec. 3.2.1: the registration response carries no-store."""
+    base, _ = oauth_gateway
+    r = _register(base)
+    assert r.status_code == 201
+    assert "no-store" in r.headers.get("cache-control", "")
+
+
 def test_register_public_client(oauth_gateway):
     base, _ = oauth_gateway
     r = _register(base)
@@ -453,7 +501,8 @@ def test_register_rejects_non_loopback(oauth_gateway):
     base, _ = oauth_gateway
     r = _register(base, redirect="https://evil.example.com/callback")
     assert r.status_code == 400
-    assert r.json()["error"] == "invalid_client_metadata"
+    # RFC 7591 Sec. 3.2.2: an invalid redirect URI uses the dedicated error code.
+    assert r.json()["error"] == "invalid_redirect_uri"
 
 
 def test_register_rejects_non_json(oauth_gateway):
@@ -947,7 +996,8 @@ def test_register_rejects_query_bearing_redirect(oauth_gateway):
     base, _ = oauth_gateway
     r = _register(base, redirect="http://127.0.0.1:5555/callback?next=x")
     assert r.status_code == 400
-    assert r.json()["error"] == "invalid_client_metadata"
+    # RFC 7591 Sec. 3.2.2: an invalid redirect URI uses the dedicated error code.
+    assert r.json()["error"] == "invalid_redirect_uri"
 
 
 def test_refresh_wrong_client_id_preserves_token(oauth_gateway):
