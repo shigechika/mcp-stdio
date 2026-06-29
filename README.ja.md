@@ -316,11 +316,14 @@ mcp-stdio --oauth http://127.0.0.1:8080/mcp
 
 オプション: `--host`（既定 `127.0.0.1`）、`--port`（既定 `8080`）、`--path`
 （既定 `/mcp`）、`--auth-token TOKEN`（または `MCP_STDIO_SERVE_TOKEN`、推奨）;
-埋め込み AS 用: `--enable-oauth`、`--public-url URL`（issuer 固定・プロキシ背後
-で推奨）、`--trusted-user-header HEADER`、`--dev-user USER`（非セキュア・検証用）、
-`--access-token-ttl SECONDS`。インメモリなので再起動で発行済みトークンは失効
-（クライアントは `--oauth` を再実行）。バックエンドコマンドはオプションの後に
-置きます（`--` 区切りも可）。
+セッション上限 `--max-sessions N`（既定 `100`、cap 超過の `initialize` は `503`）
+と `--session-idle-ttl SECONDS`（無活動がこの秒数続いたセッションと子プロセスを
+破棄。`DELETE` せず切断したクライアントが slot を占有し続けるのを防ぐ。`0`＝既定
+で無効）; 埋め込み AS 用: `--enable-oauth`、`--public-url URL`（issuer 固定・
+プロキシ背後で推奨）、`--trusted-user-header HEADER`、`--dev-user USER`
+（非セキュア・検証用）、`--access-token-ttl SECONDS`。インメモリなので再起動で
+発行済みトークンは失効（クライアントは `--oauth` を再実行）。バックエンド
+コマンドはオプションの後に置きます（`--` 区切りも可）。
 
   - *パススコープ issuer* — `--public-url` がパスを保持するので、1 ホスト配下で
     複数の `--enable-oauth` バックエンドをパスプレフィックスで多重化できる

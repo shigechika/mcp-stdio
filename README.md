@@ -318,11 +318,15 @@ mcp-stdio --oauth http://127.0.0.1:8080/mcp
 
 Options: `--host` (default `127.0.0.1`), `--port` (default `8080`), `--path`
 (default `/mcp`), `--auth-token TOKEN` (or `MCP_STDIO_SERVE_TOKEN`, preferred);
-and for the embedded AS: `--enable-oauth`, `--public-url URL` (pins the issuer;
-recommended behind a proxy), `--trusted-user-header HEADER`, `--dev-user USER`
-(insecure, testing only), `--access-token-ttl SECONDS`. In-memory tokens mean a
-restart invalidates issued tokens (the client re-runs `--oauth`). The backend
-command follows the options (an optional `--` separator is supported).
+session limits `--max-sessions N` (default `100`; an `initialize` past the cap
+gets `503`) and `--session-idle-ttl SECONDS` (evict a session and its child
+after this much inactivity so a client that disconnects without `DELETE` does
+not pin a slot; `0` = disabled, the default); and for the embedded AS:
+`--enable-oauth`, `--public-url URL` (pins the issuer; recommended behind a
+proxy), `--trusted-user-header HEADER`, `--dev-user USER` (insecure, testing
+only), `--access-token-ttl SECONDS`. In-memory tokens mean a restart
+invalidates issued tokens (the client re-runs `--oauth`). The backend command
+follows the options (an optional `--` separator is supported).
 
   - *Path-scoped issuer* — `--public-url` retains a path, so several
     `--enable-oauth` backends can share one host behind a reverse proxy, each
