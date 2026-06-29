@@ -375,6 +375,83 @@ def test_serve_main_rejects_negative_idle_ttl():
         server.serve_main(["--session-idle-ttl", "-1", "--", "true"])
 
 
+def test_serve_main_rejects_non_finite_idle_ttl():
+    # inf/nan parse as floats but would arm a reaper that never evicts.
+    for bad in ("inf", "nan"):
+        with pytest.raises(SystemExit):
+            server.serve_main(["--session-idle-ttl", bad, "--", "true"])
+
+
+def test_idle_eviction_disabled_keeps_live_session():
+    # ttl=0 disables idle eviction: a live, arbitrarily-idle session survives.
+    clock = [1000.0]
+    reg = server.SessionRegistry(_BACKEND, idle_ttl=0, now=lambda: clock[0])
+    try:
+        reg.create()
+        clock[0] += 10_000
+        assert reg.reap_idle() == 0
+        assert reg.count == 1
+    finally:
+        reg.shutdown_all()
+
+
+def test_in_flight_request_not_reaped():
+    # A session with a request in flight is not idle, even past the TTL.
+    clock = [1000.0]
+    reg = server.SessionRegistry(_BACKEND, idle_ttl=10, now=lambda: clock[0])
+    try:
+        _, backend = reg.create()
+        done = threading.Event()
+
+        def slow():
+            backend.send_request(
+                '{"jsonrpc": "2.0", "id": 1, "method": "noreply"}', 1, 2.0
+            )
+            done.set()
+
+        threading.Thread(target=slow, daemon=True).start()
+        for _ in range(100):
+            if backend.has_pending:
+                break
+            time.sleep(0.02)
+        assert backend.has_pending
+        clock[0] += 100  # well past the TTL
+        assert reg.reap_idle() == 0  # the in-flight request protects it
+        assert reg.count == 1
+        assert done.wait(5)  # the request times out -> pending cleared
+        assert not backend.has_pending
+        clock[0] += 100
+        assert reg.reap_idle() == 1  # now genuinely idle
+    finally:
+        reg.shutdown_all()
+
+
+def test_build_server_idle_ttl_evicts_http_session():
+    # End-to-end: idle_ttl threaded through build_server + start_reaper evicts
+    # an idle HTTP session, after which its id 404s.
+    httpd, registry = server.build_server(
+        _BACKEND, host="127.0.0.1", port=0, idle_ttl=0.5
+    )
+    host, port = httpd.server_address[0], httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    registry.start_reaper()
+    url = f"http://{host}:{port}/mcp"
+    try:
+        sid, r = _init(url)
+        assert r.status_code == 200 and registry.count == 1
+        deadline = time.time() + 5
+        while registry.count > 0 and time.time() < deadline:
+            time.sleep(0.05)
+        assert registry.count == 0
+        again = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo"}, sid)
+        assert again.status_code == 404
+    finally:
+        httpd.shutdown()
+        registry.shutdown_all()
+        httpd.server_close()
+
+
 # --- unit-level checks that don't need the HTTP server ---
 
 

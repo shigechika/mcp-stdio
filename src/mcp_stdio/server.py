@@ -36,6 +36,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import os
 import queue
 import re
@@ -269,6 +270,12 @@ class BackendProcess:
     def closed(self) -> bool:
         return self._closed.is_set()
 
+    @property
+    def has_pending(self) -> bool:
+        """True while at least one request is awaiting a backend response."""
+        with self._lock:
+            return bool(self._pending)
+
     def shutdown(self) -> None:
         """Terminate the backend child, escalating to kill if needed."""
         self._fail_all("gateway shutting down")
@@ -420,9 +427,17 @@ class SessionRegistry:
         victims: list[tuple[str, BackendProcess]] = []
         with self._lock:
             for sid, sess in list(self._sessions.items()):
-                if sess.backend.closed or (ttl > 0 and now - sess.last_active > ttl):
+                backend = sess.backend
+                # Don't idle-reap a session with a request in flight: a slow
+                # tool call (up to the backend-response timeout) is not idleness.
+                idle = (
+                    ttl > 0
+                    and now - sess.last_active > ttl
+                    and not backend.has_pending
+                )
+                if backend.closed or idle:
                     del self._sessions[sid]
-                    victims.append((sid, sess.backend))
+                    victims.append((sid, backend))
         for sid, backend in victims:
             backend.shutdown()
             log(f"reaped idle session {sid[:8]}...")
@@ -437,10 +452,20 @@ class SessionRegistry:
         for backend in backends:
             backend.shutdown()
 
+    def keepalive_interval(self) -> float:
+        """SSE keepalive/touch cadence — short enough that an open stream
+        refreshes its activity before the idle reaper could evict it (so a
+        connected client is never reaped even when the TTL is below the default
+        keepalive)."""
+        if self._idle_ttl > 0:
+            return max(1.0, min(_SSE_KEEPALIVE_SECS, self._idle_ttl / 2))
+        return _SSE_KEEPALIVE_SECS
+
     def start_reaper(self) -> None:
         """Start the background idle-eviction thread (no-op if TTL disabled)."""
         if self._idle_ttl <= 0 or self._reaper is not None:
             return
+        self._reaper_stop.clear()  # allow a restart after a prior stop_reaper
         interval = max(1.0, min(self._idle_ttl, _MAX_REAP_INTERVAL_SECS))
 
         def _loop() -> None:
@@ -1495,13 +1520,15 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Mcp-Session-Id", self._session_id)
         self.end_headers()
         q = backend.server_initiated
+        keepalive = self.registry.keepalive_interval()
         try:
             while not backend.closed:
                 # An open SSE stream is activity: keep the session warm so the
-                # idle reaper does not evict a connected-but-quiet client.
+                # idle reaper does not evict a connected-but-quiet client. The
+                # cadence tracks the TTL so this holds even for a small TTL.
                 self.registry.touch(self._session_id)
                 try:
-                    line = q.get(timeout=_SSE_KEEPALIVE_SECS)
+                    line = q.get(timeout=keepalive)
                 except queue.Empty:
                     # SSE comment keepalive — also how we notice backend death.
                     self.wfile.write(b": keepalive\n\n")
@@ -1790,8 +1817,8 @@ def serve_main(argv: list[str]) -> None:
         parser.error("--access-token-ttl must be > 0")
     if args.max_sessions < 1:
         parser.error("--max-sessions must be >= 1")
-    if args.session_idle_ttl < 0:
-        parser.error("--session-idle-ttl must be >= 0")
+    if args.session_idle_ttl < 0 or not math.isfinite(args.session_idle_ttl):
+        parser.error("--session-idle-ttl must be a non-negative, finite number")
     if args.enable_oauth:
         public_url = None
         if args.public_url is not None:
