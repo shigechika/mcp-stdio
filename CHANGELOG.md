@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.0](https://github.com/shigechika/mcp-stdio/compare/v0.19.0...v0.20.0) (2026-06-29)
+
+
+### Features
+
+* **oauth:** send application_type "native" in DCR (SEP-837 / RFC 8252) ([#252](https://github.com/shigechika/mcp-stdio/issues/252)) ([8201d57](https://github.com/shigechika/mcp-stdio/commit/8201d57c8c7089b3f15b6156172fc7f1ef22e977))
+
 ## [0.19.0](https://github.com/shigechika/mcp-stdio/compare/v0.18.0...v0.19.0) (2026-06-29)
 
 
