@@ -37,6 +37,8 @@ from mcp_stdio.relay import (
     _parse_retry_after,
     _parse_www_authenticate_scope,
     _post_and_stream,
+    _cold_start_loop,
+    _cold_start_response,
     _proactive_refresh_loop,
     _reinitialize,
     _start_proactive_refresh,
@@ -5341,6 +5343,171 @@ class TestProactiveRefresh:
             )
         assert refreshed.is_set()
         assert headers["Authorization"] == "Bearer refreshed"
+
+
+class TestColdStartResponse:
+    """#296: local replies synthesized while the cold-start gate is closed."""
+
+    def test_initialize_echoes_version_and_advertises_listchanged(self):
+        line = (
+            '{"jsonrpc":"2.0","id":1,"method":"initialize",'
+            '"params":{"protocolVersion":"2025-06-18"}}'
+        )
+        out = json.loads(_cold_start_response(line, 1, True))
+        assert out["id"] == 1
+        assert out["result"]["protocolVersion"] == "2025-06-18"
+        caps = out["result"]["capabilities"]
+        assert caps["tools"]["listChanged"] is True
+        assert caps["resources"]["listChanged"] is True
+        assert caps["prompts"]["listChanged"] is True
+        assert out["result"]["serverInfo"]["name"] == "mcp-stdio"
+
+    def test_initialize_floor_version_when_absent(self):
+        line = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+        out = json.loads(_cold_start_response(line, 1, True))
+        assert out["result"]["protocolVersion"] == "2024-11-05"
+
+    @pytest.mark.parametrize(
+        "method,key",
+        [
+            ("tools/list", "tools"),
+            ("resources/list", "resources"),
+            ("resources/templates/list", "resourceTemplates"),
+            ("prompts/list", "prompts"),
+        ],
+    )
+    def test_list_methods_return_empty(self, method, key):
+        line = f'{{"jsonrpc":"2.0","id":2,"method":"{method}"}}'
+        out = json.loads(_cold_start_response(line, 2, True))
+        assert out["result"] == {key: []}
+
+    def test_ping_returns_empty_result(self):
+        out = json.loads(_cold_start_response('{"jsonrpc":"2.0","id":3,"method":"ping"}', 3, True))
+        assert out["result"] == {}
+
+    def test_tools_call_returns_not_ready_error(self):
+        line = '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{}}'
+        out = json.loads(_cold_start_response(line, 4, True))
+        assert out["error"]["code"] == -32002
+        assert "retry" in out["error"]["message"].lower()
+
+    def test_notifications_are_swallowed(self):
+        # notifications/initialized and any other notification -> no reply.
+        assert _cold_start_response(
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}', None, False
+        ) is None
+        assert _cold_start_response(
+            '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}', None, False
+        ) is None
+
+
+class TestColdStartLoop:
+    """The cold-start background daemon: OAuth -> upstream session -> list_changed."""
+
+    URL = "https://example.com/mcp"
+
+    def test_opens_session_and_emits_list_changed(self, httpx_mock):
+        # _reinitialize: initialize POST -> 200 + session id + protocolVersion,
+        # then notifications/initialized -> 202.
+        httpx_mock.add_response(
+            url=self.URL,
+            headers={"mcp-session-id": "sess-1", "content-type": "application/json"},
+            json={"jsonrpc": "2.0", "id": 0, "result": {"protocolVersion": "2025-06-18"}},
+        )
+        httpx_mock.add_response(url=self.URL, status_code=202)
+
+        headers = {"Content-Type": "application/json"}
+        state = {"session_id": None, "protocol_version": None}
+        ready = threading.Event()
+        stdout = StringIO()
+        client = httpx.Client()
+        try:
+            with patch("sys.stdout", stdout):
+                _cold_start_loop(
+                    login=lambda: {"Authorization": "Bearer t"},
+                    client=client,
+                    url=self.URL,
+                    headers=headers,
+                    headers_lock=threading.Lock(),
+                    tracker=None,
+                    state=state,
+                    state_lock=threading.Lock(),
+                    ready=ready,
+                )
+        finally:
+            client.close()
+
+        assert ready.is_set()
+        assert state["session_id"] == "sess-1"
+        assert state["protocol_version"] == "2025-06-18"
+        assert headers["Authorization"] == "Bearer t"
+        out = stdout.getvalue()
+        assert "notifications/tools/list_changed" in out
+        assert "notifications/resources/list_changed" in out
+        assert "notifications/prompts/list_changed" in out
+
+    def test_failed_login_leaves_gate_closed(self, httpx_mock):
+        """login() returning None must not set ready or POST upstream."""
+        ready = threading.Event()
+        state = {"session_id": None, "protocol_version": None}
+        client = httpx.Client()
+        try:
+            _cold_start_loop(
+                login=lambda: None,
+                client=client,
+                url=self.URL,
+                headers={},
+                headers_lock=threading.Lock(),
+                tracker=None,
+                state=state,
+                state_lock=threading.Lock(),
+                ready=ready,
+            )
+        finally:
+            client.close()
+        assert not ready.is_set()
+        assert httpx_mock.get_requests() == []
+
+
+class TestRunColdStart:
+    """run() cold-start gate end-to-end (Streamable HTTP)."""
+
+    def _run_with_stdin(self, httpx_mock, stdin_lines, **kwargs):
+        stdin_data = "\n".join(stdin_lines) + "\n"
+        stdout = StringIO()
+        with patch("sys.stdin", StringIO(stdin_data)), patch("sys.stdout", stdout):
+            run(
+                "https://example.com/mcp",
+                {"Content-Type": "application/json"},
+                **kwargs,
+            )
+        return stdout.getvalue()
+
+    def test_gates_all_methods_until_login(self, httpx_mock):
+        """While OAuth has not completed (login returns None -> ready never set),
+        initialize is answered locally, list methods are empty, tools/call is
+        -32002, notifications are swallowed, and nothing is POSTed upstream."""
+        out = self._run_with_stdin(
+            httpx_mock,
+            [
+                '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}',
+                '{"jsonrpc":"2.0","id":2,"method":"tools/list"}',
+                '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{}}',
+                '{"jsonrpc":"2.0","method":"notifications/initialized"}',
+            ],
+            cold_start_login=lambda: None,  # OAuth never completes
+        )
+        by_id = {
+            m.get("id"): m for m in (json.loads(x) for x in out.splitlines() if x.strip())
+        }
+        assert by_id[1]["result"]["capabilities"]["tools"]["listChanged"] is True
+        assert by_id[1]["result"]["protocolVersion"] == "2025-06-18"
+        assert by_id[2]["result"] == {"tools": []}
+        assert by_id[3]["error"]["code"] == -32002
+        # The notification produced no frame (no id:null).
+        assert None not in by_id
+        # Nothing reached the upstream while gated.
+        assert httpx_mock.get_requests() == []
 
 
 class TestRunSse:

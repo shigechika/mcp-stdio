@@ -228,6 +228,51 @@ class TestMain:
             main()
         assert mock_ensure.call_args.kwargs["refresh_leeway"] == 300.0
 
+    def test_oauth_eager_warm_cache_no_cold_start(self):
+        """#296: --oauth-eager with a warm cache probes non-interactively and
+        runs normally (cold_start_login None)."""
+        with (
+            patch("sys.argv", ["mcp-stdio", "--oauth", "--oauth-eager", "https://example.com/mcp"]),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            mock_ensure.return_value.id_token = None
+            main()
+        # Probed non-interactively, token available -> no cold-start.
+        assert mock_ensure.call_args.kwargs["interactive"] is False
+        assert mock_run.call_args.kwargs["cold_start_login"] is None
+
+    def test_oauth_eager_cold_cache_defers_login(self):
+        """#296: --oauth-eager with a cold cache (non-interactive probe returns
+        None) defers OAuth to a background cold_start_login passed to run()."""
+        with (
+            patch("sys.argv", ["mcp-stdio", "--oauth", "--oauth-eager", "https://example.com/mcp"]),
+            patch("mcp_stdio.oauth.ensure_token", return_value=None) as mock_ensure,
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+        assert mock_ensure.call_args.kwargs["interactive"] is False
+        assert callable(mock_run.call_args.kwargs["cold_start_login"])
+
+    def test_oauth_eager_ignored_on_sse(self, capsys):
+        """--oauth-eager is Streamable-HTTP only: on --transport sse it warns and
+        falls back to the blocking (interactive) flow before the relay starts."""
+        with (
+            patch(
+                "sys.argv",
+                ["mcp-stdio", "--oauth", "--oauth-eager", "--transport", "sse",
+                 "https://example.com/sse"],
+            ),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run_sse"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            mock_ensure.return_value.id_token = None
+            main()
+        assert mock_ensure.call_args.kwargs["interactive"] is True
+        assert "ignored on --transport sse" in capsys.readouterr().err
+
     def test_oauth_timeout_default_and_flag(self):
         """: the interactive-OAuth wait is configurable via
         --oauth-timeout (default 120) and propagated to ensure_token(timeout=)."""

@@ -1266,6 +1266,144 @@ def _paginate_and_stream(
     return _StreamResult(last_session, 200)
 
 
+# --- cold-start: answer initialize locally while OAuth runs in the background ---
+#
+# An interactive OAuth flow (browser -> SSO -> MFA -> consent -> redirect) takes
+# 30-180 s, but a client's `initialize` typically times out in ~60 s, so a cold
+# (no/expired token) --oauth start fails to attach. With --oauth-eager the relay
+# answers `initialize` locally (advertising listChanged so the client honours a
+# later refresh), gates the other methods, and runs OAuth on a background thread;
+# when it completes the gate lifts and `notifications/.../list_changed` tells the
+# client to fetch the now-available lists. Streamable HTTP only (#296 / #59-adj).
+_COLD_START_NOT_READY_CODE = -32002  # "server busy / not ready" (used by tools/call)
+
+# list-method -> the empty result body returned while gated, so a client that
+# fetches before OAuth completes sees an empty (not failed) list and re-fetches
+# on the list_changed notification.
+_COLD_START_EMPTY_LIST = {
+    "tools/list": {"tools": []},
+    "resources/list": {"resources": []},
+    "resources/templates/list": {"resourceTemplates": []},
+    "prompts/list": {"prompts": []},
+}
+_COLD_START_LIST_CHANGED = (
+    "notifications/tools/list_changed",
+    "notifications/resources/list_changed",
+    "notifications/prompts/list_changed",
+)
+
+
+def _cold_start_response(line: str, req_id: Any, has_id: bool) -> str | None:
+    """Synthesize a local reply for a pre-OAuth (gated) stdin line, or None.
+
+    Returns the JSON-RPC line to emit to stdout, or ``None`` when the line should
+    be swallowed silently (a notification that must not reach the unauthorized
+    upstream). The caller never forwards a gated line upstream.
+
+    - ``initialize`` -> a local InitializeResult echoing the client's requested
+      protocolVersion (floor 2024-11-05 if absent) and advertising listChanged
+      on tools/resources/prompts, so the client honours the later list_changed.
+    - a list method -> an empty list result (the client re-fetches on
+      list_changed once OAuth completes).
+    - ``ping`` -> an empty result.
+    - any other request (tools/call, resources/read, …) -> a ``-32002`` error
+      ("authorizing, retry shortly").
+    - any notification (incl. ``notifications/initialized``) -> swallowed.
+    """
+    try:
+        msg = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        msg = None
+    method = msg.get("method") if isinstance(msg, dict) else None
+
+    if method == "initialize":
+        requested = None
+        if isinstance(msg, dict):
+            params = msg.get("params")
+            if isinstance(params, dict):
+                pv = params.get("protocolVersion")
+                if isinstance(pv, str) and pv:
+                    requested = pv
+        result = {
+            "protocolVersion": requested or "2024-11-05",
+            "capabilities": {
+                "tools": {"listChanged": True},
+                "resources": {"listChanged": True},
+                "prompts": {"listChanged": True},
+            },
+            "serverInfo": {"name": "mcp-stdio", "version": __version__},
+        }
+        return json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result})
+
+    if not has_id:
+        # A notification (including notifications/initialized) gets no reply and
+        # must not be forwarded to the not-yet-authorized upstream — swallow it.
+        return None
+
+    if method in _COLD_START_EMPTY_LIST:
+        return json.dumps(
+            {"jsonrpc": "2.0", "id": req_id, "result": _COLD_START_EMPTY_LIST[method]}
+        )
+    if method == "ping":
+        return json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {}})
+    # Any other request needs the upstream, which is not reachable until OAuth
+    # completes. Tell the client to retry shortly rather than hang.
+    return json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {
+                "code": _COLD_START_NOT_READY_CODE,
+                "message": "authorizing with the upstream server, please retry shortly",
+            },
+        }
+    )
+
+
+def _cold_start_loop(
+    *,
+    login: Callable[[], dict[str, str] | None],
+    client: httpx.Client,
+    url: str,
+    headers: dict[str, str],
+    headers_lock: threading.Lock,
+    tracker: "_CancelTracker | None",
+    state: dict[str, Any],
+    state_lock: threading.Lock,
+    ready: threading.Event,
+) -> None:
+    """Background daemon: run interactive OAuth, then open the upstream session.
+
+    On success: merge the auth headers (under ``headers_lock``), perform the
+    upstream initialize handshake (``_reinitialize`` -> session id + protocol
+    version), publish them in ``state`` (under ``state_lock``), set ``ready`` so
+    the main loop lifts the gate, and emit ``list_changed`` notifications so the
+    client fetches the now-available lists. Any failure leaves the gate closed
+    (gated requests keep returning -32002); the thread never crashes the relay.
+    """
+    try:
+        new_headers = login()
+        if not new_headers:
+            log("cold-start OAuth did not complete; gate stays closed")
+            return
+        with headers_lock:
+            headers.update(new_headers)
+            snapshot = dict(headers)
+        sid, pv = _reinitialize(client, url, snapshot, None)
+        if sid is None:
+            log("cold-start: upstream initialize failed after OAuth")
+            return
+        with state_lock:
+            state["session_id"] = sid
+            state["protocol_version"] = pv
+        ready.set()
+        log("cold-start ready: OAuth complete, upstream session established")
+        for method in _COLD_START_LIST_CHANGED:
+            _emit(json.dumps({"jsonrpc": "2.0", "method": method}), tracker)
+    except Exception as e:  # noqa: BLE001 — the daemon must never crash the relay
+        log(f"cold-start background error: {e}")
+
+
 def _reinitialize(
     client: httpx.Client,
     url: str,
@@ -1798,6 +1936,7 @@ def run(
     token_expiry_getter: Any = None,
     proactive_refresh: bool = True,
     refresh_leeway: float = 60.0,
+    cold_start_login: Any = None,
 ) -> None:
     """Run the stdio-to-HTTP relay loop.
 
@@ -1850,6 +1989,14 @@ def run(
             ``token_refresher`` / ``token_expiry_getter`` (i.e. no OAuth).
         refresh_leeway: Seconds before ``expires_at`` at which the
             proactive timer refreshes (default 60).
+        cold_start_login: Optional callable that runs the interactive OAuth
+            flow and returns updated headers (with Authorization) on success,
+            or None on failure. When set (``--oauth-eager`` with a cold cache),
+            the relay answers ``initialize`` locally and gates other methods
+            while ``cold_start_login`` runs on a background thread, then lifts
+            the gate and emits ``list_changed`` so the client fetches the
+            now-available lists — so a long OAuth flow does not blow the
+            client's initialize timeout (#296). Streamable HTTP only.
 
     Limitation — JSON-RPC batches: a top-level array (a batch) is
     treated like a notification for error synthesis. ``_extract_id_and_presence``
@@ -1931,6 +2078,33 @@ def run(
         refresh_lock=refresh_lock,
     )
 
+    # Cold-start (--oauth-eager): answer initialize locally while OAuth runs on a
+    # background thread. ``cold_gated`` stays True until OAuth completes AND the
+    # main loop has adopted the upstream session the daemon established; while
+    # gated, the stdin loop synthesizes local replies instead of POSTing upstream.
+    cold_ready = threading.Event() if cold_start_login is not None else None
+    cold_state: dict[str, Any] = {"session_id": None, "protocol_version": None}
+    cold_state_lock = threading.Lock()
+    cold_gated = cold_start_login is not None
+    cold_timer: threading.Thread | None = None
+    if cold_start_login is not None:
+        cold_timer = threading.Thread(
+            target=_cold_start_loop,
+            kwargs={
+                "login": cold_start_login,
+                "client": client,
+                "url": url,
+                "headers": headers,
+                "headers_lock": headers_lock,
+                "tracker": tracker,
+                "state": cold_state,
+                "state_lock": cold_state_lock,
+                "ready": cold_ready,
+            },
+            daemon=True,
+        )
+        cold_timer.start()
+
     try:
         for line in sys.stdin:
             line = line.strip()
@@ -1958,6 +2132,23 @@ def run(
                     # A request reusing a previously-cancelled id supersedes that
                     # cancel — untrack it so its response is delivered, not dropped.
                     tracker.discard(req_id)
+
+                # Cold-start gate (--oauth-eager): until the background OAuth flow
+                # completes, answer locally instead of POSTing to the not-yet-
+                # authorized upstream. Once ready, adopt the upstream session the
+                # daemon established and forward THIS line normally.
+                if cold_gated:
+                    if cold_ready.is_set():
+                        with cold_state_lock:
+                            session_id = cold_state["session_id"]
+                            protocol_version = cold_state["protocol_version"]
+                        cold_gated = False
+                        log("cold-start gate lifted; forwarding to upstream")
+                    else:
+                        reply = _cold_start_response(line, req_id, req_has_id)
+                        if reply is not None:
+                            _emit(reply, tracker)
+                        continue
 
                 req_headers = _prepare_headers()
 
@@ -2289,6 +2480,11 @@ def run(
                 continue
     finally:
         _stop_proactive_refresh(refresh_timer, refresh_stop)
+        # The cold-start daemon self-exits after one OAuth attempt; briefly join
+        # it so a clean shutdown does not race its final emit. daemon=True keeps
+        # process exit unblocked if it is still parked in the interactive flow.
+        if cold_timer is not None:
+            cold_timer.join(timeout=1.0)
         client.close()
 
 
