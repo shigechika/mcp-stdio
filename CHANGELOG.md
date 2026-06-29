@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.19.0](https://github.com/shigechika/mcp-stdio/compare/v0.18.0...v0.19.0) (2026-06-29)
+
+
+### Features
+
+* **oauth:** OpenID Connect Discovery 1.0 fallback for AS metadata ([#248](https://github.com/shigechika/mcp-stdio/issues/248)) ([9b60eb9](https://github.com/shigechika/mcp-stdio/commit/9b60eb9b25901ea5533a8f5c5a27c371130e0d58))
+* **serve:** RFC 9207 iss, RFC 7591 invalid_redirect_uri + DCR no-store ([#249](https://github.com/shigechika/mcp-stdio/issues/249)) ([be7de4f](https://github.com/shigechika/mcp-stdio/commit/be7de4fb71e7fe8cd51f7afd4fc05e168c97b402))
+* **serve:** RS audience binding, invalid_token, replay revocation ([#250](https://github.com/shigechika/mcp-stdio/issues/250)) ([dc0d8bf](https://github.com/shigechika/mcp-stdio/commit/dc0d8bfa8aa5ed9d5c2d1e031f6a5b5bc43f7a3d))
+
 ## [0.18.0](https://github.com/shigechika/mcp-stdio/compare/v0.17.0...v0.18.0) (2026-06-29)
 
 
