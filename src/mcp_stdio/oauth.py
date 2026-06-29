@@ -2007,6 +2007,10 @@ def _run_device_authorization_flow(
                 # token response (RFC 6749 §5.1) — mirrors the auth-code and
                 # refresh paths so a device-flow token's scope is not wiped.
                 previous_scope=scope,
+                # Likewise keep a cached id_token when the device-flow response
+                # omits one, so --oauth-use-id-token survives a device re-auth
+                # (symmetric with the auth-code / refresh paths; #59).
+                previous_id_token=cached.id_token if cached else None,
                 client_secret_expires_at=cse_at,
                 auth_method=auth_method,
                 no_resource_indicator=not resource_indicator,

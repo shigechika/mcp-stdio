@@ -5764,6 +5764,24 @@ class TestDeviceAuthorizationFlow:
         # SEP-837: the headless device-flow client is also "native".
         assert body["application_type"] == "native"
 
+    def test_device_flow_preserves_cached_id_token(self, httpx_mock, tmp_path, monkeypatch):
+        """#59: a device-flow re-auth whose token response omits id_token keeps the
+        cached id_token, so --oauth-use-id-token survives (matches refresh path)."""
+        self._patch_store(tmp_path, monkeypatch)
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={"access_token": "acc", "token_type": "Bearer"},  # no id_token
+        )
+        cached = TokenData(access_token="old", id_token="cached-idt")
+        client = httpx.Client()
+        data = _run_device_authorization_flow(
+            MCP_URL, client, metadata=_device_meta(), cached=cached
+        )
+        assert data.access_token == "acc"
+        assert data.id_token == "cached-idt"
+
     def test_da_request_includes_resource_indicator(self, httpx_mock, tmp_path, monkeypatch):
         """Device Authorization Request must include resource parameter (RFC 8707)."""
         self._patch_store(tmp_path, monkeypatch)
