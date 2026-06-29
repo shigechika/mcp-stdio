@@ -270,6 +270,14 @@ mcp-stdio --check http://127.0.0.1:8080/mcp
     [RFC 9207](https://www.rfc-editor.org/rfc/rfc9207) `iss` パラメータを付与
     （mix-up 対策）し metadata でも広告。mcp-stdio クライアントの `--oauth` が
     このゲートウェイ相手に通ります。
+- 埋め込み AS のトークンセキュリティ: リソースサーバはトークンの audience を検証
+  （[RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) / MCP — 別リソース宛の
+  トークンは拒否）、提示された無効トークンには `error="invalid_token"` を返し
+  （[RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) §3.1）、認可コードや
+  ローテーション済み refresh token の再利用検知で grant family 全体を失効
+  （[RFC 6749](https://www.rfc-editor.org/rfc/rfc6749) §4.1.2 /
+  [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700) §4.14.2、正当なリトライを
+  巻き込まない短い grace window 付き）。
 - 当面はシングルクライアント前提（JSON-RPC の id はそのまま透過）。
 
 静的トークンの例（トークンは env 経由で `ps` に出さない）:
