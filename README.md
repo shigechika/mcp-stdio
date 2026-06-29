@@ -297,6 +297,9 @@ mcp-stdio --check http://127.0.0.1:8080/mcp
   request carries it, an unknown/terminated id gets `404` (the client then
   re-initializes), and a `DELETE` tears that session's child down. A
   concurrent-session cap guards an open gateway against unbounded child spawns.
+  When OAuth is enabled each session is **bound to the authenticated user** — a
+  session id presented with a different user's token is rejected (`404`), so a
+  leaked id cannot cross tenants.
 
 Static-token example (token via env so it is not visible in `ps`):
 

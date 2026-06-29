@@ -305,13 +305,20 @@ _MAX_REAP_INTERVAL_SECS = 60.0
 
 
 class _Session:
-    """A live MCP session: its backend child plus last-activity timestamp."""
+    """A live MCP session: its backend child, last activity, and owner.
 
-    __slots__ = ("backend", "last_active")
+    ``owner`` is the authenticated OAuth user the session is bound to (``None``
+    for static-token or no-auth sessions, which carry no per-user identity).
+    """
 
-    def __init__(self, backend: BackendProcess, last_active: float) -> None:
+    __slots__ = ("backend", "last_active", "owner")
+
+    def __init__(
+        self, backend: BackendProcess, last_active: float, owner: str | None
+    ) -> None:
         self.backend = backend
         self.last_active = last_active
+        self.owner = owner
 
 
 class SessionRegistry:
@@ -354,8 +361,10 @@ class SessionRegistry:
         self._reaper: threading.Thread | None = None
         self._reaper_stop = threading.Event()
 
-    def create(self) -> tuple[str, BackendProcess] | None:
-        """Spawn a child for a new session.
+    def create(
+        self, owner: str | None = None
+    ) -> tuple[str, BackendProcess] | None:
+        """Spawn a child for a new session, optionally bound to ``owner``.
 
         Returns ``(session_id, backend)``, or ``None`` when the concurrent-
         session cap is reached (the caller then responds 503).
@@ -375,7 +384,7 @@ class SessionRegistry:
             # child rather than exceed the bound.
             over_cap = len(self._sessions) >= self._max
             if not over_cap:
-                self._sessions[sid] = _Session(backend, self._now())
+                self._sessions[sid] = _Session(backend, self._now(), owner)
         if over_cap:
             # shutdown() (terminate -> wait) runs OUTSIDE the lock so it never
             # serializes other sessions' creation or routing.
@@ -383,17 +392,23 @@ class SessionRegistry:
             return None
         return sid, backend
 
-    def get(self, sid: str | None) -> BackendProcess | None:
-        """Resolve a session id to its backend, or None if unknown.
+    def get(
+        self, sid: str | None, user: str | None = None
+    ) -> BackendProcess | None:
+        """Resolve a session id to its backend, or None if unknown — or bound
+        to a different user than ``user``.
 
         Touches the session's last-activity timestamp so an actively used
-        session is never idle-reaped.
+        session is never idle-reaped. A bound session (``owner`` set) is only
+        returned to its owner; mismatch yields None (the caller 404s, neither
+        confirming the session to a different principal nor letting that
+        principal route into it).
         """
         if not sid:
             return None
         with self._lock:
             sess = self._sessions.get(sid)
-            if sess is None:
+            if sess is None or (sess.owner is not None and sess.owner != user):
                 return None
             sess.last_active = self._now()
             return sess.backend
@@ -407,17 +422,25 @@ class SessionRegistry:
             if sess is not None:
                 sess.last_active = self._now()
 
-    def remove(self, sid: str | None) -> BackendProcess | None:
-        """Detach a session and return its backend (or None if unknown).
+    def remove(
+        self, sid: str | None, user: str | None = None
+    ) -> BackendProcess | None:
+        """Detach a session and return its backend (or None if unknown — or
+        bound to a different user than ``user``).
 
         The caller calls ``backend.shutdown()`` OUTSIDE the lock so a slow
-        terminate never freezes routing for other sessions.
+        terminate never freezes routing for other sessions. The same ownership
+        check as :meth:`get` applies, so one user cannot DELETE another's
+        session.
         """
         if not sid:
             return None
         with self._lock:
-            sess = self._sessions.pop(sid, None)
-        return sess.backend if sess is not None else None
+            sess = self._sessions.get(sid)
+            if sess is None or (sess.owner is not None and sess.owner != user):
+                return None
+            del self._sessions[sid]
+            return sess.backend
 
     def reap_idle(self) -> int:
         """Drop sessions idle past the TTL — or whose child has exited — and
@@ -988,37 +1011,54 @@ class _OAuthProvider:
 
     # -- resource-server validation --------------------------------------
 
-    def validate_access_token(
-        self, token: str, expected_resource: str | None = None
-    ) -> bool:
-        """True if ``token`` is a live issued access token for this resource.
+    def _live_entry(
+        self, token: str, expected_resource: str | None
+    ) -> dict[str, Any] | None:
+        """The live access-token entry for this resource, or None.
 
-        Beyond the lookup + expiry check, this enforces the RFC 8707 / MCP
-        audience binding: when the token was minted for a specific ``resource``
-        and the caller passes the resource it is guarding, the two MUST match —
-        a token issued for a different audience is rejected even though it is
-        otherwise live. A token with no resource binding (``None``) stays
-        accepted (lenient), as does a call that does not supply an expected
-        resource.
+        Encapsulates the lookup + expiry purge + RFC 8707 / MCP audience check
+        shared by :meth:`validate_access_token` and :meth:`user_for_token`:
+        when the token was minted for a specific ``resource`` and the caller
+        passes the resource it is guarding, the two MUST match — a token issued
+        for a different audience is rejected even though it is otherwise live. A
+        token with no resource binding (``None``) stays accepted (lenient), as
+        does a call that does not supply an expected resource.
         """
         if not token:
-            return False
+            return None
         now = self._now()
         with self._lock:
             entry = self._access.get(token)
             if entry is None:
-                return False
+                return None
             if entry["expires_at"] < now:
                 del self._access[token]
-                return False
+                return None
             tok_resource = entry.get("resource")
             if (
                 tok_resource is not None
                 and expected_resource is not None
                 and tok_resource.rstrip("/") != expected_resource.rstrip("/")
             ):
-                return False
-            return True
+                return None
+            return entry
+
+    def validate_access_token(
+        self, token: str, expected_resource: str | None = None
+    ) -> bool:
+        """True if ``token`` is a live issued access token for this resource."""
+        return self._live_entry(token, expected_resource) is not None
+
+    def user_for_token(
+        self, token: str, expected_resource: str | None = None
+    ) -> str | None:
+        """The authenticated user bound to a live access token, else None.
+
+        Same liveness + audience checks as :meth:`validate_access_token`, but
+        returns the token's user (for per-session ownership) rather than a bool.
+        """
+        entry = self._live_entry(token, expected_resource)
+        return entry.get("user") if entry is not None else None
 
     def _evict_to_capacity_locked(self, store: dict[str, dict[str, Any]], cap: int) -> None:
         """Hard-bound a TTL store: if still at the cap after GC, evict the
@@ -1340,20 +1380,38 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _resolve_session(self, req_id: Any = None) -> BackendProcess | None:
+    def _current_user(self) -> str | None:
+        """The authenticated OAuth user for this request, or None.
+
+        Only issued OAuth access tokens carry a per-user identity; static-token
+        and no-auth requests return None (their sessions are unbound). Called
+        after the auth gate, so any presented token is already known valid.
+        """
+        if self.oauth is None:
+            return None
+        auth = self.headers.get("Authorization", "")
+        prefix = "Bearer "
+        if not auth.startswith(prefix):
+            return None
+        return self.oauth.user_for_token(auth[len(prefix):], self._resource_url())
+
+    def _resolve_session(
+        self, user: str | None = None, req_id: Any = None
+    ) -> BackendProcess | None:
         """Resolve the request's session, or emit the spec error and return None.
 
         A missing ``Mcp-Session-Id`` -> 400 (MCP spec item 2); an unknown or
-        terminated id -> 404 (item 3, which drives the client's re-initialize).
-        On success records the id for the response header and returns the
-        backend. Shared by the POST (non-initialize) and GET paths so both
-        report the same status for the same condition.
+        terminated id — or one bound to a different ``user`` — -> 404 (item 3,
+        which drives the client's re-initialize). On success records the id for
+        the response header and returns the backend. Shared by the POST
+        (non-initialize) and GET paths so both report the same status for the
+        same condition.
         """
         sid = self.headers.get("Mcp-Session-Id")
         if not sid:
             self._send_json(400, _error_body("Mcp-Session-Id required", req_id))
             return None
-        backend = self.registry.get(sid)
+        backend = self.registry.get(sid, user)
         if backend is None:
             self._send_json(404, _error_body("unknown or expired session", req_id))
             return None
@@ -1420,24 +1478,28 @@ class _Handler(BaseHTTPRequestHandler):
                 return
 
         # --- session resolution (MCP Streamable HTTP session management) ---
+        # When OAuth is enabled, sessions are bound to the authenticated user so
+        # a session id (a bearer-equivalent capability) cannot be used by, or
+        # torn down by, a different principal.
+        user = self._current_user()
         is_init = kind == "request" and msg.get("method") == "initialize"
         if is_init:
             # `initialize` starts a session (MCP spec item 1): spawn a fresh
             # child and mint an id, returned via the Mcp-Session-Id response
-            # header. A presented (stale) id is dropped first.
+            # header. A presented (stale) id owned by this user is dropped first.
             stale_id = self.headers.get("Mcp-Session-Id")
             if stale_id:
-                stale = self.registry.remove(stale_id)
+                stale = self.registry.remove(stale_id, user)
                 if stale is not None:
                     stale.shutdown()
-            created = self.registry.create()
+            created = self.registry.create(owner=user)
             if created is None:
                 self._send_json(503, _error_body("session limit reached", req_id))
                 return
             self._session_id, backend = created
         else:
             # MCP spec items 2/3: sessionless -> 400, unknown/terminated -> 404.
-            backend = self._resolve_session(req_id)
+            backend = self._resolve_session(user, req_id)
             if backend is None:
                 return
 
@@ -1446,7 +1508,7 @@ class _Handler(BaseHTTPRequestHandler):
                 # Dead child: drop the session so the slot is reclaimed and the
                 # client's next request re-initializes (404) instead of looping
                 # on 503. shutdown() reaps the already-exited child.
-                stale = self.registry.remove(self._session_id)
+                stale = self.registry.remove(self._session_id, user)
                 if stale is not None:
                     stale.shutdown()
                 self._send_json(503, _error_body("backend unavailable", req_id))
@@ -1458,7 +1520,7 @@ class _Handler(BaseHTTPRequestHandler):
                 if is_init:
                     # The freshly-spawned child never answered initialize, so it
                     # never became a usable session — don't leak its slot/child.
-                    stale = self.registry.remove(self._session_id)
+                    stale = self.registry.remove(self._session_id, user)
                     if stale is not None:
                         stale.shutdown()
                 self._send_json(
@@ -1503,8 +1565,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         # The SSE stream carries a session's server-initiated messages, so it
         # must name an existing session: sessionless -> 400, unknown/terminated
-        # -> 404 (drives the client's re-initialize), as on the POST path.
-        backend = self._resolve_session()
+        # (or another user's) -> 404 (drives the client's re-initialize), as on
+        # the POST path.
+        backend = self._resolve_session(self._current_user())
         if backend is None:
             return
         # Open an SSE stream carrying server-initiated messages (notifications
@@ -1553,7 +1616,8 @@ class _Handler(BaseHTTPRequestHandler):
         if not sid_header:
             self._send_json(400, _error_body("Mcp-Session-Id required"))
             return
-        backend = self.registry.remove(sid_header)
+        # Ownership-checked: one user cannot DELETE another's session.
+        backend = self.registry.remove(sid_header, self._current_user())
         if backend is None:
             self._send_json(404, _error_body("unknown or expired session"))
             return

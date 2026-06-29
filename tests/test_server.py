@@ -1050,6 +1050,73 @@ def test_coexistence_static_and_oauth():
         assert "authorization_servers" in prm
 
 
+def _mcp(base, msg, *, token=None, sid=None):
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if sid:
+        headers["Mcp-Session-Id"] = sid
+    return httpx.post(base + "/mcp", content=json.dumps(msg), headers=headers, timeout=10)
+
+
+def test_registry_owner_binding():
+    # A session bound to a user is reachable only by that user.
+    reg = server.SessionRegistry(_BACKEND)
+    try:
+        sid, _ = reg.create(owner="alice")
+        assert reg.get(sid, "alice") is not None
+        assert reg.get(sid, "bob") is None     # bound to alice
+        assert reg.get(sid, None) is None       # a static/no-auth request
+        assert reg.remove(sid, "bob") is None   # bob cannot tear it down
+        assert reg.count == 1
+        assert reg.remove(sid, "alice") is not None
+        assert reg.count == 0
+    finally:
+        reg.shutdown_all()
+
+
+def test_unbound_session_reachable_by_anyone():
+    # owner=None (no-auth / static token) -> no per-user binding.
+    reg = server.SessionRegistry(_BACKEND)
+    try:
+        sid, _ = reg.create()
+        assert reg.get(sid, None) is not None
+        assert reg.get(sid, "anyone") is not None
+    finally:
+        reg.shutdown_all()
+
+
+def test_oauth_session_bound_to_owner():
+    # End-to-end: a session opened by alice cannot be used or deleted by bob,
+    # even though bob holds a valid token (a session id is a capability).
+    prov = _provider(trusted_user_header="X-Forwarded-User", dev_user=None)
+    with _run(oauth=prov) as (base, _):
+        _, _, _, _, tok_a = _full_flow(base, headers={"X-Forwarded-User": "alice"})
+        access_a = tok_a.json()["access_token"]
+        _, _, _, _, tok_b = _full_flow(base, headers={"X-Forwarded-User": "bob"})
+        access_b = tok_b.json()["access_token"]
+
+        r = _mcp(base, {"jsonrpc": "2.0", "id": "i", "method": "initialize"}, token=access_a)
+        assert r.status_code == 200
+        sid = r.headers["mcp-session-id"]
+
+        # alice uses her own session
+        assert _mcp(base, {"jsonrpc": "2.0", "id": 1, "method": "echo"},
+                    token=access_a, sid=sid).status_code == 200
+        # bob (valid token, different user) presenting alice's sid -> 404
+        assert _mcp(base, {"jsonrpc": "2.0", "id": 2, "method": "echo"},
+                    token=access_b, sid=sid).status_code == 404
+        # bob cannot DELETE alice's session either
+        assert httpx.request(
+            "DELETE", base + "/mcp",
+            headers={"Authorization": f"Bearer {access_b}", "Mcp-Session-Id": sid},
+            timeout=10,
+        ).status_code == 404
+        # alice's session survives bob's probing
+        assert _mcp(base, {"jsonrpc": "2.0", "id": 3, "method": "echo"},
+                    token=access_a, sid=sid).status_code == 200
+
+
 def test_as_endpoints_404_when_disabled(gateway):
     url, _ = gateway
     base = _base(url)
