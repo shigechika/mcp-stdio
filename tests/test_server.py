@@ -1117,6 +1117,29 @@ def test_oauth_session_bound_to_owner():
                     token=access_a, sid=sid).status_code == 200
 
 
+def test_static_token_cannot_ride_oauth_session():
+    # On a static + OAuth gateway, a valid static token is a different (null)
+    # principal: it must not route into or DELETE an OAuth-owned session.
+    prov = _provider(trusted_user_header="X-Forwarded-User", dev_user=None)
+    with _run(auth_token="static-tok", oauth=prov) as (base, _):
+        _, _, _, _, tok_a = _full_flow(base, headers={"X-Forwarded-User": "alice"})
+        access_a = tok_a.json()["access_token"]
+        r = _mcp(base, {"jsonrpc": "2.0", "id": "i", "method": "initialize"}, token=access_a)
+        assert r.status_code == 200
+        sid = r.headers["mcp-session-id"]
+        # the static token authenticates but is not alice -> 404 on her session
+        assert _mcp(base, {"jsonrpc": "2.0", "id": 1, "method": "echo"},
+                    token="static-tok", sid=sid).status_code == 404
+        assert httpx.request(
+            "DELETE", base + "/mcp",
+            headers={"Authorization": "Bearer static-tok", "Mcp-Session-Id": sid},
+            timeout=10,
+        ).status_code == 404
+        # alice's session survives
+        assert _mcp(base, {"jsonrpc": "2.0", "id": 2, "method": "echo"},
+                    token=access_a, sid=sid).status_code == 200
+
+
 def test_as_endpoints_404_when_disabled(gateway):
     url, _ = gateway
     base = _base(url)
