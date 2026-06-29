@@ -31,6 +31,7 @@ Bearer token、カスタムヘッダー、OAuth 2.1 認証情報をリモート�
   - [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) Authorization Server Metadata
     - §3.1 well-known URL 構築。パス付き issuer のパス挿入ルール対応
     - §3.3 `issuer` 検証（クロスオリジンの issuer は AS mix-up 対策で拒否、同一オリジンの差異〔trailing slash / path / case〕は警告して続行）
+    - §3 OpenID Connect Discovery 1.0 フォールバック（OAuth の well-known が 404 のとき `/.well-known/openid-configuration`〔path-append / path-insertion〕を試行。OIDC 形式のみ公開する AS〔Auth0・Okta・Azure AD・Google〕に対応）
   - [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) Resource Indicators
     - §2 `resource` パラメータを認可リクエスト・トークン交換・**リフレッシュ**に送信
   - [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) PKCE

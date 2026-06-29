@@ -1070,6 +1070,67 @@ class TestDiscoverMetadata:
         meta = discover_oauth_metadata("https://api.example.com/realms/test", client)
         assert meta.authorization_endpoint == "https://api.example.com/auth"
 
+    def test_openid_configuration_fallback_bare_origin(self, httpx_mock):
+        """RFC 8414 §3: when oauth-authorization-server 404s, fall back to OpenID
+        Connect /.well-known/openid-configuration (Auth0/Okta/Azure AD expose the
+        OIDC form, not the OAuth one). The OIDC schema is an RFC 8414 superset."""
+        httpx_mock.add_response(
+            url="https://auth.example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
+        # RFC 8414 oauth-authorization-server: 404
+        httpx_mock.add_response(
+            url="https://auth.example.com/.well-known/oauth-authorization-server",
+            status_code=404,
+        )
+        # OIDC discovery: 200
+        httpx_mock.add_response(
+            url="https://auth.example.com/.well-known/openid-configuration",
+            json={
+                "issuer": "https://auth.example.com",
+                "authorization_endpoint": "https://auth.example.com/oauth2/v2.0/authorize",
+                "token_endpoint": "https://auth.example.com/oauth2/v2.0/token",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata("https://auth.example.com", client)
+        assert meta.authorization_endpoint == "https://auth.example.com/oauth2/v2.0/authorize"
+        assert meta.token_endpoint == "https://auth.example.com/oauth2/v2.0/token"
+
+    def test_openid_configuration_fallback_path_append(self, httpx_mock):
+        """A path-scoped issuer whose RFC 8414 locations 404 but which serves OIDC
+        metadata at <issuer>/.well-known/openid-configuration (Keycloak realm,
+        Azure AD tenant) — the common OIDC path-append form."""
+        self._mock_no_prm(httpx_mock, base="https://idp.example.com", path="/tenant")
+        # RFC 8414 host-root + path-insertion: 404
+        httpx_mock.add_response(
+            url="https://idp.example.com/.well-known/oauth-authorization-server",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://idp.example.com/.well-known/oauth-authorization-server/tenant",
+            status_code=404,
+        )
+        # OIDC path-insertion on the bare origin (tried during the base fetch): 404
+        httpx_mock.add_response(
+            url="https://idp.example.com/.well-known/openid-configuration",
+            status_code=404,
+        )
+        # OIDC path-append on the issuer: 200
+        httpx_mock.add_response(
+            url="https://idp.example.com/tenant/.well-known/openid-configuration",
+            json={
+                "issuer": "https://idp.example.com/tenant",
+                "authorization_endpoint": "https://idp.example.com/tenant/authorize",
+                "token_endpoint": "https://idp.example.com/tenant/token",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata("https://idp.example.com/tenant", client)
+        assert meta.authorization_endpoint == "https://idp.example.com/tenant/authorize"
+        assert meta.token_endpoint == "https://idp.example.com/tenant/token"
+        assert meta.issuer == "https://idp.example.com/tenant"
+
 
 # --- register_client ---
 

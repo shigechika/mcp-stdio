@@ -33,6 +33,7 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
   - [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) Authorization Server Metadata
     - §3.1 well-known URL construction, including path insertion for issuers with path components
     - §3.3 `issuer` validation — reject a cross-origin issuer (AS mix-up guard), warn on a same-origin mismatch (trailing slash / path / case) and continue
+    - §3 OpenID Connect Discovery 1.0 fallback — when the OAuth well-known 404s, probe `/.well-known/openid-configuration` (path-append and path-insertion) for ASes that expose only the OIDC form (Auth0, Okta, Azure AD, Google)
   - [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) Resource Indicators
     - §2 `resource` parameter in authorization, token exchange, **and refresh** requests
   - [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) PKCE
