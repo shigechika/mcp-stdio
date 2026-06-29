@@ -7,12 +7,15 @@ import math
 import os
 import re
 import sys
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import httpx
 
 from . import __version__
 from .relay import check_connection, run, run_sse
+
+if TYPE_CHECKING:
+    from .token_store import TokenData
 
 def _non_negative_float(value: str) -> float:
     """argparse type for non-negative floats (rejects negative leeway)."""
@@ -76,6 +79,25 @@ def _bearer_header_value(token: str) -> str:
     return f"Bearer {token}"
 
 
+def _effective_bearer(data: TokenData, use_id_token: bool) -> str:
+    """Pick the credential to present as Bearer: id_token or access_token (#59).
+
+    With --oauth-use-id-token, the OIDC id_token is the Bearer (AWS Bedrock
+    AgentCore / Cognito expect it). Falls back to access_token when the AS
+    returned no id_token, with a one-line warning, rather than presenting an
+    empty credential.
+    """
+    if use_id_token:
+        if data.id_token:
+            return data.id_token
+        print(
+            "warning: --oauth-use-id-token set but the token response carried no "
+            "id_token; falling back to access_token",
+            file=sys.stderr,
+        )
+    return data.access_token
+
+
 def _parse_header(header: str) -> tuple[str, str]:
     """Parse a header string 'Key: Value' into a tuple.
 
@@ -115,6 +137,8 @@ def _build_token_refresher(
     headers: dict[str, str],
     timeout_connect: float,
     timeout_read: float,
+    *,
+    use_id_token: bool = False,
 ) -> Callable[[], dict[str, str] | None]:
     """Build a token refresher callback for the relay loop.
 
@@ -151,7 +175,9 @@ def _build_token_refresher(
             if data is None:
                 return None
             new_headers = dict(base_headers)
-            new_headers["Authorization"] = _bearer_header_value(data.access_token)
+            new_headers["Authorization"] = _bearer_header_value(
+                _effective_bearer(data, use_id_token)
+            )
             return new_headers
         except Exception as e:
             # Mirror upgrader(): a refresh failure beyond the network call
@@ -173,6 +199,8 @@ def _build_scope_upgrader(
     timeout_connect: float,
     timeout_read: float,
     oauth_timeout: float,
+    *,
+    use_id_token: bool = False,
 ) -> Callable[[str], dict[str, str] | None]:
     """Build a scope-upgrade callback for the relay loop.
 
@@ -206,7 +234,9 @@ def _build_scope_upgrader(
                 server_url, client, required_scope, timeout=oauth_timeout
             )
             new_headers = dict(base_headers)
-            new_headers["Authorization"] = _bearer_header_value(data.access_token)
+            new_headers["Authorization"] = _bearer_header_value(
+                _effective_bearer(data, use_id_token)
+            )
         except Exception as e:
             print(f"error: step-up authorization failed: {e}", file=sys.stderr)
             return None
@@ -318,6 +348,17 @@ def _main() -> None:
             "malformed MCP_OAUTH_REFRESH_LEEWAY value aborts startup at argument "
             "parsing even on a non-OAuth run (the env default is validated eagerly "
             "so a bad value surfaces clearly rather than silently)"
+        ),
+    )
+    parser.add_argument(
+        "--oauth-use-id-token",
+        action="store_true",
+        help=(
+            "Present the OIDC id_token as the Bearer credential instead of the "
+            "access_token. Required for servers that validate the id_token (e.g. "
+            "AWS Bedrock AgentCore / Cognito). Falls back to the access_token if "
+            "the AS returns no id_token. Only used with --oauth / --oauth-device "
+            "(#59)."
         ),
     )
     parser.add_argument(
@@ -634,7 +675,7 @@ def _main() -> None:
                 del headers[existing]
             try:
                 headers["Authorization"] = _bearer_header_value(
-                    token_data.access_token
+                    _effective_bearer(token_data, args.oauth_use_id_token)
                 )
             except ValueError as e:
                 # The AS handed us a token with CR/LF/NUL — fail startup clearly
@@ -646,7 +687,8 @@ def _main() -> None:
             # or steps up), so only build them on the real relay path. See #15.
             if not (args.check or args.test):
                 token_refresher = _build_token_refresher(
-                    args.url, headers, args.timeout_connect, args.timeout_read
+                    args.url, headers, args.timeout_connect, args.timeout_read,
+                    use_id_token=args.oauth_use_id_token,
                 )
                 scope_upgrader = _build_scope_upgrader(
                     args.url,
@@ -654,6 +696,7 @@ def _main() -> None:
                     args.timeout_connect,
                     args.timeout_read,
                     args.oauth_timeout,
+                    use_id_token=args.oauth_use_id_token,
                 )
                 token_expiry_getter = _build_token_expiry_getter(args.url)
         except Exception as e:

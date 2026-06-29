@@ -8,6 +8,7 @@ from mcp_stdio.cli import (
     _bearer_header_value,
     _build_scope_upgrader,
     _build_token_refresher,
+    _effective_bearer,
     _parse_header,
     main,
 )
@@ -28,6 +29,27 @@ class TestBearerHeaderValue:
     def test_control_char_token_rejected(self, bad):
         with pytest.raises(ValueError, match="forbidden control character"):
             _bearer_header_value(bad)
+
+
+class TestEffectiveBearer:
+    """#59: --oauth-use-id-token selects the OIDC id_token as the Bearer."""
+
+    def _data(self, **kw):
+        kw.setdefault("access_token", "acc")
+        return TokenData(**kw)
+
+    def test_access_token_by_default(self):
+        data = self._data(id_token="idt")
+        assert _effective_bearer(data, use_id_token=False) == "acc"
+
+    def test_id_token_when_flag_set(self):
+        data = self._data(id_token="idt")
+        assert _effective_bearer(data, use_id_token=True) == "idt"
+
+    def test_falls_back_to_access_token_when_no_id_token(self, capsys):
+        data = self._data(id_token=None)
+        assert _effective_bearer(data, use_id_token=True) == "acc"
+        assert "no id_token" in capsys.readouterr().err
 
 
 class TestParseHeader:

@@ -1344,6 +1344,7 @@ def _token_response_to_data(
     *,
     previous_refresh_token: str | None = None,
     previous_scope: str | None = None,
+    previous_id_token: str | None = None,
     client_secret_expires_at: float | None = None,
     auth_method: str = "none",
     no_resource_indicator: bool = False,
@@ -1357,6 +1358,8 @@ def _token_response_to_data(
     may be omitted when identical to the requested scope, which refreshes
     routinely do), so ``previous_scope`` is preserved — otherwise a refresh
     would wipe the granted scope and a later step-up could not union it.
+    The OIDC ``id_token`` is likewise commonly omitted on a refresh response,
+    so ``previous_id_token`` is preserved for --oauth-use-id-token (#59).
     """
     if not raw.get("access_token"):
         # RFC 6749 §5.1 makes access_token REQUIRED. A response missing it is
@@ -1414,11 +1417,19 @@ def _token_response_to_data(
             f"mcp-stdio sends it as a Bearer credential anyway"
         )
 
+    # OIDC id_token is a string JWT; tolerate a non-string / empty value (treat
+    # as absent) and preserve the previous one when the response omits it, so a
+    # refresh that does not re-issue the id_token keeps --oauth-use-id-token
+    # working.
+    _idt = raw.get("id_token")
+    id_token = _idt if isinstance(_idt, str) and _idt else previous_id_token
+
     return TokenData(
         access_token=raw["access_token"],
         token_type=token_type,
         expires_at=expires_at,
         refresh_token=raw.get("refresh_token") or previous_refresh_token,
+        id_token=id_token,
         scope=raw.get("scope") or previous_scope,
         client_id=client_id,
         client_secret=client_secret,
@@ -1508,6 +1519,7 @@ def refresh_cached_token(
             cached.client_secret,
             previous_refresh_token=cached.refresh_token,
             previous_scope=cached.scope,
+            previous_id_token=cached.id_token,
             client_secret_expires_at=cached.client_secret_expires_at,
             auth_method=auth_method,
             no_resource_indicator=no_resource_indicator,
@@ -1736,6 +1748,9 @@ def _run_authorization_flow(
         # through, mirroring the refresh path (refresh_cached_token). Harmless on
         # initial auth, where `cached` is None or carries no refresh_token.
         previous_refresh_token=cached.refresh_token if cached else None,
+        # Preserve a cached id_token when the step-up/credential response omits
+        # one, mirroring refresh_token, so --oauth-use-id-token survives a step-up.
+        previous_id_token=cached.id_token if cached else None,
         # RFC 6749 §5.1 lets the AS omit `scope` when it equals the requested
         # scope — exactly what a step-up does (requested == merged union). Fall
         # back to the requested `scope` so the stored TokenData.scope is not
@@ -1992,6 +2007,10 @@ def _run_device_authorization_flow(
                 # token response (RFC 6749 §5.1) — mirrors the auth-code and
                 # refresh paths so a device-flow token's scope is not wiped.
                 previous_scope=scope,
+                # Likewise keep a cached id_token when the device-flow response
+                # omits one, so --oauth-use-id-token survives a device re-auth
+                # (symmetric with the auth-code / refresh paths; #59).
+                previous_id_token=cached.id_token if cached else None,
                 client_secret_expires_at=cse_at,
                 auth_method=auth_method,
                 no_resource_indicator=not resource_indicator,

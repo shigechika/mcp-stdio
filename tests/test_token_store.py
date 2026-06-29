@@ -154,6 +154,29 @@ class TestLoadSaveDelete:
         assert loaded.access_token == "tok123"
         assert loaded.refresh_token == "ref456"
 
+    def test_id_token_round_trips(self, tmp_path, monkeypatch):
+        """#59: the OIDC id_token survives a save/load round-trip and a
+        non-string id_token from a corrupted store degrades to None."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        save_token(
+            "https://example.com/mcp",
+            TokenData(access_token="tok", id_token="eyJ.payload.sig"),
+        )
+        loaded = load_token("https://example.com/mcp")
+        assert loaded is not None and loaded.id_token == "eyJ.payload.sig"
+
+        # A type-broken id_token in the store rejects the whole entry (load None).
+        import json as _json
+
+        raw = _json.loads(store_file.read_text())
+        key = next(iter(raw))
+        raw[key]["id_token"] = 123
+        store_file.write_text(_json.dumps(raw))
+        assert load_token("https://example.com/mcp") is None
+
     def test_load_missing(self, tmp_path, monkeypatch):
         store_file = tmp_path / "tokens.json"
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)

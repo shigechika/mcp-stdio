@@ -131,6 +131,11 @@ class TokenData:
     token_type: str = "Bearer"
     expires_at: float | None = None
     refresh_token: str | None = None
+    # OIDC id_token (a JWT), captured so it can be used as the Bearer credential
+    # instead of access_token when --oauth-use-id-token is set (AWS Bedrock
+    # AgentCore / Cognito expect the id_token; #59). Not signature-verified —
+    # mcp-stdio relays it as an opaque bearer, same as access_token.
+    id_token: str | None = None
     scope: str | None = None
     # Dynamic client registration credentials
     client_id: str | None = None
@@ -859,6 +864,7 @@ def load_token(server_url: str) -> TokenData | None:
     for field in (
         "token_type",
         "refresh_token",
+        "id_token",
         "scope",
         "client_id",
         "client_secret",

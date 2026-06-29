@@ -2051,6 +2051,41 @@ class TestTokenResponseToData:
         with pytest.raises(RuntimeError, match="access_token"):
             _token_response_to_data({"token_type": "Bearer"}, self.META, "cid", None)
 
+    def test_captures_id_token(self):
+        """#59: the OIDC id_token from the response is captured into TokenData."""
+        raw = {"access_token": "at", "id_token": "eyJhbGc.payload.sig"}
+        data = _token_response_to_data(raw, self.META, "cid", None)
+        assert data.id_token == "eyJhbGc.payload.sig"
+
+    def test_preserves_previous_id_token_when_omitted(self):
+        """#59: a refresh response that omits id_token keeps the previous one
+        (mirrors refresh_token), so --oauth-use-id-token survives a refresh."""
+        raw = {"access_token": "at2"}  # refresh response without id_token
+        data = _token_response_to_data(
+            raw, self.META, "cid", None, previous_id_token="prev-idt"
+        )
+        assert data.id_token == "prev-idt"
+
+    def test_response_id_token_overrides_previous(self):
+        raw = {"access_token": "at2", "id_token": "fresh-idt"}
+        data = _token_response_to_data(
+            raw, self.META, "cid", None, previous_id_token="prev-idt"
+        )
+        assert data.id_token == "fresh-idt"
+
+    def test_non_string_id_token_falls_back_to_previous(self):
+        """A non-string / empty id_token is treated as absent (not crashed on)."""
+        raw = {"access_token": "at", "id_token": 123}
+        data = _token_response_to_data(
+            raw, self.META, "cid", None, previous_id_token="prev-idt"
+        )
+        assert data.id_token == "prev-idt"
+        # No previous either -> None, not the integer.
+        data2 = _token_response_to_data(
+            {"access_token": "at", "id_token": 123}, self.META, "cid", None
+        )
+        assert data2.id_token is None
+
     def test_persists_iss_parameter_supported_from_metadata(self):
         """: the RFC 9207 §3 flag from the discovered metadata is
         written into TokenData so a later step-up can rehydrate it. A round-trip
@@ -5728,6 +5763,24 @@ class TestDeviceAuthorizationFlow:
         assert "redirect_uris" not in body
         # SEP-837: the headless device-flow client is also "native".
         assert body["application_type"] == "native"
+
+    def test_device_flow_preserves_cached_id_token(self, httpx_mock, tmp_path, monkeypatch):
+        """#59: a device-flow re-auth whose token response omits id_token keeps the
+        cached id_token, so --oauth-use-id-token survives (matches refresh path)."""
+        self._patch_store(tmp_path, monkeypatch)
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={"access_token": "acc", "token_type": "Bearer"},  # no id_token
+        )
+        cached = TokenData(access_token="old", id_token="cached-idt")
+        client = httpx.Client()
+        data = _run_device_authorization_flow(
+            MCP_URL, client, metadata=_device_meta(), cached=cached
+        )
+        assert data.access_token == "acc"
+        assert data.id_token == "cached-idt"
 
     def test_da_request_includes_resource_indicator(self, httpx_mock, tmp_path, monkeypatch):
         """Device Authorization Request must include resource parameter (RFC 8707)."""
