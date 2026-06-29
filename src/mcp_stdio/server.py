@@ -341,15 +341,21 @@ def _redirect_key(uri: str) -> tuple[str, str, str] | None:
 
 
 def _normalize_public_url(url: str) -> str:
-    """Normalize --public-url to a canonical bare origin ``scheme://host[:port]``.
+    """Normalize --public-url to a canonical issuer ``scheme://host[:port][/path]``.
 
     Raises ValueError on a non-http(s) URL, a missing host, userinfo,
-    CR/LF/quote/space, or a non-loopback ``http://`` (a compliant client refuses
-    cleartext non-loopback endpoints). The host is lowercased, an explicit
-    default port is dropped, and an IPv6 literal is re-bracketed, so the issuer
-    is byte-identical to what a client derives (RFC 8414 Sec. 3.3). The
-    path/query/fragment are stripped — the OAuth issuer MUST be the bare origin
-    or the client cross-origin-rejects the metadata.
+    CR/LF/quote/space, a non-loopback ``http://`` (a compliant client refuses
+    cleartext non-loopback endpoints), a bad port, or a query/fragment (the
+    RFC 8414 Sec. 2 issuer grammar forbids them). The host is lowercased, an
+    explicit default port is dropped, an IPv6 literal is re-bracketed, and a
+    trailing slash is stripped, so the issuer is byte-identical to what a client
+    derives (RFC 8414 Sec. 3.3).
+
+    A PATH component is RETAINED: a path-scoped issuer (``https://host/team-a``)
+    lets several ``--enable-oauth`` backends share one host behind a reverse
+    proxy, each owning its AS namespace under its own prefix, symmetric with the
+    bundled client's RFC 8414 Sec. 3.1 / RFC 9728 Sec. 3.1 path-aware discovery
+    (#245). A bare-origin URL (no path) behaves exactly as before.
     """
     if any(c in url for c in ('"', "\r", "\n", " ")):
         raise ValueError("public-url contains forbidden characters")
@@ -358,6 +364,8 @@ def _normalize_public_url(url: str) -> str:
         raise ValueError("public-url must be an absolute http(s) URL with a host")
     if p.username or p.password or "@" in p.netloc:
         raise ValueError("public-url must not contain userinfo")
+    if p.query or p.fragment:
+        raise ValueError("public-url must not contain a query or fragment")
     host = p.hostname.lower()
     if p.scheme == "http" and host not in _LOOPBACK_HOSTS:
         raise ValueError("a non-loopback public-url must use https")
@@ -368,7 +376,25 @@ def _normalize_public_url(url: str) -> str:
     hostpart = f"[{host}]" if ":" in host else host
     default_port = 80 if p.scheme == "http" else 443
     netloc = hostpart if (port is None or port == default_port) else f"{hostpart}:{port}"
-    return f"{p.scheme}://{netloc}"
+    # Retain the path as the issuer prefix; strip only a trailing slash so
+    # "https://host/a/" and "https://host/a" canonicalize identically and a bare
+    # "https://host/" collapses to the bare origin (unchanged legacy behavior).
+    path = p.path.rstrip("/")
+    if path:
+        # The prefix is concatenated verbatim into the endpoint URLs and the
+        # well-known locations, so it MUST be a canonical, traversal-free
+        # absolute path: an empty ("//"), "." or ".." segment would be
+        # re-normalized differently by a proxy or the client and break the
+        # byte-identical-issuer contract (and could escape the intended
+        # namespace). Reject rather than silently rewrite. The leading segment
+        # is always "" because an authority-form URL path is "/"-rooted.
+        segments = path.split("/")
+        if segments[0] != "" or any(seg in ("", ".", "..") for seg in segments[1:]):
+            raise ValueError(
+                "public-url path must be a canonical absolute path "
+                "(no empty, '.', or '..' segments)"
+            )
+    return f"{p.scheme}://{netloc}{path}"
 
 
 def _redact_query(line: str) -> str:
@@ -734,10 +760,34 @@ class _Handler(BaseHTTPRequestHandler):
             return self.oauth.public_url
         return self._origin()
 
+    def _issuer_origin_and_prefix(self) -> tuple[str, str]:
+        """Split the effective issuer into (bare origin, path prefix).
+
+        The prefix is ``""`` for a bare-origin issuer (the legacy behavior and
+        the reflected-Host fallback) and e.g. ``"/team-a"`` for a path-scoped
+        ``--public-url``. It drives the root-inserted well-known locations and
+        the prefixed AS endpoint / MCP paths so a path-scoped issuer is
+        byte-symmetric with the bundled client's RFC 8414 Sec. 3.1 / RFC 9728
+        Sec. 3.1 construction (#245). The path prefix can only come from a pinned
+        ``--public-url``; the reflected ``_origin()`` never carries one.
+        """
+        parsed = urlsplit(self._effective_issuer())
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        return origin, parsed.path
+
+    def _mcp_wire_path(self) -> str:
+        """The on-the-wire MCP path: the issuer prefix + the configured path.
+
+        Behind a path-multiplexing proxy the backend receives the full prefixed
+        path (e.g. ``/team-a/mcp``); a bare-origin issuer leaves it ``/mcp``.
+        """
+        _, prefix = self._issuer_origin_and_prefix()
+        return prefix + self.mcp_path
+
     def _wrong_path(self) -> bool:
         # Compare only the path component; ignore any query string.
         path = self.path.split("?", 1)[0]
-        if path != self.mcp_path:
+        if path != self._mcp_wire_path():
             self._send_json(404, _error_body("not found"))
             return True
         return False
@@ -770,10 +820,15 @@ class _Handler(BaseHTTPRequestHandler):
         return self._effective_issuer() + self.mcp_path
 
     def _prm_url(self) -> str:
-        # RFC 9728 Sec. 3.1 path insertion. Use the effective issuer (pinned
-        # --public-url when set) so the 401 hint, the PRM document, and the AS
-        # metadata all advertise the same origin behind a proxy.
-        return self._effective_issuer() + _PRM_WELL_KNOWN_PREFIX + self.mcp_path
+        # RFC 9728 Sec. 3.1 path insertion: the well-known label is inserted
+        # between the host and the resource's FULL path (issuer prefix +
+        # mcp_path), so a path-scoped issuer yields e.g.
+        # https://host/.well-known/oauth-protected-resource/team-a/mcp — byte-
+        # symmetric with the client's _build_well_known_url. For a bare-origin
+        # issuer (prefix "") this is identical to the legacy form. The 401 hint,
+        # the PRM document, and the AS metadata thus all stay consistent (#245).
+        origin, prefix = self._issuer_origin_and_prefix()
+        return origin + _PRM_WELL_KNOWN_PREFIX + prefix + self.mcp_path
 
     def _authorized(self) -> bool:
         """True when no auth is configured, or a valid Bearer token is presented.
@@ -904,12 +959,14 @@ class _Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length > 0 else b""
         if self.oauth is not None:
             # AS POST endpoints (DCR + token) bootstrap the token, exempt from
-            # the RS gate. Match by EXACT path. Body already drained above.
+            # the RS gate. Match by EXACT path under the issuer prefix (empty for
+            # a bare-origin issuer). Body already drained above.
             path = self.path.split("?", 1)[0]
-            if path == _REGISTER_PATH:
+            _, prefix = self._issuer_origin_and_prefix()
+            if path == prefix + _REGISTER_PATH:
                 self._handle_register(raw)
                 return
-            if path == _TOKEN_PATH:
+            if path == prefix + _TOKEN_PATH:
                 self._handle_token(raw)
                 return
         if self._wrong_path():
@@ -968,11 +1025,15 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if self.oauth is not None:
             # AS endpoints bootstrap the token, so they are exempt from the RS
-            # gate. Match by EXACT path (never prefix).
-            if path == _AS_METADATA_PATH:
+            # gate. The AS metadata sits at the RFC 8414 Sec. 3.1 root-inserted
+            # location (well-known label + issuer prefix); /authorize lives under
+            # the prefix. Both reduce to the legacy root paths when the prefix is
+            # empty. Match by EXACT path (never a loose prefix).
+            origin, prefix = self._issuer_origin_and_prefix()
+            if path == _AS_METADATA_PATH + prefix:
                 self._serve_as_metadata()
                 return
-            if path == _AUTHORIZE_PATH:
+            if path == prefix + _AUTHORIZE_PATH:
                 self._handle_authorize()
                 return
         if self._wrong_path():
@@ -1155,9 +1216,14 @@ def serve_main(argv: list[str]) -> None:
         default=None,
         metavar="URL",
         help=(
-            "Canonical external origin (e.g. https://gw.example.org) used to pin "
-            "the OAuth issuer and all endpoint URLs. Strongly recommended behind "
-            "a reverse proxy; normalized to a bare origin (path stripped)."
+            "Canonical external issuer URL (e.g. https://gw.example.org) used to "
+            "pin the OAuth issuer and all endpoint URLs. Strongly recommended "
+            "behind a reverse proxy. A PATH is retained as an issuer prefix "
+            "(e.g. https://gw.example.org/team-a), letting several "
+            "--enable-oauth backends share one host under distinct path "
+            "prefixes; the AS endpoints then live under that prefix and the "
+            "well-known docs at the RFC 8414/9728 root-inserted locations. A "
+            "bare-origin URL behaves as before."
         ),
     )
     parser.add_argument(
@@ -1237,7 +1303,7 @@ def serve_main(argv: list[str]) -> None:
             except ValueError as e:
                 parser.error(f"--public-url invalid: {e}")
             if public_url != args.public_url.rstrip("/"):
-                log(f"note: --public-url normalized to origin {public_url}")
+                log(f"note: --public-url normalized to {public_url}")
         else:
             log(
                 "warning: --enable-oauth without --public-url; the issuer is "

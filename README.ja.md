@@ -294,6 +294,19 @@ mcp-stdio --oauth http://127.0.0.1:8080/mcp
 （クライアントは `--oauth` を再実行）。バックエンドコマンドはオプションの後に
 置きます（`--` 区切りも可）。
 
+  - *パススコープ issuer* — `--public-url` がパスを保持するので、1 ホスト配下で
+    複数の `--enable-oauth` バックエンドをパスプレフィックスで多重化できる
+    （例: `--public-url https://gw.example.org/team-a` で
+    `https://gw.example.org/team-a/mcp` を配信）。issuer は
+    `https://gw.example.org/team-a` となり、AS エンドポイントはプレフィックス配下
+    （`/team-a/authorize`・`/token`・`/register`）、well-known ドキュメントは
+    [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) §3.1 /
+    [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) §3.1 の root-inserted
+    位置（`/.well-known/oauth-authorization-server/team-a`、
+    `/.well-known/oauth-protected-resource/team-a/mcp`）に置かれ、クライアントの
+    パス対応ディスカバリとバイト単位で対称。パスなしの `--public-url` は従来通り
+    動作します（#245）。
+
 ## ワークアラウンド
 
 Claude Code・mcp-remote・MCP SDK・Windows の既知の問題については [WORKAROUNDS.md](WORKAROUNDS.md) を参照してください。
