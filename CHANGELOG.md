@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.21.0](https://github.com/shigechika/mcp-stdio/compare/v0.20.0...v0.21.0) (2026-06-29)
+
+
+### Features
+
+* **oauth:** --oauth-eager cold-start (local initialize + background OAuth) ([#256](https://github.com/shigechika/mcp-stdio/issues/256)) ([3b30c8e](https://github.com/shigechika/mcp-stdio/commit/3b30c8efa7859027a8ac7cb0a3082729f64e8f32))
+* **oauth:** --oauth-use-id-token to present the OIDC id_token as Bearer ([#59](https://github.com/shigechika/mcp-stdio/issues/59)) ([#254](https://github.com/shigechika/mcp-stdio/issues/254)) ([863ee66](https://github.com/shigechika/mcp-stdio/commit/863ee6669c7deaa2a4a1a15a12b59faf0222317a))
+
 ## [0.20.0](https://github.com/shigechika/mcp-stdio/compare/v0.19.0...v0.20.0) (2026-06-29)
 
 
