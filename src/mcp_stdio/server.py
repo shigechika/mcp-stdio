@@ -338,10 +338,14 @@ class SessionRegistry:
             # Re-check the cap: a burst of concurrent creates could have filled
             # it while we were spawning. Over the cap -> drop the just-spawned
             # child rather than exceed the bound.
-            if len(self._sessions) >= self._max:
-                backend.shutdown()
-                return None
-            self._sessions[sid] = backend
+            over_cap = len(self._sessions) >= self._max
+            if not over_cap:
+                self._sessions[sid] = backend
+        if over_cap:
+            # shutdown() (terminate -> wait) runs OUTSIDE the lock so it never
+            # serializes other sessions' creation or routing.
+            backend.shutdown()
+            return None
         return sid, backend
 
     def get(self, sid: str | None) -> BackendProcess | None:
@@ -1223,6 +1227,26 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _resolve_session(self, req_id: Any = None) -> BackendProcess | None:
+        """Resolve the request's session, or emit the spec error and return None.
+
+        A missing ``Mcp-Session-Id`` -> 400 (MCP spec item 2); an unknown or
+        terminated id -> 404 (item 3, which drives the client's re-initialize).
+        On success records the id for the response header and returns the
+        backend. Shared by the POST (non-initialize) and GET paths so both
+        report the same status for the same condition.
+        """
+        sid = self.headers.get("Mcp-Session-Id")
+        if not sid:
+            self._send_json(400, _error_body("Mcp-Session-Id required", req_id))
+            return None
+        backend = self.registry.get(sid)
+        if backend is None:
+            self._send_json(404, _error_body("unknown or expired session", req_id))
+            return None
+        self._session_id = sid
+        return backend
+
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         # Reset the per-request session id (the handler instance is reused
         # across keep-alive requests); responses before resolution omit it.
@@ -1283,13 +1307,14 @@ class _Handler(BaseHTTPRequestHandler):
                 return
 
         # --- session resolution (MCP Streamable HTTP session management) ---
-        sid_header = self.headers.get("Mcp-Session-Id")
-        if kind == "request" and msg.get("method") == "initialize":
+        is_init = kind == "request" and msg.get("method") == "initialize"
+        if is_init:
             # `initialize` starts a session (MCP spec item 1): spawn a fresh
             # child and mint an id, returned via the Mcp-Session-Id response
             # header. A presented (stale) id is dropped first.
-            if sid_header:
-                stale = self.registry.remove(sid_header)
+            stale_id = self.headers.get("Mcp-Session-Id")
+            if stale_id:
+                stale = self.registry.remove(stale_id)
                 if stale is not None:
                     stale.shutdown()
             created = self.registry.create()
@@ -1298,29 +1323,31 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._session_id, backend = created
         else:
-            # MCP spec item 2: a server that requires a session SHOULD reject a
-            # sessionless non-initialize request with 400.
-            if not sid_header:
-                self._send_json(400, _error_body("Mcp-Session-Id required", req_id))
-                return
-            backend = self.registry.get(sid_header)
+            # MCP spec items 2/3: sessionless -> 400, unknown/terminated -> 404.
+            backend = self._resolve_session(req_id)
             if backend is None:
-                # MCP spec item 3: an unknown/terminated session id gets 404,
-                # which drives the client's re-initialize (spec item 4).
-                self._send_json(
-                    404, _error_body("unknown or expired session", req_id)
-                )
                 return
-            self._session_id = sid_header
 
         if kind == "request":
             if backend.closed:
+                # Dead child: drop the session so the slot is reclaimed and the
+                # client's next request re-initializes (404) instead of looping
+                # on 503. shutdown() reaps the already-exited child.
+                stale = self.registry.remove(self._session_id)
+                if stale is not None:
+                    stale.shutdown()
                 self._send_json(503, _error_body("backend unavailable", req_id))
                 return
             line = backend.send_request(
                 json.dumps(msg), req_id, _BACKEND_RESPONSE_TIMEOUT_SECS
             )
             if line is None:
+                if is_init:
+                    # The freshly-spawned child never answered initialize, so it
+                    # never became a usable session — don't leak its slot/child.
+                    stale = self.registry.remove(self._session_id)
+                    if stale is not None:
+                        stale.shutdown()
                 self._send_json(
                     504, _error_body("no response from backend", req_id)
                 )
@@ -1362,14 +1389,11 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._require_auth():
             return
         # The SSE stream carries a session's server-initiated messages, so it
-        # must name an existing session. Unknown/absent id -> 404 (drives the
-        # client's re-initialize), mirroring the POST path.
-        sid_header = self.headers.get("Mcp-Session-Id")
-        backend = self.registry.get(sid_header)
+        # must name an existing session: sessionless -> 400, unknown/terminated
+        # -> 404 (drives the client's re-initialize), as on the POST path.
+        backend = self._resolve_session()
         if backend is None:
-            self._send_json(404, _error_body("unknown or expired session"))
             return
-        self._session_id = sid_header
         # Open an SSE stream carrying server-initiated messages (notifications
         # and server->client requests) until the client disconnects or the
         # backend dies. The stream has no Content-Length and is not chunked, so
@@ -1380,7 +1404,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "keep-alive")
-        self.send_header("Mcp-Session-Id", sid_header)
+        self.send_header("Mcp-Session-Id", self._session_id)
         self.end_headers()
         q = backend.server_initiated
         try:

@@ -212,6 +212,13 @@ def test_get_sse_unknown_session_returns_404(gateway):
     assert resp.status_code == 404
 
 
+def test_get_sse_without_session_returns_400(gateway):
+    # MCP spec item 2: a sessionless GET (like a sessionless POST) -> 400.
+    url, _ = gateway
+    resp = httpx.get(url, timeout=10)
+    assert resp.status_code == 400
+
+
 def test_delete_reaps_session(gateway):
     url, registry = gateway
     sid, _ = _init(url)
@@ -249,6 +256,11 @@ def test_backend_death_then_request_fails(gateway):
     resp = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo"}, sid)
     assert resp.status_code == 503
     assert resp.json()["id"] == 1
+    # The dead session is reaped, so the slot is reclaimed and the next request
+    # on that id gets 404 (the client then re-initializes) rather than 503.
+    assert registry.count == 0
+    again = _post(url, {"jsonrpc": "2.0", "id": 2, "method": "echo"}, sid)
+    assert again.status_code == 404
 
 
 def test_registry_cap_rejects_beyond_max():
