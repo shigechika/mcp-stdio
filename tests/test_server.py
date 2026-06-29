@@ -698,14 +698,155 @@ def test_public_url_pins_issuer():
         assert prm["authorization_servers"] == ["https://gw.example.org"]
 
 
+# -- path-scoped issuer (#245): multiple --enable-oauth backends behind one host --
+
+_PREFIXED = "https://gw.example.org/team-a"
+
+
+def test_path_scoped_as_metadata_root_inserted():
+    """A path-scoped issuer serves AS metadata at the RFC 8414 Sec. 3.1
+    root-inserted location, advertising prefixed endpoints; the bare-origin
+    location 404s so two backends never collide there."""
+    with _run(oauth=_provider(public_url=_PREFIXED)) as (base, _):
+        # Root-inserted well-known: /.well-known/oauth-authorization-server/team-a
+        md = httpx.get(
+            base + "/.well-known/oauth-authorization-server/team-a", timeout=10
+        ).json()
+        assert md["issuer"] == _PREFIXED
+        assert md["authorization_endpoint"] == _PREFIXED + "/authorize"
+        assert md["token_endpoint"] == _PREFIXED + "/token"
+        assert md["registration_endpoint"] == _PREFIXED + "/register"
+        # The bare-origin AS metadata path must NOT serve this backend.
+        assert httpx.get(
+            base + "/.well-known/oauth-authorization-server", timeout=10
+        ).status_code == 404
+
+
+def test_path_scoped_prm_root_inserted():
+    """PRM is root-inserted with the full resource path (prefix + mcp_path),
+    byte-symmetric with the client's _build_well_known_url."""
+    with _run(oauth=_provider(public_url=_PREFIXED)) as (base, _):
+        prm = httpx.get(
+            base + "/.well-known/oauth-protected-resource/team-a/mcp", timeout=10
+        ).json()
+        assert prm["resource"] == _PREFIXED + "/mcp"
+        assert prm["authorization_servers"] == [_PREFIXED]
+
+
+def test_path_scoped_bare_as_endpoints_404():
+    """With a prefix pinned, the bare-origin AS endpoints 404 (isolation)."""
+    with _run(oauth=_provider(public_url=_PREFIXED)) as (base, _):
+        assert httpx.get(base + "/authorize", timeout=10).status_code == 404
+        assert httpx.post(base + "/register", content="{}", timeout=10).status_code == 404
+        assert httpx.post(base + "/token", content="x=1", timeout=10).status_code == 404
+        # The MCP endpoint also lives under the prefix now.
+        assert httpx.post(base + "/mcp", content="{}", timeout=10).status_code == 404
+
+
+def test_path_scoped_full_flow():
+    """End-to-end under a path prefix: DCR -> PKCE authorize -> token -> MCP."""
+    prefix = "/team-a"
+    with _run(oauth=_provider(public_url=_PREFIXED)) as (base, _):
+        # DCR under the prefix.
+        cid = httpx.post(
+            base + prefix + "/register",
+            json={
+                "client_name": "test",
+                "redirect_uris": [_REDIRECT],
+                "response_types": ["code"],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "token_endpoint_auth_method": "none",
+            },
+            timeout=10,
+        ).json()["client_id"]
+        verifier, challenge = client_oauth.generate_pkce()
+        az = httpx.get(
+            base + prefix + "/authorize",
+            params={
+                "client_id": cid,
+                "response_type": "code",
+                "redirect_uri": _REDIRECT,
+                "state": "st-1",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "resource": _PREFIXED + "/mcp",
+            },
+            follow_redirects=False,
+            timeout=10,
+        )
+        assert az.status_code == 302, az.text
+        code = _redirect_params(az)["code"]
+        tok = httpx.post(
+            base + prefix + "/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": _REDIRECT,
+                "client_id": cid,
+                "code_verifier": verifier,
+            },
+            timeout=10,
+        ).json()
+        access = tok["access_token"]
+        # The issued token authorizes a real MCP call at the prefixed path.
+        r = httpx.post(
+            base + prefix + "/mcp",
+            content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "echo"}),
+            headers={"Authorization": f"Bearer {access}"},
+            timeout=10,
+        )
+        assert r.status_code == 200
+        # An unauthenticated prefixed MCP call is challenged with the
+        # root-inserted PRM hint.
+        chal = httpx.post(
+            base + prefix + "/mcp",
+            content=json.dumps({"jsonrpc": "2.0", "id": 2, "method": "echo"}),
+            timeout=10,
+        )
+        assert chal.status_code == 401
+        assert "/.well-known/oauth-protected-resource/team-a/mcp" in chal.headers[
+            "WWW-Authenticate"
+        ]
+
+
+def test_two_path_scoped_backends_do_not_collide():
+    """Two prefixes route to disjoint AS-metadata / endpoint paths."""
+    a = "https://gw.example.org/team-a"
+    b = "https://gw.example.org/team-b"
+    with _run(oauth=_provider(public_url=a)) as (base_a, _):
+        with _run(oauth=_provider(public_url=b)) as (base_b, _):
+            # Each backend answers only at its own root-inserted metadata path.
+            assert httpx.get(
+                base_a + "/.well-known/oauth-authorization-server/team-a", timeout=10
+            ).json()["issuer"] == a
+            assert httpx.get(
+                base_a + "/.well-known/oauth-authorization-server/team-b", timeout=10
+            ).status_code == 404
+            assert httpx.get(
+                base_b + "/.well-known/oauth-authorization-server/team-b", timeout=10
+            ).json()["issuer"] == b
+            assert httpx.get(
+                base_b + "/.well-known/oauth-authorization-server/team-a", timeout=10
+            ).status_code == 404
+
+
 def test_normalize_public_url():
-    assert server._normalize_public_url("https://gw.example.org/mcp") == "https://gw.example.org"
+    # A bare origin is unchanged (legacy behavior).
+    assert server._normalize_public_url("https://gw.example.org") == "https://gw.example.org"
     assert server._normalize_public_url("http://127.0.0.1:8080") == "http://127.0.0.1:8080"
-    # canonicalization: lowercase host, drop explicit default port
-    assert server._normalize_public_url("https://EXAMPLE.com:443/x") == "https://example.com"
+    # A path is RETAINED as the issuer prefix (#245), trailing slash stripped.
+    assert server._normalize_public_url("https://gw.example.org/team-a") == "https://gw.example.org/team-a"
+    assert server._normalize_public_url("https://gw.example.org/team-a/") == "https://gw.example.org/team-a"
+    assert server._normalize_public_url("https://gw.example.org/a/b") == "https://gw.example.org/a/b"
+    # A bare host with only a trailing slash collapses to the bare origin.
+    assert server._normalize_public_url("https://gw.example.org/") == "https://gw.example.org"
+    # canonicalization: lowercase host, drop explicit default port, keep path
+    assert server._normalize_public_url("https://EXAMPLE.com:443/x") == "https://example.com/x"
     assert server._normalize_public_url("http://LOCALHOST:80") == "http://localhost"
     for bad in ("ftp://h", "https://", 'https://h"x', "https://user@h",
-                "http://gw.example.org"):  # non-loopback http is rejected
+                "http://gw.example.org",  # non-loopback http is rejected
+                "https://gw.example.org/a?q=1",  # query forbidden in an issuer
+                "https://gw.example.org/a#f"):  # fragment forbidden in an issuer
         with pytest.raises(ValueError):
             server._normalize_public_url(bad)
 

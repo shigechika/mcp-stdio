@@ -296,6 +296,19 @@ recommended behind a proxy), `--trusted-user-header HEADER`, `--dev-user USER`
 restart invalidates issued tokens (the client re-runs `--oauth`). The backend
 command follows the options (an optional `--` separator is supported).
 
+  - *Path-scoped issuer* — `--public-url` retains a path, so several
+    `--enable-oauth` backends can share one host behind a reverse proxy, each
+    under its own prefix (e.g. `--public-url https://gw.example.org/team-a`
+    serving `https://gw.example.org/team-a/mcp`). The issuer becomes
+    `https://gw.example.org/team-a`, its AS endpoints live under the prefix
+    (`/team-a/authorize`, `/token`, `/register`), and the well-known documents
+    sit at the [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) §3.1 /
+    [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) §3.1 root-inserted
+    locations (`/.well-known/oauth-authorization-server/team-a`,
+    `/.well-known/oauth-protected-resource/team-a/mcp`) — byte-symmetric with
+    the client's path-aware discovery. A bare-origin `--public-url` behaves
+    exactly as before (#245).
+
 ## Workarounds
 
 See [WORKAROUNDS.md](WORKAROUNDS.md) for known issues in Claude Code, mcp-remote, the MCP SDKs, and Windows that mcp-stdio addresses.
