@@ -485,8 +485,12 @@ class _OAuthProvider:
         if not isinstance(body, dict):
             return bad("body must be a JSON object")
         uris = body.get("redirect_uris")
+        # RFC 7591 Sec. 3.2.2: a missing / empty / non-array redirect_uris is a
+        # STRUCTURAL metadata error (invalid_client_metadata). invalid_redirect_uri
+        # is reserved for the case where a present VALUE is invalid (the loopback
+        # check below).
         if not isinstance(uris, list) or not uris:
-            return bad_redirect("redirect_uris must be a non-empty array")
+            return bad("redirect_uris must be a non-empty array")
         keys = set()
         for u in uris:
             if not isinstance(u, str) or _redirect_key(u) is None:

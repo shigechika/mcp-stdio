@@ -505,6 +505,18 @@ def test_register_rejects_non_loopback(oauth_gateway):
     assert r.json()["error"] == "invalid_redirect_uri"
 
 
+def test_register_missing_redirect_uris_is_client_metadata_error(oauth_gateway):
+    """RFC 7591 Sec. 3.2.2: a missing/empty redirect_uris is a STRUCTURAL
+    metadata error (invalid_client_metadata), not invalid_redirect_uri."""
+    base, _ = oauth_gateway
+    r = httpx.post(base + "/register", json={"client_name": "x"}, timeout=10)
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_client_metadata"
+    r2 = httpx.post(base + "/register", json={"redirect_uris": []}, timeout=10)
+    assert r2.status_code == 400
+    assert r2.json()["error"] == "invalid_client_metadata"
+
+
 def test_register_rejects_non_json(oauth_gateway):
     base, _ = oauth_gateway
     r = httpx.post(base + "/register", content="not json", timeout=10)
