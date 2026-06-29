@@ -380,6 +380,20 @@ def _normalize_public_url(url: str) -> str:
     # "https://host/a/" and "https://host/a" canonicalize identically and a bare
     # "https://host/" collapses to the bare origin (unchanged legacy behavior).
     path = p.path.rstrip("/")
+    if path:
+        # The prefix is concatenated verbatim into the endpoint URLs and the
+        # well-known locations, so it MUST be a canonical, traversal-free
+        # absolute path: an empty ("//"), "." or ".." segment would be
+        # re-normalized differently by a proxy or the client and break the
+        # byte-identical-issuer contract (and could escape the intended
+        # namespace). Reject rather than silently rewrite. The leading segment
+        # is always "" because an authority-form URL path is "/"-rooted.
+        segments = path.split("/")
+        if segments[0] != "" or any(seg in ("", ".", "..") for seg in segments[1:]):
+            raise ValueError(
+                "public-url path must be a canonical absolute path "
+                "(no empty, '.', or '..' segments)"
+            )
     return f"{p.scheme}://{netloc}{path}"
 
 

@@ -846,7 +846,11 @@ def test_normalize_public_url():
     for bad in ("ftp://h", "https://", 'https://h"x', "https://user@h",
                 "http://gw.example.org",  # non-loopback http is rejected
                 "https://gw.example.org/a?q=1",  # query forbidden in an issuer
-                "https://gw.example.org/a#f"):  # fragment forbidden in an issuer
+                "https://gw.example.org/a#f",  # fragment forbidden in an issuer
+                "https://gw.example.org/../admin",  # traversal segment rejected
+                "https://gw.example.org/a/../b",  # interior traversal rejected
+                "https://gw.example.org/a//b",  # empty segment rejected
+                "https://gw.example.org/a/./b"):  # "." segment rejected
         with pytest.raises(ValueError):
             server._normalize_public_url(bad)
 
