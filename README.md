@@ -267,7 +267,10 @@ mcp-stdio --check http://127.0.0.1:8080/mcp
     Resource Metadata at `/.well-known/oauth-protected-resource`.
   - *Embedded OAuth AS* (`--enable-oauth`) — a minimal OAuth 2.1 Authorization
     Server (PKCE auth-code, [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591)
-    dynamic client registration, refresh, opaque in-memory tokens, stdlib only).
+    dynamic client registration with the `invalid_redirect_uri` error per §3.2.2,
+    refresh, opaque in-memory tokens, stdlib only). An https issuer echoes the
+    [RFC 9207](https://www.rfc-editor.org/rfc/rfc9207) `iss` parameter on the
+    authorization response (mix-up defence) and advertises it in metadata.
     The mcp-stdio client's `--oauth` flow then works against the gateway.
 - Single-client assumption for now: JSON-RPC ids pass through verbatim.
 

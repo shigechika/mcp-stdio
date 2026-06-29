@@ -265,8 +265,11 @@ mcp-stdio --check http://127.0.0.1:8080/mcp
     Metadata（`/.well-known/oauth-protected-resource`）を広告。
   - *埋め込み OAuth AS*（`--enable-oauth`）— 最小 OAuth 2.1 認可サーバ
     （PKCE 認可コード・[RFC 7591](https://www.rfc-editor.org/rfc/rfc7591) 動的
-    クライアント登録・refresh・不透明インメモリトークン・stdlib のみ）。
-    mcp-stdio クライアントの `--oauth` がこのゲートウェイ相手に通ります。
+    クライアント登録〔§3.2.2 の `invalid_redirect_uri` エラー対応〕・refresh・
+    不透明インメモリトークン・stdlib のみ）。https issuer のときは認可レスポンスに
+    [RFC 9207](https://www.rfc-editor.org/rfc/rfc9207) `iss` パラメータを付与
+    （mix-up 対策）し metadata でも広告。mcp-stdio クライアントの `--oauth` が
+    このゲートウェイ相手に通ります。
 - 当面はシングルクライアント前提（JSON-RPC の id はそのまま透過）。
 
 静的トークンの例（トークンは env 経由で `ps` に出さない）:

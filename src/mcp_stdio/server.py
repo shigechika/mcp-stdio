@@ -449,7 +449,7 @@ class _OAuthProvider:
     # -- metadata --------------------------------------------------------
 
     def metadata(self, issuer: str) -> dict[str, Any]:
-        return {
+        md: dict[str, Any] = {
             "issuer": issuer,
             "authorization_endpoint": issuer + _AUTHORIZE_PATH,
             "token_endpoint": issuer + _TOKEN_PATH,
@@ -459,12 +459,24 @@ class _OAuthProvider:
             "code_challenge_methods_supported": ["S256"],
             "token_endpoint_auth_methods_supported": ["none"],
         }
+        # RFC 9207 Sec. 2.3: advertise iss support only when we actually emit it
+        # — i.e. for an https issuer, since Sec. 2 requires the iss value to be an
+        # https URL. A loopback http dev issuer neither advertises the flag nor
+        # sends iss (see authorize()), keeping the two consistent.
+        if issuer.startswith("https://"):
+            md["authorization_response_iss_parameter_supported"] = True
+        return md
 
     # -- dynamic client registration (RFC 7591) --------------------------
 
     def register(self, raw: bytes) -> tuple[int, dict[str, Any]]:
         def bad(desc: str) -> tuple[int, dict[str, Any]]:
             return 400, {"error": "invalid_client_metadata", "error_description": desc}
+
+        def bad_redirect(desc: str) -> tuple[int, dict[str, Any]]:
+            # RFC 7591 Sec. 3.2.2 defines a dedicated error code for an invalid
+            # redirection URI value; prefer it over the generic metadata error.
+            return 400, {"error": "invalid_redirect_uri", "error_description": desc}
 
         try:
             body = json.loads(raw.decode("utf-8"))
@@ -473,12 +485,16 @@ class _OAuthProvider:
         if not isinstance(body, dict):
             return bad("body must be a JSON object")
         uris = body.get("redirect_uris")
+        # RFC 7591 Sec. 3.2.2: a missing / empty / non-array redirect_uris is a
+        # STRUCTURAL metadata error (invalid_client_metadata). invalid_redirect_uri
+        # is reserved for the case where a present VALUE is invalid (the loopback
+        # check below).
         if not isinstance(uris, list) or not uris:
             return bad("redirect_uris must be a non-empty array")
         keys = set()
         for u in uris:
             if not isinstance(u, str) or _redirect_key(u) is None:
-                return bad("redirect_uris must be loopback http URLs")
+                return bad_redirect("redirect_uris must be loopback http URLs")
             keys.add(_redirect_key(u))
         client_id = secrets.token_urlsafe(32)
         now = self._now()
@@ -502,13 +518,18 @@ class _OAuthProvider:
 
     # -- authorization endpoint (RFC 6749 4.1 + RFC 7636) ----------------
 
-    def authorize(self, params: dict[str, str], user: str | None) -> dict[str, str]:
+    def authorize(
+        self, params: dict[str, str], user: str | None, issuer: str
+    ) -> dict[str, str]:
         """Return an instruction dict for the handler.
 
         ``{"kind": "bad_request", "message": ...}`` -> direct 400 (NO redirect,
         per RFC 6749 4.1.2.1 for client_id/redirect_uri errors).
         ``{"kind": "redirect", "location": ...}`` -> 302 (success, or an in-band
         error whose Location carries error= + the echoed state).
+
+        ``issuer`` is the effective AS issuer; an https issuer is echoed back as
+        the RFC 9207 ``iss`` parameter on every redirect (mix-up defence).
         """
         cid = params.get("client_id", "")
         redirect_uri = params.get("redirect_uri", "")
@@ -525,6 +546,14 @@ class _OAuthProvider:
         def redirect(query: dict[str, str]) -> dict[str, str]:
             if state:
                 query = {**query, "state": state}
+            # RFC 9207 Sec. 2: include the issuer identifier in BOTH success and
+            # error authorization responses so a client talking to multiple ASes
+            # can detect a mix-up attack. Sec. 2 requires an https value, so a
+            # loopback http dev issuer is left without iss (and metadata() omits
+            # the support flag to match). Placed after state so a hostile state
+            # cannot shadow it (urlencode emits both verbatim regardless).
+            if issuer.startswith("https://"):
+                query = {**query, "iss": issuer}
             return {"kind": "redirect", "location": redirect_uri + "?" + urlencode(query)}
 
         if params.get("response_type") != "code":
@@ -905,7 +934,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _handle_register(self, raw: bytes) -> None:
         status, body = self.oauth.register(raw)
-        self._send_oauth_json(status, json.dumps(body))
+        # RFC 7591 Sec. 3.2.1's response example carries Cache-Control: no-store;
+        # send it for symmetry with the token endpoint (and in case a future
+        # registration response ever carries a credential).
+        self._send_oauth_json(status, json.dumps(body), no_store=True)
 
     def _handle_token(self, raw: bytes) -> None:
         try:
@@ -924,7 +956,7 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = parse_qs(query, keep_blank_values=True)
         params = {k: v[0] for k, v in parsed.items()}
         user = self._resolve_user()
-        result = self.oauth.authorize(params, user)
+        result = self.oauth.authorize(params, user, self._effective_issuer())
         if result["kind"] == "bad_request":
             self._send_oauth_json(
                 400,
