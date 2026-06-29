@@ -289,9 +289,22 @@ class BackendProcess:
 
 # Hard cap on concurrent sessions: a fork-bomb guard for an open (no-auth)
 # gateway, since each session spawns a child process. High enough that a single
-# logical client never trips it; a configurable knob and idle eviction land in
-# a follow-up change.
+# logical client never trips it; override with ``--max-sessions``.
 _DEFAULT_MAX_SESSIONS = 100
+
+# Longest a reaper tick waits between idle sweeps. A small TTL is swept more
+# often; a large one no less than once a minute.
+_MAX_REAP_INTERVAL_SECS = 60.0
+
+
+class _Session:
+    """A live MCP session: its backend child plus last-activity timestamp."""
+
+    __slots__ = ("backend", "last_active")
+
+    def __init__(self, backend: BackendProcess, last_active: float) -> None:
+        self.backend = backend
+        self.last_active = last_active
 
 
 class SessionRegistry:
@@ -307,17 +320,32 @@ class SessionRegistry:
     The slow operations — spawning a child (``Popen`` exec) and tearing one
     down (``terminate()`` then ``wait``) — run OUTSIDE the lock; only the dict
     mutation is guarded, so one session's lifecycle never serializes another's.
+
+    When ``idle_ttl`` is set (``> 0``), a background reaper (started by
+    :meth:`start_reaper`) sweeps sessions whose last activity is older than the
+    TTL — and any whose child has already exited — so a client that disconnects
+    without DELETE does not pin a slot forever. ``now`` is injectable so tests
+    can drive eviction on a fake clock.
     """
 
     def __init__(
-        self, command: list[str], *, max_sessions: int = _DEFAULT_MAX_SESSIONS
+        self,
+        command: list[str],
+        *,
+        max_sessions: int = _DEFAULT_MAX_SESSIONS,
+        idle_ttl: float = 0.0,
+        now: Any = time.monotonic,
     ) -> None:
         if not command:
             raise ValueError("backend command is empty")
         self._command = command
         self._max = max_sessions
+        self._idle_ttl = idle_ttl
+        self._now = now
         self._lock = threading.Lock()
-        self._sessions: dict[str, BackendProcess] = {}
+        self._sessions: dict[str, _Session] = {}
+        self._reaper: threading.Thread | None = None
+        self._reaper_stop = threading.Event()
 
     def create(self) -> tuple[str, BackendProcess] | None:
         """Spawn a child for a new session.
@@ -340,7 +368,7 @@ class SessionRegistry:
             # child rather than exceed the bound.
             over_cap = len(self._sessions) >= self._max
             if not over_cap:
-                self._sessions[sid] = backend
+                self._sessions[sid] = _Session(backend, self._now())
         if over_cap:
             # shutdown() (terminate -> wait) runs OUTSIDE the lock so it never
             # serializes other sessions' creation or routing.
@@ -349,11 +377,28 @@ class SessionRegistry:
         return sid, backend
 
     def get(self, sid: str | None) -> BackendProcess | None:
-        """Resolve a session id to its backend, or None if unknown."""
+        """Resolve a session id to its backend, or None if unknown.
+
+        Touches the session's last-activity timestamp so an actively used
+        session is never idle-reaped.
+        """
         if not sid:
             return None
         with self._lock:
-            return self._sessions.get(sid)
+            sess = self._sessions.get(sid)
+            if sess is None:
+                return None
+            sess.last_active = self._now()
+            return sess.backend
+
+    def touch(self, sid: str | None) -> None:
+        """Mark a session active without resolving it (e.g. on SSE traffic)."""
+        if not sid:
+            return
+        with self._lock:
+            sess = self._sessions.get(sid)
+            if sess is not None:
+                sess.last_active = self._now()
 
     def remove(self, sid: str | None) -> BackendProcess | None:
         """Detach a session and return its backend (or None if unknown).
@@ -364,15 +409,58 @@ class SessionRegistry:
         if not sid:
             return None
         with self._lock:
-            return self._sessions.pop(sid, None)
+            sess = self._sessions.pop(sid, None)
+        return sess.backend if sess is not None else None
+
+    def reap_idle(self) -> int:
+        """Drop sessions idle past the TTL — or whose child has exited — and
+        shut their backends down outside the lock. Returns the count reaped."""
+        ttl = self._idle_ttl
+        now = self._now()
+        victims: list[tuple[str, BackendProcess]] = []
+        with self._lock:
+            for sid, sess in list(self._sessions.items()):
+                if sess.backend.closed or (ttl > 0 and now - sess.last_active > ttl):
+                    del self._sessions[sid]
+                    victims.append((sid, sess.backend))
+        for sid, backend in victims:
+            backend.shutdown()
+            log(f"reaped idle session {sid[:8]}...")
+        return len(victims)
 
     def shutdown_all(self) -> None:
         """Tear down every session's child (gateway shutdown)."""
+        self.stop_reaper()
         with self._lock:
-            backends = list(self._sessions.values())
+            backends = [s.backend for s in self._sessions.values()]
             self._sessions.clear()
         for backend in backends:
             backend.shutdown()
+
+    def start_reaper(self) -> None:
+        """Start the background idle-eviction thread (no-op if TTL disabled)."""
+        if self._idle_ttl <= 0 or self._reaper is not None:
+            return
+        interval = max(1.0, min(self._idle_ttl, _MAX_REAP_INTERVAL_SECS))
+
+        def _loop() -> None:
+            while not self._reaper_stop.wait(interval):
+                try:
+                    self.reap_idle()
+                except Exception as e:  # pragma: no cover - defensive
+                    log(f"session reaper error: {e}")
+
+        self._reaper = threading.Thread(
+            target=_loop, name="session-reaper", daemon=True
+        )
+        self._reaper.start()
+
+    def stop_reaper(self) -> None:
+        self._reaper_stop.set()
+        reaper = self._reaper
+        if reaper is not None:
+            reaper.join(timeout=2)
+            self._reaper = None
 
     @property
     def count(self) -> int:
@@ -1409,6 +1497,9 @@ class _Handler(BaseHTTPRequestHandler):
         q = backend.server_initiated
         try:
             while not backend.closed:
+                # An open SSE stream is activity: keep the session warm so the
+                # idle reaper does not evict a connected-but-quiet client.
+                self.registry.touch(self._session_id)
                 try:
                     line = q.get(timeout=_SSE_KEEPALIVE_SECS)
                 except queue.Empty:
@@ -1455,6 +1546,7 @@ def build_server(
     auth_token: str | None = None,
     oauth: _OAuthProvider | None = None,
     max_sessions: int = _DEFAULT_MAX_SESSIONS,
+    idle_ttl: float = 0.0,
 ) -> tuple[ThreadingHTTPServer, SessionRegistry]:
     """Construct the HTTP server and session registry without running the loop.
 
@@ -1466,9 +1558,13 @@ def build_server(
     ``auth_token`` (when not None) enables the static-bearer-token Resource
     Server gate. ``oauth`` (when not None) enables the embedded OAuth
     Authorization Server: /authorize /token /register + AS metadata, and
-    the RS gate then also accepts issued access tokens.
+    the RS gate then also accepts issued access tokens. ``idle_ttl`` (when
+    ``> 0``) arms idle session eviction; the caller starts the reaper with
+    ``registry.start_reaper()``.
     """
-    registry = SessionRegistry(command, max_sessions=max_sessions)
+    registry = SessionRegistry(
+        command, max_sessions=max_sessions, idle_ttl=idle_ttl
+    )
     handler = type(
         "_BoundHandler",
         (_Handler,),
@@ -1493,13 +1589,16 @@ def serve(
     mcp_path: str = "/mcp",
     auth_token: str | None = None,
     oauth: _OAuthProvider | None = None,
+    max_sessions: int = _DEFAULT_MAX_SESSIONS,
+    idle_ttl: float = 0.0,
 ) -> None:
     """Run the reverse gateway until interrupted.
 
     Spawns ``command`` as the backend stdio MCP server and serves it at
     ``http://host:port{mcp_path}``. Blocks until SIGINT/SIGTERM, then tears
     the backend down. ``auth_token`` enables the static-token gate;
-    ``oauth`` enables the embedded Authorization Server.
+    ``oauth`` enables the embedded Authorization Server. ``max_sessions`` caps
+    concurrent sessions; ``idle_ttl`` (when ``> 0``) evicts idle sessions.
     """
     httpd, registry = build_server(
         command,
@@ -1508,7 +1607,10 @@ def serve(
         mcp_path=mcp_path,
         auth_token=auth_token,
         oauth=oauth,
+        max_sessions=max_sessions,
+        idle_ttl=idle_ttl,
     )
+    registry.start_reaper()
 
     stopping = threading.Event()
 
@@ -1529,9 +1631,11 @@ def serve(
     if oauth is not None:
         modes.append("embedded OAuth AS")
     auth_state = " + ".join(modes) if modes else "no auth"
+    ttl_state = f"idle-ttl {idle_ttl:g}s" if idle_ttl > 0 else "no idle eviction"
     log(
         f"serving {' '.join(command)} at "
-        f"http://{host}:{port}{mcp_path} ({auth_state})"
+        f"http://{host}:{port}{mcp_path} ({auth_state}; "
+        f"max {max_sessions} sessions, {ttl_state})"
     )
     try:
         httpd.serve_forever()
@@ -1621,6 +1725,28 @@ def serve_main(argv: list[str]) -> None:
         help="Issued access-token lifetime in seconds (default: 3600).",
     )
     parser.add_argument(
+        "--max-sessions",
+        type=int,
+        default=_DEFAULT_MAX_SESSIONS,
+        metavar="N",
+        help=(
+            "Maximum concurrent MCP sessions, each backed by its own child "
+            f"process (default: {_DEFAULT_MAX_SESSIONS}). An initialize past "
+            "the cap gets 503 — a fork-bomb guard for an open gateway."
+        ),
+    )
+    parser.add_argument(
+        "--session-idle-ttl",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help=(
+            "Evict a session (and its child) after this many seconds with no "
+            "activity, so a client that disconnects without DELETE does not "
+            "pin a slot. 0 (default) disables idle eviction."
+        ),
+    )
+    parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
         help="backend stdio MCP server command (after the options)",
@@ -1662,6 +1788,10 @@ def serve_main(argv: list[str]) -> None:
         parser.error("--trusted-user-header must be a valid header name")
     if args.access_token_ttl <= 0:
         parser.error("--access-token-ttl must be > 0")
+    if args.max_sessions < 1:
+        parser.error("--max-sessions must be >= 1")
+    if args.session_idle_ttl < 0:
+        parser.error("--session-idle-ttl must be >= 0")
     if args.enable_oauth:
         public_url = None
         if args.public_url is not None:
@@ -1697,4 +1827,6 @@ def serve_main(argv: list[str]) -> None:
         mcp_path=args.path,
         auth_token=auth_token,
         oauth=oauth,
+        max_sessions=args.max_sessions,
+        idle_ttl=args.session_idle_ttl,
     )

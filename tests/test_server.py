@@ -296,6 +296,85 @@ def test_session_cap_returns_503():
         httpd.server_close()
 
 
+def test_reap_idle_evicts_after_ttl():
+    # Unit-level with an injected clock: a session idle past the TTL is evicted
+    # and its child shut down.
+    clock = [1000.0]
+    reg = server.SessionRegistry(_BACKEND, idle_ttl=30, now=lambda: clock[0])
+    try:
+        _, backend = reg.create()
+        assert reg.count == 1
+        clock[0] += 20  # within TTL
+        assert reg.reap_idle() == 0
+        assert reg.count == 1
+        clock[0] += 20  # 40s since last activity > 30s TTL
+        assert reg.reap_idle() == 1
+        assert reg.count == 0
+        assert backend.closed
+    finally:
+        reg.shutdown_all()
+
+
+def test_active_session_survives_reap():
+    # get() touches last_active, so an actively-used session is never reaped.
+    clock = [1000.0]
+    reg = server.SessionRegistry(_BACKEND, idle_ttl=30, now=lambda: clock[0])
+    try:
+        sid, _ = reg.create()
+        clock[0] += 25
+        assert reg.get(sid) is not None  # touch -> last_active = 1025
+        clock[0] += 10  # only 10s since the touch
+        assert reg.reap_idle() == 0
+        assert reg.count == 1
+    finally:
+        reg.shutdown_all()
+
+
+def test_reap_idle_drops_dead_child_even_without_ttl():
+    # A child that has exited is reaped regardless of TTL (slot reclaimed).
+    reg = server.SessionRegistry(_BACKEND, idle_ttl=0)
+    try:
+        _, backend = reg.create()
+        backend.shutdown()  # simulate the child dying
+        assert backend.closed
+        assert reg.reap_idle() == 1
+        assert reg.count == 0
+    finally:
+        reg.shutdown_all()
+
+
+def test_start_reaper_noop_when_ttl_disabled():
+    reg = server.SessionRegistry(_BACKEND, idle_ttl=0)
+    reg.start_reaper()
+    assert reg._reaper is None  # no thread when eviction is disabled
+    reg.stop_reaper()  # safe no-op
+
+
+def test_reaper_thread_evicts_idle_session():
+    # The background reaper thread evicts an idle session on its own.
+    reg = server.SessionRegistry(_BACKEND, idle_ttl=0.5)
+    reg.start_reaper()
+    try:
+        reg.create()
+        assert reg.count == 1
+        deadline = time.time() + 5
+        while reg.count > 0 and time.time() < deadline:
+            time.sleep(0.05)
+        assert reg.count == 0
+    finally:
+        reg.shutdown_all()
+
+
+def test_serve_main_rejects_zero_max_sessions():
+    with pytest.raises(SystemExit):
+        server.serve_main(["--max-sessions", "0", "--", "true"])
+
+
+def test_serve_main_rejects_negative_idle_ttl():
+    with pytest.raises(SystemExit):
+        server.serve_main(["--session-idle-ttl", "-1", "--", "true"])
+
+
 # --- unit-level checks that don't need the HTTP server ---
 
 
