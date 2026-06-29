@@ -45,6 +45,7 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
   - [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591) Dynamic Client Registration
     - §3 client registration request; `token_endpoint_auth_method` chosen from `token_endpoint_auth_methods_supported` in AS metadata (prefers `none` → `client_secret_post` → `client_secret_basic`)
     - §3.2.1 `client_secret_expires_at` handling — auto re-register on expiry
+    - `application_type: "native"` in DCR ([RFC 8252](https://www.rfc-editor.org/rfc/rfc8252) §8.4 / MCP SEP-837): the loopback auth-code and headless device flows are native clients, so the loopback redirect is not rejected as the RFC 7591 default `"web"`
   - [RFC 6749](https://www.rfc-editor.org/rfc/rfc6749) OAuth 2.0
     - §2.3.1 `client_secret_basic`: `Authorization: Basic` header with percent-encoded credentials (applied to code exchange, token refresh, and Device Authorization Grant polling)
   - [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) Bearer Token usage

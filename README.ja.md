@@ -43,6 +43,7 @@ Bearer token、カスタムヘッダー、OAuth 2.1 認証情報をリモート�
   - [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591) Dynamic Client Registration
     - §3 クライアント登録リクエスト。AS メタデータの `token_endpoint_auth_methods_supported` から最適な認証方式を選択（`none` → `client_secret_post` → `client_secret_basic` の優先順）
     - §3.2.1 `client_secret_expires_at` に対応、期限切れ時に自動再登録
+    - DCR に `application_type: "native"`（[RFC 8252](https://www.rfc-editor.org/rfc/rfc8252) §8.4 / MCP SEP-837）。loopback 認可コード・ヘッドレス device フローは native クライアントなので、RFC 7591 既定の `"web"` 扱いで loopback redirect が拒否されるのを防ぐ
   - [RFC 6749](https://www.rfc-editor.org/rfc/rfc6749) OAuth 2.0
     - §2.3.1 `client_secret_basic`：percent-encode した認証情報を `Authorization: Basic` ヘッダーで送信（コード交換・トークンリフレッシュ・Device Authorization Grant ポーリングに適用）
   - [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) Bearer Token の利用
