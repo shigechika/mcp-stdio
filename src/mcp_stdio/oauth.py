@@ -470,92 +470,132 @@ def _build_well_known_url(
     return urlunsplit((parsed.scheme, netloc, well_known_path, query, ""))
 
 
+def _parse_as_metadata_response(
+    data: Any, auth_server_base: str
+) -> OAuthMetadata | None:
+    """Build OAuthMetadata from an RFC 8414 / OpenID Connect discovery body.
+
+    The schema is shared: OpenID Connect Discovery 1.0 is a superset of RFC 8414,
+    so one parser serves both well-known forms. Returns None when the body is
+    unusable (non-object) or its issuer is a CROSS-ORIGIN mix-up signal, so the
+    caller can skip to the next discovery candidate; a same-origin issuer
+    mismatch is downgraded to a warning and still used.
+    """
+    if not isinstance(data, dict):
+        return None
+    # RFC 8414 §3.3: the issuer in the response MUST be identical to the URL used
+    # for discovery. We split the spec's MUST-reject by ORIGIN:
+    #   - A cross-ORIGIN issuer (different scheme/host/port) is a mix-up /
+    #     AS-spoofing signal — REJECT (return None) so this metadata is never
+    #     used. Otherwise it would anchor the RFC 9207 `iss` check (see issuer=
+    #     below) on a FOREIGN origin: an adversarial AS that returns a different
+    #     issuer AND echoes that same `iss` on the callback would self-satisfy
+    #     the mix-up defence.
+    #   - A SAME-origin mismatch (trailing slash, path, case) is the kind of
+    #     slight misconfiguration real servers ship, so warn and continue.
+    issuer = data.get("issuer")
+    if issuer and _origin(urlparse(issuer)) != _origin(urlparse(auth_server_base)):
+        log(
+            f"warning: RFC 8414 §3.3 issuer ORIGIN mismatch — expected "
+            f"the origin of {auth_server_base!r}, got {issuer!r}; "
+            f"refusing this authorization-server metadata (mix-up guard)"
+        )
+        return None
+    if issuer and issuer.rstrip("/") != auth_server_base.rstrip("/"):
+        log(
+            f"warning: RFC 8414 §3.3 issuer mismatch (same origin) — "
+            f"expected {auth_server_base!r}, got {issuer!r}; continuing"
+        )
+    methods = data.get("token_endpoint_auth_methods_supported")
+    # Strip a trailing slash before building default endpoints so an AS
+    # URL like "https://as/" does not yield "https://as//authorize".
+    base = auth_server_base.rstrip("/")
+    # Validate every endpoint the metadata declares against the #13
+    # cleartext-leak policy before it can receive a secret. An unsafe
+    # authorization/token endpoint falls back to the default path on
+    # the already-validated AS base URL; an unsafe optional endpoint is
+    # dropped to None.
+    return OAuthMetadata(
+        authorization_endpoint=_validate_endpoint_url(
+            data.get("authorization_endpoint"), label="authorization_endpoint"
+        )
+        or f"{base}/authorize",
+        token_endpoint=_validate_endpoint_url(
+            data.get("token_endpoint"), label="token_endpoint"
+        )
+        or f"{base}/token",
+        registration_endpoint=_validate_endpoint_url(
+            data.get("registration_endpoint"), label="registration_endpoint"
+        ),
+        device_authorization_endpoint=_validate_endpoint_url(
+            data.get("device_authorization_endpoint"),
+            label="device_authorization_endpoint",
+        ),
+        token_endpoint_auth_methods_supported=methods if isinstance(methods, list) else None,
+        issuer=issuer or auth_server_base,
+        # RFC 9207 §3: a true value makes a missing `iss` on the
+        # authorization response a MUST-reject (§2.4). Coerce strictly to
+        # bool so a non-bool JSON value cannot accidentally enable the
+        # stricter check off a truthy string.
+        iss_parameter_supported=(
+            data.get("authorization_response_iss_parameter_supported") is True
+        ),
+    )
+
+
 def _fetch_authorization_server_metadata(
     auth_server_url: str, client: httpx.Client
 ) -> OAuthMetadata | None:
-    """Fetch RFC 8414 authorization server metadata.
+    """Fetch RFC 8414 / OpenID Connect authorization server metadata.
 
-    Returns None on any failure (404, invalid JSON, connection error).
+    Tries, in order, the RFC 8414 well-known location (the well-known string
+    inserted between host and path per §3.1), then the OpenID Connect Discovery
+    1.0 locations: path-append (``<issuer>/.well-known/openid-configuration`` —
+    the common form, used by Azure AD, Keycloak realms, etc.) then path-insertion.
+    OIDC discovery is the RFC 8414 §3 transitional fallback that many real-world
+    ASes (Auth0, Okta, Azure AD, Google) expose INSTEAD of the OAuth form, whose
+    metadata schema is a superset of RFC 8414's. Returns None when every
+    candidate fails (404, invalid JSON, connection error, or a cross-origin
+    issuer mix-up signal).
     """
-    # RFC 8414 issuer has no query component, so do not carry one through.
-    well_known = _build_well_known_url(auth_server_url, "oauth-authorization-server")
-    # on the Phase-2 path-scoped fallback this function is called
-    # with the full operator server_url, which may carry a query. _build_well_known_url
-    # already strips the query when forming the discovery URL, so the issuer
-    # comparison and the synthesized default endpoints must use the SAME
-    # query/fragment-stripped base — otherwise a server_url like
-    # ``https://host/mcp?tenant=x`` produces a spurious §3.3 mismatch warning and
-    # malformed ``.../mcp?tenant=x/authorize`` defaults.
+    # RFC 8414 issuer has no query/fragment/userinfo; _build_well_known_url
+    # already strips all three when forming the discovery URL, so the issuer
+    # comparison, the OIDC path-append candidate, and the synthesized default
+    # endpoints must use the SAME stripped base. Otherwise a server_url like
+    # ``https://host/mcp?tenant=x`` (passed on the Phase-2 path-scoped fallback)
+    # produces a spurious §3.3 mismatch warning and a malformed default, and a
+    # ``https://user:pass@host/mcp`` would leak credentials into the OIDC GET and
+    # the default token endpoint (the #13 cleartext/credential-leak policy strips
+    # userinfo everywhere else). Drop any userinfo (everything before the last
+    # ``@``) from the netloc; host[:port] and an IPv6 literal pass through.
     _asp = urlsplit(auth_server_url)
-    auth_server_base = urlunsplit((_asp.scheme, _asp.netloc, _asp.path, "", ""))
-    try:
-        resp = client.get(well_known)
-        if resp.status_code == 200:
+    _netloc = _asp.netloc.rsplit("@", 1)[-1]
+    auth_server_base = urlunsplit((_asp.scheme, _netloc, _asp.path, "", ""))
+    base_noslash = auth_server_base.rstrip("/")
+    # Most-authoritative first, de-duplicated (the OIDC path-append and
+    # path-insertion forms coincide for a bare-origin issuer).
+    candidates: list[str] = []
+    for url in (
+        _build_well_known_url(auth_server_url, "oauth-authorization-server"),
+        f"{base_noslash}/.well-known/openid-configuration",
+        _build_well_known_url(auth_server_url, "openid-configuration"),
+    ):
+        if url and url not in candidates:
+            candidates.append(url)
+    for well_known in candidates:
+        try:
+            resp = client.get(well_known)
+        except Exception:
+            continue
+        if resp.status_code != 200:
+            continue
+        try:
             data = resp.json()
-            # RFC 8414 §3.3: the issuer in the response MUST be identical to the
-            # URL used for discovery. We split the spec's MUST-reject by ORIGIN:
-            #   - A cross-ORIGIN issuer (different scheme/host/port) is a mix-up /
-            #     AS-spoofing signal — REJECT (return None) so this metadata is
-            #     never used. Otherwise it would anchor the RFC 9207 `iss` check
-            #     (see issuer= below) on a FOREIGN origin: an adversarial AS that
-            #     returns a different issuer AND echoes that same `iss` on the
-            #     callback would self-satisfy the mix-up defence.
-            #   - A SAME-origin mismatch (trailing slash, path, case) is the kind
-            #     of slight misconfiguration real servers ship, so warn and
-            #     continue — rejecting on a cosmetic difference is too strict.
-            issuer = data.get("issuer")
-            if issuer and _origin(urlparse(issuer)) != _origin(
-                urlparse(auth_server_base)
-            ):
-                log(
-                    f"warning: RFC 8414 §3.3 issuer ORIGIN mismatch — expected "
-                    f"the origin of {auth_server_base!r}, got {issuer!r}; "
-                    f"refusing this authorization-server metadata (mix-up guard)"
-                )
-                return None
-            if issuer and issuer.rstrip("/") != auth_server_base.rstrip("/"):
-                log(
-                    f"warning: RFC 8414 §3.3 issuer mismatch (same origin) — "
-                    f"expected {auth_server_base!r}, got {issuer!r}; continuing"
-                )
-            methods = data.get("token_endpoint_auth_methods_supported")
-            # Strip a trailing slash before building default endpoints so an AS
-            # URL like "https://as/" does not yield "https://as//authorize".
-            base = auth_server_base.rstrip("/")
-            # Validate every endpoint the metadata declares against the #13
-            # cleartext-leak policy before it can receive a secret. An unsafe
-            # authorization/token endpoint falls back to the default path on
-            # the already-validated AS base URL; an unsafe optional endpoint is
-            # dropped to None.
-            return OAuthMetadata(
-                authorization_endpoint=_validate_endpoint_url(
-                    data.get("authorization_endpoint"), label="authorization_endpoint"
-                )
-                or f"{base}/authorize",
-                token_endpoint=_validate_endpoint_url(
-                    data.get("token_endpoint"), label="token_endpoint"
-                )
-                or f"{base}/token",
-                registration_endpoint=_validate_endpoint_url(
-                    data.get("registration_endpoint"), label="registration_endpoint"
-                ),
-                device_authorization_endpoint=_validate_endpoint_url(
-                    data.get("device_authorization_endpoint"),
-                    label="device_authorization_endpoint",
-                ),
-                token_endpoint_auth_methods_supported=methods if isinstance(methods, list) else None,
-                issuer=issuer or auth_server_base,
-                # RFC 9207 §3: a true value makes a missing `iss` on the
-                # authorization response a MUST-reject (§2.4). Coerce strictly to
-                # bool so a non-bool JSON value cannot accidentally enable the
-                # stricter check off a truthy string.
-                iss_parameter_supported=(
-                    data.get("authorization_response_iss_parameter_supported")
-                    is True
-                ),
-            )
-    except Exception:
-        pass
+        except Exception:
+            continue
+        meta = _parse_as_metadata_response(data, auth_server_base)
+        if meta is not None:
+            return meta
     return None
 
 

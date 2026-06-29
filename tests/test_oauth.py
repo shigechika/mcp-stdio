@@ -41,6 +41,15 @@ from mcp_stdio.oauth import (
 )
 from mcp_stdio.token_store import TokenData
 
+# OAuth discovery probes multiple fallback well-known URLs (RFC 8414, then the
+# OpenID Connect Discovery 1.0 locations) and tolerates a 404 / unmocked probe
+# at each step. Asserting that EVERY request was pre-registered is the wrong
+# strictness for this fallback-probing code: a test only mocks the URLs it
+# cares about, and the extra OIDC probes legitimately miss. Relax that one
+# pytest-httpx check module-wide; the complementary
+# assert_all_responses_were_requested (mocked-but-unused) stays on.
+pytestmark = pytest.mark.httpx_mock(assert_all_requests_were_expected=False)
+
 
 # --- _safe_int ---
 
@@ -1069,6 +1078,99 @@ class TestDiscoverMetadata:
         client = httpx.Client()
         meta = discover_oauth_metadata("https://api.example.com/realms/test", client)
         assert meta.authorization_endpoint == "https://api.example.com/auth"
+
+    def test_openid_configuration_fallback_bare_origin(self, httpx_mock):
+        """RFC 8414 §3: when oauth-authorization-server 404s, fall back to OpenID
+        Connect /.well-known/openid-configuration (Auth0/Okta/Azure AD expose the
+        OIDC form, not the OAuth one). The OIDC schema is an RFC 8414 superset."""
+        httpx_mock.add_response(
+            url="https://auth.example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
+        # RFC 8414 oauth-authorization-server: 404
+        httpx_mock.add_response(
+            url="https://auth.example.com/.well-known/oauth-authorization-server",
+            status_code=404,
+        )
+        # OIDC discovery: 200
+        httpx_mock.add_response(
+            url="https://auth.example.com/.well-known/openid-configuration",
+            json={
+                "issuer": "https://auth.example.com",
+                "authorization_endpoint": "https://auth.example.com/oauth2/v2.0/authorize",
+                "token_endpoint": "https://auth.example.com/oauth2/v2.0/token",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata("https://auth.example.com", client)
+        assert meta.authorization_endpoint == "https://auth.example.com/oauth2/v2.0/authorize"
+        assert meta.token_endpoint == "https://auth.example.com/oauth2/v2.0/token"
+
+    def test_openid_configuration_fallback_path_append(self, httpx_mock):
+        """A path-scoped issuer whose RFC 8414 locations 404 but which serves OIDC
+        metadata at <issuer>/.well-known/openid-configuration (Keycloak realm,
+        Azure AD tenant) — the common OIDC path-append form."""
+        self._mock_no_prm(httpx_mock, base="https://idp.example.com", path="/tenant")
+        # RFC 8414 host-root + path-insertion: 404
+        httpx_mock.add_response(
+            url="https://idp.example.com/.well-known/oauth-authorization-server",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://idp.example.com/.well-known/oauth-authorization-server/tenant",
+            status_code=404,
+        )
+        # OIDC path-insertion on the bare origin (tried during the base fetch): 404
+        httpx_mock.add_response(
+            url="https://idp.example.com/.well-known/openid-configuration",
+            status_code=404,
+        )
+        # OIDC path-append on the issuer: 200
+        httpx_mock.add_response(
+            url="https://idp.example.com/tenant/.well-known/openid-configuration",
+            json={
+                "issuer": "https://idp.example.com/tenant",
+                "authorization_endpoint": "https://idp.example.com/tenant/authorize",
+                "token_endpoint": "https://idp.example.com/tenant/token",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata("https://idp.example.com/tenant", client)
+        assert meta.authorization_endpoint == "https://idp.example.com/tenant/authorize"
+        assert meta.token_endpoint == "https://idp.example.com/tenant/token"
+        assert meta.issuer == "https://idp.example.com/tenant"
+
+    def test_fetch_as_metadata_strips_userinfo_from_base(self):
+        """A userinfo-bearing AS URL must NOT leak credentials into the OIDC
+        path-append probe or the synthesized default endpoints (#13). Forces the
+        OIDC path-append candidate to be the match so its construction is
+        exercised directly."""
+        from mcp_stdio.oauth import _fetch_authorization_server_metadata
+        captured: dict = {}
+
+        class _CaptureClient:
+            def get(self, url):
+                captured.setdefault("urls", []).append(url)
+                req = httpx.Request("GET", url)
+                # Only the OIDC path-append candidate answers, with metadata that
+                # omits token_endpoint so a default is synthesized from the base.
+                if url.endswith("/oauth/.well-known/openid-configuration"):
+                    return httpx.Response(
+                        200,
+                        json={"issuer": "https://api.example.com/oauth"},
+                        request=req,
+                    )
+                return httpx.Response(404, request=req)
+
+        meta = _fetch_authorization_server_metadata(
+            "https://user:pass@api.example.com/oauth", _CaptureClient()
+        )
+        assert meta is not None
+        # Every probed URL is userinfo-free (incl. the new OIDC path-append one).
+        assert captured["urls"]
+        assert all("@" not in u for u in captured["urls"])
+        # The synthesized default token endpoint is userinfo-free too.
+        assert meta.token_endpoint == "https://api.example.com/oauth/token"
 
 
 # --- register_client ---
