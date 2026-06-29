@@ -296,6 +296,12 @@ _DEFAULT_ACCESS_TTL_SECS = 3600.0
 _REFRESH_TTL_SECS = 60.0 * 60.0 * 24.0 * 30.0  # 30 days
 _STORE_CAP = 10000  # per-store entry cap (DoS bound); GC runs before the cap
 _CLIENT_CAP = 1000
+# Reuse of a just-consumed authorization code / rotated refresh token within
+# this window is treated as a benign client retry or concurrent double-submit
+# (deny without revoking); a reuse OUTSIDE the window is a theft signal and
+# revokes the whole grant family. RFC 9700 Sec. 4.14.2 permits tolerating a
+# brief reuse window so a racing/retrying legitimate client is not punished.
+_REUSE_GRACE_SECS = 10.0
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 # RFC 7636 Sec. 4.1 code_verifier unreserved set.
@@ -445,6 +451,13 @@ class _OAuthProvider:
         self._codes: dict[str, dict[str, Any]] = {}
         self._access: dict[str, dict[str, Any]] = {}
         self._refresh: dict[str, dict[str, Any]] = {}
+        # Tombstones for replay detection (RFC 6749 Sec. 4.1.2 / RFC 9700
+        # Sec. 4.14.2): a consumed authorization code or a rotated refresh token
+        # is recorded here (token -> {"family", "expires_at"}) so a later replay
+        # is detected and the whole token family it minted is revoked. Both are
+        # TTL-bounded (GC'd in _gc_locked) and capped like the live stores.
+        self._consumed_codes: dict[str, dict[str, Any]] = {}
+        self._consumed_refresh: dict[str, dict[str, Any]] = {}
 
     # -- metadata --------------------------------------------------------
 
@@ -612,7 +625,32 @@ class _OAuthProvider:
             # Single-use: POP before validating so a replay / concurrent
             # double-POST sees None and cannot mint a second token.
             entry = self._codes.pop(code, None)
+            replay_family: str | None = None
+            replay_detected = False
+            if entry is None:
+                # RFC 6749 Sec. 4.1.2: a code used more than once MUST be denied
+                # AND SHOULD revoke the tokens previously issued from it. A live
+                # tombstone (set on successful issuance below) marks a real
+                # reuse; outside the grace window it is a theft signal and we
+                # revoke the family. Within the window it is a benign retry /
+                # concurrent double-submit, so deny without revoking (falls
+                # through to the plain denial). A code that never issued a token
+                # (failed validation) leaves no tombstone — plain denial too.
+                tomb = self._consumed_codes.get(code)
+                if (
+                    tomb is not None
+                    and tomb["expires_at"] >= now
+                    and now - tomb["consumed_at"] > _REUSE_GRACE_SECS
+                ):
+                    replay_detected = True
+                    replay_family = tomb["family"]
+                    self._revoke_family_locked(replay_family)
         if entry is None:
+            if replay_detected:
+                return 400, {
+                    "error": "invalid_grant",
+                    "error_description": "authorization code already used; issued tokens revoked",
+                }
             return 400, {"error": "invalid_grant", "error_description": "unknown or used code"}
         if entry["expires_at"] < now:
             return 400, {"error": "invalid_grant", "error_description": "code expired"}
@@ -625,7 +663,12 @@ class _OAuthProvider:
             return 400, {"error": "invalid_request", "error_description": "invalid code_verifier"}
         if not hmac.compare_digest(_pkce_s256_challenge(verifier), entry["code_challenge"]):
             return 400, {"error": "invalid_grant", "error_description": "PKCE verification failed"}
-        return self._issue(entry["user"], entry["client_id"], entry["scope"], entry["resource"])
+        # Start a new grant family keyed by the code; tombstone the code under
+        # the issue lock so a subsequent replay is detected and revoked.
+        return self._issue(
+            entry["user"], entry["client_id"], entry["scope"], entry["resource"],
+            family=code, consumed_code=code,
+        )
 
     def _token_refresh(self, form: dict[str, str]) -> tuple[int, dict[str, Any]]:
         rt = form.get("refresh_token", "")
@@ -640,34 +683,89 @@ class _OAuthProvider:
             # same valid token finds None on the second pass.
             entry = self._refresh.get(rt)
             if entry is None:
+                # RFC 9700 Sec. 4.14.2: a replay of an already-rotated refresh
+                # token OUTSIDE the grace window is a theft signal — revoke the
+                # whole family so the attacker AND the racing legitimate client
+                # are both cut off (the client re-runs the flow). WITHIN the
+                # window it is a benign retry / concurrent double-submit: deny
+                # without revoking so the winner's freshly-rotated tokens
+                # survive. A token that never existed stays a plain "unknown".
+                tomb = self._consumed_refresh.get(rt)
+                if tomb is not None and tomb["expires_at"] >= now:
+                    if now - tomb["consumed_at"] > _REUSE_GRACE_SECS:
+                        self._revoke_family_locked(tomb["family"])
+                        return 400, {
+                            "error": "invalid_grant",
+                            "error_description": "refresh token reuse detected; token family revoked",
+                        }
+                    return 400, {
+                        "error": "invalid_grant",
+                        "error_description": "refresh_token already rotated",
+                    }
                 return 400, {"error": "invalid_grant", "error_description": "unknown refresh_token"}
             if entry["expires_at"] < now:
                 del self._refresh[rt]
                 return 400, {"error": "invalid_grant", "error_description": "refresh_token expired"}
             if form.get("client_id") != entry["client_id"]:
                 return 400, {"error": "invalid_grant", "error_description": "client_id mismatch"}
-            del self._refresh[rt]  # consume on success (RFC 9700 rotation)
-        return self._issue(entry["user"], entry["client_id"], entry["scope"], entry["resource"])
+            family = entry.get("family")
+            # Rotate: tombstone the spent token (instead of a plain delete) so a
+            # later replay of THIS value is detected as reuse above.
+            del self._refresh[rt]
+            self._consumed_refresh[rt] = {
+                "family": family, "consumed_at": now,
+                "expires_at": now + self.refresh_ttl,
+            }
+        return self._issue(
+            entry["user"], entry["client_id"], entry["scope"], entry["resource"],
+            family=family,
+        )
 
     def _issue(
-        self, user: str, client_id: str, scope: str, resource: str | None
+        self,
+        user: str,
+        client_id: str,
+        scope: str,
+        resource: str | None,
+        *,
+        family: str | None = None,
+        consumed_code: str | None = None,
     ) -> tuple[int, dict[str, Any]]:
+        """Mint an access + refresh token pair.
+
+        ``family`` tags both tokens so a later replay of the authorization code
+        or a rotated refresh token can revoke the entire grant (see
+        _revoke_family_locked). ``consumed_code``, when set, tombstones the
+        just-spent authorization code under the same lock so a replay is
+        detectable without a separate critical section.
+        """
         now = self._now()
         access = secrets.token_urlsafe(32)
         refresh = secrets.token_urlsafe(32)
         with self._lock:
-            if len(self._access) >= _STORE_CAP or len(self._refresh) >= _STORE_CAP:
+            stores = (
+                self._access, self._refresh,
+                self._consumed_codes, self._consumed_refresh,
+            )
+            if any(len(s) >= _STORE_CAP for s in stores):
                 self._gc_locked()
-                self._evict_to_capacity_locked(self._access, _STORE_CAP)
-                self._evict_to_capacity_locked(self._refresh, _STORE_CAP)
+                for s in stores:
+                    self._evict_to_capacity_locked(s, _STORE_CAP)
             self._access[access] = {
                 "user": user, "client_id": client_id, "scope": scope,
-                "resource": resource, "expires_at": now + self.access_ttl,
+                "resource": resource, "family": family,
+                "expires_at": now + self.access_ttl,
             }
             self._refresh[refresh] = {
                 "user": user, "client_id": client_id, "scope": scope,
-                "resource": resource, "expires_at": now + self.refresh_ttl,
+                "resource": resource, "family": family,
+                "expires_at": now + self.refresh_ttl,
             }
+            if consumed_code is not None:
+                self._consumed_codes[consumed_code] = {
+                    "family": family, "consumed_at": now,
+                    "expires_at": now + self.refresh_ttl,
+                }
         body: dict[str, Any] = {
             "access_token": access,
             "token_type": "Bearer",
@@ -681,8 +779,19 @@ class _OAuthProvider:
 
     # -- resource-server validation --------------------------------------
 
-    def validate_access_token(self, token: str) -> bool:
-        """True if ``token`` is a live issued access token (lookup + expiry)."""
+    def validate_access_token(
+        self, token: str, expected_resource: str | None = None
+    ) -> bool:
+        """True if ``token`` is a live issued access token for this resource.
+
+        Beyond the lookup + expiry check, this enforces the RFC 8707 / MCP
+        audience binding: when the token was minted for a specific ``resource``
+        and the caller passes the resource it is guarding, the two MUST match —
+        a token issued for a different audience is rejected even though it is
+        otherwise live. A token with no resource binding (``None``) stays
+        accepted (lenient), as does a call that does not supply an expected
+        resource.
+        """
         if not token:
             return False
         now = self._now()
@@ -692,6 +801,13 @@ class _OAuthProvider:
                 return False
             if entry["expires_at"] < now:
                 del self._access[token]
+                return False
+            tok_resource = entry.get("resource")
+            if (
+                tok_resource is not None
+                and expected_resource is not None
+                and tok_resource.rstrip("/") != expected_resource.rstrip("/")
+            ):
                 return False
             return True
 
@@ -708,8 +824,25 @@ class _OAuthProvider:
 
     def _gc_locked(self) -> None:
         now = self._now()
-        for store in (self._codes, self._access, self._refresh):
+        for store in (
+            self._codes, self._access, self._refresh,
+            self._consumed_codes, self._consumed_refresh,
+        ):
             for k in [k for k, v in store.items() if v["expires_at"] < now]:
+                del store[k]
+
+    def _revoke_family_locked(self, family: str | None) -> None:
+        """Revoke every live access/refresh token in a grant family.
+
+        Called on a detected authorization-code or refresh-token replay
+        (RFC 6749 Sec. 4.1.2 / RFC 9700 Sec. 4.14.2). A ``None`` family (a token
+        minted before family tagging, or a code that never issued a token) is a
+        no-op. The caller already holds ``self._lock``.
+        """
+        if family is None:
+            return
+        for store in (self._access, self._refresh):
+            for k in [k for k, v in store.items() if v.get("family") == family]:
                 del store[k]
 
     def _recycle_clients_locked(self) -> None:
@@ -875,7 +1008,11 @@ class _Handler(BaseHTTPRequestHandler):
             and hmac.compare_digest(token.encode("utf-8"), self.auth_token.encode("utf-8"))
         ):
             return True
-        if self.oauth is not None and token and self.oauth.validate_access_token(token):
+        if (
+            self.oauth is not None
+            and token
+            and self.oauth.validate_access_token(token, self._resource_url())
+        ):
             return True
         return self.auth_token is None and self.oauth is None
 
@@ -883,12 +1020,27 @@ class _Handler(BaseHTTPRequestHandler):
         """Return True if the request may proceed; else send 401 and return False."""
         if self._authorized():
             return True
-        body = _error_body("authentication required").encode("utf-8")
+        # RFC 6750 Sec. 3 / 3.1: when the request CARRIED a bearer token that
+        # failed validation (wrong, expired, revoked, or wrong audience), the
+        # challenge SHOULD carry error="invalid_token". When NO token was
+        # presented, omit the error attribute — the bare challenge is how the
+        # client discovers how to authenticate (adding error there would be a
+        # spec violation). RFC 9728 Sec. 5.1: always include the
+        # resource_metadata pointer.
+        token_presented = self.headers.get("Authorization", "").startswith("Bearer ")
+        params = []
+        if token_presented:
+            params.append('error="invalid_token"')
+            params.append(
+                'error_description="the access token is expired, revoked, malformed, '
+                'or issued for another resource"'
+            )
+        params.append(f'resource_metadata="{self._prm_url()}"')
+        challenge = "Bearer " + ", ".join(params)
+        msg = "invalid access token" if token_presented else "authentication required"
+        body = _error_body(msg).encode("utf-8")
         self.send_response(401)
-        # RFC 9728 Sec. 5.1: point the client at the protected-resource metadata.
-        self.send_header(
-            "WWW-Authenticate", f'Bearer resource_metadata="{self._prm_url()}"'
-        )
+        self.send_header("WWW-Authenticate", challenge)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()

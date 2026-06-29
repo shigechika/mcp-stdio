@@ -272,6 +272,14 @@ mcp-stdio --check http://127.0.0.1:8080/mcp
     [RFC 9207](https://www.rfc-editor.org/rfc/rfc9207) `iss` parameter on the
     authorization response (mix-up defence) and advertises it in metadata.
     The mcp-stdio client's `--oauth` flow then works against the gateway.
+- Embedded-AS token security: the Resource Server validates token audience
+  ([RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) / MCP — a token issued for
+  another resource is rejected); a presented-but-invalid token gets
+  `error="invalid_token"` ([RFC 6750](https://www.rfc-editor.org/rfc/rfc6750)
+  §3.1); and replaying an authorization code or a rotated refresh token revokes
+  the whole grant family ([RFC 6749](https://www.rfc-editor.org/rfc/rfc6749)
+  §4.1.2 / [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700) §4.14.2), with a
+  brief grace window so a benign client retry is not punished.
 - Single-client assumption for now: JSON-RPC ids pass through verbatim.
 
 Static-token example (token via env so it is not visible in `ps`):

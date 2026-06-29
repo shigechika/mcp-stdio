@@ -400,6 +400,16 @@ def _token(base, data):
     return httpx.post(base + "/token", data=data, timeout=10)
 
 
+def _authed_mcp(base, token, mid=1):
+    """An authenticated MCP echo call with the given bearer token."""
+    return httpx.post(
+        base + "/mcp",
+        content=json.dumps({"jsonrpc": "2.0", "id": mid, "method": "echo"}),
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10,
+    )
+
+
 def _full_flow(base, redirect=_REDIRECT, headers=None):
     cid = _register(base, redirect).json()["client_id"]
     verifier, challenge = client_oauth.generate_pkce()
@@ -1075,3 +1085,134 @@ def test_refresh_token_expires():
         r = _token(base, {"grant_type": "refresh_token", "refresh_token": rt, "client_id": cid})
         assert r.status_code == 400
         assert r.json()["error"] == "invalid_grant"
+
+
+# -- RFC 6750 invalid_token challenge (audit fix A) --
+
+def test_invalid_token_challenge_has_error(oauth_gateway):
+    """RFC 6750 Sec. 3.1: a presented-but-invalid bearer token yields
+    error="invalid_token" in the challenge."""
+    base, _ = oauth_gateway
+    r = _authed_mcp(base, "bogus-token")
+    assert r.status_code == 401
+    wa = r.headers.get("www-authenticate", "")
+    assert 'error="invalid_token"' in wa
+    assert "resource_metadata=" in wa
+
+
+def test_no_token_challenge_omits_error(oauth_gateway):
+    """RFC 6750 Sec. 3: with NO token presented, the error attribute is omitted
+    (the bare challenge is how the client learns to authenticate)."""
+    base, _ = oauth_gateway
+    r = _post(base + "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "echo"})
+    assert r.status_code == 401
+    wa = r.headers.get("www-authenticate", "")
+    assert "error=" not in wa
+    assert "resource_metadata=" in wa
+
+
+# -- RFC 8707 / MCP audience binding (audit fix H) --
+
+def test_validate_access_token_audience():
+    """A token minted for resource A is rejected when guarding resource B."""
+    prov = _provider()
+    _, body = prov._issue("u", "c", "", "https://api.example.com/mcp", family="f")
+    token = body["access_token"]
+    assert prov.validate_access_token(token, "https://api.example.com/mcp") is True
+    # trailing-slash difference tolerated
+    assert prov.validate_access_token(token, "https://api.example.com/mcp/") is True
+    # a different audience is rejected even though the token is live
+    assert prov.validate_access_token(token, "https://other.example.com/mcp") is False
+    # no expected resource supplied -> lenient (back-compat)
+    assert prov.validate_access_token(token, None) is True
+
+
+def test_validate_access_token_no_audience_binding():
+    """A token with no resource binding is accepted for any resource."""
+    prov = _provider()
+    _, body = prov._issue("u", "c", "", None, family="f")
+    token = body["access_token"]
+    assert prov.validate_access_token(token, "https://api.example.com/mcp") is True
+
+
+def test_mcp_call_rejects_token_for_other_audience():
+    """End-to-end: a token bound to a different resource cannot call this MCP."""
+    with _run(oauth=_provider()) as (base, _):
+        cid = _register(base).json()["client_id"]
+        verifier, challenge = client_oauth.generate_pkce()
+        # Authorize with a resource that is NOT this gateway's MCP endpoint.
+        az = httpx.get(
+            base + "/authorize",
+            params={
+                "client_id": cid, "response_type": "code",
+                "redirect_uri": _REDIRECT, "state": "s",
+                "code_challenge": challenge, "code_challenge_method": "S256",
+                "resource": "https://other.example.com/mcp",
+            },
+            follow_redirects=False, timeout=10,
+        )
+        code = _redirect_params(az)["code"]
+        tok = _token(base, {
+            "grant_type": "authorization_code", "code": code,
+            "redirect_uri": _REDIRECT, "client_id": cid, "code_verifier": verifier,
+        })
+        access = tok.json()["access_token"]
+        # The token is live but bound to other.example.com -> this RS rejects it.
+        assert _authed_mcp(base, access).status_code == 401
+
+
+# -- authorization-code replay revocation (audit fix F, RFC 6749 Sec. 4.1.2) --
+
+def test_auth_code_replay_revokes_family():
+    clock = [1000.0]
+    prov = _provider(now=lambda: clock[0])
+    with _run(oauth=prov) as (base, _):
+        cid, verifier, challenge, code, tok = _full_flow(base)
+        assert tok.status_code == 200
+        access = tok.json()["access_token"]
+        assert _authed_mcp(base, access).status_code == 200
+        # Past the reuse grace window, replaying the code is a theft signal.
+        clock[0] += _grace() + 5
+        replay = _token(base, {
+            "grant_type": "authorization_code", "code": code,
+            "redirect_uri": _REDIRECT, "client_id": cid, "code_verifier": verifier,
+        })
+        assert replay.status_code == 400
+        assert replay.json()["error"] == "invalid_grant"
+        assert "revoked" in replay.json()["error_description"]
+        # The previously-issued token is now revoked.
+        assert _authed_mcp(base, access).status_code == 401
+
+
+# -- refresh-token reuse revocation (audit fix G, RFC 9700 Sec. 4.14.2) --
+
+def test_refresh_reuse_revokes_family():
+    clock = [1000.0]
+    prov = _provider(now=lambda: clock[0])
+    with _run(oauth=prov) as (base, _):
+        cid, _, _, _, tok = _full_flow(base)
+        rt0 = tok.json()["refresh_token"]
+        # Rotate rt0 -> rt1.
+        r1 = _token(base, {"grant_type": "refresh_token", "refresh_token": rt0, "client_id": cid})
+        assert r1.status_code == 200
+        access1 = r1.json()["access_token"]
+        rt1 = r1.json()["refresh_token"]
+        assert _authed_mcp(base, access1).status_code == 200
+        # Within the grace window, reusing rt0 is denied but does NOT revoke.
+        benign = _token(base, {"grant_type": "refresh_token", "refresh_token": rt0, "client_id": cid})
+        assert benign.status_code == 400
+        assert benign.json()["error_description"] == "refresh_token already rotated"
+        assert _authed_mcp(base, access1).status_code == 200  # survives
+        # Past the grace window, reusing rt0 is theft -> revoke the whole family.
+        clock[0] += _grace() + 5
+        theft = _token(base, {"grant_type": "refresh_token", "refresh_token": rt0, "client_id": cid})
+        assert theft.status_code == 400
+        assert "reuse detected" in theft.json()["error_description"]
+        # access1 and rt1 (same family) are now revoked.
+        assert _authed_mcp(base, access1).status_code == 401
+        r3 = _token(base, {"grant_type": "refresh_token", "refresh_token": rt1, "client_id": cid})
+        assert r3.status_code == 400
+
+
+def _grace():
+    return server._REUSE_GRACE_SECS
