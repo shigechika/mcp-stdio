@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.0](https://github.com/shigechika/mcp-stdio/compare/v0.17.0...v0.18.0) (2026-06-29)
+
+
+### Features
+
+* **serve:** path-scoped issuer for --enable-oauth ([#245](https://github.com/shigechika/mcp-stdio/issues/245)) ([#246](https://github.com/shigechika/mcp-stdio/issues/246)) ([59e4027](https://github.com/shigechika/mcp-stdio/commit/59e40277f145f7b8529e8f9d1cc830df04017867))
+
 ## [0.17.0](https://github.com/shigechika/mcp-stdio/compare/v0.16.0...v0.17.0) (2026-06-28)
 
 
