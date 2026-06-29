@@ -1198,6 +1198,8 @@ class TestRegisterClient:
         assert body["client_name"] == "mcp-stdio"
         assert "http://127.0.0.1:9999/callback" in body["redirect_uris"]
         assert body["token_endpoint_auth_method"] == "none"
+        # SEP-837 / RFC 8252: a loopback-redirect client is "native".
+        assert body["application_type"] == "native"
 
     def test_success_without_client_secret(self, httpx_mock):
         """Some servers return only client_id (public client)."""
@@ -5724,6 +5726,8 @@ class TestDeviceAuthorizationFlow:
         body = json.loads(dcr_req.content)
         assert "urn:ietf:params:oauth:grant-type:device_code" in body["grant_types"]
         assert "redirect_uris" not in body
+        # SEP-837: the headless device-flow client is also "native".
+        assert body["application_type"] == "native"
 
     def test_da_request_includes_resource_indicator(self, httpx_mock, tmp_path, monkeypatch):
         """Device Authorization Request must include resource parameter (RFC 8707)."""

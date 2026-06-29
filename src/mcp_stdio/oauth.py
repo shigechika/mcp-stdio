@@ -889,15 +889,23 @@ def register_client(
     auth_method = _pick_token_endpoint_auth_method(
         metadata.token_endpoint_auth_methods_supported
     )
+    # SEP-837 / RFC 8252 §8.4: mcp-stdio is a NATIVE client — the auth-code flow
+    # uses a loopback (http://127.0.0.1:<port>/callback) redirect and the device
+    # flow is a headless native grant. SEP-837 requires DCR to specify an
+    # appropriate application_type (loopback/localhost -> "native"); the RFC 7591
+    # default is "web", so omitting it lets an AS reject or mis-treat the loopback
+    # redirect. Send "native" explicitly on both paths.
     if device_flow:
         body: dict[str, object] = {
             "client_name": "mcp-stdio",
+            "application_type": "native",
             "grant_types": ["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"],
             "token_endpoint_auth_method": auth_method,
         }
     else:
         body = {
             "client_name": "mcp-stdio",
+            "application_type": "native",
             "redirect_uris": [redirect_uri],
             "response_types": ["code"],
             "grant_types": ["authorization_code", "refresh_token"],
