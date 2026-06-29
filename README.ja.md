@@ -188,6 +188,9 @@ mcp-stdio [OPTIONS] URL
   --oauth-device         OAuth 2.1 Device Authorization Grant（RFC 8628）— ヘッドレス環境向け
   --client-id ID         事前登録済み OAuth クライアント ID（MCP_OAUTH_CLIENT_ID 環境変数でも指定可）
   --oauth-scope SCOPE    要求する OAuth スコープ
+  --oauth-use-id-token   access_token ではなく OIDC id_token を Bearer として送信
+                         （AWS Bedrock AgentCore / Cognito 向け）。id_token が
+                         無ければ access_token にフォールバック（#59）
   --oauth-refresh-leeway SECONDS
                          アクセストークンを expire の何秒前に proactive refresh
                          するか（デフォルト: 60、または MCP_OAUTH_REFRESH_LEEWAY 環境変数）
