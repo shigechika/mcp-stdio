@@ -2081,7 +2081,8 @@ def ensure_token(
     device_flow: bool = False,
     refresh_leeway: float = 60.0,
     resource_indicator: bool = True,
-) -> TokenData:
+    interactive: bool = True,
+) -> TokenData | None:
     """Ensure a valid access token is available.
 
     1. Check cached token — use if not expired (with ``refresh_leeway`` margin)
@@ -2089,6 +2090,13 @@ def ensure_token(
     3. If no token or refresh fails, run OAuth flow:
        - ``device_flow=True``: Device Authorization Grant (RFC 8628)
        - ``device_flow=False``: Authorization Code flow with PKCE (default)
+
+    When ``interactive=False``, step 3 is skipped: if no cached/refreshable
+    token is available the function returns ``None`` instead of opening a
+    browser / device-code flow. The ``--oauth-eager`` cold-start uses this to
+    decide, without blocking, whether the warm path applies (token available)
+    or the cold path (run OAuth on a background thread). With the default
+    ``interactive=True`` the function always returns a TokenData or raises.
 
     ``refresh_leeway`` is the proactive-refresh window in seconds: a cached
     token is considered expired when its actual expiry is within this many
@@ -2117,6 +2125,11 @@ def ensure_token(
             # flow below isn't blocked by cached failure state
             # (cf. anthropics/claude-code#37747).
             delete_token(server_url)
+
+    if not interactive:
+        # Non-interactive probe (--oauth-eager warm check): no cached/refreshable
+        # token, and the caller does not want to block on a browser/device flow.
+        return None
 
     log("starting OAuth 2.1 authorization flow")
     # Probe the MCP server for a WWW-Authenticate resource_metadata hint

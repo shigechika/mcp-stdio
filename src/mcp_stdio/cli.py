@@ -273,6 +273,68 @@ def _build_token_expiry_getter(
     return getter
 
 
+def _build_cold_start_login(
+    server_url: str,
+    headers: dict[str, str],
+    *,
+    client_id: str | None,
+    scope: str | None,
+    device_flow: bool,
+    refresh_leeway: float,
+    resource_indicator: bool,
+    oauth_timeout: float,
+    timeout_connect: float,
+    timeout_read: float,
+    use_id_token: bool,
+) -> Callable[[], dict[str, str] | None]:
+    """Build the cold-start background-OAuth callback for the relay (#296).
+
+    Returns a callable that runs the FULL interactive OAuth flow (browser /
+    device code, bounded by ``oauth_timeout``) and, on success, returns the base
+    headers with a fresh ``Authorization`` (id_token or access_token per #59), or
+    None on failure. The relay runs it on a background thread so a long login
+    does not block the locally-answered ``initialize``. Mirrors
+    ``_build_token_refresher``: a frozen header snapshot, its own short-lived
+    client with redirects pinned off, all exceptions degraded to None.
+    """
+    base_headers = dict(headers)
+
+    def login() -> dict[str, str] | None:
+        from .oauth import ensure_token
+
+        client = httpx.Client(
+            timeout=httpx.Timeout(
+                connect=timeout_connect, read=timeout_read, write=30, pool=10
+            ),
+            follow_redirects=False,
+        )
+        try:
+            data = ensure_token(
+                server_url,
+                client,
+                client_id=client_id or None,
+                scope=scope or None,
+                device_flow=device_flow,
+                refresh_leeway=refresh_leeway,
+                resource_indicator=resource_indicator,
+                timeout=oauth_timeout,
+            )
+            if data is None:  # interactive=True never returns None, but be safe
+                return None
+            new_headers = dict(base_headers)
+            new_headers["Authorization"] = _bearer_header_value(
+                _effective_bearer(data, use_id_token)
+            )
+            return new_headers
+        except Exception as e:
+            print(f"error: cold-start OAuth failed: {e}", file=sys.stderr)
+            return None
+        finally:
+            client.close()
+
+    return login
+
+
 def _main() -> None:
     """CLI body. Wrapped by ``main`` for top-level interrupt handling."""
     parser = argparse.ArgumentParser(
@@ -348,6 +410,21 @@ def _main() -> None:
             "malformed MCP_OAUTH_REFRESH_LEEWAY value aborts startup at argument "
             "parsing even on a non-OAuth run (the env default is validated eagerly "
             "so a bad value surfaces clearly rather than silently)"
+        ),
+    )
+    parser.add_argument(
+        "--oauth-eager",
+        action="store_true",
+        help=(
+            "Start serving immediately and run the interactive OAuth flow in the "
+            "background (cold-start). The relay answers the client's initialize "
+            "locally and returns -32002 for tool calls until OAuth completes, "
+            "then emits notifications/*/list_changed so the client fetches the "
+            "now-available lists. Avoids the client's ~60 s initialize timeout "
+            "when a browser/SSO/MFA login takes longer (#296). Streamable HTTP "
+            "only; ignored (blocking flow) on --transport sse. A warm cache "
+            "(valid/refreshable token) is unaffected. Only with --oauth / "
+            "--oauth-device."
         ),
     )
     parser.add_argument(
@@ -624,6 +701,7 @@ def _main() -> None:
     token_refresher: Callable[[], dict[str, str] | None] | None = None
     scope_upgrader: Callable[[str], dict[str, str] | None] | None = None
     token_expiry_getter: Callable[[], float | None] | None = None
+    cold_start_login: Callable[[], dict[str, str] | None] | None = None
     if args.oauth or args.oauth_device:
         # NOTE: this runs BEFORE the --check branch below, and
         # ensure_token only short-circuits on a valid cached/refreshable token.
@@ -632,6 +710,19 @@ def _main() -> None:
         # so a --check of the authenticated path is verified end-to-end. This is
         # documented in the --check help text; it is not a non-interactive probe.
         from .oauth import ensure_token
+
+        # --oauth-eager (cold-start) is Streamable HTTP only and meaningless for a
+        # one-shot --check/--test probe. When eligible, probe the cache
+        # NON-interactively so a cold cache defers the browser/device flow to a
+        # background thread in the relay instead of blocking startup.
+        eager = args.oauth_eager and not (args.check or args.test)
+        if eager and args.transport == "sse":
+            print(
+                "warning: --oauth-eager is ignored on --transport sse; the OAuth "
+                "flow runs before the relay starts",
+                file=sys.stderr,
+            )
+            eager = False
 
         client = httpx.Client(
             timeout=httpx.Timeout(
@@ -657,34 +748,56 @@ def _main() -> None:
                 refresh_leeway=args.oauth_refresh_leeway,
                 resource_indicator=not args.no_resource_indicator,
                 timeout=args.oauth_timeout,
+                interactive=not eager,
             )
-            # Drop any differently-cased 'authorization' header a -H supplied
-            # earlier (the -H loop ran before this block), so the OAuth token is
-            # the single Authorization sent rather than a duplicate header pair.
-            overridden = [k for k in headers if k.lower() == "authorization"]
-            if overridden:
-                # The user explicitly supplied -H 'Authorization: ...' AND an
-                # OAuth flow — warn that the OAuth token wins, instead of
-                # silently discarding their header.
-                print(
-                    "warning: explicit -H 'Authorization' header is overridden "
-                    "by the OAuth-acquired token",
-                    file=sys.stderr,
+            if eager and token_data is None:
+                # COLD path: no cached/refreshable token. Defer the interactive
+                # OAuth to a background thread in the relay (it answers initialize
+                # locally and gates until login completes). No Authorization is
+                # set now; the cold-start daemon installs it on success.
+                cold_start_login = _build_cold_start_login(
+                    args.url,
+                    headers,
+                    client_id=client_id or None,
+                    scope=args.oauth_scope or None,
+                    device_flow=args.oauth_device,
+                    refresh_leeway=args.oauth_refresh_leeway,
+                    resource_indicator=not args.no_resource_indicator,
+                    oauth_timeout=args.oauth_timeout,
+                    timeout_connect=args.timeout_connect,
+                    timeout_read=args.timeout_read,
+                    use_id_token=args.oauth_use_id_token,
                 )
-            for existing in overridden:
-                del headers[existing]
-            try:
-                headers["Authorization"] = _bearer_header_value(
-                    _effective_bearer(token_data, args.oauth_use_id_token)
-                )
-            except ValueError as e:
-                # The AS handed us a token with CR/LF/NUL — fail startup clearly
-                # rather than splitting headers on the wire.
-                print(f"error: {e}", file=sys.stderr)
-                sys.exit(1)
+            else:
+                # WARM path (token available, or non-eager blocking flow). Drop
+                # any differently-cased 'authorization' header a -H supplied
+                # earlier (the -H loop ran before this block), so the OAuth token
+                # is the single Authorization sent rather than a duplicate pair.
+                overridden = [k for k in headers if k.lower() == "authorization"]
+                if overridden:
+                    # Explicit -H 'Authorization: ...' AND an OAuth flow — warn
+                    # that the OAuth token wins instead of silently discarding it.
+                    print(
+                        "warning: explicit -H 'Authorization' header is overridden "
+                        "by the OAuth-acquired token",
+                        file=sys.stderr,
+                    )
+                for existing in overridden:
+                    del headers[existing]
+                try:
+                    headers["Authorization"] = _bearer_header_value(
+                        _effective_bearer(token_data, args.oauth_use_id_token)
+                    )
+                except ValueError as e:
+                    # The AS handed us a token with CR/LF/NUL — fail startup
+                    # clearly rather than splitting headers on the wire.
+                    print(f"error: {e}", file=sys.stderr)
+                    sys.exit(1)
             # The relay-loop 401/403 recovery callbacks are unused by the
             # one-shot --check / --test probe (check_connection never refreshes
             # or steps up), so only build them on the real relay path. See #15.
+            # They work for both warm and cold paths: the refresher/upgrader
+            # rebuild Authorization from the (eventually) cached token.
             if not (args.check or args.test):
                 token_refresher = _build_token_refresher(
                     args.url, headers, args.timeout_connect, args.timeout_read,
@@ -760,6 +873,7 @@ def _main() -> None:
             token_expiry_getter=token_expiry_getter,
             proactive_refresh=proactive_refresh,
             refresh_leeway=args.oauth_refresh_leeway,
+            cold_start_login=cold_start_login,
         )
 
 

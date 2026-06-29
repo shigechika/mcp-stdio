@@ -62,6 +62,7 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
 - **Token refresh on 401** — automatically refreshes expired OAuth tokens mid-session (OAuth mode only)
 - **Proactive token refresh** — a background timer refreshes the OAuth token shortly before it expires (lead time: `--oauth-refresh-leeway`), so a long-lived session survives gateways that signal token expiry as an HTTP 200 tool-error instead of a transport 401 (e.g. Atlassian's MCP gateway); on by default in OAuth mode, opt out with `--no-proactive-refresh` (#242)
 - **Step-up authorization on 403** — on a `Bearer error="insufficient_scope"` challenge, re-authorizes for the union of the granted and required scopes ([RFC 9470](https://www.rfc-editor.org/rfc/rfc9470) / MCP step-up; cf. anthropics/claude-code#44652)
+- **Cold-start (`--oauth-eager`)** — answers `initialize` locally and runs the interactive OAuth flow on a background thread, so a 30–180 s browser/SSO/MFA login does not exceed the client's ~60 s initialize timeout. Gated methods return `-32002` until login completes, then `notifications/*/list_changed` tells the client to fetch the now-available lists. Streamable HTTP only; a warm (valid/refreshable) cache is unaffected (#296)
 - **Bearer token auth** — via `--bearer-token` flag or `MCP_BEARER_TOKEN` env var
 - **Custom headers** — pass any header with `-H` / `--header`
 - **Graceful shutdown** — handles SIGTERM/SIGINT
@@ -193,6 +194,11 @@ Options:
   --oauth-use-id-token   Present the OIDC id_token as the Bearer credential
                          instead of the access_token (AWS Bedrock AgentCore /
                          Cognito); falls back to access_token if none is returned (#59)
+  --oauth-eager          Cold-start: answer initialize locally and run the
+                         interactive OAuth flow in the background, so a long
+                         browser/SSO/MFA login does not blow the client's ~60 s
+                         initialize timeout. Streamable HTTP only; ignored on
+                         --transport sse. Warm cache unaffected (#296)
   --oauth-refresh-leeway SECONDS
                          Proactively refresh tokens this many seconds before
                          expiry (default: 60, or MCP_OAUTH_REFRESH_LEEWAY)

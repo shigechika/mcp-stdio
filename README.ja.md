@@ -60,6 +60,7 @@ Bearer token、カスタムヘッダー、OAuth 2.1 認証情報をリモート�
 - **401 時の自動トークンリフレッシュ** — セッション中に OAuth トークンが失効しても自動更新（OAuth モード時のみ）
 - **プロアクティブなトークンリフレッシュ** — バックグラウンドタイマーが OAuth トークンを失効直前にリフレッシュ（リード時間は `--oauth-refresh-leeway`）。トークン失効をトランスポート層の 401 ではなく HTTP 200 のツールエラーとして返すゲートウェイ（例: Atlassian の MCP ゲートウェイ）でも長時間セッションが生き残る。OAuth モードではデフォルト有効、`--no-proactive-refresh` で無効化（#242）
 - **403 時のステップアップ認可** — `Bearer error="insufficient_scope"` チャレンジを受けると、付与済みスコープと要求スコープの和集合で再認可（[RFC 9470](https://www.rfc-editor.org/rfc/rfc9470) / MCP step-up、cf. anthropics/claude-code#44652）
+- **コールドスタート（`--oauth-eager`）** — `initialize` をローカルで即答し、対話 OAuth フローはバックグラウンドスレッドで実行。30〜180 秒かかるブラウザ/SSO/MFA ログインでもクライアントの約 60 秒 initialize タイムアウトを超えない。ログイン完了まで該当メソッドは `-32002` を返し、完了後に `notifications/*/list_changed` でクライアントに再取得を促す。Streamable HTTP 限定、warm（有効/refresh 可能）キャッシュは不変（#296）
 - **Bearer token 認証** — `--bearer-token` フラグまたは `MCP_BEARER_TOKEN` 環境変数
 - **カスタムヘッダー** — `-H` / `--header` で任意のヘッダーを送信
 - **グレースフルシャットダウン** — SIGTERM/SIGINT ハンドリング
@@ -191,6 +192,11 @@ mcp-stdio [OPTIONS] URL
   --oauth-use-id-token   access_token ではなく OIDC id_token を Bearer として送信
                          （AWS Bedrock AgentCore / Cognito 向け）。id_token が
                          無ければ access_token にフォールバック（#59）
+  --oauth-eager          コールドスタート: initialize をローカル即答し対話 OAuth を
+                         バックグラウンド実行。長いブラウザ/SSO/MFA ログインでも
+                         クライアントの約 60 秒 initialize タイムアウトを超えない。
+                         Streamable HTTP 限定、--transport sse では無視。warm
+                         キャッシュは不変（#296）
   --oauth-refresh-leeway SECONDS
                          アクセストークンを expire の何秒前に proactive refresh
                          するか（デフォルト: 60、または MCP_OAUTH_REFRESH_LEEWAY 環境変数）
