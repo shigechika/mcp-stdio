@@ -3,7 +3,7 @@
 Reads newline-delimited JSON-RPC from stdin and reacts:
 
 - ``initialize`` (request)      -> an InitializeResult with protocolVersion
-- ``echo`` (request)            -> result {"echoed": <params>}
+- ``echo`` (request)            -> result {"echoed": <params>, "pid": <os pid>}
 - ``noreply`` (request)         -> never responds (drives the timeout path)
 - ``trigger_push`` (notification) -> emits a server-initiated notification
 - ``exit`` (any)                -> the process exits
@@ -13,6 +13,7 @@ script path by the tests.
 """
 
 import json
+import os
 import sys
 
 
@@ -48,7 +49,15 @@ def main() -> None:
                 }
             )
         elif method == "echo" and "id" in msg:
-            _send({"jsonrpc": "2.0", "id": mid, "result": {"echoed": msg.get("params")}})
+            # pid lets a test prove two sessions hit two distinct child
+            # processes (no cross-session response leakage).
+            _send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": mid,
+                    "result": {"echoed": msg.get("params"), "pid": os.getpid()},
+                }
+            )
         elif method == "noreply" and "id" in msg:
             pass  # intentionally silent -> exercises the gateway timeout path
         elif method == "trigger_push":  # a notification (no id)

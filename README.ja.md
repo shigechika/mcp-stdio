@@ -265,8 +265,8 @@ mcp-stdio --check http://127.0.0.1:8080/mcp
 ```
 
 - 標準ライブラリのみ（`http.server`）— ランタイム依存は増えません。
-- Streamable HTTP のリクエスト/レスポンス・通知のセマンティクスに加え、
-  サーバ起点メッセージ用の GET SSE チャネルを実装。
+- Streamable HTTP のリクエスト/レスポンス・通知のセマンティクス、セッション
+  管理に加え、サーバ起点メッセージ用の GET SSE チャネルを実装。
 - **認証は任意・段階的:**
   - *トークン無し* — エンドポイントは素通し（TLS 終端プロキシ背後で運用）。
   - *静的トークン*（`--auth-token` / `MCP_STDIO_SERVE_TOKEN`）— OAuth リソース
@@ -288,7 +288,13 @@ mcp-stdio --check http://127.0.0.1:8080/mcp
   （[RFC 6749](https://www.rfc-editor.org/rfc/rfc6749) §4.1.2 /
   [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700) §4.14.2、正当なリトライを
   巻き込まない短い grace window 付き）。
-- 当面はシングルクライアント前提（JSON-RPC の id はそのまま透過）。
+- **セッション単位のマルチクライアント分離** — MCP セッションごとに専用の
+  バックエンド子プロセスを spawn するため、並行クライアントはプロセス境界で
+  分離される（クライアント間で JSON-RPC の id が衝突しても応答が混線しない）。
+  MCP Streamable HTTP 仕様どおり、`initialize` で `Mcp-Session-Id` を払い出し、
+  以降のリクエストはそれを携行、未知/終了済みの id には `404`（クライアントは
+  再 initialize）、`DELETE` でそのセッションの子を破棄。並行セッション数には
+  上限を設け、素通しゲートウェイでの子プロセス無制限 spawn を防ぐ。
 
 静的トークンの例（トークンは env 経由で `ps` に出さない）:
 

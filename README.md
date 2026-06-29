@@ -267,8 +267,8 @@ mcp-stdio --check http://127.0.0.1:8080/mcp
 ```
 
 - Stdlib only (`http.server`) — adds no runtime dependency.
-- Implements the Streamable HTTP request/response and notification semantics
-  plus a GET SSE channel for server-initiated messages.
+- Implements the Streamable HTTP request/response and notification semantics,
+  session management, plus a GET SSE channel for server-initiated messages.
 - **Authentication is optional and layered:**
   - *No token* — the endpoint is open (run it behind a TLS-terminating proxy).
   - *Static token* (`--auth-token` / `MCP_STDIO_SERVE_TOKEN`) — acts as an OAuth
@@ -290,7 +290,13 @@ mcp-stdio --check http://127.0.0.1:8080/mcp
   the whole grant family ([RFC 6749](https://www.rfc-editor.org/rfc/rfc6749)
   §4.1.2 / [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700) §4.14.2), with a
   brief grace window so a benign client retry is not punished.
-- Single-client assumption for now: JSON-RPC ids pass through verbatim.
+- **Multi-client isolation by session** — each MCP session gets its own spawned
+  backend child, so concurrent clients are isolated by process boundary (a
+  JSON-RPC id collision across clients can never cross responses). Per the MCP
+  Streamable HTTP spec, `initialize` mints an `Mcp-Session-Id`, every later
+  request carries it, an unknown/terminated id gets `404` (the client then
+  re-initializes), and a `DELETE` tears that session's child down. A
+  concurrent-session cap guards an open gateway against unbounded child spawns.
 
 Static-token example (token via env so it is not visible in `ps`):
 
