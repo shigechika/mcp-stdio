@@ -6,25 +6,27 @@ it spawns a local stdio MCP server as a child process and publishes it as a
 Streamable HTTP MCP endpoint, so clients that cannot spawn the server locally
 (a laptop without it installed, a remote bot) can reach it over the network.
 
-A single backend. Authentication is optional and layered: with no token the
-endpoint is open; ``--auth-token`` adds a static-bearer Resource Server gate;
-``--enable-oauth`` adds an embedded OAuth 2.1 Authorization Server. The HTTP
-surface implements the MCP Streamable HTTP transport's request/response and
-notification semantics plus a GET SSE channel for server-initiated messages.
+One backend child PER SESSION. Authentication is optional and layered: with no
+token the endpoint is open; ``--auth-token`` adds a static-bearer Resource
+Server gate; ``--enable-oauth`` adds an embedded OAuth 2.1 Authorization
+Server. The HTTP surface implements the MCP Streamable HTTP transport's
+request/response and notification semantics, session management (an
+``Mcp-Session-Id`` minted on ``initialize``, 404 on an unknown id, DELETE to
+terminate), plus a GET SSE channel for server-initiated messages.
 
 Stdlib only (``http.server`` + ``subprocess`` + ``threading``), matching the
 project's httpx-only-runtime constraint: the server path adds no dependency.
 
-Concurrency model: one long-lived backend child speaks newline-delimited
-JSON-RPC over its stdin/stdout. A single reader thread drains the child's
-stdout and routes each message — a response (id + result/error, no method)
-wakes the waiting HTTP handler keyed by the JSON-RPC id; anything
-server-initiated (carries ``method``) is queued for the GET SSE stream.
+Concurrency model: each MCP session owns a dedicated backend child (see
+:class:`SessionRegistry`) that speaks newline-delimited JSON-RPC over its
+stdin/stdout. Per child, a single reader thread drains stdout and routes each
+message — a response (id + result/error, no method) wakes the waiting HTTP
+handler keyed by the JSON-RPC id; anything server-initiated (carries
+``method``) is queued for that session's GET SSE stream.
 
-Single-client assumption: JSON-RPC ids are passed through verbatim, so two
-distinct clients that happen to reuse the same id while sharing one backend
-could cross responses. This targets one logical client (e.g. one Claude); id
-remapping for true multi-client fan-out is left for later.
+Multi-client isolation is by process boundary: concurrent clients land on
+distinct sessions and distinct children, so a JSON-RPC id collision across
+clients cannot cross responses (each id is unique within its own child).
 """
 
 from __future__ import annotations
@@ -42,7 +44,6 @@ import signal
 import subprocess
 import threading
 import time
-import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -145,7 +146,7 @@ class BackendProcess:
         # id -> single-slot holder {"event": Event, "line": str|None}
         self._pending: dict[Any, dict[str, Any]] = {}
         # Server-initiated messages (requests/notifications) awaiting an SSE
-        # consumer. Unbounded queue is acceptable for the single-client model;
+        # consumer. Unbounded queue is acceptable for one client per session;
         # a later change can bound + shed.
         self.server_initiated: "queue.Queue[str]" = queue.Queue()
         self._closed = threading.Event()
@@ -222,7 +223,7 @@ class BackendProcess:
             if self._closed.is_set():
                 return None
             # Reuse-of-an-in-flight-id is a client bug; last writer wins and the
-            # earlier waiter will time out. Acceptable for the single-client model.
+            # earlier waiter will time out. Acceptable: one client per session.
             self._pending[req_id] = slot
         if not self._write(line):
             with self._lock:
@@ -282,6 +283,101 @@ class BackendProcess:
                 proc.kill()
         except Exception as e:  # pragma: no cover - defensive
             log(f"backend shutdown error: {e}")
+
+
+# --- per-session backend registry: one child stdio server per MCP session ---
+
+# Hard cap on concurrent sessions: a fork-bomb guard for an open (no-auth)
+# gateway, since each session spawns a child process. High enough that a single
+# logical client never trips it; a configurable knob and idle eviction land in
+# a follow-up change.
+_DEFAULT_MAX_SESSIONS = 100
+
+
+class SessionRegistry:
+    """Thread-safe map of ``Mcp-Session-Id`` -> backend child process.
+
+    Each MCP session gets its OWN stdio backend, so concurrent clients are
+    isolated by process boundary rather than multiplexed onto one shared child
+    (which could cross responses on a JSON-RPC id collision). A session is
+    created when a client POSTs ``initialize`` (the gateway mints an id and
+    spawns a dedicated :class:`BackendProcess`), looked up by that header on
+    every later request, and removed on DELETE or gateway shutdown.
+
+    The slow operations — spawning a child (``Popen`` exec) and tearing one
+    down (``terminate()`` then ``wait``) — run OUTSIDE the lock; only the dict
+    mutation is guarded, so one session's lifecycle never serializes another's.
+    """
+
+    def __init__(
+        self, command: list[str], *, max_sessions: int = _DEFAULT_MAX_SESSIONS
+    ) -> None:
+        if not command:
+            raise ValueError("backend command is empty")
+        self._command = command
+        self._max = max_sessions
+        self._lock = threading.Lock()
+        self._sessions: dict[str, BackendProcess] = {}
+
+    def create(self) -> tuple[str, BackendProcess] | None:
+        """Spawn a child for a new session.
+
+        Returns ``(session_id, backend)``, or ``None`` when the concurrent-
+        session cap is reached (the caller then responds 503).
+        """
+        with self._lock:
+            if len(self._sessions) >= self._max:
+                return None
+        # Spawn outside the lock: a Popen exec must not serialize other
+        # sessions' creation or routing.
+        backend = BackendProcess(self._command)
+        # MCP spec: the session id SHOULD be globally unique and
+        # cryptographically secure, and MUST contain only visible ASCII.
+        sid = secrets.token_hex(16)
+        with self._lock:
+            # Re-check the cap: a burst of concurrent creates could have filled
+            # it while we were spawning. Over the cap -> drop the just-spawned
+            # child rather than exceed the bound.
+            over_cap = len(self._sessions) >= self._max
+            if not over_cap:
+                self._sessions[sid] = backend
+        if over_cap:
+            # shutdown() (terminate -> wait) runs OUTSIDE the lock so it never
+            # serializes other sessions' creation or routing.
+            backend.shutdown()
+            return None
+        return sid, backend
+
+    def get(self, sid: str | None) -> BackendProcess | None:
+        """Resolve a session id to its backend, or None if unknown."""
+        if not sid:
+            return None
+        with self._lock:
+            return self._sessions.get(sid)
+
+    def remove(self, sid: str | None) -> BackendProcess | None:
+        """Detach a session and return its backend (or None if unknown).
+
+        The caller calls ``backend.shutdown()`` OUTSIDE the lock so a slow
+        terminate never freezes routing for other sessions.
+        """
+        if not sid:
+            return None
+        with self._lock:
+            return self._sessions.pop(sid, None)
+
+    def shutdown_all(self) -> None:
+        """Tear down every session's child (gateway shutdown)."""
+        with self._lock:
+            backends = list(self._sessions.values())
+            self._sessions.clear()
+        for backend in backends:
+            backend.shutdown()
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return len(self._sessions)
 
 
 # --- embedded OAuth 2.1 Authorization Server (stdlib only, opaque tokens) ---
@@ -857,15 +953,18 @@ class _OAuthProvider:
 
 
 class _Handler(BaseHTTPRequestHandler):
-    """Streamable HTTP MCP endpoint backed by a single stdio child.
+    """Streamable HTTP MCP endpoint backed by a per-session stdio child.
 
-    Class attributes ``backend``, ``mcp_path`` and ``session_id`` are bound by
-    :func:`serve` before the server loop starts.
+    Class attributes ``registry`` and ``mcp_path`` are bound by
+    :func:`build_server` before the server loop starts. The session id for the
+    request in flight is held in the per-request instance attribute
+    ``_session_id`` (reset at the top of each verb handler), so response
+    helpers can echo it — or omit it for errors raised before a session is
+    resolved.
     """
 
-    backend: BackendProcess
+    registry: SessionRegistry
     mcp_path: str
-    session_id: str
     # None disables authentication. A non-None value enables the
     # static-bearer-token Resource Server gate.
     auth_token: str | None = None
@@ -886,14 +985,18 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Mcp-Session-Id", self.session_id)
+        sid = getattr(self, "_session_id", None)
+        if sid is not None:
+            self.send_header("Mcp-Session-Id", sid)
         self.end_headers()
         self.wfile.write(data)
 
     def _send_empty(self, status: int) -> None:
         self.send_response(status)
         self.send_header("Content-Length", "0")
-        self.send_header("Mcp-Session-Id", self.session_id)
+        sid = getattr(self, "_session_id", None)
+        if sid is not None:
+            self.send_header("Mcp-Session-Id", sid)
         self.end_headers()
 
     def _send_oauth_json(self, status: int, body: str, *, no_store: bool = False) -> None:
@@ -1124,7 +1227,30 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _resolve_session(self, req_id: Any = None) -> BackendProcess | None:
+        """Resolve the request's session, or emit the spec error and return None.
+
+        A missing ``Mcp-Session-Id`` -> 400 (MCP spec item 2); an unknown or
+        terminated id -> 404 (item 3, which drives the client's re-initialize).
+        On success records the id for the response header and returns the
+        backend. Shared by the POST (non-initialize) and GET paths so both
+        report the same status for the same condition.
+        """
+        sid = self.headers.get("Mcp-Session-Id")
+        if not sid:
+            self._send_json(400, _error_body("Mcp-Session-Id required", req_id))
+            return None
+        backend = self.registry.get(sid)
+        if backend is None:
+            self._send_json(404, _error_body("unknown or expired session", req_id))
+            return None
+        self._session_id = sid
+        return backend
+
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        # Reset the per-request session id (the handler instance is reused
+        # across keep-alive requests); responses before resolution omit it.
+        self._session_id = None
         # Read (drain) the request body BEFORE any early return. On HTTP/1.1
         # keep-alive, leaving an unread body in the socket makes the handler
         # parse those leftover bytes as the next request line ("Bad request
@@ -1165,8 +1291,12 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         kind = _classify(msg)
+        if kind not in ("request", "notification", "response"):
+            # Batches and malformed payloads are out of scope here.
+            self._send_json(400, _error_body("unsupported or invalid message"))
+            return
+        req_id = msg.get("id") if kind == "request" else None
         if kind == "request":
-            req_id = msg.get("id")
             # A JSON-RPC id is a String, Number, or null. A non-scalar id
             # (object / array) is malformed AND unhashable, so using it as the
             # pending-response dict key would raise TypeError and crash the
@@ -1175,28 +1305,62 @@ class _Handler(BaseHTTPRequestHandler):
             if req_id is not None and not isinstance(req_id, (str, int, float)):
                 self._send_json(400, _error_body("invalid JSON-RPC id"))
                 return
-            if self.backend.closed:
+
+        # --- session resolution (MCP Streamable HTTP session management) ---
+        is_init = kind == "request" and msg.get("method") == "initialize"
+        if is_init:
+            # `initialize` starts a session (MCP spec item 1): spawn a fresh
+            # child and mint an id, returned via the Mcp-Session-Id response
+            # header. A presented (stale) id is dropped first.
+            stale_id = self.headers.get("Mcp-Session-Id")
+            if stale_id:
+                stale = self.registry.remove(stale_id)
+                if stale is not None:
+                    stale.shutdown()
+            created = self.registry.create()
+            if created is None:
+                self._send_json(503, _error_body("session limit reached", req_id))
+                return
+            self._session_id, backend = created
+        else:
+            # MCP spec items 2/3: sessionless -> 400, unknown/terminated -> 404.
+            backend = self._resolve_session(req_id)
+            if backend is None:
+                return
+
+        if kind == "request":
+            if backend.closed:
+                # Dead child: drop the session so the slot is reclaimed and the
+                # client's next request re-initializes (404) instead of looping
+                # on 503. shutdown() reaps the already-exited child.
+                stale = self.registry.remove(self._session_id)
+                if stale is not None:
+                    stale.shutdown()
                 self._send_json(503, _error_body("backend unavailable", req_id))
                 return
-            line = self.backend.send_request(
+            line = backend.send_request(
                 json.dumps(msg), req_id, _BACKEND_RESPONSE_TIMEOUT_SECS
             )
             if line is None:
+                if is_init:
+                    # The freshly-spawned child never answered initialize, so it
+                    # never became a usable session — don't leak its slot/child.
+                    stale = self.registry.remove(self._session_id)
+                    if stale is not None:
+                        stale.shutdown()
                 self._send_json(
                     504, _error_body("no response from backend", req_id)
                 )
                 return
             self._send_json(200, line)
-        elif kind in ("notification", "response"):
+        else:
             # Fire-and-forget toward the backend; the MCP spec returns 202 for
             # a POST that carries no request needing a reply.
-            self.backend.send_oneway(json.dumps(msg))
+            backend.send_oneway(json.dumps(msg))
             self._send_empty(202)
-        else:
-            # Batches and malformed payloads are out of scope here.
-            self._send_json(400, _error_body("unsupported or invalid message"))
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        self._session_id = None
         path = self.path.split("?", 1)[0]
         # RFC 9728 metadata is unauthenticated — it is how the client discovers
         # how to authenticate — so it is checked before the auth gate. Match the
@@ -1224,6 +1388,12 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if not self._require_auth():
             return
+        # The SSE stream carries a session's server-initiated messages, so it
+        # must name an existing session: sessionless -> 400, unknown/terminated
+        # -> 404 (drives the client's re-initialize), as on the POST path.
+        backend = self._resolve_session()
+        if backend is None:
+            return
         # Open an SSE stream carrying server-initiated messages (notifications
         # and server->client requests) until the client disconnects or the
         # backend dies. The stream has no Content-Length and is not chunked, so
@@ -1234,11 +1404,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "keep-alive")
-        self.send_header("Mcp-Session-Id", self.session_id)
+        self.send_header("Mcp-Session-Id", self._session_id)
         self.end_headers()
-        q = self.backend.server_initiated
+        q = backend.server_initiated
         try:
-            while not self.backend.closed:
+            while not backend.closed:
                 try:
                     line = q.get(timeout=_SSE_KEEPALIVE_SECS)
                 except queue.Empty:
@@ -1254,12 +1424,25 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
     def do_DELETE(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        # MCP clients DELETE the endpoint to end a session. This gateway has one
-        # long-lived backend, so acknowledge without tearing it down.
+        # MCP clients DELETE the endpoint to terminate a session (spec item 5).
+        # Tear down that session's backend child.
+        self._session_id = None
         if self._wrong_path():
             return
         if not self._require_auth():
             return
+        sid_header = self.headers.get("Mcp-Session-Id")
+        if not sid_header:
+            self._send_json(400, _error_body("Mcp-Session-Id required"))
+            return
+        backend = self.registry.remove(sid_header)
+        if backend is None:
+            self._send_json(404, _error_body("unknown or expired session"))
+            return
+        # shutdown() (terminate -> wait) runs after the dict pop, off the lock.
+        backend.shutdown()
+        log(f"session {sid_header[:8]}... terminated by client")
+        self._session_id = sid_header
         self._send_empty(200)
 
 
@@ -1271,27 +1454,27 @@ def build_server(
     mcp_path: str = "/mcp",
     auth_token: str | None = None,
     oauth: _OAuthProvider | None = None,
-) -> tuple[ThreadingHTTPServer, BackendProcess]:
-    """Construct the HTTP server and backend without running the loop.
+    max_sessions: int = _DEFAULT_MAX_SESSIONS,
+) -> tuple[ThreadingHTTPServer, SessionRegistry]:
+    """Construct the HTTP server and session registry without running the loop.
 
     Separated from :func:`serve` so tests can drive the server on an ephemeral
     port (``port=0``) without installing signal handlers or blocking. The
     caller owns the lifecycle: run ``httpd.serve_forever()`` (typically in a
-    thread), then ``backend.shutdown()`` + ``httpd.server_close()``.
+    thread), then ``registry.shutdown_all()`` + ``httpd.server_close()``.
 
     ``auth_token`` (when not None) enables the static-bearer-token Resource
     Server gate. ``oauth`` (when not None) enables the embedded OAuth
     Authorization Server: /authorize /token /register + AS metadata, and
     the RS gate then also accepts issued access tokens.
     """
-    backend = BackendProcess(command)
+    registry = SessionRegistry(command, max_sessions=max_sessions)
     handler = type(
         "_BoundHandler",
         (_Handler,),
         {
-            "backend": backend,
+            "registry": registry,
             "mcp_path": mcp_path,
-            "session_id": uuid.uuid4().hex,
             "auth_token": auth_token,
             "oauth": oauth,
         },
@@ -1299,7 +1482,7 @@ def build_server(
     httpd = ThreadingHTTPServer((host, port), handler)
     # Don't let the process hang on lingering SSE handler threads at shutdown.
     httpd.daemon_threads = True
-    return httpd, backend
+    return httpd, registry
 
 
 def serve(
@@ -1318,7 +1501,7 @@ def serve(
     the backend down. ``auth_token`` enables the static-token gate;
     ``oauth`` enables the embedded Authorization Server.
     """
-    httpd, backend = build_server(
+    httpd, registry = build_server(
         command,
         host=host,
         port=port,
@@ -1353,7 +1536,7 @@ def serve(
     try:
         httpd.serve_forever()
     finally:
-        backend.shutdown()
+        registry.shutdown_all()
         httpd.server_close()
 
 

@@ -23,26 +23,39 @@ _BACKEND = [sys.executable, os.path.join(os.path.dirname(__file__), "_fake_backe
 @pytest.fixture()
 def gateway():
     """Start the gateway on an ephemeral port; yield its base MCP URL."""
-    httpd, backend = server.build_server(_BACKEND, host="127.0.0.1", port=0)
+    httpd, registry = server.build_server(_BACKEND, host="127.0.0.1", port=0)
     host, port = httpd.server_address[0], httpd.server_address[1]
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
     url = f"http://{host}:{port}/mcp"
     try:
-        yield url, backend
+        yield url, registry
     finally:
         httpd.shutdown()
-        backend.shutdown()
+        registry.shutdown_all()
         httpd.server_close()
 
 
-def _post(url: str, msg: dict) -> httpx.Response:
-    return httpx.post(url, content=json.dumps(msg), timeout=10)
+def _post(url: str, msg: dict, sid: str | None = None) -> httpx.Response:
+    headers = {"Mcp-Session-Id": sid} if sid else {}
+    return httpx.post(url, content=json.dumps(msg), headers=headers, timeout=10)
+
+
+def _init(url: str, headers: dict | None = None) -> tuple[str | None, httpx.Response]:
+    """POST ``initialize`` to open a session; return (session_id, response)."""
+    resp = httpx.post(
+        url,
+        content=json.dumps({"jsonrpc": "2.0", "id": "init", "method": "initialize"}),
+        headers=headers or {},
+        timeout=10,
+    )
+    return resp.headers.get("mcp-session-id"), resp
 
 
 def test_request_response(gateway):
     url, _ = gateway
-    resp = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo", "params": {"a": 1}})
+    sid, _ = _init(url)
+    resp = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo", "params": {"a": 1}}, sid)
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "application/json"
     body = resp.json()
@@ -52,23 +65,56 @@ def test_request_response(gateway):
 
 def test_initialize_returns_protocol_version(gateway):
     url, _ = gateway
-    resp = _post(url, {"jsonrpc": "2.0", "id": "init", "method": "initialize"})
+    _, resp = _init(url)
     assert resp.status_code == 200
     assert resp.json()["result"]["protocolVersion"] == "2025-06-18"
 
 
-def test_session_id_header_present_and_stable(gateway):
+def test_initialize_assigns_session(gateway):
+    url, registry = gateway
+    sid, resp = _init(url)
+    assert resp.status_code == 200
+    assert sid  # the gateway minted an Mcp-Session-Id
+    assert registry.count == 1
+
+
+def test_session_id_per_initialize(gateway):
+    # Each initialize starts a NEW session with its own id (was a constant id
+    # under the old single-backend model).
+    url, registry = gateway
+    sid1, _ = _init(url)
+    sid2, _ = _init(url)
+    assert sid1 and sid2 and sid1 != sid2
+    assert registry.count == 2
+
+
+def test_two_initializes_distinct_children(gateway):
+    # Two sessions -> two distinct child processes (process-boundary isolation).
     url, _ = gateway
-    r1 = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo"})
-    r2 = _post(url, {"jsonrpc": "2.0", "id": 2, "method": "echo"})
-    sid1 = r1.headers.get("mcp-session-id")
-    sid2 = r2.headers.get("mcp-session-id")
-    assert sid1 and sid1 == sid2
+    sid1, _ = _init(url)
+    sid2, _ = _init(url)
+    p1 = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo"}, sid1).json()["result"]["pid"]
+    p2 = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo"}, sid2).json()["result"]["pid"]
+    assert p1 != p2
+
+
+def test_no_cross_session_id_leak(gateway):
+    # Two sessions both use JSON-RPC id=1; each must get ITS OWN child's
+    # response, never the other's (the single-backend model could cross them).
+    url, _ = gateway
+    sid_a, _ = _init(url)
+    sid_b, _ = _init(url)
+    ra = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo", "params": {"who": "A"}}, sid_a).json()
+    rb = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo", "params": {"who": "B"}}, sid_b).json()
+    assert ra["result"]["echoed"] == {"who": "A"}
+    assert rb["result"]["echoed"] == {"who": "B"}
+    assert ra["result"]["pid"] != rb["result"]["pid"]
 
 
 def test_notification_returns_202(gateway):
     url, _ = gateway
-    resp = _post(url, {"jsonrpc": "2.0", "method": "somenotify"})
+    sid, _ = _init(url)
+    resp = _post(url, {"jsonrpc": "2.0", "method": "somenotify"}, sid)
     assert resp.status_code == 202
 
 
@@ -76,8 +122,23 @@ def test_client_response_returns_202(gateway):
     # A client answering a server-initiated request is a JSON-RPC response
     # (id + result, no method): the gateway forwards it one-way -> 202.
     url, _ = gateway
-    resp = _post(url, {"jsonrpc": "2.0", "id": 99, "result": {"ok": True}})
+    sid, _ = _init(url)
+    resp = _post(url, {"jsonrpc": "2.0", "id": 99, "result": {"ok": True}}, sid)
     assert resp.status_code == 202
+
+
+def test_sessionless_non_init_returns_400(gateway):
+    # MCP spec: a non-initialize request without an Mcp-Session-Id -> 400.
+    url, _ = gateway
+    resp = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo"})
+    assert resp.status_code == 400
+
+
+def test_unknown_session_returns_404(gateway):
+    # MCP spec: an unknown/terminated session id -> 404 (drives re-initialize).
+    url, _ = gateway
+    resp = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo"}, "deadbeef" * 4)
+    assert resp.status_code == 404
 
 
 def test_batch_is_rejected(gateway):
@@ -110,7 +171,8 @@ def test_wrong_path_returns_404(gateway):
 def test_backend_timeout_returns_504(gateway, monkeypatch):
     url, _ = gateway
     monkeypatch.setattr(server, "_BACKEND_RESPONSE_TIMEOUT_SECS", 0.4)
-    resp = _post(url, {"jsonrpc": "2.0", "id": 7, "method": "noreply"})
+    sid, _ = _init(url)
+    resp = _post(url, {"jsonrpc": "2.0", "id": 7, "method": "noreply"}, sid)
     assert resp.status_code == 504
     assert resp.json()["id"] == 7
     assert resp.json()["error"]["code"] == -32000
@@ -118,11 +180,14 @@ def test_backend_timeout_returns_504(gateway, monkeypatch):
 
 def test_get_sse_delivers_server_initiated(gateway):
     url, _ = gateway
+    sid, _ = _init(url)
     received: list[str] = []
     ready = threading.Event()
 
     def reader():
-        with httpx.stream("GET", url, timeout=10) as r:
+        with httpx.stream(
+            "GET", url, headers={"Mcp-Session-Id": sid}, timeout=10
+        ) as r:
             ready.set()
             for line in r.iter_lines():
                 if line.startswith("data: "):
@@ -133,7 +198,7 @@ def test_get_sse_delivers_server_initiated(gateway):
     t.start()
     ready.wait(5)
     time.sleep(0.2)  # let the GET stream attach before we trigger a push
-    _post(url, {"jsonrpc": "2.0", "method": "trigger_push"})
+    _post(url, {"jsonrpc": "2.0", "method": "trigger_push"}, sid)
     t.join(5)
     assert received, "no SSE message received"
     msg = json.loads(received[0])
@@ -141,23 +206,94 @@ def test_get_sse_delivers_server_initiated(gateway):
     assert msg["params"] == {"hello": "world"}
 
 
-def test_delete_returns_200(gateway):
+def test_get_sse_unknown_session_returns_404(gateway):
+    url, _ = gateway
+    resp = httpx.get(url, headers={"Mcp-Session-Id": "nope" * 8}, timeout=10)
+    assert resp.status_code == 404
+
+
+def test_get_sse_without_session_returns_400(gateway):
+    # MCP spec item 2: a sessionless GET (like a sessionless POST) -> 400.
+    url, _ = gateway
+    resp = httpx.get(url, timeout=10)
+    assert resp.status_code == 400
+
+
+def test_delete_reaps_session(gateway):
+    url, registry = gateway
+    sid, _ = _init(url)
+    assert registry.count == 1
+    resp = httpx.request("DELETE", url, headers={"Mcp-Session-Id": sid}, timeout=10)
+    assert resp.status_code == 200
+    assert registry.count == 0
+    # The terminated session id is now unknown -> 404.
+    again = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo"}, sid)
+    assert again.status_code == 404
+
+
+def test_delete_without_session_id_returns_400(gateway):
     url, _ = gateway
     resp = httpx.request("DELETE", url, timeout=10)
-    assert resp.status_code == 200
+    assert resp.status_code == 400
+
+
+def test_delete_unknown_session_returns_404(gateway):
+    url, _ = gateway
+    resp = httpx.request("DELETE", url, headers={"Mcp-Session-Id": "x" * 32}, timeout=10)
+    assert resp.status_code == 404
 
 
 def test_backend_death_then_request_fails(gateway):
-    url, backend = gateway
+    url, registry = gateway
+    sid, _ = _init(url)
+    backend = registry.get(sid)
     # Tell the backend to exit, then give the reader thread a moment to notice.
-    _post(url, {"jsonrpc": "2.0", "method": "exit"})
+    _post(url, {"jsonrpc": "2.0", "method": "exit"}, sid)
     deadline = time.time() + 5
     while not backend.closed and time.time() < deadline:
         time.sleep(0.05)
     assert backend.closed
-    resp = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo"})
+    resp = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo"}, sid)
     assert resp.status_code == 503
     assert resp.json()["id"] == 1
+    # The dead session is reaped, so the slot is reclaimed and the next request
+    # on that id gets 404 (the client then re-initializes) rather than 503.
+    assert registry.count == 0
+    again = _post(url, {"jsonrpc": "2.0", "id": 2, "method": "echo"}, sid)
+    assert again.status_code == 404
+
+
+def test_registry_cap_rejects_beyond_max():
+    # Unit-level: the registry returns None past the concurrent-session cap.
+    reg = server.SessionRegistry(_BACKEND, max_sessions=2)
+    try:
+        assert reg.create() is not None
+        assert reg.create() is not None
+        assert reg.create() is None  # cap reached
+        assert reg.count == 2
+    finally:
+        reg.shutdown_all()
+    assert reg.count == 0
+
+
+def test_session_cap_returns_503():
+    # HTTP-level: an initialize past the cap gets 503.
+    httpd, registry = server.build_server(
+        _BACKEND, host="127.0.0.1", port=0, max_sessions=1
+    )
+    host, port = httpd.server_address[0], httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    url = f"http://{host}:{port}/mcp"
+    try:
+        sid1, r1 = _init(url)
+        assert r1.status_code == 200 and sid1
+        _, r2 = _init(url)
+        assert r2.status_code == 503
+    finally:
+        httpd.shutdown()
+        registry.shutdown_all()
+        httpd.server_close()
 
 
 # --- unit-level checks that don't need the HTTP server ---
@@ -191,7 +327,7 @@ _TOKEN = "s3cr3t-token"
 @pytest.fixture()
 def auth_gateway():
     """A gateway protected by a static bearer token."""
-    httpd, backend = server.build_server(
+    httpd, registry = server.build_server(
         _BACKEND, host="127.0.0.1", port=0, auth_token=_TOKEN
     )
     host, port = httpd.server_address[0], httpd.server_address[1]
@@ -199,10 +335,10 @@ def auth_gateway():
     t.start()
     url = f"http://{host}:{port}/mcp"
     try:
-        yield url, backend
+        yield url, registry
     finally:
         httpd.shutdown()
-        backend.shutdown()
+        registry.shutdown_all()
         httpd.server_close()
 
 
@@ -233,12 +369,14 @@ def test_auth_wrong_token_returns_401(auth_gateway):
 
 def test_auth_valid_token_returns_200(auth_gateway):
     url, _ = auth_gateway
+    auth = {"Authorization": f"Bearer {_TOKEN}"}
+    sid, _ = _init(url, headers=auth)
     resp = httpx.post(
         url,
         content=json.dumps(
             {"jsonrpc": "2.0", "id": 1, "method": "echo", "params": {"a": 1}}
         ),
-        headers={"Authorization": f"Bearer {_TOKEN}"},
+        headers={**auth, "Mcp-Session-Id": sid},
         timeout=10,
     )
     assert resp.status_code == 200
@@ -299,7 +437,7 @@ def test_prm_honors_forwarded_headers(auth_gateway):
 def test_no_auth_fixture_still_open(gateway):
     # The default fixture has no token: a request without Authorization is 200.
     url, _ = gateway
-    resp = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo"})
+    _, resp = _init(url)
     assert resp.status_code == 200
 
 
@@ -332,18 +470,18 @@ _REDIRECT = "http://127.0.0.1:5555/callback"
 
 @contextlib.contextmanager
 def _run(*, auth_token=None, oauth=None):
-    """Start a gateway with the given auth config; yield (base_url, backend)."""
-    httpd, backend = server.build_server(
+    """Start a gateway with the given auth config; yield (base_url, registry)."""
+    httpd, registry = server.build_server(
         _BACKEND, host="127.0.0.1", port=0, auth_token=auth_token, oauth=oauth
     )
     host, port = httpd.server_address[0], httpd.server_address[1]
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
     try:
-        yield f"http://{host}:{port}", backend
+        yield f"http://{host}:{port}", registry
     finally:
         httpd.shutdown()
-        backend.shutdown()
+        registry.shutdown_all()
         httpd.server_close()
 
 
@@ -357,8 +495,8 @@ def _provider(**kw):
 @pytest.fixture()
 def oauth_gateway():
     """A gateway with the embedded AS enabled and --dev-user=alice."""
-    with _run(oauth=_provider()) as (base, backend):
-        yield base, backend
+    with _run(oauth=_provider()) as (base, registry):
+        yield base, registry
 
 
 def _register(base, redirect=_REDIRECT):
@@ -401,10 +539,15 @@ def _token(base, data):
 
 
 def _authed_mcp(base, token, mid=1):
-    """An authenticated MCP echo call with the given bearer token."""
+    """An authenticated MCP call with the given bearer token.
+
+    Uses ``initialize`` so a valid token gets 200 (and opens a session) while
+    an invalid one is rejected by the auth gate (401) before session creation —
+    exactly the status distinction these tests assert.
+    """
     return httpx.post(
         base + "/mcp",
-        content=json.dumps({"jsonrpc": "2.0", "id": mid, "method": "echo"}),
+        content=json.dumps({"jsonrpc": "2.0", "id": mid, "method": "initialize"}),
         headers={"Authorization": f"Bearer {token}"},
         timeout=10,
     )
@@ -546,9 +689,11 @@ def test_full_auth_code_flow_and_use_token(oauth_gateway):
     assert body["refresh_token"]
     assert tok.headers.get("cache-control") == "no-store"
     # use the issued token on an MCP request
+    auth = {"Authorization": f"Bearer {body['access_token']}"}
+    sid, _ = _init(base + "/mcp", headers=auth)
     r = httpx.post(base + "/mcp",
                    content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "echo", "params": {"x": 1}}),
-                   headers={"Authorization": f"Bearer {body['access_token']}"}, timeout=10)
+                   headers={**auth, "Mcp-Session-Id": sid}, timeout=10)
     assert r.status_code == 200
     assert r.json()["result"]["echoed"] == {"x": 1}
     # without the token -> 401
@@ -718,7 +863,7 @@ def test_issued_token_expires():
         _, _, _, _, tok = _full_flow(base)
         at = tok.json()["access_token"]
         ok = httpx.post(base + "/mcp",
-                        content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "echo"}),
+                        content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
                         headers={"Authorization": f"Bearer {at}"}, timeout=10)
         assert ok.status_code == 200
         clock[0] += 100  # advance past TTL
@@ -734,14 +879,14 @@ def test_coexistence_static_and_oauth():
     with _run(auth_token="static-tok", oauth=_provider()) as (base, _):
         # static token authorizes
         r1 = httpx.post(base + "/mcp",
-                        content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "echo"}),
+                        content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
                         headers={"Authorization": "Bearer static-tok"}, timeout=10)
         assert r1.status_code == 200
         # issued token authorizes
         _, _, _, _, tok = _full_flow(base)
         at = tok.json()["access_token"]
         r2 = httpx.post(base + "/mcp",
-                        content=json.dumps({"jsonrpc": "2.0", "id": 2, "method": "echo"}),
+                        content=json.dumps({"jsonrpc": "2.0", "id": 2, "method": "initialize"}),
                         headers={"Authorization": f"Bearer {at}"}, timeout=10)
         assert r2.status_code == 200
         # PRM advertises authorization_servers
@@ -862,7 +1007,7 @@ def test_path_scoped_full_flow():
         # The issued token authorizes a real MCP call at the prefixed path.
         r = httpx.post(
             base + prefix + "/mcp",
-            content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "echo"}),
+            content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
             headers={"Authorization": f"Bearer {access}"},
             timeout=10,
         )
@@ -972,7 +1117,7 @@ def test_real_client_ensure_token(monkeypatch, tmp_path):
         assert td.access_token
         # the obtained token authorizes a real MCP call
         r = httpx.post(base + "/mcp",
-                       content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "echo"}),
+                       content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
                        headers={"Authorization": f"Bearer {td.access_token}"}, timeout=10)
         assert r.status_code == 200
 
