@@ -318,6 +318,7 @@ def _build_cold_start_login(
                 refresh_leeway=refresh_leeway,
                 resource_indicator=resource_indicator,
                 timeout=oauth_timeout,
+                interactive=True,  # cold-start: run the full browser/device flow
             )
             if data is None:  # interactive=True never returns None, but be safe
                 return None
@@ -624,10 +625,13 @@ def _main() -> None:
         args.client_id is not None
         or args.oauth_scope
         or args.no_resource_indicator
+        or args.oauth_use_id_token
+        or args.oauth_eager
     ):
         print(
-            "warning: --client-id / --oauth-scope / --no-resource-indicator are "
-            "ignored without --oauth or --oauth-device",
+            "warning: --client-id / --oauth-scope / --no-resource-indicator / "
+            "--oauth-use-id-token / --oauth-eager are ignored without --oauth "
+            "or --oauth-device",
             file=sys.stderr,
         )
 
