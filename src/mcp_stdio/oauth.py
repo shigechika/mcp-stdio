@@ -92,6 +92,12 @@ class OAuthMetadata:
     # RFC 9207 §3 metadata flag. When the AS advertises this true, RFC 9207 §2.4
     # makes the client MUST reject an authorization response that lacks ``iss``.
     iss_parameter_supported: bool = False
+    # MCP 2025-11-25 "Client ID Metadata Documents" / RFC 8414 extension
+    # (draft-ietf-oauth-client-id-metadata-document-00 §5 "Authorization Server
+    # Metadata"). When the AS advertises this true, an HTTPS URL pointing to a
+    # client metadata document may be used as ``client_id`` in place of DCR or
+    # a pre-registered id (#60).
+    client_id_metadata_document_supported: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +546,12 @@ def _parse_as_metadata_response(
         iss_parameter_supported=(
             data.get("authorization_response_iss_parameter_supported") is True
         ),
+        # draft-ietf-oauth-client-id-metadata-document-00 §5: same strict-bool
+        # coercion as iss_parameter_supported, for the same reason — a non-bool
+        # JSON value must not accidentally enable the CIMD client_id path.
+        client_id_metadata_document_supported=(
+            data.get("client_id_metadata_document_supported") is True
+        ),
     )
 
 
@@ -883,7 +895,7 @@ def register_client(
     if not metadata.registration_endpoint:
         raise ValueError(
             "Server does not support dynamic client registration. "
-            "Provide a --client-id instead."
+            "Provide a --client-id or --client-metadata-url instead."
         )
 
     auth_method = _pick_token_endpoint_auth_method(
@@ -1540,6 +1552,32 @@ def refresh_cached_token(
     return data
 
 
+def _resolve_cimd_client_id(
+    client_metadata_url: str | None, metadata: OAuthMetadata
+) -> str | None:
+    """Resolve a Client ID Metadata Document URL into a client_id (#60).
+
+    Shared by ``_run_authorization_flow`` and ``_run_device_authorization_flow``
+    so the warn-and-use logic lives in one place. Returns ``client_metadata_url``
+    unchanged (a CIMD client_id IS just a URL) when given, or ``None`` when not.
+    An explicit ``--client-metadata-url`` always wins over cache/DCR — the same
+    explicit-opt-in rule as ``client_id_override`` — so this never second-
+    guesses the caller; it only warns when the AS metadata doesn't (yet)
+    confirm support, so a parse miss or a misconfigured AS is still actionable.
+    """
+    if not client_metadata_url:
+        return None
+    if not metadata.client_id_metadata_document_supported:
+        log(
+            "warning: --client-metadata-url is set but the authorization "
+            "server does not advertise client_id_metadata_document_supported "
+            "(draft-ietf-oauth-client-id-metadata-document-00 §5); using it "
+            "anyway"
+        )
+    log(f"using Client ID Metadata Document as client_id: {client_metadata_url}")
+    return client_metadata_url
+
+
 def _run_authorization_flow(
     server_url: str,
     client: httpx.Client,
@@ -1547,6 +1585,7 @@ def _run_authorization_flow(
     metadata: OAuthMetadata,
     cached: TokenData | None,
     client_id_override: str | None = None,
+    client_metadata_url: str | None = None,
     scope: str | None = None,
     timeout: float = 120,
     resource_indicator: bool = True,
@@ -1555,8 +1594,17 @@ def _run_authorization_flow(
 
     Shared by both ``ensure_token`` (initial auth) and ``step_up_authorize``
     (RFC 9470 / MCP step-up for 403 insufficient_scope). Handles callback
-    server setup, DCR (when no usable cached client credentials exist),
-    PKCE, browser launch, code exchange, and persistence.
+    server setup, client_id resolution (pre-registered override, Client ID
+    Metadata Document, or DCR — in that priority order, per the MCP
+    "Client Registration Approaches" priority list), PKCE, browser launch,
+    code exchange, and persistence.
+
+    ``client_metadata_url`` (``--client-metadata-url``, #60) is an operator-
+    hosted HTTPS URL to a Client ID Metadata Document
+    (draft-ietf-oauth-client-id-metadata-document-00); when set it is an
+    explicit opt-in and is used as ``client_id`` even if the AS metadata does
+    not (yet) advertise ``client_id_metadata_document_supported`` — mirroring
+    how an explicit ``client_id_override`` is never second-guessed.
     """
     cb_result = CallbackResult()
     handler_cls = _make_callback_handler(cb_result)
@@ -1576,7 +1624,7 @@ def _run_authorization_flow(
     port = callback_server.server_address[1]
     redirect_uri = f"http://127.0.0.1:{port}/callback"
 
-    cid = client_id_override
+    cid = client_id_override or _resolve_cimd_client_id(client_metadata_url, metadata)
     csecret: str | None = None
     cse_at: float | None = None
     auth_method = "none"
@@ -1773,6 +1821,7 @@ def _run_device_authorization_flow(
     metadata: OAuthMetadata,
     cached: TokenData | None,
     client_id_override: str | None = None,
+    client_metadata_url: str | None = None,
     scope: str | None = None,
     resource_indicator: bool = True,
     timeout: float | None = None,
@@ -1787,6 +1836,9 @@ def _run_device_authorization_flow(
     bounds how long this waits for the user to confirm the device code — the
     effective poll lifetime is ``min(timeout, server-advertised expires_in)``.
     A direct caller passing ``None`` keeps the full RFC 8628 server lifetime.
+
+    ``client_metadata_url`` (#60) mirrors ``_run_authorization_flow``'s Client
+    ID Metadata Document support — see that function's docstring.
     """
     if not metadata.device_authorization_endpoint:
         raise ValueError(
@@ -1795,7 +1847,7 @@ def _run_device_authorization_flow(
             "Use --oauth for browser-based flow instead."
         )
 
-    cid = client_id_override
+    cid = client_id_override or _resolve_cimd_client_id(client_metadata_url, metadata)
     csecret: str | None = None
     cse_at: float | None = None
     auth_method = "none"
@@ -1816,7 +1868,7 @@ def _run_device_authorization_flow(
         else:
             raise ValueError(
                 "Server does not support dynamic client registration. "
-                "Provide a --client-id instead."
+                "Provide a --client-id or --client-metadata-url instead."
             )
     if cid is None:  # -O-safe invariant (every branch above sets cid)
         raise RuntimeError("no client_id available for device authorization")
@@ -2076,6 +2128,7 @@ def ensure_token(
     client: httpx.Client,
     *,
     client_id: str | None = None,
+    client_metadata_url: str | None = None,
     scope: str | None = None,
     timeout: float = 120,
     device_flow: bool = False,
@@ -2090,6 +2143,11 @@ def ensure_token(
     3. If no token or refresh fails, run OAuth flow:
        - ``device_flow=True``: Device Authorization Grant (RFC 8628)
        - ``device_flow=False``: Authorization Code flow with PKCE (default)
+
+    ``client_metadata_url`` (``--client-metadata-url``, #60) is used as the
+    OAuth ``client_id`` (a Client ID Metadata Document URL) when no
+    ``client_id`` override applies — see ``_run_authorization_flow`` /
+    ``_run_device_authorization_flow`` for the full priority order.
 
     When ``interactive=False``, step 3 is skipped: if no cached/refreshable
     token is available the function returns ``None`` instead of opening a
@@ -2145,6 +2203,7 @@ def ensure_token(
             metadata=metadata,
             cached=cached,
             client_id_override=client_id,
+            client_metadata_url=client_metadata_url,
             scope=scope,
             resource_indicator=resource_indicator,
             # honour --oauth-timeout for the device-code wait too,
@@ -2157,6 +2216,7 @@ def ensure_token(
         metadata=metadata,
         cached=cached,
         client_id_override=client_id,
+        client_metadata_url=client_metadata_url,
         scope=scope,
         timeout=timeout,
         resource_indicator=resource_indicator,

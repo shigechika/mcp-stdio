@@ -8,6 +8,7 @@ import os
 import re
 import sys
 from typing import TYPE_CHECKING, Callable
+from urllib.parse import urlparse
 
 import httpx
 
@@ -50,6 +51,37 @@ def _positive_float(value: str) -> float:
     if f == 0:
         raise argparse.ArgumentTypeError("value must be > 0")
     return f
+
+
+def _https_url_with_path(value: str) -> str:
+    """argparse type for a Client ID Metadata Document URL (#60).
+
+    draft-ietf-oauth-client-id-metadata-document-00 §3 "Client Identifier"
+    defines the client_id URL as: MUST use the https scheme, MUST contain a
+    path component, MUST NOT contain single-dot/double-dot path segments,
+    MUST NOT contain a fragment, and MUST NOT contain userinfo. Reject a
+    violation here rather than surfacing an opaque AS rejection deep in the
+    OAuth flow.
+    """
+    parsed = urlparse(value)
+    path_segments = parsed.path.split("/")
+    if (
+        parsed.scheme != "https"
+        or parsed.path in ("", "/")
+        or "." in path_segments
+        or ".." in path_segments
+        or parsed.fragment
+        # urlparse only ever sets `password` when userinfo is present, and
+        # whenever it does `username` is also non-None (at minimum ""), so
+        # checking `username` alone already catches every userinfo case.
+        or parsed.username is not None
+    ):
+        raise argparse.ArgumentTypeError(
+            f"must be an https:// URL with a path component, no "
+            f"single-dot/double-dot path segments, no fragment, and no "
+            f"userinfo (e.g. https://example.com/client.json), got {value!r}"
+        )
+    return value
 
 
 # RFC 7230 §3.2.6 field-name = token = 1*tchar. tchar covers
@@ -278,6 +310,7 @@ def _build_cold_start_login(
     headers: dict[str, str],
     *,
     client_id: str | None,
+    client_metadata_url: str | None,
     scope: str | None,
     device_flow: bool,
     refresh_leeway: float,
@@ -313,6 +346,7 @@ def _build_cold_start_login(
                 server_url,
                 client,
                 client_id=client_id or None,
+                client_metadata_url=client_metadata_url,
                 scope=scope or None,
                 device_flow=device_flow,
                 refresh_leeway=refresh_leeway,
@@ -373,6 +407,25 @@ def _main() -> None:
         # the "ignored without --oauth" warning below.
         default=None,
         help="Pre-registered OAuth client ID (or set MCP_OAUTH_CLIENT_ID env var)",
+    )
+    parser.add_argument(
+        "--client-metadata-url",
+        default=None,
+        type=_https_url_with_path,
+        metavar="URL",
+        help=(
+            "HTTPS URL of a Client ID Metadata Document you host "
+            "(draft-ietf-oauth-client-id-metadata-document-00), used as the "
+            "OAuth client_id instead of Dynamic Client Registration. Used "
+            "when set, regardless of whether the AS metadata advertises "
+            "client_id_metadata_document_supported (warns if it does not). "
+            "Ignored if --client-id is also given. You must host the "
+            "document yourself — mcp-stdio does not serve one; its "
+            "redirect_uris should list mcp-stdio's loopback callback "
+            "(http://127.0.0.1/callback) — the AS must accept any port for "
+            "a loopback redirect (RFC 8252 §7.3/§8.4). Only used with "
+            "--oauth / --oauth-device (#60)."
+        ),
     )
     parser.add_argument(
         "--oauth-scope",
@@ -623,15 +676,33 @@ def _main() -> None:
     # presence-detected here — their help text flags them as OAuth-only instead.
     if not (args.oauth or args.oauth_device) and (
         args.client_id is not None
+        or args.client_metadata_url is not None
         or args.oauth_scope
         or args.no_resource_indicator
         or args.oauth_use_id_token
         or args.oauth_eager
     ):
         print(
-            "warning: --client-id / --oauth-scope / --no-resource-indicator / "
-            "--oauth-use-id-token / --oauth-eager are ignored without --oauth "
-            "or --oauth-device",
+            "warning: --client-id / --client-metadata-url / --oauth-scope / "
+            "--no-resource-indicator / --oauth-use-id-token / --oauth-eager "
+            "are ignored without --oauth or --oauth-device",
+            file=sys.stderr,
+        )
+
+    # A pre-registered client_id (--client-id, OR an ambient MCP_OAUTH_CLIENT_ID
+    # — see the resolution above) outranks --client-metadata-url (CIMD) per the
+    # MCP "Client Registration Approaches" priority order (#60). Gate this on
+    # the RESOLVED `client_id` (the same `client_id or None` truthiness check
+    # oauth.py applies at line 811/828 below), not on `args.client_id is not
+    # None`: that presence-only check missed an ambient env var silently
+    # winning with no warning, and misfired on an explicit `--client-id ''`
+    # (falsy — --client-metadata-url actually wins there) with a warning that
+    # claimed the opposite of what happens.
+    if client_id and args.client_metadata_url is not None:
+        print(
+            "warning: a pre-registered client_id (--client-id or "
+            "MCP_OAUTH_CLIENT_ID) and --client-metadata-url were both given; "
+            "the pre-registered client_id takes precedence",
             file=sys.stderr,
         )
 
@@ -747,6 +818,7 @@ def _main() -> None:
                 args.url,
                 client,
                 client_id=client_id or None,
+                client_metadata_url=args.client_metadata_url,
                 scope=args.oauth_scope or None,
                 device_flow=args.oauth_device,
                 refresh_leeway=args.oauth_refresh_leeway,
@@ -763,6 +835,7 @@ def _main() -> None:
                     args.url,
                     headers,
                     client_id=client_id or None,
+                    client_metadata_url=args.client_metadata_url,
                     scope=args.oauth_scope or None,
                     device_flow=args.oauth_device,
                     refresh_leeway=args.oauth_refresh_leeway,

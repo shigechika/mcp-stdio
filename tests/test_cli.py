@@ -1,5 +1,6 @@
 """Tests for mcp_stdio.cli module."""
 
+import argparse
 from unittest.mock import patch
 
 import pytest
@@ -9,6 +10,7 @@ from mcp_stdio.cli import (
     _build_scope_upgrader,
     _build_token_refresher,
     _effective_bearer,
+    _https_url_with_path,
     _parse_header,
     main,
 )
@@ -752,6 +754,204 @@ class TestMain:
         ):
             main()
         assert "ignored without --oauth" in capsys.readouterr().err
+
+
+class TestHttpsUrlWithPath:
+    """#60: argparse type validating a Client ID Metadata Document URL
+    (draft-ietf-oauth-client-id-metadata-document-00 §3)."""
+
+    def test_valid_url_accepted(self):
+        url = "https://example.com/client.json"
+        assert _https_url_with_path(url) == url
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "http://example.com/client.json",  # not https
+            "https://example.com",  # no path
+            "https://example.com/",  # root path only
+            "https://example.com/a/./b",  # single-dot segment
+            "https://example.com/a/../b",  # double-dot segment
+            "https://example.com/client.json#frag",  # fragment
+            "https://user:pass@example.com/client.json",  # userinfo
+            "https://:pass@example.com/client.json",  # password-only userinfo
+            "not a url",
+        ],
+    )
+    def test_invalid_url_rejected(self, bad):
+        with pytest.raises(argparse.ArgumentTypeError):
+            _https_url_with_path(bad)
+
+
+class TestClientMetadataUrlFlag:
+    """#60: --client-metadata-url CLI wiring."""
+
+    def test_ignored_without_oauth_warns(self, capsys):
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--client-metadata-url",
+                    "https://app.example.com/client.json",
+                    "https://example.com/mcp",
+                ],
+            ),
+            patch("mcp_stdio.cli.run"),
+        ):
+            main()
+        assert "ignored without --oauth" in capsys.readouterr().err
+
+    def test_no_warning_with_oauth(self, capsys):
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--oauth",
+                    "--client-metadata-url",
+                    "https://app.example.com/client.json",
+                    "https://example.com/mcp",
+                ],
+            ),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        assert "ignored without --oauth" not in capsys.readouterr().err
+
+    def test_both_client_id_and_metadata_url_warns_precedence(self, capsys):
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--oauth",
+                    "--client-id",
+                    "cid",
+                    "--client-metadata-url",
+                    "https://app.example.com/client.json",
+                    "https://example.com/mcp",
+                ],
+            ),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        err = capsys.readouterr().err
+        assert "the pre-registered client_id takes precedence" in err
+
+    def test_ambient_env_client_id_warns_and_wins_over_metadata_url(
+        self, monkeypatch, capsys
+    ):
+        """An ambient MCP_OAUTH_CLIENT_ID (no --client-id flag) is also a
+        pre-registered client_id and must trip the precedence warning — a
+        presence-only check on args.client_id missed this and let the env var
+        silently override --client-metadata-url with zero diagnostic."""
+        monkeypatch.setenv("MCP_OAUTH_CLIENT_ID", "env-cid")
+        url = "https://app.example.com/client.json"
+        with (
+            patch(
+                "sys.argv",
+                ["mcp-stdio", "--oauth", "--client-metadata-url", url, "https://example.com/mcp"],
+            ),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        assert mock_ensure.call_args.kwargs["client_id"] == "env-cid"
+        assert mock_ensure.call_args.kwargs["client_metadata_url"] == url
+        assert (
+            "the pre-registered client_id takes precedence"
+            in capsys.readouterr().err
+        )
+
+    def test_empty_explicit_client_id_does_not_warn_and_metadata_url_wins(
+        self, monkeypatch, capsys
+    ):
+        """An explicit but EMPTY --client-id '' is falsy, so --client-metadata-url
+        is what's actually used — the precedence warning must not fire here
+        (it previously fired with text claiming the opposite of what happens)."""
+        monkeypatch.delenv("MCP_OAUTH_CLIENT_ID", raising=False)
+        url = "https://app.example.com/client.json"
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--oauth",
+                    "--client-id",
+                    "",
+                    "--client-metadata-url",
+                    url,
+                    "https://example.com/mcp",
+                ],
+            ),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        assert mock_ensure.call_args.kwargs["client_id"] is None
+        assert mock_ensure.call_args.kwargs["client_metadata_url"] == url
+        assert "takes precedence" not in capsys.readouterr().err
+
+    def test_invalid_url_rejected_at_parse_time(self, capsys):
+        with patch(
+            "sys.argv",
+            [
+                "mcp-stdio",
+                "--oauth",
+                "--client-metadata-url",
+                "http://example.com/client.json",
+                "https://example.com/mcp",
+            ],
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 2
+        assert "must be an https" in capsys.readouterr().err
+
+    def test_forwarded_to_ensure_token(self):
+        url = "https://app.example.com/client.json"
+        with (
+            patch(
+                "sys.argv",
+                ["mcp-stdio", "--oauth", "--client-metadata-url", url, "https://example.com/mcp"],
+            ),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        assert mock_ensure.call_args.kwargs["client_metadata_url"] == url
+
+    def test_forwarded_to_cold_start_login(self):
+        """#296 + #60: a cold cache defers to _build_cold_start_login, which
+        must also receive client_metadata_url so the background login uses it."""
+        url = "https://app.example.com/client.json"
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--oauth",
+                    "--oauth-eager",
+                    "--client-metadata-url",
+                    url,
+                    "https://example.com/mcp",
+                ],
+            ),
+            patch("mcp_stdio.oauth.ensure_token", return_value=None),
+            patch("mcp_stdio.cli._build_cold_start_login") as mock_builder,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_builder.return_value = lambda: None
+            main()
+        assert mock_builder.call_args.kwargs["client_metadata_url"] == url
 
     @pytest.mark.parametrize(
         "bad", ["tok\nInjected: x", "tok\rx", "tok\x00x", "tok\r\nInjected: x"]

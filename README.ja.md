@@ -44,6 +44,9 @@ Bearer token、カスタムヘッダー、OAuth 2.1 認証情報をリモート�
     - §3 クライアント登録リクエスト。AS メタデータの `token_endpoint_auth_methods_supported` から最適な認証方式を選択（`none` → `client_secret_post` → `client_secret_basic` の優先順）
     - §3.2.1 `client_secret_expires_at` に対応、期限切れ時に自動再登録
     - DCR に `application_type: "native"`（[RFC 8252](https://www.rfc-editor.org/rfc/rfc8252) §8.4 / MCP SEP-837）。loopback 認可コード・ヘッドレス device フローは native クライアントなので、RFC 7591 既定の `"web"` 扱いで loopback redirect が拒否されるのを防ぐ
+  - [Client ID Metadata Documents](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization#client-id-metadata-documents)（MCP 2025-11-25 / [draft-ietf-oauth-client-id-metadata-document-00](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document-00)）
+    - `--client-metadata-url` で運用者がホストする HTTPS ドキュメント URL を `client_id` として提示し、Dynamic Client Registration を省略する。AS メタデータが `client_id_metadata_document_supported` をまだ広告していなくても、設定されていれば尊重する（黙ってフォールバックせず警告を出す）。事前登録済みの client_id（`--client-id` または `MCP_OAUTH_CLIENT_ID`）が指定された場合はそちらが優先される（#60）
+    - ホストするドキュメントの `redirect_uris` には mcp-stdio の loopback コールバックを **ポート無し**（`http://127.0.0.1/callback`）で含める必要がある。実際のコールバックは毎回異なる ephemeral port にバインドされるため、AS は loopback リダイレクト URI について任意のポートを許可しなければならない（[RFC 8252](https://www.rfc-editor.org/rfc/rfc8252) §7.3 / §8.4）
   - [RFC 6749](https://www.rfc-editor.org/rfc/rfc6749) OAuth 2.0
     - §2.3.1 `client_secret_basic`：percent-encode した認証情報を `Authorization: Basic` ヘッダーで送信（コード交換・トークンリフレッシュ・Device Authorization Grant ポーリングに適用）
   - [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) Bearer Token の利用
@@ -188,6 +191,11 @@ mcp-stdio [OPTIONS] URL
   --oauth                OAuth 2.1 認証を有効化（ブラウザフロー）
   --oauth-device         OAuth 2.1 Device Authorization Grant（RFC 8628）— ヘッドレス環境向け
   --client-id ID         事前登録済み OAuth クライアント ID（MCP_OAUTH_CLIENT_ID 環境変数でも指定可）
+  --client-metadata-url URL
+                         自分でホストする Client ID Metadata Document の HTTPS URL
+                         （draft-ietf-oauth-client-id-metadata-document-00）を
+                         client_id として使用し、Dynamic Client Registration を
+                         省略する。--client-id も指定されている場合は無視される（#60）
   --oauth-scope SCOPE    要求する OAuth スコープ
   --oauth-use-id-token   access_token ではなく OIDC id_token を Bearer として送信
                          （AWS Bedrock AgentCore / Cognito 向け）。id_token が
