@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.22.0](https://github.com/shigechika/mcp-stdio/compare/v0.21.0...v0.22.0) (2026-06-30)
+
+
+### Features
+
+* **serve:** bind OAuth sessions to the authenticated user ([#263](https://github.com/shigechika/mcp-stdio/issues/263)) ([9fcd8d3](https://github.com/shigechika/mcp-stdio/commit/9fcd8d33d2a492f1e156a53f9b3116c1261d36c7))
+* **serve:** per-session backend child for concurrent-client isolation ([#258](https://github.com/shigechika/mcp-stdio/issues/258)) ([624581f](https://github.com/shigechika/mcp-stdio/commit/624581fdf05ada70ac897d8db7d025f9bc327d27))
+* **serve:** session resource governance — max-sessions, idle eviction ([#261](https://github.com/shigechika/mcp-stdio/issues/261)) ([78c8e88](https://github.com/shigechika/mcp-stdio/commit/78c8e88e5e274d193e379137b98f2972a323be97))
+
 ## [0.21.0](https://github.com/shigechika/mcp-stdio/compare/v0.20.0...v0.21.0) (2026-06-29)
 
 
