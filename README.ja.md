@@ -340,6 +340,66 @@ mcp-stdio --oauth http://127.0.0.1:8080/mcp
     パス対応ディスカバリとバイト単位で対称。パスなしの `--public-url` は従来通り
     動作します（#245）。
 
+### マルチユーザ運用
+
+`serve` は複数ユーザの同時利用を前提に設計されています。MCP セッションごとに
+専用のバックエンド子プロセスを spawn し、OAuth 有効時は各セッションを認証ユーザに
+束縛するので、ユーザは**プロセス境界**で分離され、漏れた session id がテナントを
+またげません。
+
+エンドユーザのログインは前段リバースプロキシに委譲します。プロキシが実際の SSO を
+行い、`--trusted-user-header` でユーザを主張します（クライアント由来の同名ヘッダを
+プロキシが除去するからこそ信頼できる）。埋め込み AS がユーザごとのトークンを発行し、
+ゲートウェイが各セッションをそのユーザに束縛します。
+
+```mermaid
+flowchart TD
+    UA["User A<br>mcp-stdio --oauth"]
+    UB["User B<br>mcp-stdio --oauth"]
+    RP["リバースプロキシ<br>SSO ログイン, X-Forwarded-User 付与<br>クライアント由来コピーは除去"]
+    GW["mcp-stdio serve --enable-oauth<br>--trusted-user-header X-Forwarded-User"]
+    CA["stdio 子プロセス<br>A のセッション"]
+    CB["stdio 子プロセス<br>B のセッション"]
+    UA == "Streamable HTTP<br>OAuth 2.1 (PKCE)" ==> RP
+    UB == "Streamable HTTP<br>OAuth 2.1 (PKCE)" ==> RP
+    RP ==> GW
+    GW -- "セッションごとに spawn" --> CA
+    GW -- "セッションごとに spawn" --> CB
+```
+
+ゲートウェイ（プロキシ背後の loopback にバインド）:
+
+```bash
+mcp-stdio serve --enable-oauth \
+  --public-url https://mcp.example.org \
+  --trusted-user-header X-Forwarded-User \
+  --max-sessions 200 --session-idle-ttl 900 \
+  --host 127.0.0.1 --port 8080 -- python -m my_mcp_server
+```
+
+- `--public-url` は issuer をプロキシが配信する外部 HTTPS URL に固定。
+- `--trusted-user-header` はプロキシがログイン後に付与するヘッダ。プロキシが
+  クライアント由来コピーを除去するからこそ信頼する。
+- `--max-sessions` はユーザごとの子プロセス数の上限、`--session-idle-ttl` は
+  ユーザが `DELETE` せず切断した子プロセスを回収。
+
+各ユーザはクライアントをゲートウェイに向け、一度 OAuth フローを通せば専用の
+子プロセスで処理されます:
+
+```bash
+mcp-stdio --oauth https://mcp.example.org/mcp
+```
+
+注意:
+
+- **分離はプロセス境界による** — ユーザ A と B は子プロセスを共有しないので、
+  接続ごとのバックエンド状態（や JSON-RPC id 衝突）が相互に漏れない。
+- バックエンドコマンドは**テンプレート**です。セッションごとに同じコマンドを
+  新しい子として spawn します。identity はゲートウェイ側で強制（セッション→ユーザ
+  束縛）され、子プロセスには注入されません。ユーザ固有のコンテキストが必要な
+  バックエンドはリクエストから導出するか、バックエンド構成ごとに 1 ゲートウェイを
+  立てて（必要ならパスで多重化、上記*パススコープ issuer*）運用してください。
+
 ## ワークアラウンド
 
 Claude Code・mcp-remote・MCP SDK・Windows の既知の問題については [WORKAROUNDS.md](WORKAROUNDS.md) を参照してください。

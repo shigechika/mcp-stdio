@@ -344,6 +344,67 @@ follows the options (an optional `--` separator is supported).
     the client's path-aware discovery. A bare-origin `--public-url` behaves
     exactly as before (#245).
 
+### Multi-user deployment
+
+`serve` is built for multiple concurrent users. Each MCP session gets its own
+spawned backend child and — with OAuth enabled — is bound to the authenticated
+user, so users are isolated by **process boundary** and a leaked session id
+cannot cross tenants.
+
+End-user login is delegated to a fronting reverse proxy that performs the real
+SSO and asserts the user via `--trusted-user-header` (trusted ONLY because the
+proxy strips any client-supplied copy). The embedded AS then mints per-user
+tokens, and the gateway binds each session to that user.
+
+```mermaid
+flowchart TD
+    UA["User A<br>mcp-stdio --oauth"]
+    UB["User B<br>mcp-stdio --oauth"]
+    RP["Reverse proxy<br>SSO login, sets X-Forwarded-User<br>strips any client-supplied copy"]
+    GW["mcp-stdio serve --enable-oauth<br>--trusted-user-header X-Forwarded-User"]
+    CA["stdio child<br>session of A"]
+    CB["stdio child<br>session of B"]
+    UA == "Streamable HTTP<br>OAuth 2.1 (PKCE)" ==> RP
+    UB == "Streamable HTTP<br>OAuth 2.1 (PKCE)" ==> RP
+    RP ==> GW
+    GW -- "spawn per session" --> CA
+    GW -- "spawn per session" --> CB
+```
+
+Gateway (bound to loopback, behind the proxy):
+
+```bash
+mcp-stdio serve --enable-oauth \
+  --public-url https://mcp.example.org \
+  --trusted-user-header X-Forwarded-User \
+  --max-sessions 200 --session-idle-ttl 900 \
+  --host 127.0.0.1 --port 8080 -- python -m my_mcp_server
+```
+
+- `--public-url` pins the issuer to the external HTTPS URL the proxy serves.
+- `--trusted-user-header` is the header the proxy sets after login; the gateway
+  trusts it only because the proxy strips any client-supplied copy.
+- `--max-sessions` caps concurrent per-user children; `--session-idle-ttl`
+  reclaims a child after a user disconnects without sending `DELETE`.
+
+Each user points their client at the gateway, runs the OAuth flow once, and is
+served by a dedicated child:
+
+```bash
+mcp-stdio --oauth https://mcp.example.org/mcp
+```
+
+Notes:
+
+- **Isolation is by process boundary** — user A and user B never share a child,
+  so per-connection backend state (or a JSON-RPC id collision) cannot leak
+  across them.
+- The backend command is a **template**: every session spawns the same command
+  as a fresh child. Identity is enforced at the gateway (session→user binding);
+  it is not injected into the child today, so a backend that needs per-user
+  context should derive it from the request, or run one gateway per backend
+  configuration (optionally multiplexed by path — see *Path-scoped issuer*).
+
 ## Workarounds
 
 See [WORKAROUNDS.md](WORKAROUNDS.md) for known issues in Claude Code, mcp-remote, the MCP SDKs, and Windows that mcp-stdio addresses.
