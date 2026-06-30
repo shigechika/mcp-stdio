@@ -1115,6 +1115,74 @@ def test_oauth_session_bound_to_owner():
         # alice's session survives bob's probing
         assert _mcp(base, {"jsonrpc": "2.0", "id": 3, "method": "echo"},
                     token=access_a, sid=sid).status_code == 200
+        # bob's token IS valid (distinct principal): he opens his own session,
+        # which pins the 404s above to ownership, not an auth failure.
+        rb = _mcp(base, {"jsonrpc": "2.0", "id": "ib", "method": "initialize"}, token=access_b)
+        assert rb.status_code == 200
+        assert rb.headers["mcp-session-id"] != sid
+
+
+def test_oauth_sse_stream_bound_to_owner():
+    # The GET SSE path is ownership-checked too: bob cannot open alice's stream.
+    prov = _provider(trusted_user_header="X-Forwarded-User", dev_user=None)
+    with _run(oauth=prov) as (base, _):
+        _, _, _, _, tok_a = _full_flow(base, headers={"X-Forwarded-User": "alice"})
+        access_a = tok_a.json()["access_token"]
+        _, _, _, _, tok_b = _full_flow(base, headers={"X-Forwarded-User": "bob"})
+        access_b = tok_b.json()["access_token"]
+        r = _mcp(base, {"jsonrpc": "2.0", "id": "i", "method": "initialize"}, token=access_a)
+        sid = r.headers["mcp-session-id"]
+        # bob's GET with alice's sid -> 404 (binding), not a hung stream
+        gr = httpx.get(
+            base + "/mcp",
+            headers={"Authorization": f"Bearer {access_b}", "Mcp-Session-Id": sid},
+            timeout=10,
+        )
+        assert gr.status_code == 404
+        # positive control: alice still owns the session
+        assert _mcp(base, {"jsonrpc": "2.0", "id": 1, "method": "echo"},
+                    token=access_a, sid=sid).status_code == 200
+
+
+def test_refreshed_token_keeps_session_ownership():
+    # A rotated (refreshed) access token is the same principal and still owns
+    # the session opened with the original token.
+    prov = _provider(trusted_user_header="X-Forwarded-User", dev_user=None)
+    with _run(oauth=prov) as (base, _):
+        cid, _, _, _, tok = _full_flow(base, headers={"X-Forwarded-User": "alice"})
+        access1 = tok.json()["access_token"]
+        refresh = tok.json()["refresh_token"]
+        r = _mcp(base, {"jsonrpc": "2.0", "id": "i", "method": "initialize"}, token=access1)
+        sid = r.headers["mcp-session-id"]
+        tok2 = _token(base, {
+            "grant_type": "refresh_token", "refresh_token": refresh, "client_id": cid,
+        })
+        access2 = tok2.json()["access_token"]
+        assert access2 and access2 != access1
+        assert _mcp(base, {"jsonrpc": "2.0", "id": 1, "method": "echo"},
+                    token=access2, sid=sid).status_code == 200
+
+
+def test_oauth_user_cannot_ride_static_session():
+    # The fixed direction: on a static + OAuth gateway, a static-token session
+    # is bound to the static principal — an OAuth user cannot ride or DELETE it.
+    prov = _provider(trusted_user_header="X-Forwarded-User", dev_user=None)
+    with _run(auth_token="static-tok", oauth=prov) as (base, _):
+        r = _mcp(base, {"jsonrpc": "2.0", "id": "i", "method": "initialize"}, token="static-tok")
+        assert r.status_code == 200
+        sid = r.headers["mcp-session-id"]
+        _, _, _, _, tok_a = _full_flow(base, headers={"X-Forwarded-User": "alice"})
+        access_a = tok_a.json()["access_token"]
+        assert _mcp(base, {"jsonrpc": "2.0", "id": 1, "method": "echo"},
+                    token=access_a, sid=sid).status_code == 404
+        assert httpx.request(
+            "DELETE", base + "/mcp",
+            headers={"Authorization": f"Bearer {access_a}", "Mcp-Session-Id": sid},
+            timeout=10,
+        ).status_code == 404
+        # the static session itself still works
+        assert _mcp(base, {"jsonrpc": "2.0", "id": 2, "method": "echo"},
+                    token="static-tok", sid=sid).status_code == 200
 
 
 def test_static_token_cannot_ride_oauth_session():

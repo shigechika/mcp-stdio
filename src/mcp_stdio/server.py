@@ -303,6 +303,13 @@ _DEFAULT_MAX_SESSIONS = 100
 # often; a large one no less than once a minute.
 _MAX_REAP_INTERVAL_SECS = 60.0
 
+# Owner identity of a session created by a static-token request. It is a single
+# shared principal (a static token has no per-user identity), distinct from any
+# OAuth user, so on a static+OAuth gateway an OAuth user cannot ride or tear
+# down a static-token session (and vice versa). The NUL prefix keeps it from
+# colliding with any header-supplied OAuth username.
+_STATIC_PRINCIPAL = "\x00static-token"
+
 
 class _Session:
     """A live MCP session: its backend child, last activity, and owner.
@@ -319,6 +326,16 @@ class _Session:
         self.backend = backend
         self.last_active = last_active
         self.owner = owner
+
+    def accessible_by(self, user: str | None) -> bool:
+        """Whether a request authenticated as ``user`` may use this session.
+
+        Unbound sessions (``owner`` None — open gateway) are accessible by
+        anyone; a bound session only by its owner. Single source of truth for
+        the ownership rule shared by :meth:`SessionRegistry.get` and
+        :meth:`SessionRegistry.remove`.
+        """
+        return self.owner is None or self.owner == user
 
 
 class SessionRegistry:
@@ -392,11 +409,9 @@ class SessionRegistry:
             return None
         return sid, backend
 
-    def get(
-        self, sid: str | None, user: str | None = None
-    ) -> BackendProcess | None:
+    def get(self, sid: str | None, user: str | None = None) -> BackendProcess | None:
         """Resolve a session id to its backend, or None if unknown — or bound
-        to a different user than ``user``.
+        to a different principal than ``user``.
 
         Touches the session's last-activity timestamp so an actively used
         session is never idle-reaped. A bound session (``owner`` set) is only
@@ -408,7 +423,7 @@ class SessionRegistry:
             return None
         with self._lock:
             sess = self._sessions.get(sid)
-            if sess is None or (sess.owner is not None and sess.owner != user):
+            if sess is None or not sess.accessible_by(user):
                 return None
             sess.last_active = self._now()
             return sess.backend
@@ -422,22 +437,20 @@ class SessionRegistry:
             if sess is not None:
                 sess.last_active = self._now()
 
-    def remove(
-        self, sid: str | None, user: str | None = None
-    ) -> BackendProcess | None:
+    def remove(self, sid: str | None, user: str | None = None) -> BackendProcess | None:
         """Detach a session and return its backend (or None if unknown — or
-        bound to a different user than ``user``).
+        bound to a different principal than ``user``).
 
         The caller calls ``backend.shutdown()`` OUTSIDE the lock so a slow
         terminate never freezes routing for other sessions. The same ownership
-        check as :meth:`get` applies, so one user cannot DELETE another's
+        check as :meth:`get` applies, so one principal cannot DELETE another's
         session.
         """
         if not sid:
             return None
         with self._lock:
             sess = self._sessions.get(sid)
-            if sess is None or (sess.owner is not None and sess.owner != user):
+            if sess is None or not sess.accessible_by(user):
                 return None
             del self._sessions[sid]
             return sess.backend
@@ -1254,7 +1267,15 @@ class _Handler(BaseHTTPRequestHandler):
         Precedence: the static token is checked first (constant-time, exempt
         from expiry), then an issued access token (lookup + expiry). The
         endpoint is open only when NEITHER mechanism is configured.
+
+        Captures the authenticated principal on ``self._principal`` for session
+        ownership (:meth:`_current_user`): the shared :data:`_STATIC_PRINCIPAL`
+        for a static-token request, the OAuth user for an issued token, or None
+        for an open (no-auth) gateway. Deriving it HERE — once, from the same
+        lookup the gate decides on — keeps the binding from ever disagreeing
+        with the gate (no second resolve that could expire in between).
         """
+        self._principal = None
         auth = self.headers.get("Authorization", "")
         prefix = "Bearer "
         token = auth[len(prefix):] if auth.startswith(prefix) else ""
@@ -1263,13 +1284,16 @@ class _Handler(BaseHTTPRequestHandler):
             and token
             and hmac.compare_digest(token.encode("utf-8"), self.auth_token.encode("utf-8"))
         ):
+            self._principal = _STATIC_PRINCIPAL
             return True
-        if (
-            self.oauth is not None
-            and token
-            and self.oauth.validate_access_token(token, self._resource_url())
-        ):
-            return True
+        if self.oauth is not None and token:
+            # A valid issued token always carries a non-empty user (authorize
+            # fails closed on an empty user), so user-presence == validity here;
+            # if it were ever absent, treating it as unauthorized fails closed.
+            user = self.oauth.user_for_token(token, self._resource_url())
+            if user is not None:
+                self._principal = user
+                return True
         return self.auth_token is None and self.oauth is None
 
     def _require_auth(self) -> bool:
@@ -1381,19 +1405,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _current_user(self) -> str | None:
-        """The authenticated OAuth user for this request, or None.
-
-        Only issued OAuth access tokens carry a per-user identity; static-token
-        and no-auth requests return None (their sessions are unbound). Called
-        after the auth gate, so any presented token is already known valid.
+        """The authenticated principal for this request, captured by the auth
+        gate (:meth:`_authorized`): the shared static-token principal, an OAuth
+        user, or None for an open gateway. Must be called after ``_require_auth``.
         """
-        if self.oauth is None:
-            return None
-        auth = self.headers.get("Authorization", "")
-        prefix = "Bearer "
-        if not auth.startswith(prefix):
-            return None
-        return self.oauth.user_for_token(auth[len(prefix):], self._resource_url())
+        return getattr(self, "_principal", None)
 
     def _resolve_session(
         self, user: str | None = None, req_id: Any = None
