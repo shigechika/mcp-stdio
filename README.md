@@ -46,6 +46,9 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
     - §3 client registration request; `token_endpoint_auth_method` chosen from `token_endpoint_auth_methods_supported` in AS metadata (prefers `none` → `client_secret_post` → `client_secret_basic`)
     - §3.2.1 `client_secret_expires_at` handling — auto re-register on expiry
     - `application_type: "native"` in DCR ([RFC 8252](https://www.rfc-editor.org/rfc/rfc8252) §8.4 / MCP SEP-837): the loopback auth-code and headless device flows are native clients, so the loopback redirect is not rejected as the RFC 7591 default `"web"`
+  - [Client ID Metadata Documents](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization#client-id-metadata-documents) (MCP 2025-11-25 / [draft-ietf-oauth-client-id-metadata-document-00](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document-00))
+    - `--client-metadata-url` presents an operator-hosted HTTPS document URL as `client_id`, skipping Dynamic Client Registration; honoured when set even if the AS metadata does not (yet) advertise `client_id_metadata_document_supported` (warns instead of silently falling back), and outranked by an explicit `--client-id` (#60)
+    - the hosted document's `redirect_uris` must include mcp-stdio's loopback callback (`http://127.0.0.1:{port}/callback`, a fresh ephemeral port each run) — the AS must accept any port for a loopback redirect URI ([RFC 8252](https://www.rfc-editor.org/rfc/rfc8252) §7.3 / §8.4)
   - [RFC 6749](https://www.rfc-editor.org/rfc/rfc6749) OAuth 2.0
     - §2.3.1 `client_secret_basic`: `Authorization: Basic` header with percent-encoded credentials (applied to code exchange, token refresh, and Device Authorization Grant polling)
   - [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) Bearer Token usage
@@ -190,6 +193,11 @@ Options:
   --oauth                Enable OAuth 2.1 authentication (browser flow)
   --oauth-device         Enable OAuth 2.1 Device Authorization Grant (RFC 8628, headless)
   --client-id ID         Pre-registered OAuth client ID (or set MCP_OAUTH_CLIENT_ID)
+  --client-metadata-url URL
+                         HTTPS URL of a Client ID Metadata Document you host
+                         (draft-ietf-oauth-client-id-metadata-document-00), used
+                         as client_id instead of Dynamic Client Registration.
+                         Ignored if --client-id is also given (#60)
   --oauth-scope SCOPE    OAuth scope to request
   --oauth-use-id-token   Present the OIDC id_token as the Bearer credential
                          instead of the access_token (AWS Bedrock AgentCore /

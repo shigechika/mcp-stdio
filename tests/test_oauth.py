@@ -473,6 +473,41 @@ class TestDiscoverMetadata:
         meta = discover_oauth_metadata("https://api.example.com/mcp", client)
         assert meta.iss_parameter_supported is False
 
+    def test_client_id_metadata_document_supported_parsed(self, httpx_mock):
+        """#60: draft-ietf-oauth-client-id-metadata-document-00 §5 flag is
+        parsed into OAuthMetadata."""
+        self._mock_no_prm(httpx_mock)
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-authorization-server",
+            json={
+                "issuer": "https://api.example.com",
+                "authorization_endpoint": "https://api.example.com/auth",
+                "token_endpoint": "https://api.example.com/tok",
+                "client_id_metadata_document_supported": True,
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata("https://api.example.com/mcp", client)
+        assert meta.client_id_metadata_document_supported is True
+
+    def test_client_id_metadata_document_supported_defaults_false(self, httpx_mock):
+        """#60: absent or non-true, client_id_metadata_document_supported is
+        False — a non-bool truthy value (e.g. a string) must not enable CIMD,
+        mirroring the iss_parameter_supported strict-bool coercion."""
+        self._mock_no_prm(httpx_mock)
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-authorization-server",
+            json={
+                "issuer": "https://api.example.com",
+                "authorization_endpoint": "https://api.example.com/auth",
+                "token_endpoint": "https://api.example.com/tok",
+                "client_id_metadata_document_supported": "true",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata("https://api.example.com/mcp", client)
+        assert meta.client_id_metadata_document_supported is False
+
     def test_partial_metadata_uses_defaults(self, httpx_mock):
         """Server returns metadata with only some endpoints."""
         self._mock_no_prm(httpx_mock)
@@ -2861,6 +2896,39 @@ class TestEnsureToken:
         assert data is sentinel
         assert called["refresh"] is False
 
+    def test_client_metadata_url_forwarded_to_auth_code_flow(self, monkeypatch):
+        """#60: ensure_token's client_metadata_url reaches
+        _run_authorization_flow unchanged."""
+        captured = {}
+
+        def fake_flow(*_a, **kwargs):
+            captured.update(kwargs)
+            return TokenData(access_token="tok")
+
+        monkeypatch.setattr(
+            "mcp_stdio.oauth._probe_www_authenticate", lambda *a, **k: None
+        )
+        monkeypatch.setattr(
+            "mcp_stdio.oauth.discover_oauth_metadata",
+            lambda *a, **k: OAuthMetadata(
+                authorization_endpoint="https://example.com/authorize",
+                token_endpoint="https://example.com/token",
+            ),
+        )
+        monkeypatch.setattr("mcp_stdio.oauth._run_authorization_flow", fake_flow)
+
+        client = httpx.Client()
+        data = ensure_token(
+            "https://example.com/mcp",
+            client,
+            client_metadata_url="https://app.example.com/client.json",
+        )
+        assert data.access_token == "tok"
+        assert (
+            captured["client_metadata_url"]
+            == "https://app.example.com/client.json"
+        )
+
     def test_refresh_leeway_zero_uses_actual_expiry(self, tmp_path, monkeypatch):
         """#56: refresh_leeway=0 disables proactive refresh — token valid until literal expiry.
 
@@ -4783,6 +4851,268 @@ class TestAuthorizationFlowFailurePaths:
         assert closed, "callback server was not closed on the webbrowser failure"
 
 
+class TestClientIdMetadataDocument:
+    """#60: Client ID Metadata Document (draft-ietf-oauth-client-id-metadata-
+    document-00) support in `_run_authorization_flow`'s client_id resolution.
+
+    Each test captures the `client_id` query param `_run_authorization_flow`
+    sends to the (mocked) authorization endpoint, then lets the flow time out
+    (no callback ever arrives) — the resolution happens before the browser is
+    opened, so the timeout is an inert way to end the flow without a full
+    code-exchange mock.
+    """
+
+    URL = "https://app.example.com/oauth/client-metadata.json"
+
+    def _capture_client_id(self, monkeypatch) -> dict[str, str]:
+        from urllib.parse import parse_qs, urlparse
+
+        captured: dict[str, str] = {}
+
+        def fake_open(auth_url: str) -> bool:
+            captured["client_id"] = parse_qs(urlparse(auth_url).query)["client_id"][0]
+            return True
+
+        monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", fake_open)
+        return captured
+
+    def test_used_when_as_advertises_support(self, monkeypatch):
+        """AS advertises support, no cached/override client_id -> the CIMD URL
+        is used as client_id and DCR is never attempted."""
+        captured = self._capture_client_id(monkeypatch)
+
+        def boom(*_args, **_kwargs):
+            raise AssertionError("DCR must not run when CIMD applies")
+
+        monkeypatch.setattr("mcp_stdio.oauth.register_client", boom)
+        meta = OAuthMetadata(
+            authorization_endpoint="https://ex.com/authorize",
+            token_endpoint="https://ex.com/token",
+            registration_endpoint="https://ex.com/register",
+            client_id_metadata_document_supported=True,
+        )
+        client = httpx.Client()
+        with pytest.raises(TimeoutError):
+            _run_authorization_flow(
+                "https://ex.com/mcp",
+                client,
+                metadata=meta,
+                cached=None,
+                client_metadata_url=self.URL,
+                timeout=0.3,
+            )
+        assert captured["client_id"] == self.URL
+
+    def test_used_with_warning_when_as_does_not_advertise_support(
+        self, monkeypatch, capsys
+    ):
+        """An explicit --client-metadata-url is honoured even when the AS
+        metadata doesn't confirm client_id_metadata_document_supported — the
+        flag is an explicit opt-in and must not be silently dropped, but a
+        warning is emitted so a parse miss / misconfigured AS is actionable."""
+        captured = self._capture_client_id(monkeypatch)
+        meta = OAuthMetadata(
+            authorization_endpoint="https://ex.com/authorize",
+            token_endpoint="https://ex.com/token",
+            # client_id_metadata_document_supported defaults to False
+        )
+        client = httpx.Client()
+        with pytest.raises(TimeoutError):
+            _run_authorization_flow(
+                "https://ex.com/mcp",
+                client,
+                metadata=meta,
+                cached=None,
+                client_metadata_url=self.URL,
+                timeout=0.3,
+            )
+        assert captured["client_id"] == self.URL
+        assert (
+            "client_id_metadata_document_supported" in capsys.readouterr().err
+        )
+
+    def test_explicit_client_id_override_wins(self, monkeypatch):
+        """--client-id (a pre-registered id) outranks --client-metadata-url
+        per the MCP client-registration priority order."""
+        captured = self._capture_client_id(monkeypatch)
+        meta = OAuthMetadata(
+            authorization_endpoint="https://ex.com/authorize",
+            token_endpoint="https://ex.com/token",
+            client_id_metadata_document_supported=True,
+        )
+        client = httpx.Client()
+        with pytest.raises(TimeoutError):
+            _run_authorization_flow(
+                "https://ex.com/mcp",
+                client,
+                metadata=meta,
+                cached=None,
+                client_id_override="preregistered-cid",
+                client_metadata_url=self.URL,
+                timeout=0.3,
+            )
+        assert captured["client_id"] == "preregistered-cid"
+
+    def test_overrides_cached_dcr_client_id(self, monkeypatch):
+        """An explicit --client-metadata-url is used even when a cached
+        (previously DCR-registered) client_id exists — the explicit flag is a
+        deliberate per-invocation choice, not second-guessed by a stale cache."""
+        captured = self._capture_client_id(monkeypatch)
+        meta = OAuthMetadata(
+            authorization_endpoint="https://ex.com/authorize",
+            token_endpoint="https://ex.com/token",
+            client_id_metadata_document_supported=True,
+        )
+        cached = TokenData(
+            access_token="stale",
+            client_id="dcr-registered-cid",
+            token_endpoint="https://ex.com/token",
+            authorization_endpoint="https://ex.com/authorize",
+        )
+        client = httpx.Client()
+        with pytest.raises(TimeoutError):
+            _run_authorization_flow(
+                "https://ex.com/mcp",
+                client,
+                metadata=meta,
+                cached=cached,
+                client_metadata_url=self.URL,
+                timeout=0.3,
+            )
+        assert captured["client_id"] == self.URL
+
+    def test_no_client_metadata_url_falls_back_to_dcr(self, monkeypatch):
+        """Without --client-metadata-url, behaviour is unchanged: DCR still
+        runs even when the AS advertises CIMD support."""
+        captured = self._capture_client_id(monkeypatch)
+        meta = OAuthMetadata(
+            authorization_endpoint="https://ex.com/authorize",
+            token_endpoint="https://ex.com/token",
+            registration_endpoint="https://ex.com/register",
+            client_id_metadata_document_supported=True,
+        )
+        client = httpx.Client()
+
+        def fake_register_client(*_args, **_kwargs):
+            from mcp_stdio.oauth import ClientRegistration
+
+            return ClientRegistration(client_id="dcr-cid")
+
+        monkeypatch.setattr(
+            "mcp_stdio.oauth.register_client", fake_register_client
+        )
+        with pytest.raises(TimeoutError):
+            _run_authorization_flow(
+                "https://ex.com/mcp",
+                client,
+                metadata=meta,
+                cached=None,
+                timeout=0.3,
+            )
+        assert captured["client_id"] == "dcr-cid"
+
+
+class TestClientIdMetadataDocumentDeviceFlow:
+    """#60: same Client ID Metadata Document priority order, for
+    `_run_device_authorization_flow`.
+
+    Note: the CIMD spec (draft-ietf-oauth-client-id-metadata-document-00) and
+    the MCP authorization spec describe this mechanism in auth-code/redirect
+    terms only — the metadata document's REQUIRED `redirect_uris` field is
+    meaningless for the device grant. Sending a URL-formatted client_id on
+    the device-authorization request is a client-side extrapolation (the
+    value is just an opaque string to mcp-stdio); these tests verify
+    mcp-stdio's own client_id-resolution logic, not that any real AS accepts
+    it on this endpoint — no spec mandates that and no AS was available to
+    confirm it end-to-end.
+    """
+
+    URL = "https://app.example.com/oauth/client-metadata.json"
+    META = OAuthMetadata(
+        authorization_endpoint="https://ex.com/authorize",
+        token_endpoint="https://ex.com/token",
+        device_authorization_endpoint="https://ex.com/device",
+        client_id_metadata_document_supported=True,
+    )
+
+    def test_used_instead_of_dcr(self, httpx_mock):
+        """The CIMD URL is sent as client_id on the device-authorization
+        request, and DCR (no registration_endpoint here) is never needed."""
+        httpx_mock.add_response(
+            url="https://ex.com/device",
+            json={
+                "device_code": "dc",
+                "user_code": "UC",
+                "verification_uri": "https://ex.com/verify",
+                "expires_in": 1,
+                "interval": 1,
+            },
+        )
+        httpx_mock.add_response(
+            url="https://ex.com/token",
+            status_code=400,
+            json={"error": "expired_token"},
+        )
+        client = httpx.Client()
+        with pytest.raises(RuntimeError, match="expired_token|Device flow failed"):
+            _run_device_authorization_flow(
+                "https://ex.com/mcp",
+                client,
+                metadata=self.META,
+                cached=None,
+                client_metadata_url=self.URL,
+                timeout=5,
+            )
+        from urllib.parse import quote
+
+        sent = httpx_mock.get_requests(url="https://ex.com/device")[0]
+        assert f"client_id={quote(self.URL, safe='')}".encode() in sent.content
+
+    def test_enables_device_flow_with_no_registration_endpoint(self, httpx_mock):
+        """A server with NO registration_endpoint at all (no DCR support) lets
+        --client-metadata-url's client_id through to the device-authorization
+        request instead of raising. Whether a real AS *accepts* a URL-shaped
+        client_id there is unverified (see the class docstring) — this only
+        confirms mcp-stdio's own resolution logic doesn't block on missing
+        DCR (mcp-remote#224 / #60)."""
+        meta = OAuthMetadata(
+            authorization_endpoint="https://ex.com/authorize",
+            token_endpoint="https://ex.com/token",
+            device_authorization_endpoint="https://ex.com/device",
+            registration_endpoint=None,
+            client_id_metadata_document_supported=False,  # not advertised either
+        )
+        httpx_mock.add_response(
+            url="https://ex.com/device",
+            json={
+                "device_code": "dc",
+                "user_code": "UC",
+                "verification_uri": "https://ex.com/verify",
+                "expires_in": 1,
+                "interval": 1,
+            },
+        )
+        httpx_mock.add_response(
+            url="https://ex.com/token",
+            status_code=400,
+            json={"error": "expired_token"},
+        )
+        client = httpx.Client()
+        with pytest.raises(RuntimeError):
+            _run_device_authorization_flow(
+                "https://ex.com/mcp",
+                client,
+                metadata=meta,
+                cached=None,
+                client_metadata_url=self.URL,
+                timeout=5,
+            )
+        from urllib.parse import quote
+
+        sent = httpx_mock.get_requests(url="https://ex.com/device")[0]
+        assert f"client_id={quote(self.URL, safe='')}".encode() in sent.content
+
+
 class TestRfc9207IssValidation:
     """RFC 9207: validate the authorization-response `iss` parameter against the
     discovered issuer (AS mix-up defence)."""
@@ -6174,6 +6504,54 @@ class TestEnsureTokenDeviceFlow:
         # Verify device_authorization endpoint was actually called
         reqs = httpx_mock.get_requests()
         assert any(str(r.url).startswith(DEVICE_AUTH_URL) for r in reqs)
+
+    def test_client_metadata_url_skips_dcr_end_to_end(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """#60: ensure_token(device_flow=True, client_metadata_url=...) against
+        an AS advertising CIMD support skips DCR entirely (no request to
+        REG_URL) and sends the metadata URL as client_id."""
+        from urllib.parse import quote
+
+        self._patch_store(tmp_path, monkeypatch)
+        httpx_mock.add_response(url=self.MCP_URL, status_code=401, headers={})
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource/mcp",
+            status_code=404,
+        )
+        httpx_mock.add_response(url=self.WELL_KNOWN_PRM, status_code=404)
+        httpx_mock.add_response(
+            url=self.WELL_KNOWN_AS,
+            json={
+                "issuer": "https://api.example.com",
+                "authorization_endpoint": AUTH_URL,
+                "token_endpoint": TOKEN_URL,
+                "registration_endpoint": REG_URL,
+                "device_authorization_endpoint": DEVICE_AUTH_URL,
+                "client_id_metadata_document_supported": True,
+            },
+        )
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={"access_token": "acc", "token_type": "Bearer"},
+        )
+
+        client = httpx.Client()
+        cimd_url = "https://app.example.com/client.json"
+        data = ensure_token(
+            self.MCP_URL,
+            client,
+            device_flow=True,
+            client_metadata_url=cimd_url,
+        )
+        assert data.access_token == "acc"
+        assert data.client_id == cimd_url
+
+        reqs = httpx_mock.get_requests()
+        assert not any(str(r.url).startswith(REG_URL) for r in reqs)
+        da_req = next(r for r in reqs if str(r.url).startswith(DEVICE_AUTH_URL))
+        assert f"client_id={quote(cimd_url, safe='')}".encode() in da_req.content
 
 
 # --- _pick_token_endpoint_auth_method ---
