@@ -774,6 +774,7 @@ class TestHttpsUrlWithPath:
             "https://example.com/a/../b",  # double-dot segment
             "https://example.com/client.json#frag",  # fragment
             "https://user:pass@example.com/client.json",  # userinfo
+            "https://:pass@example.com/client.json",  # password-only userinfo
             "not a url",
         ],
     )
@@ -840,7 +841,63 @@ class TestClientMetadataUrlFlag:
             mock_ensure.return_value.access_token = "tok"
             main()
         err = capsys.readouterr().err
-        assert "--client-id takes precedence" in err
+        assert "the pre-registered client_id takes precedence" in err
+
+    def test_ambient_env_client_id_warns_and_wins_over_metadata_url(
+        self, monkeypatch, capsys
+    ):
+        """An ambient MCP_OAUTH_CLIENT_ID (no --client-id flag) is also a
+        pre-registered client_id and must trip the precedence warning — a
+        presence-only check on args.client_id missed this and let the env var
+        silently override --client-metadata-url with zero diagnostic."""
+        monkeypatch.setenv("MCP_OAUTH_CLIENT_ID", "env-cid")
+        url = "https://app.example.com/client.json"
+        with (
+            patch(
+                "sys.argv",
+                ["mcp-stdio", "--oauth", "--client-metadata-url", url, "https://example.com/mcp"],
+            ),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        assert mock_ensure.call_args.kwargs["client_id"] == "env-cid"
+        assert mock_ensure.call_args.kwargs["client_metadata_url"] == url
+        assert (
+            "the pre-registered client_id takes precedence"
+            in capsys.readouterr().err
+        )
+
+    def test_empty_explicit_client_id_does_not_warn_and_metadata_url_wins(
+        self, monkeypatch, capsys
+    ):
+        """An explicit but EMPTY --client-id '' is falsy, so --client-metadata-url
+        is what's actually used — the precedence warning must not fire here
+        (it previously fired with text claiming the opposite of what happens)."""
+        monkeypatch.delenv("MCP_OAUTH_CLIENT_ID", raising=False)
+        url = "https://app.example.com/client.json"
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--oauth",
+                    "--client-id",
+                    "",
+                    "--client-metadata-url",
+                    url,
+                    "https://example.com/mcp",
+                ],
+            ),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        assert mock_ensure.call_args.kwargs["client_id"] is None
+        assert mock_ensure.call_args.kwargs["client_metadata_url"] == url
+        assert "takes precedence" not in capsys.readouterr().err
 
     def test_invalid_url_rejected_at_parse_time(self, capsys):
         with patch(

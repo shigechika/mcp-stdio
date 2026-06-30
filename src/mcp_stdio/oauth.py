@@ -1552,6 +1552,32 @@ def refresh_cached_token(
     return data
 
 
+def _resolve_cimd_client_id(
+    client_metadata_url: str | None, metadata: OAuthMetadata
+) -> str | None:
+    """Resolve a Client ID Metadata Document URL into a client_id (#60).
+
+    Shared by ``_run_authorization_flow`` and ``_run_device_authorization_flow``
+    so the warn-and-use logic lives in one place. Returns ``client_metadata_url``
+    unchanged (a CIMD client_id IS just a URL) when given, or ``None`` when not.
+    An explicit ``--client-metadata-url`` always wins over cache/DCR — the same
+    explicit-opt-in rule as ``client_id_override`` — so this never second-
+    guesses the caller; it only warns when the AS metadata doesn't (yet)
+    confirm support, so a parse miss or a misconfigured AS is still actionable.
+    """
+    if not client_metadata_url:
+        return None
+    if not metadata.client_id_metadata_document_supported:
+        log(
+            "warning: --client-metadata-url is set but the authorization "
+            "server does not advertise client_id_metadata_document_supported "
+            "(draft-ietf-oauth-client-id-metadata-document-00 §5); using it "
+            "anyway"
+        )
+    log(f"using Client ID Metadata Document as client_id: {client_metadata_url}")
+    return client_metadata_url
+
+
 def _run_authorization_flow(
     server_url: str,
     client: httpx.Client,
@@ -1598,25 +1624,10 @@ def _run_authorization_flow(
     port = callback_server.server_address[1]
     redirect_uri = f"http://127.0.0.1:{port}/callback"
 
-    cid = client_id_override
+    cid = client_id_override or _resolve_cimd_client_id(client_metadata_url, metadata)
     csecret: str | None = None
     cse_at: float | None = None
     auth_method = "none"
-    if not cid and client_metadata_url:
-        # Explicit opt-in always wins (same rule as client_id_override) — do
-        # NOT silently fall back to DCR/cache just because the AS metadata
-        # didn't confirm support; warn instead so a parse miss or an AS that
-        # forgot to advertise the flag is still actionable.
-        if not metadata.client_id_metadata_document_supported:
-            log(
-                "warning: --client-metadata-url is set but the authorization "
-                "server does not advertise "
-                "client_id_metadata_document_supported "
-                "(draft-ietf-oauth-client-id-metadata-document-00 §5); "
-                "using it anyway"
-            )
-        cid = client_metadata_url
-        log(f"using Client ID Metadata Document as client_id: {cid}")
     if not cid:
         if cached and cached.client_id and not _is_client_secret_expired(cached):
             cid = cached.client_id
@@ -1836,21 +1847,10 @@ def _run_device_authorization_flow(
             "Use --oauth for browser-based flow instead."
         )
 
-    cid = client_id_override
+    cid = client_id_override or _resolve_cimd_client_id(client_metadata_url, metadata)
     csecret: str | None = None
     cse_at: float | None = None
     auth_method = "none"
-    if not cid and client_metadata_url:
-        if not metadata.client_id_metadata_document_supported:
-            log(
-                "warning: --client-metadata-url is set but the authorization "
-                "server does not advertise "
-                "client_id_metadata_document_supported "
-                "(draft-ietf-oauth-client-id-metadata-document-00 §5); "
-                "using it anyway"
-            )
-        cid = client_metadata_url
-        log(f"using Client ID Metadata Document as client_id: {cid}")
     if not cid:
         if cached and cached.client_id and not _is_client_secret_expired(cached):
             cid = cached.client_id

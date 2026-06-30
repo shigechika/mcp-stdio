@@ -71,8 +71,10 @@ def _https_url_with_path(value: str) -> str:
         or "." in path_segments
         or ".." in path_segments
         or parsed.fragment
+        # urlparse only ever sets `password` when userinfo is present, and
+        # whenever it does `username` is also non-None (at minimum ""), so
+        # checking `username` alone already catches every userinfo case.
         or parsed.username is not None
-        or parsed.password is not None
     ):
         raise argparse.ArgumentTypeError(
             f"must be an https:// URL with a path component, no "
@@ -687,13 +689,20 @@ def _main() -> None:
             file=sys.stderr,
         )
 
-    # --client-id (pre-registered) outranks --client-metadata-url (CIMD) per the
-    # MCP "Client Registration Approaches" priority order (#60) — surface the
-    # conflict instead of silently dropping the metadata URL.
-    if args.client_id is not None and args.client_metadata_url is not None:
+    # A pre-registered client_id (--client-id, OR an ambient MCP_OAUTH_CLIENT_ID
+    # — see the resolution above) outranks --client-metadata-url (CIMD) per the
+    # MCP "Client Registration Approaches" priority order (#60). Gate this on
+    # the RESOLVED `client_id` (the same `client_id or None` truthiness check
+    # oauth.py applies at line 811/828 below), not on `args.client_id is not
+    # None`: that presence-only check missed an ambient env var silently
+    # winning with no warning, and misfired on an explicit `--client-id ''`
+    # (falsy — --client-metadata-url actually wins there) with a warning that
+    # claimed the opposite of what happens.
+    if client_id and args.client_metadata_url is not None:
         print(
-            "warning: both --client-id and --client-metadata-url given; "
-            "--client-id takes precedence",
+            "warning: a pre-registered client_id (--client-id or "
+            "MCP_OAUTH_CLIENT_ID) and --client-metadata-url were both given; "
+            "the pre-registered client_id takes precedence",
             file=sys.stderr,
         )
 
