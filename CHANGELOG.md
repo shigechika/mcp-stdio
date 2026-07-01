@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.24.0](https://github.com/shigechika/mcp-stdio/compare/v0.23.0...v0.24.0) (2026-07-01)
+
+
+### Features
+
+* **serve:** --allow-redirect-uri exact-match allowlist for remote HTTPS clients ([#268](https://github.com/shigechika/mcp-stdio/issues/268)) ([a426de1](https://github.com/shigechika/mcp-stdio/commit/a426de12ce9723a0620d5d236420995c39a5b5d8))
+
 ## [0.23.0](https://github.com/shigechika/mcp-stdio/compare/v0.22.0...v0.23.0) (2026-06-30)
 
 
