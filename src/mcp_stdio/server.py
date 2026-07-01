@@ -608,13 +608,23 @@ def _validate_allowed_redirect_uri(uri: str) -> str:
     """
     if "\r" in uri or "\n" in uri:
         raise ValueError(f"{uri!r}: contains CR/LF")
-    p = urlsplit(uri)
+    try:
+        p = urlsplit(uri)
+    except ValueError as e:
+        raise ValueError(f"{uri!r}: {e}") from e
     if p.scheme != "https":
         raise ValueError(f"{uri!r}: must be an https:// URL (never http for a non-loopback redirect)")
     if not p.hostname:
         raise ValueError(f"{uri!r}: missing host")
     if p.username or p.password or "@" in p.netloc:
         raise ValueError(f"{uri!r}: must not contain userinfo")
+    # Mirrors _redirect_key()'s query rejection: authorize()'s redirect()
+    # builds the Location as `redirect_uri + "?" + urlencode(query)`, so a
+    # redirect_uri that already carries a query produces a malformed
+    # double-"?" Location in which "code" is swallowed into the tail of the
+    # existing query's last value instead of appearing as its own parameter.
+    if p.query:
+        raise ValueError(f"{uri!r}: must not contain a query string")
     if p.fragment:
         raise ValueError(f"{uri!r}: must not contain a fragment")
     return uri
@@ -1462,7 +1472,9 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
         # 302 to the validated redirect_uri (Location built via urlencode and a
-        # CR/LF-free, registered loopback redirect_uri — no injection surface).
+        # CR/LF-free, registered redirect_uri -- loopback per _redirect_key(),
+        # or an operator-allowlisted exact HTTPS match per _match_key() -- no
+        # injection surface either way).
         self.send_response(302)
         self.send_header("Location", result["location"])
         self.send_header("Content-Length", "0")

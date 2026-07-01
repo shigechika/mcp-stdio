@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -1506,11 +1507,23 @@ def test_validate_allowed_redirect_uri_accepts_https_rejects_bad():
         "http://claude.example/api/mcp/auth_callback",  # not https
         "https://u:p@claude.example/cb",  # userinfo
         "https://claude.example/cb#frag",  # fragment
+        "https://claude.example/cb?next=x",  # query (see test below for why)
         "https:///cb",  # missing host
         "https://claude.example/cb\r\nX-Injected: 1",  # CR/LF
+        "https://[::1/cb",  # malformed IPv6 host -> urlsplit itself raises
     ):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=re.escape(repr(bad))):
             server._validate_allowed_redirect_uri(bad)
+
+
+def test_validate_allowed_redirect_uri_rejects_query_to_prevent_double_question_mark():
+    """A query-bearing allowlisted redirect_uri would make authorize()'s
+    `redirect_uri + "?" + urlencode(query)` produce a malformed double-"?"
+    Location, silently swallowing `code` into the tail of the existing
+    query's last value instead of its own parameter -- the same failure mode
+    _redirect_key() already guards against on the loopback path."""
+    with pytest.raises(ValueError):
+        server._validate_allowed_redirect_uri("https://claude.example/cb?evil=1")
 
 
 def test_match_key_exact_is_independent_of_loopback():
