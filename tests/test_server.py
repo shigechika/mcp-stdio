@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -1402,6 +1403,20 @@ def test_serve_main_bad_trusted_header():
         server.serve_main(["--enable-oauth", "--trusted-user-header", "bad header", "--", "true"])
 
 
+def test_serve_main_allow_redirect_uri_requires_oauth():
+    with pytest.raises(SystemExit):
+        server.serve_main(["--allow-redirect-uri", _ALLOWED_HTTPS, "--", "true"])
+
+
+def test_serve_main_bad_allow_redirect_uri():
+    with pytest.raises(SystemExit):
+        server.serve_main([
+            "--enable-oauth", "--dev-user", "a",
+            "--allow-redirect-uri", "http://not-https.example/cb",
+            "--", "true",
+        ])
+
+
 # -- real-client interop: drive mcp_stdio.oauth.ensure_token end to end --
 
 def test_real_client_ensure_token(monkeypatch, tmp_path):
@@ -1479,6 +1494,83 @@ def test_register_rejects_query_bearing_redirect(oauth_gateway):
     assert r.status_code == 400
     # RFC 7591 Sec. 3.2.2: an invalid redirect URI uses the dedicated error code.
     assert r.json()["error"] == "invalid_redirect_uri"
+
+
+# -- --allow-redirect-uri: exact-match remote HTTPS callback --
+
+_ALLOWED_HTTPS = "https://claude.example/api/mcp/auth_callback"
+
+
+def test_validate_allowed_redirect_uri_accepts_https_rejects_bad():
+    assert server._validate_allowed_redirect_uri(_ALLOWED_HTTPS) == _ALLOWED_HTTPS
+    for bad in (
+        "http://claude.example/api/mcp/auth_callback",  # not https
+        "https://u:p@claude.example/cb",  # userinfo
+        "https://claude.example/cb#frag",  # fragment
+        "https://claude.example/cb?next=x",  # query (see test below for why)
+        "https:///cb",  # missing host
+        "https://claude.example/cb\r\nX-Injected: 1",  # CR/LF
+        "https://[::1/cb",  # malformed IPv6 host -> urlsplit itself raises
+    ):
+        with pytest.raises(ValueError, match=re.escape(repr(bad))):
+            server._validate_allowed_redirect_uri(bad)
+
+
+def test_validate_allowed_redirect_uri_rejects_query_to_prevent_double_question_mark():
+    """A query-bearing allowlisted redirect_uri would make authorize()'s
+    `redirect_uri + "?" + urlencode(query)` produce a malformed double-"?"
+    Location, silently swallowing `code` into the tail of the existing
+    query's last value instead of its own parameter -- the same failure mode
+    _redirect_key() already guards against on the loopback path."""
+    with pytest.raises(ValueError):
+        server._validate_allowed_redirect_uri("https://claude.example/cb?evil=1")
+
+
+def test_match_key_exact_is_independent_of_loopback():
+    allowed = frozenset({_ALLOWED_HTTPS})
+    # loopback still resolves through _redirect_key, unaffected by the allowlist
+    assert server._match_key("http://127.0.0.1:5/cb", allowed) == ("loopback", "http", "127.0.0.1", "/cb")
+    # the exact allowlisted URI matches
+    assert server._match_key(_ALLOWED_HTTPS, allowed) == ("exact", _ALLOWED_HTTPS)
+    # a non-allowlisted https URL does not, even though it "looks" similar
+    assert server._match_key("https://claude.example/other", allowed) is None
+    assert server._match_key("https://claude.example.evil.com/api/mcp/auth_callback", allowed) is None
+    assert server._match_key(_ALLOWED_HTTPS + ":443", allowed) is None
+    assert server._match_key(_ALLOWED_HTTPS + "/", allowed) is None
+
+
+def test_register_accepts_allowlisted_https_redirect():
+    with _run(oauth=_provider(allowed_redirect_uris=frozenset({_ALLOWED_HTTPS}))) as (base, _):
+        r = _register(base, redirect=_ALLOWED_HTTPS)
+        assert r.status_code == 201, r.text
+
+
+def test_register_still_rejects_non_allowlisted_https_redirect():
+    with _run(oauth=_provider(allowed_redirect_uris=frozenset({_ALLOWED_HTTPS}))) as (base, _):
+        r = _register(base, redirect="https://evil.example.com/callback")
+        assert r.status_code == 400
+        assert r.json()["error"] == "invalid_redirect_uri"
+
+
+def test_authorize_and_token_exchange_succeed_for_allowlisted_https_redirect():
+    with _run(oauth=_provider(allowed_redirect_uris=frozenset({_ALLOWED_HTTPS}))) as (base, _):
+        cid, verifier, challenge, code, tok = _full_flow(base, redirect=_ALLOWED_HTTPS)
+        assert tok.status_code == 200, tok.text
+        assert tok.json()["access_token"]
+
+
+def test_authorize_rejects_lookalike_of_allowlisted_https_redirect():
+    with _run(oauth=_provider(allowed_redirect_uris=frozenset({_ALLOWED_HTTPS}))) as (base, _):
+        cid = _register(base, redirect=_ALLOWED_HTTPS).json()["client_id"]
+        _, challenge = client_oauth.generate_pkce()
+        for lookalike in (
+            "https://claude.example.evil.com/api/mcp/auth_callback",  # host lookalike
+            _ALLOWED_HTTPS + ":443",  # explicit default port, not byte-identical
+            _ALLOWED_HTTPS + "/",  # trailing slash
+            _ALLOWED_HTTPS.replace("https://", "http://"),  # scheme downgrade
+        ):
+            az = _authorize(base, cid, challenge, redirect=lookalike)
+            assert az.status_code == 400, f"{lookalike!r} unexpectedly accepted"
 
 
 def test_refresh_wrong_client_id_preserves_token(oauth_gateway):

@@ -591,6 +591,67 @@ def _redirect_key(uri: str) -> tuple[str, str, str] | None:
     return (p.scheme, host, p.path or "/")
 
 
+def _validate_allowed_redirect_uri(uri: str) -> str:
+    """Validate an operator-configured (``--allow-redirect-uri``) exact-match
+    HTTPS redirect target.
+
+    Unlike the loopback ``_redirect_key()`` path (RFC 8252, port-agnostic,
+    ``http`` only, for a locally-run CLI/native client), this is for a KNOWN,
+    FIXED remote callback -- e.g. a browser-based MCP client hosted on a
+    public domain -- that the operator has explicitly decided to trust. It is
+    matched byte-for-byte at registration/authorize time (see ``_match_key``),
+    never widened or normalized, so this validation only needs to catch an
+    unsafe *configuration* (a typo'd scheme, a stray fragment), not guard
+    against a client-controlled bypass.
+
+    Raises ValueError with a human-readable reason on rejection.
+    """
+    if "\r" in uri or "\n" in uri:
+        raise ValueError(f"{uri!r}: contains CR/LF")
+    try:
+        p = urlsplit(uri)
+    except ValueError as e:
+        raise ValueError(f"{uri!r}: {e}") from e
+    if p.scheme != "https":
+        raise ValueError(f"{uri!r}: must be an https:// URL (never http for a non-loopback redirect)")
+    if not p.hostname:
+        raise ValueError(f"{uri!r}: missing host")
+    if p.username or p.password or "@" in p.netloc:
+        raise ValueError(f"{uri!r}: must not contain userinfo")
+    # Mirrors _redirect_key()'s query rejection: authorize()'s redirect()
+    # builds the Location as `redirect_uri + "?" + urlencode(query)`, so a
+    # redirect_uri that already carries a query produces a malformed
+    # double-"?" Location in which "code" is swallowed into the tail of the
+    # existing query's last value instead of appearing as its own parameter.
+    if p.query:
+        raise ValueError(f"{uri!r}: must not contain a query string")
+    if p.fragment:
+        raise ValueError(f"{uri!r}: must not contain a fragment")
+    return uri
+
+
+def _match_key(uri: str, allowed_redirects: frozenset[str]) -> tuple[Any, ...] | None:
+    """Registration/authorize matching key for a ``redirect_uri``.
+
+    Two disjoint forms are accepted, each through its own independent check --
+    the exact-match form is deliberately NOT folded into ``_redirect_key()``,
+    so widening one can never accidentally widen the other:
+
+    - RFC 8252 loopback ``http``, via ``_redirect_key()``: port-agnostic.
+    - An operator-configured ``--allow-redirect-uri`` entry: matched
+      byte-for-byte, no normalization, so a client can never satisfy it with
+      anything but the exact configured string.
+
+    Returns None if neither applies.
+    """
+    rk = _redirect_key(uri)
+    if rk is not None:
+        return ("loopback", *rk)
+    if uri in allowed_redirects:
+        return ("exact", uri)
+    return None
+
+
 def _normalize_public_url(url: str) -> str:
     """Normalize --public-url to a canonical issuer ``scheme://host[:port][/path]``.
 
@@ -682,6 +743,7 @@ class _OAuthProvider:
         access_ttl: float = _DEFAULT_ACCESS_TTL_SECS,
         code_ttl: float = _AUTH_CODE_TTL_SECS,
         refresh_ttl: float = _REFRESH_TTL_SECS,
+        allowed_redirect_uris: frozenset[str] = frozenset(),
         now: Any = time.time,
     ) -> None:
         self.public_url = public_url
@@ -690,6 +752,12 @@ class _OAuthProvider:
         self.access_ttl = access_ttl
         self.code_ttl = code_ttl
         self.refresh_ttl = refresh_ttl
+        # Raises ValueError (surfaced by the CLI as a startup parser.error) on a
+        # malformed entry -- fail fast on an operator typo rather than accepting
+        # a client whose redirect the operator did not actually intend to trust.
+        self.allowed_redirect_uris = frozenset(
+            _validate_allowed_redirect_uri(u) for u in allowed_redirect_uris
+        )
         self._now = now
         self._lock = threading.Lock()
         self._clients: dict[str, dict[str, Any]] = {}
@@ -736,6 +804,11 @@ class _OAuthProvider:
             # redirection URI value; prefer it over the generic metadata error.
             return 400, {"error": "invalid_redirect_uri", "error_description": desc}
 
+        _redirect_err = (
+            "redirect_uris must be loopback http URLs"
+            + (" or an operator-allowlisted https URL" if self.allowed_redirect_uris else "")
+        )
+
         try:
             body = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -751,9 +824,10 @@ class _OAuthProvider:
             return bad("redirect_uris must be a non-empty array")
         keys = set()
         for u in uris:
-            if not isinstance(u, str) or _redirect_key(u) is None:
-                return bad_redirect("redirect_uris must be loopback http URLs")
-            keys.add(_redirect_key(u))
+            key = _match_key(u, self.allowed_redirect_uris) if isinstance(u, str) else None
+            if key is None:
+                return bad_redirect(_redirect_err)
+            keys.add(key)
         client_id = secrets.token_urlsafe(32)
         now = self._now()
         with self._lock:
@@ -795,7 +869,7 @@ class _OAuthProvider:
             client = self._clients.get(cid)
         if not cid or client is None:
             return {"kind": "bad_request", "message": "unknown or missing client_id"}
-        rk = _redirect_key(redirect_uri)
+        rk = _match_key(redirect_uri, self.allowed_redirect_uris)
         if rk is None or rk not in client["redirect_keys"]:
             return {"kind": "bad_request", "message": "invalid redirect_uri"}
 
@@ -1398,7 +1472,9 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
         # 302 to the validated redirect_uri (Location built via urlencode and a
-        # CR/LF-free, registered loopback redirect_uri — no injection surface).
+        # CR/LF-free, registered redirect_uri -- loopback per _redirect_key(),
+        # or an operator-allowlisted exact HTTPS match per _match_key() -- no
+        # injection surface either way).
         self.send_response(302)
         self.send_header("Location", result["location"])
         self.send_header("Content-Length", "0")
@@ -1825,6 +1901,20 @@ def serve_main(argv: list[str]) -> None:
         ),
     )
     parser.add_argument(
+        "--allow-redirect-uri",
+        action="append",
+        default=[],
+        metavar="URL",
+        help=(
+            "Trust this exact HTTPS redirect_uri in addition to the RFC 8252 "
+            "loopback default, for a known non-loopback remote client (e.g. a "
+            "browser-based MCP client's fixed OAuth callback). Repeatable. "
+            "Matched byte-for-byte -- never widened to a host or prefix -- so "
+            "only add a URL you have verified belongs to a client you trust; "
+            "each is exactly as trusted as a hardcoded redirect target."
+        ),
+    )
+    parser.add_argument(
         "--access-token-ttl",
         type=int,
         default=int(_DEFAULT_ACCESS_TTL_SECS),
@@ -1889,6 +1979,8 @@ def serve_main(argv: list[str]) -> None:
     oauth = None
     if args.dev_user is not None and not args.enable_oauth:
         parser.error("--dev-user requires --enable-oauth")
+    if args.allow_redirect_uri and not args.enable_oauth:
+        parser.error("--allow-redirect-uri requires --enable-oauth")
     if args.trusted_user_header is not None and any(
         c in args.trusted_user_header for c in (" ", "\r", "\n", ":")
     ):
@@ -1920,11 +2012,20 @@ def serve_main(argv: list[str]) -> None:
             )
         if args.dev_user is not None:
             log("warning: --dev-user is INSECURE; for loopback testing only")
+        try:
+            allowed_redirect_uris = frozenset(
+                _validate_allowed_redirect_uri(u) for u in args.allow_redirect_uri
+            )
+        except ValueError as e:
+            parser.error(f"--allow-redirect-uri invalid: {e}")
+        for u in allowed_redirect_uris:
+            log(f"note: trusting exact redirect_uri {u!r} in addition to loopback")
         oauth = _OAuthProvider(
             public_url=public_url,
             trusted_user_header=args.trusted_user_header,
             dev_user=args.dev_user,
             access_ttl=float(args.access_token_ttl),
+            allowed_redirect_uris=allowed_redirect_uris,
         )
 
     serve(
