@@ -327,10 +327,20 @@ after this much inactivity so a client that disconnects without `DELETE` does
 not pin a slot; `0` = disabled, the default); and for the embedded AS:
 `--enable-oauth`, `--public-url URL` (pins the issuer; recommended behind a
 proxy), `--trusted-user-header HEADER`, `--dev-user USER` (insecure, testing
-only), `--access-token-ttl SECONDS`. In-memory tokens mean a restart
-invalidates issued tokens (the client re-runs `--oauth`). The backend command
-follows the options (an optional `--` separator is supported).
+only), `--access-token-ttl SECONDS`, `--allow-redirect-uri URL` (repeatable;
+see below). In-memory tokens mean a restart invalidates issued tokens (the
+client re-runs `--oauth`). The backend command follows the options (an
+optional `--` separator is supported).
 
+  - *Non-loopback remote clients* — DCR only accepts an RFC 8252 loopback
+    `http://` `redirect_uri` by default, which a browser-based remote MCP
+    client (a web app with a fixed HTTPS OAuth callback, not a locally-run
+    CLI/native app) cannot satisfy. `--allow-redirect-uri URL` (repeatable)
+    trusts one additional `redirect_uri` **byte-for-byte** — no host, prefix,
+    or port matching — so add only a URL you have verified belongs to a
+    client you actually trust; each entry is exactly as trusted as a
+    hardcoded redirect target. It is independent of the loopback path (adding
+    one never widens the other) and requires `--enable-oauth`.
   - *Path-scoped issuer* — `--public-url` retains a path, so several
     `--enable-oauth` backends can share one host behind a reverse proxy, each
     under its own prefix (e.g. `--public-url https://gw.example.org/team-a`
