@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.0](https://github.com/shigechika/mcp-stdio/compare/v0.22.0...v0.23.0) (2026-06-30)
+
+
+### Features
+
+* **oauth:** support Client ID Metadata Documents (MCP 2025-11-25 / [#60](https://github.com/shigechika/mcp-stdio/issues/60)) ([#265](https://github.com/shigechika/mcp-stdio/issues/265)) ([80de50a](https://github.com/shigechika/mcp-stdio/commit/80de50a104c9fe80eaf610ff397fd961f89f58f0))
+
 ## [0.22.0](https://github.com/shigechika/mcp-stdio/compare/v0.21.0...v0.22.0) (2026-06-30)
 
 
