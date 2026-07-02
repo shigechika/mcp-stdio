@@ -394,13 +394,18 @@ class _CancelTracker:
 
 
 def _is_scalar_id(rid: Any) -> bool:
-    """True when ``rid`` is a usable JSON-RPC id: a String or Number.
+    """True when ``rid`` is a usable JSON-RPC id: a String or finite Number.
 
     A NON-SCALAR id (object / array) is malformed AND unhashable, so any
     set/dict tracking keyed on it would raise ``TypeError`` — and it can never
     match a real response id anyway. ``None``/``null`` is excluded: it is
-    uncorrelatable (multiple requests could share it).
+    uncorrelatable (multiple requests could share it). A non-finite float
+    (``json.loads`` accepts the non-standard ``NaN``/``Infinity`` literals by
+    default) is excluded too: echoing it back through ``json.dumps`` would put
+    invalid JSON on the wire, and ``NaN != NaN`` breaks key correlation.
     """
+    if isinstance(rid, float) and not math.isfinite(rid):
+        return False
     return rid is not None and isinstance(rid, (str, int, float))
 
 
@@ -577,40 +582,54 @@ def _emit(line: str, tracker: "_CancelTracker | None") -> None:
     if not isinstance(msg, dict):
         _write_line(line)
         return
-    rid = msg.get("id")
-    # Drop only a pure JSON-RPC RESPONSE (id + result/error, NO method). A
-    # message carrying `method` is by definition a request / notification, not
-    # a response — so a malformed peer that sends `method` alongside
-    # result/error under a (coincidentally cancelled) id must still pass
-    # through, matching this function's documented scope ("server-initiated
-    # requests ... pass through"). _extract_response_id below applies the
-    # SAME test — keep the two in sync.
-    if rid is not None and "method" not in msg and ("result" in msg or "error" in msg):
-        if tracker.consume(rid):
+    # Drop only a pure JSON-RPC RESPONSE (id + result/error, NO method — see
+    # _is_pure_response, shared with _extract_response_id so the two gates
+    # can never drift). A message carrying `method` is by definition a
+    # request / notification, not a response — so a malformed peer that sends
+    # `method` alongside result/error under a (coincidentally cancelled) id
+    # must still pass through, matching this function's documented scope
+    # ("server-initiated requests ... pass through"). The scalar guard is a
+    # behavior no-op (a non-scalar id can never have been tracked) that keeps
+    # an unhashable id out of tracker.consume's dict lookup.
+    if _is_pure_response(msg):
+        rid = msg["id"]
+        if _is_scalar_id(rid) and tracker.consume(rid):
             log(f"dropped late response for cancelled id {rid!r}")
             return
     _write_line(line)
 
 
+def _is_pure_response(msg: Any) -> bool:
+    """True for a pure JSON-RPC response: an object with a non-null id, NO
+    ``method``, and ``result`` or ``error`` present.
+
+    The single source of truth for "is this a response" — shared by
+    ``_emit``'s cancel gate and ``_extract_response_id`` (the SSE in-flight
+    tracker) so the two can never drift apart.
+    """
+    return (
+        isinstance(msg, dict)
+        and msg.get("id") is not None
+        and "method" not in msg
+        and ("result" in msg or "error" in msg)
+    )
+
+
 def _extract_response_id(line: str) -> Any:
     """The id of a pure JSON-RPC response, or ``None``.
 
-    Applies the same test as ``_emit``'s cancel gate (object, non-null id,
-    no ``method``, ``result`` or ``error`` present — keep the two in sync)
-    plus the ``_is_scalar_id`` guard, so the SSE in-flight tracker only ever
-    pops keys it could have stored. Standalone rather than a ``_emit`` return
-    value: ``_emit`` skips parsing entirely when the cancel filter is off,
-    but in-flight tracking must work under ``--no-cancel-filter`` too.
+    ``_is_pure_response`` plus the ``_is_scalar_id`` guard, so the SSE
+    in-flight tracker only ever pops keys it could have stored. Standalone
+    rather than a ``_emit`` return value: ``_emit`` skips parsing entirely
+    when the cancel filter is off, but in-flight tracking must work under
+    ``--no-cancel-filter`` too.
     """
     try:
         msg = json.loads(line)
     except (json.JSONDecodeError, TypeError):
         return None
-    if not isinstance(msg, dict):
-        return None
-    rid = msg.get("id")
-    if "method" not in msg and ("result" in msg or "error" in msg) and _is_scalar_id(rid):
-        return rid
+    if _is_pure_response(msg) and _is_scalar_id(msg["id"]):
+        return msg["id"]
     return None
 
 
@@ -2545,12 +2564,13 @@ def run(
 
 
 # Upper bound on tracked in-flight request ids awaiting a response on the SSE
-# GET stream (see _SseState.pending). At the cap the OLDEST tracking entry is
-# evicted silently: an evicted id merely reverts to the pre-#272 behavior
-# (hang on disconnect) — no new failure mode. A TTL is deliberately NOT used:
-# tool calls legitimately run for many minutes, and a TTL-fired synthesized
-# error followed by the real response would put TWO responses on the wire for
-# one id — the framing-error class this relay exists to absorb.
+# GET stream (see _SseState.track): at the cap a NEW id is simply not tracked
+# (it reverts to the pre-#272 hang-on-disconnect behavior — no new failure
+# mode) so the oldest, longest-running calls keep their protection. A TTL is
+# deliberately NOT used: tool calls legitimately run for many minutes, and a
+# TTL-fired synthesized error followed by the real response would put TWO
+# responses on the wire for one id — the framing-error class this relay
+# exists to absorb.
 _SSE_PENDING_MAX = 4096
 
 
@@ -2566,22 +2586,68 @@ class _SseState:
     acceptable in practice: legacy SSE reconnect endpoints are stable. ``ready``
     / ``stop`` are ``threading.Event``s, which carry their own synchronization.
 
-    ``pending`` maps each request id POSTed on the current GET stream to its
-    ``time.monotonic()`` POST time (the value is informational; dict insertion
-    order is what the ``_SSE_PENDING_MAX`` eviction uses). The main loop adds
-    after a 2xx POST, the reader thread pops on response delivery and drains
-    on disconnect (#272). ``lock`` guards ``pending`` ONLY — ``endpoint_url``'s
-    lock-free contract above is unchanged.
+    ``pending`` is an insertion-ordered set (a dict with ``None`` values) of
+    request ids POSTed and awaiting their async reply on the GET stream. The
+    main loop ``track()``s an id BEFORE the POST — the reply can arrive on
+    the GET stream before ``client.post()`` even returns, so adding
+    afterwards would let the reader's pop no-op and the answered id linger
+    until the next drop, where the drain would synthesize a second response
+    for it — and ``untrack()``s it on every path that synthesizes an inline
+    error instead. The reader thread ``untrack()``s on response delivery and
+    drains on disconnect (#272). ``lock`` guards ``pending`` ONLY —
+    ``endpoint_url``'s lock-free contract above is unchanged.
     """
 
-    __slots__ = ("endpoint_url", "ready", "stop", "lock", "pending")
+    __slots__ = ("endpoint_url", "ready", "stop", "lock", "pending", "busy")
 
     def __init__(self) -> None:
         self.endpoint_url: str | None = None
         self.ready = threading.Event()
         self.stop = threading.Event()
         self.lock = threading.Lock()
-        self.pending: dict[Any, float] = {}
+        self.pending: dict[Any, None] = {}
+        # The id the main thread is CURRENTLY settling (between track() and
+        # clear_busy()). A disconnect drain leaves it alone: the POST path
+        # owns its outcome — an inline error on failure, or a ride to the
+        # next drop on a POST that succeeded concurrently with the drain —
+        # so the drain and the inline synthesis can never both answer it.
+        self.busy: Any = None
+
+    def track(self, rid: Any) -> bool:
+        """Track an id awaiting its reply; False when the cap refused it.
+
+        At ``_SSE_PENDING_MAX`` a NEW id is refused (left untracked — it
+        merely reverts to the pre-#272 hang-on-disconnect) rather than
+        evicting the oldest: the oldest entries are the longest-running
+        calls, exactly the ones a stream drop hurts most (claude-code#60061),
+        so they keep their protection. A re-POST of an already-tracked id is
+        always accepted (it refreshes nothing; one drain error per id).
+
+        The tracked id is also marked busy until :meth:`clear_busy`.
+        """
+        with self.lock:
+            if rid not in self.pending and len(self.pending) >= _SSE_PENDING_MAX:
+                return False
+            self.pending[rid] = None
+            self.busy = rid
+            return True
+
+    def clear_busy(self) -> None:
+        with self.lock:
+            self.busy = None
+
+    def untrack(self, rid: Any) -> bool:
+        """Remove ``rid``; True when it was still tracked.
+
+        False means the id was already settled elsewhere — the reader
+        delivered its real reply, or a disconnect drain synthesized an error
+        for it — so the caller must NOT put another response on the wire.
+        """
+        with self.lock:
+            if rid in self.pending:
+                del self.pending[rid]
+                return True
+            return False
 
 
 def _drain_pending(state: _SseState, tracker: _CancelTracker | None) -> None:
@@ -2601,18 +2667,40 @@ def _drain_pending(state: _SseState, tracker: _CancelTracker | None) -> None:
     synthesis for a line the client just sent, whereas this drain fires
     arbitrarily later for an id the client may have long abandoned.
 
+    Two accepted residual windows, both narrow and self-limiting: (a) a real
+    reply that still surfaces AFTER the drain (buffered on the dead socket,
+    or a server that keeps the session across reconnect) is delivered as a
+    second response for that id — the same undeduplicated two-responses
+    window already documented at the non-2xx POST branch, made observable
+    where it previously was a silent hang; (b) a cancel whose stdin line has
+    not yet been processed when the drain snapshots is indistinguishable
+    from a response crossing the cancel in flight — the MCP cancellation
+    spec's crossing case, which the canceller ignores.
+
     Locking discipline: ``state.lock`` is held only for the snapshot-and-clear
     — never across stdout I/O or the tracker's internal lock. The write loop
     swallows ``OSError`` (mirroring run()'s second-write handling) because two
     call sites are inside ``except`` handlers where a ``BrokenPipeError``
-    would kill the reader thread for good.
+    would kill the reader thread for good. The per-iteration ``stop`` check
+    bounds how long a drain can keep writing after run_sse begins shutdown
+    (the reader is a daemon; a clean exit should not flush errors into a
+    stdout the process is abandoning).
     """
+    if state.stop.is_set():
+        return
     with state.lock:
         if not state.pending:
             return
-        ids = list(state.pending)
-        state.pending.clear()
+        # The busy id (actively being settled by the main thread's POST
+        # path) is left tracked: its owner writes the inline error on
+        # failure, and a POST that succeeds concurrently with this drain
+        # rides until the next drop — either way, exactly one response.
+        ids = [rid for rid in state.pending if rid != state.busy]
+        for rid in ids:
+            del state.pending[rid]
     for rid in ids:
+        if state.stop.is_set():
+            return
         if tracker is not None and tracker.contains(rid):
             log(f"not synthesizing disconnect error for cancelled id {rid!r}")
             continue
@@ -2670,6 +2758,20 @@ def _sse_reader_loop(
 
     Reconnects automatically on disconnect.
     """
+    def stream_lost() -> None:
+        """The shared disconnect sequence, identical at every reconnect site.
+
+        Ordering invariant: clear ``ready`` BEFORE nulling ``endpoint_url``
+        so the main loop's ready.wait() blocks out the in-progress reconnect
+        instead of returning immediately on a stale set() and surfacing a
+        spurious "SSE endpoint unavailable"; then drain the ids orphaned on
+        the dropped stream. One definition so a future fifth reconnect path
+        cannot get the order wrong or forget the drain.
+        """
+        state.ready.clear()
+        state.endpoint_url = None
+        _drain_pending(state, tracker)
+
     # Whether a usable endpoint was EVER established. A non-200 on the very
     # first connect is fatal (the server is unusable — fail startup fast); a
     # non-200 on a later RECONNECT is treated as a transient outage and retried,
@@ -2692,9 +2794,7 @@ def _sse_reader_loop(
                         state.ready.set()
                         return
                     # Reconnect failure: keep trying rather than dying.
-                    state.ready.clear()
-                    state.endpoint_url = None
-                    _drain_pending(state, tracker)
+                    stream_lost()
                     if state.stop.wait(RETRY_DELAY):
                         return
                     continue
@@ -2725,27 +2825,20 @@ def _sse_reader_loop(
                         log(f"SSE endpoint: {resolved}")
                     elif event_type == "message":
                         # A delivered response settles its pending entry —
-                        # pop BEFORE _emit (and regardless of whether the
+                        # untrack BEFORE _emit (and regardless of whether the
                         # cancel gate then drops the line: the response
                         # arrived; it will never come again), so an emit
                         # failure cannot later produce a duplicate
                         # synthesized error for an already-answered id.
                         rid = _extract_response_id(data)
                         if rid is not None:
-                            with state.lock:
-                                state.pending.pop(rid, None)
+                            state.untrack(rid)
                         _emit(data, tracker)
 
                 if state.stop.is_set():
                     return
                 log("SSE stream ended, reconnecting")
-                # Clear ``ready`` BEFORE nulling endpoint_url so the main loop's
-                # ready.wait() blocks out the in-progress reconnect instead of
-                # returning immediately on a stale set() and surfacing a spurious
-                # "SSE endpoint unavailable".
-                state.ready.clear()
-                state.endpoint_url = None
-                _drain_pending(state, tracker)
+                stream_lost()
                 # Responsive reconnect delay: exits immediately on stop.
                 if state.stop.wait(RETRY_DELAY):
                     return
@@ -2753,9 +2846,7 @@ def _sse_reader_loop(
             if state.stop.is_set():
                 return
             log(f"SSE disconnected, reconnecting: {e}")
-            state.ready.clear()  # clear before nulling endpoint_url (see above)
-            state.endpoint_url = None
-            _drain_pending(state, tracker)
+            stream_lost()
             if state.stop.wait(RETRY_DELAY):
                 return
         except Exception as e:  # noqa: BLE001 — thread safety net
@@ -2782,9 +2873,7 @@ def _sse_reader_loop(
             # instead of hanging, then reconnect — a one-off bad event should not be
             # fatal (cf. the loop's stated intent above).
             log(f"SSE reader unexpected error, reconnecting: {e}")
-            state.ready.clear()
-            state.endpoint_url = None
-            _drain_pending(state, tracker)
+            stream_lost()
             if state.stop.wait(RETRY_DELAY):
                 return
 
@@ -2946,6 +3035,7 @@ def run_sse(
                 continue
 
             req_id, req_has_id = None, False
+            tracked = False
             try:
                 if normalize_arguments:
                     line = _normalize_null_arguments(line)
@@ -2957,12 +3047,13 @@ def run_sse(
                     # A cancelled id has no waiter — untrack it so a later
                     # stream drop does not synthesize an unsolicited error for
                     # it (done regardless of the cancel filter: the in-flight
-                    # tracker is independent of response filtering). The
-                    # drain's tracker.contains() check is only the race-closer
-                    # for a cancel concurrent with a drain snapshot; this pop
-                    # is the primary path.
-                    with state.lock:
-                        state.pending.pop(cid, None)
+                    # tracker is independent of response filtering). This is
+                    # the primary path; the drain's tracker.contains() check
+                    # narrows the drop-concurrent-with-cancel window but a
+                    # drain that snapshots before this line is processed is
+                    # inherently the spec's crossing case (a response passing
+                    # the cancel in flight, which the canceller ignores).
+                    state.untrack(cid)
 
                 # Derive both the id value and its presence from one parse (the
                 # hot path). A notification (no id) must never receive a response —
@@ -3000,6 +3091,27 @@ def run_sse(
                             _write_line(_error_response("SSE endpoint unavailable", req_id))
                         continue
 
+                # Track BEFORE the POST: on this transport the reply rides the
+                # GET stream and can be delivered by the reader thread before
+                # client.post() even returns (a fast server) or during a
+                # 401/403 refresh round-trip below — tracking afterwards would
+                # let the reader's untrack no-op and the already-answered id
+                # linger until the next drop, where the drain would put a
+                # spurious second response on the wire. Every failure path
+                # that synthesizes an inline error below untracks instead. A
+                # POST that completes concurrently with a drain snapshot
+                # lands after the clear and rides until the NEXT disconnect —
+                # narrow and self-healing, same spirit as the endpoint TOCTOU
+                # window documented above. `id:null` stays untracked
+                # (uncorrelatable; a null-id response also fails
+                # _extract_response_id, so it could never be untracked).
+                if req_has_id and _is_scalar_id(req_id):
+                    tracked = state.track(req_id)
+                    if not tracked:
+                        log(
+                            f"in-flight tracker at cap {_SSE_PENDING_MAX}; "
+                            f"not tracking id {req_id!r}"
+                        )
                 try:
                     post_timeout = httpx.Timeout(
                         connect=timeout_connect,
@@ -3076,7 +3188,13 @@ def run_sse(
                             )
                         else:
                             log("token refresh failed, returning error")
-                            if req_has_id:
+                            # Skip the inline error when the id was already
+                            # settled elsewhere (reader delivered the real
+                            # reply mid-refresh, or a drain answered it) — a
+                            # second response for one id is the framing-error
+                            # class this transport works around.
+                            settled = tracked and not state.untrack(req_id)
+                            if req_has_id and not settled:
                                 _write_line(_error_response("authentication failed", req_id))
                             continue
 
@@ -3111,7 +3229,8 @@ def run_sse(
                                 log(
                                     "step-up authorization failed, returning error"
                                 )
-                                if req_has_id:
+                                settled = tracked and not state.untrack(req_id)
+                                if req_has_id and not settled:
                                     _write_line(_error_response("authorization failed", req_id))
                                 continue
 
@@ -3127,7 +3246,8 @@ def run_sse(
                         # accepted and no reply follows, so the window is narrow;
                         # mcp-stdio deliberately does not de-duplicate it (consistent
                         # with the cancel filter's narrow scope).
-                        if req_has_id:
+                        settled = tracked and not state.untrack(req_id)
+                        if req_has_id and not settled:
                             err_data = None
                             if resp.status_code in _RETRYABLE_RATE_LIMIT_STATUSES:
                                 secs = _parse_retry_after(resp.headers.get("retry-after"))
@@ -3138,37 +3258,10 @@ def run_sse(
                                     f"HTTP {resp.status_code}", req_id, data=err_data
                                 )
                             )
-                    elif req_has_id and _is_scalar_id(req_id):
-                        # Accepted: the async reply arrives only on the GET
-                        # stream, so track the id until the reader delivers it
-                        # or a stream drop drains it into a synthesized error
-                        # (#272). `id:null` requests stay untracked — they are
-                        # uncorrelatable, and a response with a null id fails
-                        # _extract_response_id so it could never be popped. A
-                        # POST that completes concurrently with a drain
-                        # snapshot lands after the clear and rides until the
-                        # NEXT disconnect — narrow and self-healing, same
-                        # spirit as the endpoint TOCTOU window documented
-                        # above. A duplicate re-POST of a pending id just
-                        # refreshes its entry (one drain error per id).
-                        evicted = 0
-                        with state.lock:
-                            state.pending[req_id] = time.monotonic()
-                            while len(state.pending) > _SSE_PENDING_MAX:
-                                # Bound memory against a server that never
-                                # replies: evict the OLDEST tracking (it
-                                # reverts to the pre-#272 hang-on-disconnect,
-                                # no new failure mode).
-                                del state.pending[next(iter(state.pending))]
-                                evicted += 1
-                        if evicted:
-                            log(
-                                f"in-flight tracker at cap {_SSE_PENDING_MAX}; "
-                                f"dropped tracking for {evicted} oldest id(s)"
-                            )
                 except httpx.HTTPError as e:
                     log(f"POST failed: {e}")
-                    if req_has_id:
+                    settled = tracked and not state.untrack(req_id)
+                    if req_has_id and not settled:
                         _write_line(_error_response(str(e), req_id))
             except Exception as e:  # noqa: BLE001 — never crash the gateway
                 # Structural #11 guard, mirroring run() and the SSE reader: an
@@ -3176,7 +3269,8 @@ def run_sse(
                 # BrokenPipeError on the endpoint-unavailable path) degrades THIS
                 # request to an error and keeps the loop alive, never crashing.
                 log(f"internal relay error handling request: {e}")
-                if req_has_id:
+                settled = tracked and not state.untrack(req_id)
+                if req_has_id and not settled:
                     try:
                         _write_line(_error_response("internal relay error", req_id))
                     except OSError:
@@ -3186,6 +3280,11 @@ def run_sse(
                         # nothing, and the stderr log above already recorded it.
                         pass
                 continue
+            finally:
+                # This request is no longer being actively settled: hand the
+                # id (if still pending — POST accepted, reply outstanding)
+                # back to the drain's jurisdiction.
+                state.clear_busy()
     finally:
         state.stop.set()
         # Set stop first, then briefly join so the reader can exit its own

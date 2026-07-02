@@ -5830,13 +5830,15 @@ class TestRunSse:
         """
         bootstrap_url = "https://example.com/messages"
 
-        class _OneShotEndpointState:
+        class _OneShotEndpointState(_SseState):
+            # Subclass the real state so the in-flight tracker API
+            # (track/untrack/clear_busy) is inherited; only endpoint_url
+            # reads are faked.
+            __slots__ = ("_reads",)
+
             def __init__(self):
+                super().__init__()
                 self._reads = 0
-                self.ready = threading.Event()
-                self.stop = threading.Event()
-                self.lock = threading.Lock()
-                self.pending = {}
 
             @property
             def endpoint_url(self):
@@ -6363,13 +6365,16 @@ class TestRunSse:
             def is_set(self):
                 return False
 
-        class _ReconnectingState:
+        class _ReconnectingState(_SseState):
+            # Subclass the real state so the in-flight tracker API
+            # (track/untrack/clear_busy) is inherited; only endpoint_url
+            # reads and the ready event are faked.
+            __slots__ = ("_reads",)
+
             def __init__(self):
+                super().__init__()
                 self._reads = 0
                 self.ready = _FakeReady()
-                self.stop = threading.Event()
-                self.lock = threading.Lock()
-                self.pending = {}
 
             @property
             def endpoint_url(self):
@@ -8205,6 +8210,10 @@ class TestExtractResponseId:
             ('{"jsonrpc":"2.0","result":{},"id":null}', None),
             # non-scalar id could never have been tracked
             ('{"jsonrpc":"2.0","result":{},"id":[1]}', None),
+            # non-finite ids (json.loads accepts the non-standard literals)
+            # would emit invalid JSON if echoed, and NaN != NaN breaks keys
+            ('{"jsonrpc":"2.0","result":{},"id":NaN}', None),
+            ('{"jsonrpc":"2.0","result":{},"id":Infinity}', None),
             # batches / non-objects / garbage pass through untouched
             ('[{"jsonrpc":"2.0","result":{},"id":7}]', None),
             ("not json", None),
@@ -8350,14 +8359,17 @@ class TestRunSseInflightDrain:
             yield b"event: endpoint\ndata: /messages?sid=abc\n\n"
             # Wait until the main loop has POSTed (and tracked) every line —
             # only then drop the stream, so the drain is deterministic.
-            all_posted.wait(timeout=5)
+            # Generous timeouts: on a loaded CI runner a short wait firing
+            # early would drop the stream before every id is tracked and
+            # flake the assertions.
+            all_posted.wait(timeout=10)
             if first_stream_tail:
                 yield first_stream_tail
 
         def sse_gen_2():
             yield b"event: endpoint\ndata: /messages?sid=abc\n\n"
             release_stdin.set()
-            hold_gen2.wait(timeout=2)
+            hold_gen2.wait(timeout=5)
 
         for gen in (sse_gen_1, sse_gen_2):
             httpx_mock.add_response(
@@ -8412,7 +8424,67 @@ class TestRunSseInflightDrain:
         )
         assert msgs == []  # cancelled: no waiter, no synthesized error
 
-    def test_pending_cap_evicts_oldest(self, httpx_mock, monkeypatch, capsys):
+    def test_reply_racing_the_post_causes_no_error(self, httpx_mock, monkeypatch):
+        # Deliver-before-add race regression: the reply for id 1 arrives on
+        # the GET stream BEFORE client.post() returns (a fast server).
+        # Tracking happens before the POST, so the reader settles the id and
+        # the later drop must synthesize nothing — tracking-after-POST would
+        # leave the answered id in pending and put a spurious second
+        # response on the wire at the next drop.
+        monkeypatch.setattr("mcp_stdio.relay.RETRY_DELAY", 0.05)
+        release_stdin = threading.Event()
+        hold_gen2 = threading.Event()
+        post_started = threading.Event()
+        post_done = threading.Event()
+        stdout = StringIO()
+        reply = '{"jsonrpc":"2.0","result":{"ok":1},"id":1}'
+
+        def post_callback(request):
+            post_started.set()
+            # Hold the POST open until the reader has written the reply, so
+            # delivery strictly precedes the POST returning.
+            for _ in range(500):
+                if "ok" in stdout.getvalue():
+                    break
+                time.sleep(0.01)
+            post_done.set()
+            return httpx.Response(202)
+
+        httpx_mock.add_callback(
+            post_callback, url=self.POST_URL, method="POST", is_reusable=True
+        )
+
+        def sse_gen_1():
+            yield b"event: endpoint\ndata: /messages?sid=abc\n\n"
+            post_started.wait(timeout=10)
+            yield f"event: message\ndata: {reply}\n\n".encode()
+            post_done.wait(timeout=10)
+            # Stream drops only after the POST returned: the drain must
+            # find nothing for id 1.
+
+        def sse_gen_2():
+            yield b"event: endpoint\ndata: /messages?sid=abc\n\n"
+            release_stdin.set()
+            hold_gen2.wait(timeout=5)
+
+        for gen in (sse_gen_1, sse_gen_2):
+            httpx_mock.add_response(
+                url=self.URL,
+                method="GET",
+                stream=IteratorStream(gen()),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        stdin = _BlockingStdin(
+            ['{"jsonrpc":"2.0","id":1,"method":"tools/list"}'], release_stdin
+        )
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {"Content-Type": "application/json"})
+        hold_gen2.set()
+        msgs = [json.loads(x) for x in stdout.getvalue().strip().splitlines() if x]
+        assert msgs == [json.loads(reply)]
+
+    def test_pending_cap_refuses_new_ids(self, httpx_mock, monkeypatch, capsys):
         msgs = self._drive(
             httpx_mock,
             monkeypatch,
@@ -8422,7 +8494,8 @@ class TestRunSseInflightDrain:
             ],
             pending_cap=1,
         )
-        # id 1's tracking was evicted at the cap (reverting it to the
-        # pre-#272 behavior); only id 2 gets the synthesized error.
-        assert [m["id"] for m in msgs] == [2]
+        # At the cap the NEW id is refused (reverting it to the pre-#272
+        # behavior) so the oldest, longest-running call keeps its
+        # protection: only id 1 gets the synthesized error.
+        assert [m["id"] for m in msgs] == [1]
         assert "in-flight tracker at cap" in capsys.readouterr().err
