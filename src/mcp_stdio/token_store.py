@@ -605,37 +605,93 @@ def _read_store(*, for_write: bool = False) -> dict[str, Any]:
     return data
 
 
-def _write_store(data: dict[str, Any]) -> None:
-    """Write the token store file atomically with secure permissions.
+def _atomic_write_json_file(path: Path, data: dict[str, Any]) -> None:
+    """Atomically write ``data`` as JSON to ``path`` with 0o600 permissions.
 
     Uses a temp file created with 0o600 from the start (no umask window),
     then atomically renames it over the target file so a crash mid-write
-    cannot corrupt existing tokens. After the rename the parent directory is
+    cannot corrupt the existing file. After the rename the parent directory is
     fsynced so the directory entry change is itself durable across a power
     loss (the file data fsync alone does not guarantee the rename survives).
 
+    Raises ``ValueError`` when ``data`` holds a non-finite number
+    (``allow_nan=False`` — the serialisation happens before any file is
+    touched, so a rejected payload has no on-disk side effect) and ``OSError``
+    on an I/O failure. The parent directory must already exist.
+
     Note: a HARD kill (SIGKILL / power loss / OOM) between the temp
-    file's creation and the os.replace leaves an orphaned ``tokens.json.tmp.*``
+    file's creation and the os.replace leaves an orphaned ``*.tmp.*``
     sibling (0o600) that is never swept. This is accepted as harmless: the real
-    store is untouched (os.replace is atomic), the unique random suffix prevents
+    file is untouched (os.replace is atomic), the unique random suffix prevents
     any collision with a future write, and the bytes stay 0o600. No per-write
     directory scan is done to reclaim them — that cost is not worth paying on the
     hot path for a leak that only a hard crash can produce.
     """
-    _ensure_store_dir()
     # sort_keys for stable, diff-friendly on-disk output: without it
-    # the per-server key order follows dict-insertion order and churns across the
+    # the key order follows dict-insertion order and churns across
     # read-modify-write saves, complicating inspection/diffing for no benefit.
     # allow_nan=False: Python's default would serialise a non-finite
     # expires_at (inf/nan) as the non-standard literal `Infinity`/`NaN`, which a
-    # strict JSON parser rejects and which only the load-side math.isfinite guard
+    # strict JSON parser rejects and which only a load-side math.isfinite guard
     # catches. Raise ValueError instead so the bad value never reaches disk —
-    # keeping the store standards-compliant rather than relying on the read-side
+    # keeping the file standards-compliant rather than relying on the read-side
     # backstop.
+    payload = json.dumps(data, indent=2, sort_keys=True, allow_nan=False).encode(
+        "utf-8"
+    )
+    # Per-write unique temp name. PID alone is not enough: when the advisory
+    # lock degrades to a no-op (lock fs unavailable), two THREADS in one process
+    # share the PID and would otherwise pick the same temp path and clobber each
+    # other's in-flight write. Thread id + random make every temp file distinct,
+    # leaving only the documented os.replace last-writer-wins on the final file.
+    uniq = f"{os.getpid()}.{threading.get_ident()}.{os.urandom(4).hex()}"
+    tmp_path = path.with_suffix(path.suffix + f".tmp.{uniq}")
+    # O_EXCL: the random temp name should never pre-exist; if it somehow does
+    # (a stale temp or a planted file/symlink), fail rather than open/truncate
+    # it. With O_EXCL the kernel also refuses a symlink at the path, so the temp
+    # write can never be redirected. (O_NOFOLLOW is kept for platforms where it
+    # adds protection independent of O_EXCL.)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW
+    fd = os.open(tmp_path, flags, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
     try:
-        payload = json.dumps(data, indent=2, sort_keys=True, allow_nan=False).encode(
-            "utf-8"
-        )
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+    # Make the rename durable. Best-effort: some platforms/filesystems reject a
+    # directory fsync, and opening a directory fails on Windows — neither should
+    # fail the write.
+    try:
+        # _O_NONBLOCK for consistency with every other os.open in this file
+        #. Harmless on a directory (a dir open never blocks), but
+        # it keeps the defensive open discipline uniform so a future copy of
+        # this pattern does not omit it where it DOES matter (FIFO at a path).
+        dir_fd = os.open(str(path.parent), os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+
+
+def _write_store(data: dict[str, Any]) -> None:
+    """Write the token store file atomically with secure permissions.
+
+    Delegates the atomic 0o600 temp-file + fsync + rename mechanics to
+    :func:`_atomic_write_json_file`; this wrapper adds the store-specific
+    directory bootstrap and the foreign-bad-entry recovery below.
+    """
+    _ensure_store_dir()
+    try:
+        _atomic_write_json_file(_STORE_FILE, data)
     except ValueError:
         # One PRE-EXISTING entry from a foreign writer (a hand-edited / 3rd-party
         # tokens.json carrying a non-finite Infinity/NaN — which load_token
@@ -662,50 +718,7 @@ def _write_store(data: dict[str, Any]) -> None:
                 f"foreign writer); affected servers need re-auth.",
                 file=sys.stderr,
             )
-        payload = json.dumps(
-            clean, indent=2, sort_keys=True, allow_nan=False
-        ).encode("utf-8")
-    # Per-write unique temp name. PID alone is not enough: when the advisory
-    # lock degrades to a no-op (lock fs unavailable), two THREADS in one process
-    # share the PID and would otherwise pick the same temp path and clobber each
-    # other's in-flight write. Thread id + random make every temp file distinct,
-    # leaving only the documented os.replace last-writer-wins on the final file.
-    uniq = f"{os.getpid()}.{threading.get_ident()}.{os.urandom(4).hex()}"
-    tmp_path = _STORE_FILE.with_suffix(_STORE_FILE.suffix + f".tmp.{uniq}")
-    # O_EXCL: the random temp name should never pre-exist; if it somehow does
-    # (a stale temp or a planted file/symlink), fail rather than open/truncate
-    # it. With O_EXCL the kernel also refuses a symlink at the path, so the temp
-    # write can never be redirected. (O_NOFOLLOW is kept for platforms where it
-    # adds protection independent of O_EXCL.)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW
-    fd = os.open(tmp_path, flags, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, _STORE_FILE)
-    except Exception:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-        raise
-    # Make the rename durable. Best-effort: some platforms/filesystems reject a
-    # directory fsync, and opening a directory fails on Windows — neither should
-    # fail the write.
-    try:
-        # _O_NONBLOCK for consistency with every other os.open in this file
-        #. Harmless on a directory (a dir open never blocks), but
-        # it keeps the defensive open discipline uniform so a future copy of
-        # this pattern does not omit it where it DOES matter (FIFO at a path).
-        dir_fd = os.open(str(_STORE_DIR), os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except OSError:
-        pass
+        _atomic_write_json_file(_STORE_FILE, clean)
 
 
 @contextlib.contextmanager

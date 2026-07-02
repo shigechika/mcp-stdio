@@ -46,10 +46,12 @@ import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from .relay import log
+from .token_store import _atomic_write_json_file, _read_json_object_file
 
 # Bound how long an HTTP request waits for the backend to answer before the
 # handler synthesizes a JSON-RPC error. A backend that wedges must not pin the
@@ -724,6 +726,69 @@ def _redact_query(line: str) -> str:
     return re.sub(r'\?[^\s"]*', "?<redacted>", line)
 
 
+# On-disk AS-state schema version (--token-store). Bump when the snapshot
+# layout changes incompatibly; an unrecognized version starts empty rather
+# than guessing at field meanings.
+_STATE_VERSION = 1
+
+
+def _finite_num(v: Any) -> bool:
+    """True for a finite int/float (bool excluded — JSON true/false must not
+    pass as a timestamp)."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _opt_str(v: Any) -> bool:
+    return v is None or isinstance(v, str)
+
+
+def _valid_client_record(v: Any) -> bool:
+    return (
+        isinstance(v, dict)
+        and isinstance(v.get("redirect_uris"), list)
+        and bool(v["redirect_uris"])
+        and all(isinstance(u, str) for u in v["redirect_uris"])
+        and _finite_num(v.get("created_at"))
+    )
+
+
+def _valid_code_record(v: Any) -> bool:
+    return (
+        isinstance(v, dict)
+        and isinstance(v.get("client_id"), str)
+        and isinstance(v.get("redirect_uri"), str)
+        and isinstance(v.get("code_challenge"), str)
+        and isinstance(v.get("user"), str)
+        and bool(v["user"])
+        and isinstance(v.get("scope"), str)
+        and _opt_str(v.get("resource"))
+        and _finite_num(v.get("expires_at"))
+    )
+
+
+def _valid_grant_record(v: Any) -> bool:
+    """An access- or refresh-token record (both share one shape)."""
+    return (
+        isinstance(v, dict)
+        and isinstance(v.get("user"), str)
+        and bool(v["user"])
+        and isinstance(v.get("client_id"), str)
+        and isinstance(v.get("scope"), str)
+        and _opt_str(v.get("resource"))
+        and _opt_str(v.get("family"))
+        and _finite_num(v.get("expires_at"))
+    )
+
+
+def _valid_tombstone_record(v: Any) -> bool:
+    return (
+        isinstance(v, dict)
+        and _opt_str(v.get("family"))
+        and _finite_num(v.get("consumed_at"))
+        and _finite_num(v.get("expires_at"))
+    )
+
+
 class _OAuthProvider:
     """Minimal OAuth 2.1 Authorization Server: DCR + authorization-code + PKCE
     + refresh, with opaque in-memory tokens (no crypto dependency).
@@ -732,6 +797,9 @@ class _OAuthProvider:
     its own thread. ``now`` is injectable so tests can drive TTL expiry without
     sleeping. ``public_url`` (bare origin) pins the issuer; when None the caller
     passes a per-request reflected origin into the metadata builders.
+    ``store_path`` (--token-store) optionally persists all state to a 0o600
+    JSON file on every mutation so issued tokens survive a restart (#277);
+    None keeps the tokens purely in-memory.
     """
 
     def __init__(
@@ -745,6 +813,7 @@ class _OAuthProvider:
         refresh_ttl: float = _REFRESH_TTL_SECS,
         allowed_redirect_uris: frozenset[str] = frozenset(),
         now: Any = time.time,
+        store_path: Path | None = None,
     ) -> None:
         self.public_url = public_url
         self.trusted_user_header = trusted_user_header
@@ -771,6 +840,142 @@ class _OAuthProvider:
         # TTL-bounded (GC'd in _gc_locked) and capped like the live stores.
         self._consumed_codes: dict[str, dict[str, Any]] = {}
         self._consumed_refresh: dict[str, dict[str, Any]] = {}
+        # --token-store: when set, every state mutation snapshots the six
+        # stores to this JSON file (0o600) so issued tokens, tombstones, and
+        # client registrations survive a process restart (issue #277). None
+        # keeps the pre-existing in-memory-only behavior.
+        self._store_path = store_path
+        self._warned_persist_failure = False
+        if store_path is not None:
+            self._load_state()
+
+    # -- state persistence (--token-store) --------------------------------
+
+    def _load_state(self) -> None:
+        """Restore AS state from ``self._store_path``.
+
+        Called from ``__init__`` only, before the HTTP server threads start,
+        so no lock is needed. Defensive by construction: a missing file is a
+        clean first start; an unreadable/corrupt/unversioned file starts empty
+        with a warning (the file is replaced on the next mutation, mirroring
+        the client token store's overwrite-safe recovery); individual
+        malformed or expired entries are dropped, never trusted.
+        """
+        path = self._store_path
+        assert path is not None
+        data = _read_json_object_file(path)
+        if data is None:
+            if path.exists():
+                log(
+                    f"warning: OAuth state file {path} is unreadable or "
+                    "corrupt; starting empty (previously issued tokens need a "
+                    "re-auth). It is replaced on the next issuance."
+                )
+            return
+        if data.get("version") != _STATE_VERSION:
+            log(
+                f"warning: OAuth state file {path} has unsupported version "
+                f"{data.get('version')!r}; starting empty."
+            )
+            return
+        now = self._now()
+        dropped = 0
+
+        def load(key: str, valid: Any) -> dict[str, dict[str, Any]]:
+            nonlocal dropped
+            out: dict[str, dict[str, Any]] = {}
+            raw = data.get(key)
+            if not isinstance(raw, dict):
+                return out
+            for k, v in raw.items():
+                if k and valid(v) and v["expires_at"] >= now:
+                    out[k] = v
+                else:
+                    dropped += 1
+            return out
+
+        raw_clients = data.get("clients")
+        if isinstance(raw_clients, dict):
+            for cid, rec in raw_clients.items():
+                if not (cid and _valid_client_record(rec)):
+                    dropped += 1
+                    continue
+                # redirect_keys are DERIVED state (tuples, not JSON-clean):
+                # recompute them from the persisted redirect_uris against the
+                # CURRENT allowlist, so an --allow-redirect-uri removed
+                # between restarts stops matching immediately instead of
+                # surviving via a stale persisted key. A URI that no longer
+                # yields a key is skipped; a client left with none is dropped
+                # (it could never authorize anyway).
+                keys = {
+                    key
+                    for u in rec["redirect_uris"]
+                    if (key := _match_key(u, self.allowed_redirect_uris)) is not None
+                }
+                if not keys:
+                    dropped += 1
+                    continue
+                self._clients[cid] = {
+                    "redirect_keys": keys,
+                    "redirect_uris": list(rec["redirect_uris"]),
+                    "created_at": rec["created_at"],
+                }
+        self._codes = load("codes", _valid_code_record)
+        self._access = load("access", _valid_grant_record)
+        self._refresh = load("refresh", _valid_grant_record)
+        self._consumed_codes = load("consumed_codes", _valid_tombstone_record)
+        self._consumed_refresh = load("consumed_refresh", _valid_tombstone_record)
+        if dropped:
+            log(
+                f"note: dropped {dropped} expired or malformed entr"
+                f"{'y' if dropped == 1 else 'ies'} while loading {path}"
+            )
+        log(
+            f"note: restored OAuth state from {path}: "
+            f"{len(self._access)} access / {len(self._refresh)} refresh "
+            f"token(s), {len(self._clients)} client registration(s)"
+        )
+
+    def _persist_locked(self) -> None:
+        """Snapshot all six stores to ``self._store_path`` (caller holds
+        ``self._lock``, which makes the snapshot point-in-time consistent and
+        serializes concurrent writers).
+
+        Failure is soft: the AS keeps serving from memory — availability over
+        durability — with a one-shot warning so the operator knows
+        restart-survival is off. Writes happen only on state mutations
+        (issuance, rotation, revocation, registration), never on the
+        read-heavy validation path.
+        """
+        if self._store_path is None:
+            return
+        snapshot = {
+            "version": _STATE_VERSION,
+            # redirect_keys are intentionally NOT serialized (derived state,
+            # recomputed on load — see _load_state).
+            "clients": {
+                cid: {
+                    "redirect_uris": list(rec["redirect_uris"]),
+                    "created_at": rec["created_at"],
+                }
+                for cid, rec in self._clients.items()
+            },
+            "codes": self._codes,
+            "access": self._access,
+            "refresh": self._refresh,
+            "consumed_codes": self._consumed_codes,
+            "consumed_refresh": self._consumed_refresh,
+        }
+        try:
+            _atomic_write_json_file(self._store_path, snapshot)
+        except Exception as e:
+            if not self._warned_persist_failure:
+                self._warned_persist_failure = True
+                log(
+                    f"warning: could not persist OAuth state to "
+                    f"{self._store_path}: {e}; continuing in-memory only "
+                    "(issued tokens will not survive a restart)"
+                )
 
     # -- metadata --------------------------------------------------------
 
@@ -839,6 +1044,7 @@ class _OAuthProvider:
                 "redirect_uris": list(uris),
                 "created_at": now,
             }
+            self._persist_locked()
         return 201, {
             "client_id": client_id,
             "redirect_uris": list(uris),
@@ -919,6 +1125,7 @@ class _OAuthProvider:
                 "resource": params.get("resource"),
                 "expires_at": now + self.code_ttl,
             }
+            self._persist_locked()
         return redirect({"code": code})
 
     # -- token endpoint (RFC 6749 + RFC 7636) ----------------------------
@@ -964,6 +1171,12 @@ class _OAuthProvider:
                     replay_detected = True
                     replay_family = tomb["family"]
                     self._revoke_family_locked(replay_family)
+            if entry is not None or replay_detected:
+                # The pop consumed a live code, and/or the replay revoked a
+                # family — both must reach the store so a crash right after
+                # this block cannot resurrect the consumed code (single-use
+                # would otherwise not survive a restart).
+                self._persist_locked()
         if entry is None:
             if replay_detected:
                 return 400, {
@@ -1013,6 +1226,7 @@ class _OAuthProvider:
                 if tomb is not None and tomb["expires_at"] >= now:
                     if now - tomb["consumed_at"] > _REUSE_GRACE_SECS:
                         self._revoke_family_locked(tomb["family"])
+                        self._persist_locked()
                         return 400, {
                             "error": "invalid_grant",
                             "error_description": "refresh token reuse detected; token family revoked",
@@ -1024,6 +1238,7 @@ class _OAuthProvider:
                 return 400, {"error": "invalid_grant", "error_description": "unknown refresh_token"}
             if entry["expires_at"] < now:
                 del self._refresh[rt]
+                self._persist_locked()
                 return 400, {"error": "invalid_grant", "error_description": "refresh_token expired"}
             if form.get("client_id") != entry["client_id"]:
                 return 400, {"error": "invalid_grant", "error_description": "client_id mismatch"}
@@ -1035,6 +1250,10 @@ class _OAuthProvider:
                 "family": family, "consumed_at": now,
                 "expires_at": now + self.refresh_ttl,
             }
+            # Persist the rotation before minting: a crash between this block
+            # and _issue must leave the spent token tombstoned on disk, not
+            # replayable after a restart.
+            self._persist_locked()
         return self._issue(
             entry["user"], entry["client_id"], entry["scope"], entry["resource"],
             family=family,
@@ -1085,6 +1304,7 @@ class _OAuthProvider:
                     "family": family, "consumed_at": now,
                     "expires_at": now + self.refresh_ttl,
                 }
+            self._persist_locked()
         body: dict[str, Any] = {
             "access_token": access,
             "token_type": "Bearer",
@@ -1922,6 +2142,19 @@ def serve_main(argv: list[str]) -> None:
         help="Issued access-token lifetime in seconds (default: 3600).",
     )
     parser.add_argument(
+        "--token-store",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Persist issued OAuth tokens and client registrations to this "
+            "JSON file (created 0600) so they survive a serve restart. "
+            "Without it every restart invalidates all issued tokens and every "
+            "connected client must re-authorize. The file is credential "
+            "material -- guard it like a private key. Each serve process "
+            "needs its own path. Requires --enable-oauth."
+        ),
+    )
+    parser.add_argument(
         "--max-sessions",
         type=int,
         default=_DEFAULT_MAX_SESSIONS,
@@ -1981,6 +2214,10 @@ def serve_main(argv: list[str]) -> None:
         parser.error("--dev-user requires --enable-oauth")
     if args.allow_redirect_uri and not args.enable_oauth:
         parser.error("--allow-redirect-uri requires --enable-oauth")
+    if args.token_store is not None and not args.enable_oauth:
+        parser.error("--token-store requires --enable-oauth")
+    if args.token_store is not None and not args.token_store.strip():
+        parser.error("--token-store must not be empty")
     if args.trusted_user_header is not None and any(
         c in args.trusted_user_header for c in (" ", "\r", "\n", ":")
     ):
@@ -2020,12 +2257,27 @@ def serve_main(argv: list[str]) -> None:
             parser.error(f"--allow-redirect-uri invalid: {e}")
         for u in allowed_redirect_uris:
             log(f"note: trusting exact redirect_uri {u!r} in addition to loopback")
+        store_path = None
+        if args.token_store is not None:
+            store_path = Path(args.token_store).expanduser()
+            try:
+                # 0o700 like the client token-store directory: the file inside
+                # is credential material, so directories WE create are tight
+                # from the start (a pre-existing parent is left untouched).
+                store_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            except OSError as e:
+                parser.error(f"--token-store: cannot create parent directory: {e}")
+            log(
+                f"note: persisting issued OAuth state to {store_path} "
+                "(credential material; created 0600)"
+            )
         oauth = _OAuthProvider(
             public_url=public_url,
             trusted_user_header=args.trusted_user_header,
             dev_user=args.dev_user,
             access_ttl=float(args.access_token_ttl),
             allowed_redirect_uris=allowed_redirect_uris,
+            store_path=store_path,
         )
 
     serve(

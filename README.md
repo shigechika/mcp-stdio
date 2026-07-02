@@ -336,9 +336,10 @@ not pin a slot; `0` = disabled, the default); and for the embedded AS:
 `--enable-oauth`, `--public-url URL` (pins the issuer; recommended behind a
 proxy), `--trusted-user-header HEADER`, `--dev-user USER` (insecure, testing
 only), `--access-token-ttl SECONDS`, `--allow-redirect-uri URL` (repeatable;
-see below). In-memory tokens mean a restart invalidates issued tokens (the
-client re-runs `--oauth`). The backend command follows the options (an
-optional `--` separator is supported).
+see below), `--token-store PATH` (see below). Without `--token-store`, tokens
+are in-memory only and a restart invalidates them (the client re-runs
+`--oauth`). The backend command follows the options (an optional `--`
+separator is supported).
 
   - *Non-loopback remote clients* — DCR only accepts an RFC 8252 loopback
     `http://` `redirect_uri` by default, which a browser-based remote MCP
@@ -349,6 +350,18 @@ optional `--` separator is supported).
     client you actually trust; each entry is exactly as trusted as a
     hardcoded redirect target. It is independent of the loopback path (adding
     one never widens the other) and requires `--enable-oauth`.
+  - *Restart-durable tokens* — `--token-store PATH` persists the issued
+    tokens, rotation tombstones, and client registrations to a JSON file
+    (created `0600`, written atomically on every state change), so a client
+    that held a valid token before a restart keeps calling tools without a
+    new interactive authorization, and a refresh presented after the restart
+    is honored. This keeps deploys transparent for remote clients that do not
+    re-authorize on `401`/`invalid_grant` (they would otherwise replay the
+    dead token indefinitely and appear connected while their tools silently
+    vanish). Refresh-token reuse detection and grant-family revocation
+    survive the restart too — the consumption ledger is part of the persisted
+    state. The file is credential material: guard it like a private key, and
+    give each `serve` process its own path. Requires `--enable-oauth` (#277).
   - *Path-scoped issuer* — `--public-url` retains a path, so several
     `--enable-oauth` backends can share one host behind a reverse proxy, each
     under its own prefix (e.g. `--public-url https://gw.example.org/team-a`
