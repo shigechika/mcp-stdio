@@ -1,0 +1,83 @@
+# stdio サーバーを公開する
+
+ゴール：ホスト上の stdio MCP サーバーを HTTPS の Streamable HTTP
+エンドポイントにして、リモートの MCP クライアント——Claude Desktop、
+Claude Code、さらに Claude.ai のカスタムコネクタ——から使えるようにする。
+各ユーザーは専用の子プロセスに隔離され、本物の OAuth 2.1 ログインで
+守られます。
+
+## 1. ループバックで動作確認
+
+```bash
+mcp-stdio serve --enable-oauth --public-url http://127.0.0.1:8080 \
+  --dev-user alice --port 8080 -- python -m my_mcp_server
+```
+
+別のターミナルから、mcp-stdio 自身のクライアントモードで接続します：
+
+```bash
+mcp-stdio --check --oauth http://127.0.0.1:8080/mcp
+```
+
+`--dev-user` はループバック検証専用の**非セキュアな**代用アイデンティティ
+です——本物のログインなしで OAuth フロー全体を通せます。`--check` が
+`initialize` 成功を報告すればゲートウェイは動いています。ここから先は
+デプロイの話だけです。
+
+## 2. リバースプロキシの背後にデプロイ
+
+本番ではアイデンティティは SSO から来ます。TLS 終端と認証はリバース
+プロキシ（nginx、Apache など）に任せ、ログイン済みユーザーを信頼できる
+ヘッダーで mcp-stdio に渡します：
+
+```bash
+mcp-stdio serve --enable-oauth \
+  --public-url https://mcp.example.com \
+  --trusted-user-header X-Forwarded-User \
+  --token-store /var/lib/mcp-stdio/state.json \
+  --session-idle-ttl 180 \
+  -- python -m my_mcp_server
+```
+
+- `--public-url` は OAuth issuer を公開アドレスに固定します（プロキシ
+  背後では必須）。
+- `--trusted-user-header` はプロキシが設定し、**かつクライアント由来の
+  同名ヘッダーを剥がす**ヘッダー名です——その剥がしこそが信頼の根拠です。
+- `--token-store` は発行済みトークン・クライアント登録・replay 検知の
+  台帳を永続化（`0600`）し、**再起動やデプロイで全ユーザーがログアウト
+  されるのを防ぎます**。これがないとデプロイのたびに全トークンが無効に。
+  パスは serve プロセスごとに 1 つ——sidecar の `.lock` が誤共有を起動時に
+  拒否します。
+- `--session-idle-ttl` は、切断処理なしに消えたクライアントの子プロセスを
+  回収します。
+
+接続ユーザーごとに得られるもの：専用の子プロセス（`initialize` で
+spawn、切断か idle タイムアウトで破棄）、認証済みアイデンティティに
+束縛されたセッション——他人のセッション id を提示しても `404` で、
+越境はできません。
+
+## 3. オプションの追加機能
+
+| こうしたい | こうする |
+|---|---|
+| Claude.ai カスタムコネクタ（ブラウザベースのクライアント） | `--allow-redirect-uri https://claude.ai/api/mcp/auth_callback` |
+| 1 ホストに複数バックエンド | バックエンドごとに serve プロセスを分け、パススコープ issuer を使う：`--public-url https://mcp.example.com/team-a`、`…/team-b`——AS エンドポイントと well-known もプレフィックス配下に収まります |
+| 同時ユーザー数の上限 | `--max-sessions N`（既定 100。超過した `initialize` は `503`） |
+| OAuth の代わりに静的トークン | `--enable-oauth` を外して `MCP_STDIO_SERVE_TOKEN` を設定 |
+| アクセストークンの寿命を調整 | `--access-token-ttl SECONDS`（既定 3600） |
+
+## 運用者向けメモ
+
+- 内蔵の認可サーバーは Dynamic Client Registration、PKCE（S256 のみ）、
+  replay 検知付き refresh ローテーション、RFC 8707 の audience 束縛を
+  実装しています。MCP クライアントは標準の well-known ドキュメント経由で
+  すべてを自動発見するので、クライアント側の設定は不要です。
+- `--token-store` のファイルは秘密鍵と同様に扱ってください。`0700` の
+  ディレクトリに `0600` で作成されます。
+- 全リクエストはクエリ文字列を redact した形で stderr にログされます。
+
+実運用の参照例：この構成そのままで、1 ホスト配下に複数の stdio MCP
+サーバーを公開し、定常的な再デプロイをユーザーに気づかれずに乗り切って
+います。子プロセスの*内側*でユーザーごとの資格情報が必要なら、それは
+あなたのサーバーの設計判断です——ゲートウェイは意図的にアイデンティティを
+子へ注入しません。

@@ -1,0 +1,64 @@
+site_name: mcp-stdio
+site_description: >-
+  A minimal stdio-to-HTTP gateway for MCP servers — connect MCP clients to
+  remote servers, or publish your stdio server over Streamable HTTP + OAuth.
+site_url: https://shigechika.github.io/mcp-stdio/
+repo_url: https://github.com/shigechika/mcp-stdio
+repo_name: shigechika/mcp-stdio
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.footer
+    - content.code.copy
+    - content.action.edit
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+
+plugins:
+  - search
+  - i18n:
+      docs_structure: suffix
+      languages:
+        - locale: en
+          name: English
+          default: true
+          build: true
+        - locale: ja
+          name: 日本語
+          build: true
+
+nav:
+  - Home: index.md
+  - Two ways to use it: modes.md
+  - Guides:
+      - Connect to a remote MCP server: guides/connect-remote.md
+      - Publish your stdio server: guides/serve.md
