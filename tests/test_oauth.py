@@ -4739,7 +4739,11 @@ class TestScopeOmittedWhenUnset:
         assert data is not None and data.access_token == "at"
 
         assert len(captured_auth_urls) == 1
-        q = parse_qs(urlparse(captured_auth_urls[0]).query)
+        # keep_blank_values: parse_qs would otherwise DROP an empty `scope=`,
+        # letting exactly the empty-param regression this test pins slip by.
+        q = parse_qs(
+            urlparse(captured_auth_urls[0]).query, keep_blank_values=True
+        )
         assert "scope" not in q
         # Positive control: the URL is fully formed otherwise.
         assert q["resource"] == [self.SERVER_URL]
@@ -6286,7 +6290,9 @@ class TestDeviceAuthorizationFlow:
         reqs = httpx_mock.get_requests()
         da_req = next(r for r in reqs if str(r.url).startswith(DEVICE_AUTH_URL))
         from urllib.parse import parse_qs
-        body = parse_qs(da_req.content.decode())
+        # keep_blank_values: parse_qs would otherwise DROP an empty `scope=`,
+        # letting exactly the empty-param regression this test pins slip by.
+        body = parse_qs(da_req.content.decode(), keep_blank_values=True)
         assert "scope" not in body
 
     def test_metadata_discovers_device_endpoint(self, httpx_mock):
