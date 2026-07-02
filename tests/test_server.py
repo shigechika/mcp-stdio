@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import re
+import stat
 import sys
 import threading
 import time
@@ -1767,3 +1768,350 @@ def test_refresh_reuse_revokes_family():
 
 def _grace():
     return server._REUSE_GRACE_SECS
+
+# --- --token-store: AS state persistence across restarts (#277) ---
+#
+# Rationale: every serve restart (deploy, config change) previously
+# invalidated ALL issued tokens; hosted remote-connector clients that do not
+# re-authorize on 401/invalid_grant were left silently dead until a manual
+# reconnect. These tests drive the provider directly (no HTTP) and simulate a
+# restart by constructing a second provider over the same store file.
+
+
+def _direct_flow(prov, *, resource=None, redirect=_REDIRECT):
+    """register -> authorize -> token directly against the provider."""
+    status, reg = prov.register(json.dumps({"redirect_uris": [redirect]}).encode())
+    assert status == 201, reg
+    cid = reg["client_id"]
+    verifier, challenge = client_oauth.generate_pkce()
+    params = {
+        "client_id": cid, "response_type": "code", "redirect_uri": redirect,
+        "code_challenge": challenge, "code_challenge_method": "S256",
+    }
+    if resource is not None:
+        params["resource"] = resource
+    out = prov.authorize(params, "alice", "https://gw.example")
+    assert out["kind"] == "redirect", out
+    code = parse_qs(urlsplit(out["location"]).query)["code"][0]
+    status, tok = prov.token({
+        "grant_type": "authorization_code", "code": code,
+        "redirect_uri": redirect, "client_id": cid, "code_verifier": verifier,
+    })
+    assert status == 200, tok
+    return cid, tok
+
+
+def test_token_store_access_token_survives_restart(tmp_path):
+    path = tmp_path / "as-state.json"
+    p1 = _provider(store_path=path)
+    _, tok = _direct_flow(p1)
+    p2 = _provider(store_path=path)  # simulated restart
+    assert p2.validate_access_token(tok["access_token"]) is True
+    assert p2.user_for_token(tok["access_token"]) == "alice"
+
+
+def test_token_store_refresh_and_client_survive_restart(tmp_path):
+    path = tmp_path / "as-state.json"
+    p1 = _provider(store_path=path)
+    cid, tok = _direct_flow(p1)
+    p2 = _provider(store_path=path)
+    status, body = p2.token({
+        "grant_type": "refresh_token",
+        "refresh_token": tok["refresh_token"], "client_id": cid,
+    })
+    assert status == 200, body
+    assert p2.validate_access_token(body["access_token"]) is True
+    # The DCR registration also survived: the same client_id can authorize
+    # again without a fresh POST /register.
+    _, challenge = client_oauth.generate_pkce()
+    out = p2.authorize({
+        "client_id": cid, "response_type": "code", "redirect_uri": _REDIRECT,
+        "code_challenge": challenge, "code_challenge_method": "S256",
+    }, "alice", "https://gw.example")
+    assert out["kind"] == "redirect" and "code=" in out["location"]
+
+
+def test_token_store_resource_binding_survives_restart(tmp_path):
+    path = tmp_path / "as-state.json"
+    p1 = _provider(store_path=path)
+    _, tok = _direct_flow(p1, resource="https://gw.example/mcp")
+    p2 = _provider(store_path=path)
+    access = tok["access_token"]
+    assert p2.validate_access_token(access, "https://gw.example/mcp") is True
+    # RFC 8707 audience binding is not laundered away by the round-trip.
+    assert p2.validate_access_token(access, "https://other.example/mcp") is False
+
+
+def test_token_store_refresh_reuse_detected_across_restart(tmp_path):
+    # The rotation tombstone survives: replaying the pre-restart refresh
+    # token after the grace window revokes the family in the NEW process.
+    clock = [1000.0]
+    path = tmp_path / "as-state.json"
+    p1 = _provider(store_path=path, now=lambda: clock[0])
+    cid, tok = _direct_flow(p1)
+    rt0 = tok["refresh_token"]
+    status, r1 = p1.token({
+        "grant_type": "refresh_token", "refresh_token": rt0, "client_id": cid,
+    })
+    assert status == 200
+    clock[0] += _grace() + 5
+    p2 = _provider(store_path=path, now=lambda: clock[0])
+    status, theft = p2.token({
+        "grant_type": "refresh_token", "refresh_token": rt0, "client_id": cid,
+    })
+    assert status == 400
+    assert "reuse detected" in theft["error_description"]
+    # The family minted by the rotation is revoked in p2 as well.
+    assert p2.validate_access_token(r1["access_token"]) is False
+    status, _ = p2.token({
+        "grant_type": "refresh_token",
+        "refresh_token": r1["refresh_token"], "client_id": cid,
+    })
+    assert status == 400
+
+
+def test_token_store_consumed_code_not_resurrected_by_restart(tmp_path):
+    # Single-use survives: an authorization code spent before the restart
+    # stays spent, and its replay past the grace window revokes the family.
+    clock = [1000.0]
+    path = tmp_path / "as-state.json"
+    p1 = _provider(store_path=path, now=lambda: clock[0])
+    status, reg = p1.register(json.dumps({"redirect_uris": [_REDIRECT]}).encode())
+    cid = reg["client_id"]
+    verifier, challenge = client_oauth.generate_pkce()
+    out = p1.authorize({
+        "client_id": cid, "response_type": "code", "redirect_uri": _REDIRECT,
+        "code_challenge": challenge, "code_challenge_method": "S256",
+    }, "alice", "https://gw.example")
+    code = parse_qs(urlsplit(out["location"]).query)["code"][0]
+    exchange = {
+        "grant_type": "authorization_code", "code": code,
+        "redirect_uri": _REDIRECT, "client_id": cid, "code_verifier": verifier,
+    }
+    status, tok = p1.token(exchange)
+    assert status == 200
+    clock[0] += _grace() + 5
+    p2 = _provider(store_path=path, now=lambda: clock[0])
+    status, replay = p2.token(exchange)
+    assert status == 400
+    assert "already used" in replay["error_description"]
+    assert p2.validate_access_token(tok["access_token"]) is False
+
+
+def test_token_store_expired_entries_dropped_on_load(tmp_path):
+    clock = [1000.0]
+    path = tmp_path / "as-state.json"
+    p1 = _provider(store_path=path, now=lambda: clock[0], access_ttl=60.0)
+    _, tok = _direct_flow(p1)
+    clock[0] += 120  # access expired; refresh (30 days) still live
+    p2 = _provider(store_path=path, now=lambda: clock[0])
+    assert p2.validate_access_token(tok["access_token"]) is False
+    assert tok["access_token"] not in p2._access  # dropped at load, not lazily
+    assert tok["refresh_token"] in p2._refresh
+
+
+def test_token_store_corrupt_file_starts_empty_then_replaced(tmp_path, capsys):
+    path = tmp_path / "as-state.json"
+    path.write_text("{not json", encoding="utf-8")
+    p = _provider(store_path=path)
+    assert p._access == {}
+    assert "unreadable or corrupt" in capsys.readouterr().err
+    # The next issuance replaces the corrupt file with a valid store.
+    _direct_flow(p)
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 1
+
+
+def test_token_store_unsupported_version_starts_empty(tmp_path, capsys):
+    path = tmp_path / "as-state.json"
+    path.write_text(json.dumps({"version": 99, "access": {"t": {}}}), encoding="utf-8")
+    p = _provider(store_path=path)
+    assert p._access == {}
+    assert "unsupported version" in capsys.readouterr().err
+
+
+def test_token_store_malformed_entries_dropped(tmp_path, capsys):
+    good = {"user": "alice", "client_id": "c", "scope": "", "resource": None,
+            "family": None, "expires_at": 4102444800.0}
+    path = tmp_path / "as-state.json"
+    path.write_text(json.dumps({
+        "version": 1,
+        "clients": {"cid": {"redirect_uris": "not-a-list", "created_at": 1.0}},
+        "access": {
+            "good": good,
+            "non-str-user": {**good, "user": 42},
+            "bool-expiry": {**good, "expires_at": True},
+            "inf-expiry": {**good, "expires_at": float("inf")},
+            "not-a-dict": "x",
+        },
+        "refresh": {"": good},  # empty key
+        "codes": "not-a-dict",  # whole store malformed
+    }), encoding="utf-8")
+    p = _provider(store_path=path)
+    assert set(p._access) == {"good"}
+    assert p._clients == {}
+    assert p._refresh == {}
+    assert p._codes == {}
+    assert "dropped" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_token_store_file_created_0600(tmp_path):
+    path = tmp_path / "as-state.json"
+    p = _provider(store_path=path)
+    _direct_flow(p)
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+
+def test_token_store_persist_failure_soft_fails_and_warns_once(
+    tmp_path, capsys, monkeypatch
+):
+    path = tmp_path / "as-state.json"
+    p = _provider(store_path=path)
+
+    def boom(_path, _data):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(server, "_atomic_write_json_file", boom)
+    _, tok = _direct_flow(p)  # issuance still succeeds (availability first)
+    assert p.validate_access_token(tok["access_token"]) is True
+    _direct_flow(p)  # more mutations: still no second warning
+    assert capsys.readouterr().err.count("could not persist OAuth state") == 1
+
+
+def test_token_store_none_never_writes(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        server, "_atomic_write_json_file", lambda *a: calls.append(a)
+    )
+    p = _provider()  # no store_path: pre-existing in-memory-only behavior
+    _direct_flow(p)
+    assert calls == []
+
+
+def test_serve_main_token_store_requires_oauth():
+    with pytest.raises(SystemExit):
+        server.serve_main(["--token-store", "/tmp/x.json", "--", "true"])
+
+
+def test_serve_main_token_store_empty_path_rejected():
+    with pytest.raises(SystemExit):
+        server.serve_main([
+            "--enable-oauth", "--dev-user", "a",
+            "--token-store", "  ", "--", "true",
+        ])
+
+def test_token_store_removed_allowlist_entry_stops_matching_after_restart(tmp_path):
+    # redirect_keys are recomputed on load against the CURRENT allowlist: a
+    # client registered for an https redirect the operator later removes from
+    # --allow-redirect-uri is dropped, not resurrected via a stale key.
+    path = tmp_path / "as-state.json"
+    allowed = "https://client.example/cb"
+    p1 = _provider(store_path=path,
+                   allowed_redirect_uris=frozenset({allowed}))
+    status, reg = p1.register(json.dumps({"redirect_uris": [allowed]}).encode())
+    assert status == 201
+    cid = reg["client_id"]
+    p2 = _provider(store_path=path)  # restart WITHOUT the allowlist entry
+    _, challenge = client_oauth.generate_pkce()
+    out = p2.authorize({
+        "client_id": cid, "response_type": "code", "redirect_uri": allowed,
+        "code_challenge": challenge, "code_challenge_method": "S256",
+    }, "alice", "https://gw.example")
+    assert out["kind"] == "bad_request"
+    # Restarted WITH the allowlist entry, the registration keeps working.
+    p3 = _provider(store_path=path,
+                   allowed_redirect_uris=frozenset({allowed}))
+    out = p3.authorize({
+        "client_id": cid, "response_type": "code", "redirect_uri": allowed,
+        "code_challenge": challenge, "code_challenge_method": "S256",
+    }, "alice", "https://gw.example")
+    assert out["kind"] == "redirect" and "code=" in out["location"]
+
+def test_token_store_tombstone_missing_family_dropped(tmp_path):
+    # A tombstone without the "family" KEY (not merely None) must be dropped
+    # at load: the replay path subscripts tomb["family"], so trusting it
+    # would 500 the token endpoint and skip the family revocation.
+    path = tmp_path / "as-state.json"
+    path.write_text(json.dumps({
+        "version": 1,
+        "consumed_refresh": {
+            "rt-no-family": {"consumed_at": 1000.0, "expires_at": 4102444800.0},
+            "rt-ok": {"family": None, "consumed_at": 1000.0,
+                      "expires_at": 4102444800.0},
+        },
+        "refresh": {
+            "rt-no-resource": {"user": "alice", "client_id": "c", "scope": "",
+                               "family": None, "expires_at": 4102444800.0},
+        },
+    }), encoding="utf-8")
+    p = _provider(store_path=path)
+    assert set(p._consumed_refresh) == {"rt-ok"}
+    # A grant record missing the "resource" KEY is dropped for the same
+    # reason (the refresh path subscripts entry["resource"]).
+    assert p._refresh == {}
+
+
+def test_token_store_persist_now_raises_on_unwritable_path(tmp_path):
+    target = tmp_path / "occupied-dir"
+    target.mkdir()  # an existing directory: os.replace onto it must fail
+    p = _provider(store_path=target)
+    with pytest.raises(OSError):
+        p.persist_now()
+
+
+def test_token_store_persist_now_creates_file_at_startup(tmp_path):
+    path = tmp_path / "as-state.json"
+    p = _provider(store_path=path)
+    p.persist_now()
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 1
+
+
+def test_serve_main_token_store_unwritable_fails_fast(tmp_path):
+    # A --token-store pointing at an existing directory must abort startup
+    # (parser.error), not silently run in-memory-only after logging that
+    # persistence is on.
+    target = tmp_path / "state-dir"
+    target.mkdir()
+    with pytest.raises(SystemExit):
+        server.serve_main([
+            "--enable-oauth", "--dev-user", "a",
+            "--token-store", str(target), "--", "true",
+        ])
+
+
+def test_token_store_sidecar_lock_refuses_second_holder(tmp_path):
+    # The in-test skip below handles a platform with no lock primitive
+    # (_acquire_store_lock returns None there).
+    path = tmp_path / "as-state.json"
+    fd1 = server._acquire_store_lock(path)
+    if fd1 is None:
+        pytest.skip("no lock primitive on this platform")
+    try:
+        with pytest.raises(OSError):
+            server._acquire_store_lock(path)
+    finally:
+        os.close(fd1)
+    # Released: a new holder succeeds.
+    fd2 = server._acquire_store_lock(path)
+    assert fd2 is not None
+    os.close(fd2)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_token_store_mkdir_private_tightens_intermediates(tmp_path):
+    deep = tmp_path / "a" / "b" / "c"
+    server._mkdir_private(deep)
+    for d in (tmp_path / "a", tmp_path / "a" / "b", deep):
+        assert stat.S_IMODE(os.stat(d).st_mode) == 0o700
+
+
+def test_token_store_allowlist_drop_warning_names_client(tmp_path, capsys):
+    path = tmp_path / "as-state.json"
+    allowed = "https://client.example/cb"
+    p1 = _provider(store_path=path, allowed_redirect_uris=frozenset({allowed}))
+    status, reg = p1.register(json.dumps({"redirect_uris": [allowed]}).encode())
+    assert status == 201
+    _provider(store_path=path)  # restart without the allowlist entry
+    err = capsys.readouterr().err
+    assert "dropping persisted client registration" in err
+    assert reg["client_id"] in err
