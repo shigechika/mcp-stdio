@@ -20,12 +20,14 @@ from mcp_stdio.relay import (
     _CancelTracker,
     _SseState,
     _detect_paginated_list,
+    _drain_pending,
     _emit,
     _enforce_lf_stdio,
     _error_response,
     _escape_js_line_separators,
     _extract_cancel_id,
     _extract_id_and_presence,
+    _extract_response_id,
     _extract_protocol_version,
     _handle_rate_limit,
     _is_initialize_request,
@@ -5053,26 +5055,25 @@ class TestSseReaderLoop:
 
 
 class _BlockingStdin:
-    """Stdin iterator that yields one line then blocks until released.
+    """Stdin iterator that yields its line(s) then blocks until released.
 
-    Keeps run_sse's main loop alive after the POST so the SSE reader
+    Keeps run_sse's main loop alive after the POST(s) so the SSE reader
     thread has time to receive and print the response event. Once the
     release event is set, the iterator raises StopIteration and the
-    main loop exits cleanly.
+    main loop exits cleanly. Accepts a single line (str) or a list of
+    lines, yielded in order before blocking.
     """
 
-    def __init__(self, line: str, release: threading.Event):
-        self._line = line
-        self._emitted = False
+    def __init__(self, line: "str | list[str]", release: threading.Event):
+        self._lines = [line] if isinstance(line, str) else list(line)
         self._release = release
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        if not self._emitted:
-            self._emitted = True
-            return self._line
+        if self._lines:
+            return self._lines.pop(0)
         self._release.wait(timeout=5)
         raise StopIteration
 
@@ -5834,6 +5835,8 @@ class TestRunSse:
                 self._reads = 0
                 self.ready = threading.Event()
                 self.stop = threading.Event()
+                self.lock = threading.Lock()
+                self.pending = {}
 
             @property
             def endpoint_url(self):
@@ -6365,6 +6368,8 @@ class TestRunSse:
                 self._reads = 0
                 self.ready = _FakeReady()
                 self.stop = threading.Event()
+                self.lock = threading.Lock()
+                self.pending = {}
 
             @property
             def endpoint_url(self):
@@ -8181,3 +8186,243 @@ class TestPaginate429Retry:
         assert 2.0 in slept, f"expected a 2.0-second sleep, got {slept!r}"
         merged = json.loads(output.strip())
         assert [t["name"] for t in merged["result"]["tools"]] == ["t1"]
+
+# --- SSE in-flight drain (#272) ---
+
+
+class TestExtractResponseId:
+    """_extract_response_id applies _emit's pure-response test + scalar guard."""
+
+    @pytest.mark.parametrize(
+        "line,expected",
+        [
+            ('{"jsonrpc":"2.0","result":{},"id":7}', 7),
+            ('{"jsonrpc":"2.0","error":{"code":1,"message":"x"},"id":"a"}', "a"),
+            # method present => request/notification, never a response
+            ('{"jsonrpc":"2.0","method":"ping","id":7}', None),
+            ('{"jsonrpc":"2.0","method":"m","result":{},"id":7}', None),
+            # id:null is uncorrelatable
+            ('{"jsonrpc":"2.0","result":{},"id":null}', None),
+            # non-scalar id could never have been tracked
+            ('{"jsonrpc":"2.0","result":{},"id":[1]}', None),
+            # batches / non-objects / garbage pass through untouched
+            ('[{"jsonrpc":"2.0","result":{},"id":7}]', None),
+            ("not json", None),
+            ('{"jsonrpc":"2.0","id":7}', None),  # neither result nor error
+        ],
+    )
+    def test_extraction(self, line, expected):
+        assert _extract_response_id(line) == expected
+
+
+class TestSseInflightDrain:
+    """A stream drop synthesizes -32000 errors for ids POSTed on the dropped
+    stream and still awaiting their async reply (#272) — instead of leaving
+    the stdio client hanging forever (the claude-code#60061 class)."""
+
+    URL = "https://example.com/sse"
+
+    def _run_reader_two_streams(
+        self, httpx_mock, first_chunks, state, tracker=None
+    ):
+        """Drive _sse_reader_loop through one stream drop + one reconnect.
+
+        The existing _run_reader helper cannot be used: its generator sets
+        state.stop at end-of-stream, and the reader's stop check sits BEFORE
+        the drain by design (a clean shutdown must not drain), so the drain
+        would never run. Here the FIRST stream ends without stop (a real
+        drop), and the SECOND stream stops the loop.
+        """
+
+        def gen1():
+            yield from first_chunks
+
+        def gen2():
+            yield b"event: endpoint\ndata: /messages?sid=abc\n\n"
+            state.stop.set()
+
+        for gen in (gen1, gen2):
+            httpx_mock.add_response(
+                url=self.URL,
+                method="GET",
+                stream=IteratorStream(gen()),
+                headers={"content-type": "text/event-stream"},
+            )
+        client = httpx.Client()
+        stdout = StringIO()
+        try:
+            with (
+                patch("sys.stdout", stdout),
+                patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            ):
+                _sse_reader_loop(client, self.URL, {}, state, tracker)
+        finally:
+            client.close()
+        return stdout.getvalue()
+
+    def test_stream_end_drains_pending_to_errors(self, httpx_mock):
+        state = _SseState()
+        state.pending[7] = 0.0
+        out = self._run_reader_two_streams(
+            httpx_mock, [b"event: endpoint\ndata: /m\n\n"], state
+        )
+        msgs = [json.loads(x) for x in out.strip().splitlines() if x]
+        errs = [m for m in msgs if m.get("id") == 7 and "error" in m]
+        assert len(errs) == 1
+        assert errs[0]["error"]["code"] == -32000
+        assert "disconnected" in errs[0]["error"]["message"]
+        assert state.pending == {}
+
+    def test_delivered_response_pops_pending(self, httpx_mock):
+        state = _SseState()
+        state.pending[7] = 0.0
+        state.pending[8] = 0.0
+        reply = '{"jsonrpc":"2.0","result":{"ok":1},"id":7}'
+        out = self._run_reader_two_streams(
+            httpx_mock,
+            [
+                b"event: endpoint\ndata: /m\n\n",
+                f"event: message\ndata: {reply}\n\n".encode(),
+            ],
+            state,
+        )
+        msgs = [json.loads(x) for x in out.strip().splitlines() if x]
+        # id 7 got its real reply and must NOT get a synthesized error;
+        # id 8 was still in flight at the drop and must get exactly one.
+        by_id_7 = [m for m in msgs if m.get("id") == 7]
+        assert by_id_7 == [json.loads(reply)]
+        errs_8 = [m for m in msgs if m.get("id") == 8 and "error" in m]
+        assert len(errs_8) == 1
+
+    def test_cancelled_id_skipped_in_drain(self, httpx_mock, capsys):
+        state = _SseState()
+        state.pending[7] = 0.0
+        tracker = _CancelTracker()
+        tracker.add(7)
+        out = self._run_reader_two_streams(
+            httpx_mock, [b"event: endpoint\ndata: /m\n\n"], state, tracker
+        )
+        assert out.strip() == ""  # no unsolicited response for a cancelled id
+        assert "cancelled id 7" in capsys.readouterr().err
+        # Non-consuming check: the cancel entry must survive the drain so a
+        # residual real late response would still be gated.
+        assert tracker.contains(7)
+
+    def test_drain_pending_is_noop_when_empty(self):
+        state = _SseState()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            _drain_pending(state, None)
+        assert stdout.getvalue() == ""
+
+
+class TestRunSseInflightDrain:
+    """End-to-end: request POSTed, reply pending, stream drops."""
+
+    URL = "https://example.com/sse"
+    POST_URL = "https://example.com/messages?sid=abc"
+
+    def _drive(self, httpx_mock, monkeypatch, stdin_lines, first_stream_tail=None,
+               pending_cap=None):
+        """run_sse with a two-GET stream: GET-1 ends after ALL stdin lines have
+        been POSTed (so every pending add strictly precedes the drain), GET-2
+        releases stdin and holds until shutdown."""
+        monkeypatch.setattr("mcp_stdio.relay.RETRY_DELAY", 0.05)
+        if pending_cap is not None:
+            monkeypatch.setattr("mcp_stdio.relay._SSE_PENDING_MAX", pending_cap)
+        release_stdin = threading.Event()
+        hold_gen2 = threading.Event()
+        all_posted = threading.Event()
+        n_lines = len(stdin_lines)
+        posts = {"n": 0}
+
+        def post_callback(request):
+            posts["n"] += 1
+            if posts["n"] >= n_lines:
+                all_posted.set()
+            return httpx.Response(202)
+
+        httpx_mock.add_callback(
+            post_callback, url=self.POST_URL, method="POST", is_reusable=True
+        )
+
+        def sse_gen_1():
+            yield b"event: endpoint\ndata: /messages?sid=abc\n\n"
+            # Wait until the main loop has POSTed (and tracked) every line —
+            # only then drop the stream, so the drain is deterministic.
+            all_posted.wait(timeout=5)
+            if first_stream_tail:
+                yield first_stream_tail
+
+        def sse_gen_2():
+            yield b"event: endpoint\ndata: /messages?sid=abc\n\n"
+            release_stdin.set()
+            hold_gen2.wait(timeout=2)
+
+        for gen in (sse_gen_1, sse_gen_2):
+            httpx_mock.add_response(
+                url=self.URL,
+                method="GET",
+                stream=IteratorStream(gen()),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        stdin = _BlockingStdin(stdin_lines, release_stdin)
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(self.URL, {"Content-Type": "application/json"})
+        hold_gen2.set()
+        return [json.loads(x) for x in stdout.getvalue().strip().splitlines() if x]
+
+    def test_inflight_request_gets_error_on_drop(self, httpx_mock, monkeypatch):
+        msgs = self._drive(
+            httpx_mock,
+            monkeypatch,
+            [
+                '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+                '{"jsonrpc":"2.0","method":"notifications/initialized"}',
+            ],
+        )
+        # Exactly one synthesized error, for the request id — never for the
+        # notification.
+        assert len(msgs) == 1
+        assert msgs[0]["id"] == 1
+        assert msgs[0]["error"]["code"] == -32000
+        assert "disconnected" in msgs[0]["error"]["message"]
+
+    def test_answered_request_gets_no_error_on_drop(self, httpx_mock, monkeypatch):
+        reply = '{"jsonrpc":"2.0","result":{"ok":1},"id":1}'
+        msgs = self._drive(
+            httpx_mock,
+            monkeypatch,
+            ['{"jsonrpc":"2.0","id":1,"method":"tools/list"}'],
+            first_stream_tail=f"event: message\ndata: {reply}\n\n".encode(),
+        )
+        assert msgs == [json.loads(reply)]
+
+    def test_cancelled_request_gets_no_error_on_drop(self, httpx_mock, monkeypatch):
+        msgs = self._drive(
+            httpx_mock,
+            monkeypatch,
+            [
+                '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+                '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+                '"params":{"requestId":1}}',
+            ],
+        )
+        assert msgs == []  # cancelled: no waiter, no synthesized error
+
+    def test_pending_cap_evicts_oldest(self, httpx_mock, monkeypatch, capsys):
+        msgs = self._drive(
+            httpx_mock,
+            monkeypatch,
+            [
+                '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+                '{"jsonrpc":"2.0","id":2,"method":"tools/list"}',
+            ],
+            pending_cap=1,
+        )
+        # id 1's tracking was evicted at the cap (reverting it to the
+        # pre-#272 behavior); only id 2 gets the synthesized error.
+        assert [m["id"] for m in msgs] == [2]
+        assert "in-flight tracker at cap" in capsys.readouterr().err
