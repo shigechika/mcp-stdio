@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.25.0](https://github.com/shigechika/mcp-stdio/compare/v0.24.1...v0.25.0) (2026-07-02)
+
+
+### Features
+
+* **serve:** --token-store persists AS-issued tokens across restarts ([#279](https://github.com/shigechika/mcp-stdio/issues/279)) ([e8ca6b9](https://github.com/shigechika/mcp-stdio/commit/e8ca6b98c4e160df31dd399c342137c48fab214b))
+
 ## [0.24.1](https://github.com/shigechika/mcp-stdio/compare/v0.24.0...v0.24.1) (2026-07-02)
 
 
