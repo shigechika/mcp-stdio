@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.25.1](https://github.com/shigechika/mcp-stdio/compare/v0.25.0...v0.25.1) (2026-07-02)
+
+
+### Bug Fixes
+
+* **run_sse:** synthesize errors for requests in flight when the SSE stream drops ([#282](https://github.com/shigechika/mcp-stdio/issues/282)) ([f7de3be](https://github.com/shigechika/mcp-stdio/commit/f7de3be64aaab42c1b0d5d628d549ca55764e2be))
+
 ## [0.25.0](https://github.com/shigechika/mcp-stdio/compare/v0.24.1...v0.25.0) (2026-07-02)
 
 
