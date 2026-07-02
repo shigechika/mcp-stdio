@@ -58,6 +58,7 @@ Bearer token、カスタムヘッダー、OAuth 2.1 認証情報をリモート�
 - **行区切り文字の安全化** — 上流レスポンス中の生の `U+2028` / `U+2029`（JSON では合法だが JavaScript の行終端文字）をエスケープし、これらを改行として扱うクライアントによるフレーム崩れを防止。ロスレス（cf. modelcontextprotocol/typescript-sdk#2155）
 - **引数の正規化** — `tools/call` の `arguments` が `null` の場合は `{}` に書き換え、null 形式を拒否する厳格なサーバーでも呼び出せるようにする。デフォルト有効、`--no-normalize-arguments` で無効化（cf. modelcontextprotocol/typescript-sdk#2012）
 - **キャンセル対応フィルタ** — stdin の `notifications/cancelled` でキャンセルされた id を追跡し、その id を持つ遅延レスポンスがクライアントに届く前に drop する（MCP キャンセル仕様準拠）。デフォルト有効（TTL 60 秒）、`--no-cancel-filter` で無効化（cf. anthropics/claude-code#51073）
+- **SSE 切断時のエラー合成** — legacy SSE transport では応答が長寿命の GET ストリームだけに届くため、ストリーム切断時に POST 済みリクエストは永久にハングしてしまう。mcp-stdio は現行ストリームで in-flight の id を追跡し、切断時に各 id へ JSON-RPC `-32000` エラーを合成——クライアントはハングせず再試行できる——しつつストリームを自動再接続する。キャンセル済み id はスキップ（cf. anthropics/claude-code#60061）
 - **セッション回復** — 404 でセッション ID をリセットして再試行
 - **プロトコルバージョンヘッダー** — `initialize` 応答から交渉済みの `protocolVersion` を捕捉し、以降の Streamable HTTP リクエストすべてに `MCP-Protocol-Version` を付与（MCP 仕様 rev 2025-06-18）。このヘッダーを強制するサーバーは未送信時に初期化後リクエストを `400 Bad Request` で拒否する
 - **401 時の自動トークンリフレッシュ** — セッション中に OAuth トークンが失効しても自動更新（OAuth モード時のみ）
