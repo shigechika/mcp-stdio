@@ -15,6 +15,7 @@ from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urljoin, urlsplit
+from urllib.request import parse_http_list, parse_keqv_list
 
 import httpx
 
@@ -612,9 +613,39 @@ class _StreamResult:
         self.retry_after = retry_after
 
 
-_INSUFFICIENT_SCOPE_RE = re.compile(r'error\s*=\s*"?insufficient_scope"?')
-_SCOPE_QUOTED_RE = re.compile(r'scope\s*=\s*"([^"]*)"')
-_SCOPE_UNQUOTED_RE = re.compile(r'scope\s*=\s*([^,\s]+)')
+def _parse_auth_params(header: str | None) -> dict[str, str]:
+    """Parse a WWW-Authenticate challenge's auth-params into a name->value dict.
+
+    Splits with the stdlib's quote-aware helpers (``parse_http_list`` +
+    ``parse_keqv_list``) rather than per-name regexes, so a ``name=value``
+    pair is only recognised as a genuine auth-param. This structurally avoids
+    the whole defect class of modelcontextprotocol/python-sdk#3009: a decoy
+    param whose name merely ends in the target (``error_scope=``,
+    ``x.resource_metadata=``) is a distinct key, and a ``scope=`` substring
+    living inside another param's quoted value (an ``error_description`` in
+    prose) stays part of that value and is never mistaken for the parameter.
+
+    Names are lowercased — auth-param names are case-insensitive (RFC 9110
+    §11.2 / RFC 7235 §2.1) — and quoted values are unquoted. A leading
+    auth-scheme token (e.g. ``Bearer``) is dropped. Only a single challenge is
+    parsed: multiple space-separated challenges in one header (RFC 7235 §4.1)
+    are not disentangled by scheme, matching the narrow scope of the callers
+    (they act on a single Bearer challenge).
+    """
+    if not header:
+        return {}
+    text = header.strip()
+    # Drop a leading auth-scheme token ("Bearer", "Basic", ...) — it has no
+    # "=", unlike an auth-param. A bare scheme with no params yields {}.
+    head, sep, rest = text.partition(" ")
+    if sep and "=" not in head:
+        text = rest
+    pairs = [item for item in parse_http_list(text) if "=" in item]
+    try:
+        parsed = parse_keqv_list(pairs)
+    except ValueError:
+        return {}
+    return {name.lower(): value for name, value in parsed.items()}
 
 
 def _parse_www_authenticate_scope(header: str | None) -> str | None:
@@ -622,23 +653,16 @@ def _parse_www_authenticate_scope(header: str | None) -> str | None:
 
     Returns the scope string when the challenge signals
     ``error="insufficient_scope"`` and carries a ``scope`` parameter;
-    otherwise returns ``None``. Handles both quoted and unquoted
-    parameter values per RFC 7235.
+    otherwise returns ``None``.
 
     Used to drive RFC 9470 / MCP step-up authorization (cf.
     anthropics/claude-code#44652).
     """
-    if not header:
+    params = _parse_auth_params(header)
+    if params.get("error") != "insufficient_scope":
         return None
-    if not _INSUFFICIENT_SCOPE_RE.search(header):
-        return None
-    match = _SCOPE_QUOTED_RE.search(header)
-    if match:
-        return match.group(1).strip()
-    match = _SCOPE_UNQUOTED_RE.search(header)
-    if match:
-        return match.group(1).strip()
-    return None
+    scope = params.get("scope")
+    return scope.strip() if scope else None
 
 
 # WHATWG Server-Sent Events recognises only CR, LF, and CRLF as line
