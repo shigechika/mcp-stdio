@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.24.1](https://github.com/shigechika/mcp-stdio/compare/v0.24.0...v0.24.1) (2026-07-02)
+
+
+### Bug Fixes
+
+* anchor WWW-Authenticate auth-param parsing at token boundaries ([#275](https://github.com/shigechika/mcp-stdio/issues/275)) ([a8c2178](https://github.com/shigechika/mcp-stdio/commit/a8c217826c72d13385bf5098595589e6e3dcf928))
+
 ## [0.24.0](https://github.com/shigechika/mcp-stdio/compare/v0.23.0...v0.24.0) (2026-07-01)
 
 
