@@ -2115,3 +2115,31 @@ def test_token_store_allowlist_drop_warning_names_client(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "dropping persisted client registration" in err
     assert reg["client_id"] in err
+
+# --- cross-SDK guard tests (#273) ---
+
+
+def test_register_ignores_application_type(oauth_gateway):
+    # SEP-837 clients send RFC 7591 `application_type: "native"`; per RFC 7591
+    # Sec. 2 a server ignores client metadata it does not understand, so
+    # registration must still return 201. Guards against ever rejecting
+    # unknown metadata fields.
+    base, _ = oauth_gateway
+    r = httpx.post(
+        base + "/register",
+        json={"redirect_uris": [_REDIRECT], "application_type": "native"},
+        timeout=10,
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["client_id"]
+
+
+def test_token_response_is_identity_encoded(oauth_gateway):
+    # No Content-Encoding on /token responses: a compressed body breaks
+    # clients that JSON.parse the raw bytes (the typescript-sdk#2408 failure
+    # class). httpx headers are case-insensitive.
+    base, _ = oauth_gateway
+    _, _, _, _, tok = _full_flow(base)
+    assert tok.status_code == 200, tok.text
+    assert "content-encoding" not in tok.headers
+    assert tok.headers["content-type"] == "application/json"
