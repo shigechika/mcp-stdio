@@ -35,6 +35,7 @@ from mcp_stdio.relay import (
     _make_httpx_transport,
     _normalize_null_arguments,
     _parse_retry_after,
+    _parse_auth_params,
     _parse_www_authenticate_scope,
     _post_and_stream,
     _cold_start_loop,
@@ -2716,6 +2717,38 @@ class TestProtocolVersionHeader:
 # --- step-up authorization (anthropics/claude-code#44652) ---
 
 
+class TestParseAuthParams:
+    """Quote-aware WWW-Authenticate auth-param tokenizer."""
+
+    def test_scheme_stripped_and_names_lowercased(self):
+        header = 'Bearer Realm="mcp", Scope="a b"'
+        assert _parse_auth_params(header) == {"realm": "mcp", "scope": "a b"}
+
+    def test_unquoted_values(self):
+        header = "Bearer error=insufficient_scope, scope=mcp:read"
+        assert _parse_auth_params(header) == {
+            "error": "insufficient_scope",
+            "scope": "mcp:read",
+        }
+
+    def test_embedded_equals_in_quoted_value_kept(self):
+        header = 'Bearer error_description="grant scope=mcp:write"'
+        assert _parse_auth_params(header) == {
+            "error_description": "grant scope=mcp:write"
+        }
+
+    def test_bare_scheme_only(self):
+        assert _parse_auth_params("Bearer") == {}
+
+    def test_empty_and_none(self):
+        assert _parse_auth_params("") == {}
+        assert _parse_auth_params(None) == {}
+
+    def test_no_scheme_prefix(self):
+        """A header that is already bare params still parses."""
+        assert _parse_auth_params('realm="mcp"') == {"realm": "mcp"}
+
+
 class TestParseWwwAuthenticateScope:
     """Parse RFC 9470 insufficient_scope challenges."""
 
@@ -2754,17 +2787,19 @@ class TestParseWwwAuthenticateScope:
         header = 'Basic realm="private"'
         assert _parse_www_authenticate_scope(header) is None
 
-    def test_decoy_param_before_real_scope(self):
+    def test_decoy_param_ending_in_scope_ignored(self):
         """A param name merely ending in "scope" must not shadow the real one.
 
-        Same defect class as modelcontextprotocol/python-sdk#3009: without a
-        token boundary, error_scope="decoy" satisfies the scope= pattern first.
+        Defect class of modelcontextprotocol/python-sdk#3009: a name-suffix
+        decoy (error_scope=, and the wider-tchar x.scope=) is a distinct
+        auth-param, not the scope parameter.
         """
-        header = (
-            'Bearer error="insufficient_scope", error_scope="decoy", '
-            'scope="mcp:read hr:read"'
-        )
-        assert _parse_www_authenticate_scope(header) == "mcp:read hr:read"
+        for decoy in ("error_scope", "x.scope", "x-scope", "acme+scope"):
+            header = (
+                f'Bearer error="insufficient_scope", {decoy}="decoy", '
+                'scope="mcp:read hr:read"'
+            )
+            assert _parse_www_authenticate_scope(header) == "mcp:read hr:read"
 
     def test_decoy_param_only_is_not_scope(self):
         """error_scope alone must not be mistaken for a scope parameter."""
@@ -2785,6 +2820,23 @@ class TestParseWwwAuthenticateScope:
         """error="insufficient_scope_extended" is a different error code."""
         header = 'Bearer error="insufficient_scope_extended", scope="mcp:read"'
         assert _parse_www_authenticate_scope(header) is None
+
+    def test_scope_inside_other_param_value_ignored(self):
+        """A scope= substring inside another param's quoted value is not a param.
+
+        error_description free text often contains prose like "grant scope=…";
+        that must not be extracted as the required scope.
+        """
+        header = (
+            'Bearer error="insufficient_scope", '
+            'error_description="ask admin to grant scope=mcp:write"'
+        )
+        assert _parse_www_authenticate_scope(header) is None
+
+    def test_case_insensitive_param_names(self):
+        """Auth-param names are case-insensitive (RFC 9110 §11.2)."""
+        header = 'Bearer Error="insufficient_scope", Scope="mcp:read"'
+        assert _parse_www_authenticate_scope(header) == "mcp:read"
 
 
 class TestStepUpScopeChallenge:

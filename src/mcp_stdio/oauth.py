@@ -20,7 +20,7 @@ from urllib.parse import ParseResult, parse_qs, quote, urlencode, urlparse, urls
 
 import httpx
 
-from .relay import log
+from .relay import _parse_auth_params, log
 from .token_store import TokenData, delete_token, load_token, save_token
 
 # ---------------------------------------------------------------------------
@@ -314,29 +314,17 @@ def _validate_auth_server_url(auth_server_url: str, mcp_server_url: str) -> bool
     return True
 
 
-# (?<![\w-]) rejects a longer auth-param name that merely ends in the target
-# (x_resource_metadata= must not satisfy resource_metadata=). Same defect
-# class as modelcontextprotocol/python-sdk#3009.
-_RESOURCE_METADATA_QUOTED_RE = re.compile(r'(?<![\w-])resource_metadata\s*=\s*"([^"]+)"')
-_RESOURCE_METADATA_UNQUOTED_RE = re.compile(r"(?<![\w-])resource_metadata\s*=\s*([^\s,\"]+)")
-
-
 def _parse_resource_metadata_hint(header: str | None) -> str | None:
     """Extract the resource_metadata URL from a WWW-Authenticate Bearer challenge.
 
     RFC 9728 §5.1 defines the ``resource_metadata`` parameter as a hint
     pointing directly to the Protected Resource Metadata document URL.
-    Returns the URL string when present; ``None`` otherwise.
+    Returns the URL string when present; ``None`` otherwise. Uses the shared
+    quote-aware auth-param parser (``_parse_auth_params``), so a decoy param
+    ending in ``resource_metadata`` or a URL embedded in another param's
+    quoted value is not mis-extracted (cf. modelcontextprotocol/python-sdk#3009).
     """
-    if not header:
-        return None
-    match = _RESOURCE_METADATA_QUOTED_RE.search(header)
-    if match:
-        return match.group(1)
-    match = _RESOURCE_METADATA_UNQUOTED_RE.search(header)
-    if match:
-        return match.group(1)
-    return None
+    return _parse_auth_params(header).get("resource_metadata") or None
 
 
 def _validate_prm_hint_url(hint_url: str, server_url: str) -> bool:

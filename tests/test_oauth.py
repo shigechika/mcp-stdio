@@ -5401,20 +5401,22 @@ class TestParseResourceMetadataHint:
         header = "Basic realm=example"
         assert _parse_resource_metadata_hint(header) is None
 
-    def test_decoy_param_before_real_value(self):
+    def test_decoy_param_ending_in_name_ignored(self):
         """A param name merely ending in "resource_metadata" must not win.
 
-        Same defect class as modelcontextprotocol/python-sdk#3009: without a
-        token boundary, x_resource_metadata= satisfies the pattern first.
+        Defect class of modelcontextprotocol/python-sdk#3009: a name-suffix
+        decoy (x_resource_metadata=, and the wider-tchar x.resource_metadata=)
+        is a distinct auth-param, not the resource_metadata hint.
         """
-        header = (
-            'Bearer x_resource_metadata="https://decoy.example.com/prm", '
-            'resource_metadata="https://resource.example.com/prm"'
-        )
-        assert (
-            _parse_resource_metadata_hint(header)
-            == "https://resource.example.com/prm"
-        )
+        for decoy in ("x_resource_metadata", "x.resource_metadata"):
+            header = (
+                f'Bearer {decoy}="https://decoy.example.com/prm", '
+                'resource_metadata="https://resource.example.com/prm"'
+            )
+            assert (
+                _parse_resource_metadata_hint(header)
+                == "https://resource.example.com/prm"
+            )
 
     def test_decoy_param_only_returns_none(self):
         """x_resource_metadata alone is not a resource_metadata hint."""
@@ -5427,6 +5429,21 @@ class TestParseResourceMetadataHint:
             "Bearer x_resource_metadata=https://decoy.example.com/prm, "
             "resource_metadata=https://resource.example.com/prm"
         )
+        assert (
+            _parse_resource_metadata_hint(header)
+            == "https://resource.example.com/prm"
+        )
+
+    def test_value_inside_other_param_ignored(self):
+        """resource_metadata= inside another param's quoted value is not a hint."""
+        header = (
+            'Bearer realm="see resource_metadata=https://evil.example/prm for docs"'
+        )
+        assert _parse_resource_metadata_hint(header) is None
+
+    def test_case_insensitive_param_name(self):
+        """Auth-param names are case-insensitive (RFC 9110 §11.2)."""
+        header = 'Bearer Resource_Metadata="https://resource.example.com/prm"'
         assert (
             _parse_resource_metadata_hint(header)
             == "https://resource.example.com/prm"
