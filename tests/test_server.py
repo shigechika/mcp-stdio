@@ -2052,7 +2052,7 @@ def test_token_store_tombstone_missing_family_dropped(tmp_path):
 
 
 def test_token_store_persist_now_raises_on_unwritable_path(tmp_path):
-    target = tmp_path / "занято"
+    target = tmp_path / "occupied-dir"
     target.mkdir()  # an existing directory: os.replace onto it must fail
     p = _provider(store_path=target)
     with pytest.raises(OSError):
@@ -2079,11 +2079,9 @@ def test_serve_main_token_store_unwritable_fails_fast(tmp_path):
         ])
 
 
-@pytest.mark.skipif(
-    not hasattr(server.os, "O_NOFOLLOW") and sys.platform != "win32",
-    reason="needs an advisory-lock primitive",
-)
 def test_token_store_sidecar_lock_refuses_second_holder(tmp_path):
+    # The in-test skip below handles a platform with no lock primitive
+    # (_acquire_store_lock returns None there).
     path = tmp_path / "as-state.json"
     fd1 = server._acquire_store_lock(path)
     if fd1 is None:
