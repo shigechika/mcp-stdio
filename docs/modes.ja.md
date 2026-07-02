@@ -43,7 +43,7 @@ mcp-stdio --oauth https://mcp.example.com/mcp
 
 - ベンダーやチームがホストする MCP サーバーを Claude Desktop / Claude
   Code から使いたいとき；
-- クライアント自身がうまく扱えない OAuth ログインをサーバーが要求する
+- クライアント単体では完結できない OAuth ログインをサーバーが要求する
   とき；
 - クライアントが対応をやめた legacy SSE トランスポートをサーバーが
   まだ話しているとき。

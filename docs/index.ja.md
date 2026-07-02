@@ -53,10 +53,11 @@ HTTPS で公開する——は
 
 ## なぜ存在するのか
 
-MCP のクライアントとサーバーはトランスポートの解釈が食い違い、OAuth の
-実装も現実のデプロイを壊す形で手を抜きがちです。mcp-stdio はその中間に
-立って差異を吸収します：MCP 仕様と OAuth 関連 RFC に忠実に従い、
-[主要クライアントの既知の問題](https://github.com/shigechika/mcp-stdio/blob/main/WORKAROUNDS.md)
+MCP のクライアントとサーバーはトランスポートの解釈が常に一致するとは
+限らず、OAuth の細部も実装ごとに異なり、その差は実際のデプロイで表面化
+します。mcp-stdio はその中間に立って差異を吸収します：MCP 仕様と OAuth
+関連 RFC に忠実に従い、
+[既知の相互運用ギャップ](https://github.com/shigechika/mcp-stdio/blob/main/WORKAROUNDS.md)
 を回避し、監査できる小ささを保っています。
 
 機能一覧と標準準拠の詳細は

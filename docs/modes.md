@@ -40,7 +40,7 @@ You want this mode when:
 
 - a vendor / your team hosts an MCP server and you want it in Claude
   Desktop or Claude Code;
-- the server needs an OAuth login the client itself fumbles;
+- the server needs an OAuth login your client cannot complete on its own;
 - the server still speaks the legacy SSE transport your client dropped.
 
 → Continue with **[Connect to a remote MCP server](guides/connect-remote.md)**.

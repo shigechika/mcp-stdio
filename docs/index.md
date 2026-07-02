@@ -50,11 +50,11 @@ stdio MCP server over HTTPS — see
 
 ## Why this exists
 
-MCP clients and servers disagree about transports and cut corners around
-OAuth in ways that break real deployments. mcp-stdio sits in the middle and
-absorbs those differences: it follows the MCP spec and the OAuth RFCs
-closely, works around
-[known issues in popular clients](https://github.com/shigechika/mcp-stdio/blob/main/WORKAROUNDS.md),
+MCP clients and servers do not always agree on transports, and OAuth
+details vary between implementations in ways that surface in real
+deployments. mcp-stdio sits in the middle and absorbs those differences: it
+follows the MCP spec and the OAuth RFCs closely, works around
+[known interoperability gaps](https://github.com/shigechika/mcp-stdio/blob/main/WORKAROUNDS.md),
 and stays small enough to audit.
 
 For the full feature list and standards conformance, see the
