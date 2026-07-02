@@ -103,6 +103,10 @@ class TestResourceIndicator:
             ("https://api.example.com/mcp", "https://api.example.com/mcp"),
             # port + query kept; userinfo stripped
             ("https://u:p@host:8443/mcp?a=1", "https://host:8443/mcp?a=1"),
+            # bare host stays slash-free: URL-normalizing to "https://host/"
+            # is the cross-SDK failure class of typescript-sdk#1968 /
+            # python-sdk#2883 / claude-code#52871 (Entra AADSTS9010010)
+            ("https://host", "https://host"),
             # fragment dropped (RFC 8707 §2 MUST NOT)
             ("https://api.example.com/mcp#frag", "https://api.example.com/mcp"),
             # unparseable / non-http stays unchanged
@@ -4663,6 +4667,88 @@ class TestStateCsrfCheck:
         assert ("attacker-state", sent["state"]) in calls
 
 
+class TestScopeOmittedWhenUnset:
+    """No configured scope -> the authorize URL carries no ``scope`` param at
+    all (never an empty ``scope=``). Guards the failure class of
+    claude-code#72440 (AADSTS900144 on Microsoft Entra ID). The device-flow
+    twin lives in TestDeviceAuthorizationFlow."""
+
+    SERVER_URL = "https://example.com/mcp"
+
+    def test_authorize_url_has_no_scope_param(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        from urllib.parse import parse_qs, urlparse
+        from urllib.request import urlopen
+
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        httpx_mock.add_response(url="https://example.com/mcp", status_code=401)
+        httpx_mock.add_response(
+            url=(
+                "https://example.com/.well-known/"
+                "oauth-protected-resource/mcp"
+            ),
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-protected-resource",
+            status_code=404,
+        )
+        httpx_mock.add_response(
+            url="https://example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://example.com/authorize",
+                "token_endpoint": "https://example.com/token",
+                "registration_endpoint": "https://example.com/register",
+            },
+        )
+        httpx_mock.add_response(
+            url="https://example.com/register",
+            json={"client_id": "cid"},
+        )
+        httpx_mock.add_response(
+            url="https://example.com/token",
+            json={"access_token": "at", "token_type": "Bearer"},
+        )
+
+        captured_auth_urls: list[str] = []
+
+        def fake_open(auth_url: str) -> bool:
+            captured_auth_urls.append(auth_url)
+            q = parse_qs(urlparse(auth_url).query)
+            redirect_uri = q["redirect_uri"][0]
+            state = q["state"][0]
+
+            def hit_callback() -> None:
+                cb_url = f"{redirect_uri}?code=ok_code&state={state}"
+                try:
+                    urlopen(cb_url, timeout=5).read()
+                except Exception:
+                    pass
+
+            threading.Thread(target=hit_callback, daemon=True).start()
+            return True
+
+        monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", fake_open)
+
+        client = httpx.Client()
+        data = ensure_token(self.SERVER_URL, client, timeout=5)
+        assert data is not None and data.access_token == "at"
+
+        assert len(captured_auth_urls) == 1
+        # keep_blank_values: parse_qs would otherwise DROP an empty `scope=`,
+        # letting exactly the empty-param regression this test pins slip by.
+        q = parse_qs(
+            urlparse(captured_auth_urls[0]).query, keep_blank_values=True
+        )
+        assert "scope" not in q
+        # Positive control: the URL is fully formed otherwise.
+        assert q["resource"] == [self.SERVER_URL]
+
+
 class TestAuthorizationFlowFailurePaths:
     """End-to-end failure paths of `_run_authorization_flow`: the callback
     timeout and the server-returned-error branch (both clean up the server)."""
@@ -6179,6 +6265,35 @@ class TestDeviceAuthorizationFlow:
         from urllib.parse import parse_qs
         body = parse_qs(da_req.content.decode())
         assert body.get("resource") == [MCP_URL]
+
+    def test_da_request_omits_scope_when_unset(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
+        """No scope configured -> no scope param at all (never an empty
+        ``scope=``). Guards the failure class of claude-code#72440, where a
+        v2.1.196 regression sent no scope on the unset path and Microsoft
+        Entra ID rejected the request with AADSTS900144."""
+        self._patch_store(tmp_path, monkeypatch)
+
+        httpx_mock.add_response(url=REG_URL, json={"client_id": "cid"})
+        httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
+        httpx_mock.add_response(
+            url=TOKEN_URL,
+            json={"access_token": "acc", "token_type": "Bearer"},
+        )
+
+        client = httpx.Client()
+        _run_device_authorization_flow(
+            MCP_URL, client, metadata=_device_meta(), cached=None
+        )
+
+        reqs = httpx_mock.get_requests()
+        da_req = next(r for r in reqs if str(r.url).startswith(DEVICE_AUTH_URL))
+        from urllib.parse import parse_qs
+        # keep_blank_values: parse_qs would otherwise DROP an empty `scope=`,
+        # letting exactly the empty-param regression this test pins slip by.
+        body = parse_qs(da_req.content.decode(), keep_blank_values=True)
+        assert "scope" not in body
 
     def test_metadata_discovers_device_endpoint(self, httpx_mock):
         """device_authorization_endpoint is read from RFC 8414 metadata."""
