@@ -2,6 +2,8 @@
 
 [English](README.md) | 日本語
 
+📖 **はじめての方は[ユーザーガイド](https://shigechika.github.io/mcp-stdio/ja/)へ**——「つなぐ」「公開する」のやりたいこと別ドキュメントです。この README は網羅的なリファレンスです。
+
 Stdio-to-HTTP ゲートウェイ — MCP クライアントとリモート HTTP MCP サーバーを接続します。
 
 ## 概要

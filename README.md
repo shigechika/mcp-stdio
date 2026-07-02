@@ -6,6 +6,8 @@ English | [日本語](README.ja.md)
 
 Stdio-to-HTTP gateway — connects MCP clients to remote HTTP MCP servers.
 
+📖 **New here? Start with the [user guide](https://shigechika.github.io/mcp-stdio/)** — task-oriented docs for connecting a client or publishing a server. This README is the full reference.
+
 ## Overview
 
 [MCP](https://modelcontextprotocol.io/) clients like Claude Desktop and Claude Code see mcp-stdio as a locally running self-hosted MCP server, while it relays all requests to a remote MCP server with support for various authentication methods:
