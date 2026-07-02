@@ -726,9 +726,11 @@ def _redact_query(line: str) -> str:
     return re.sub(r'\?[^\s"]*', "?<redacted>", line)
 
 
-# On-disk AS-state schema version (--token-store). Bump when the snapshot
-# layout changes incompatibly; an unrecognized version starts empty rather
-# than guessing at field meanings.
+# On-disk AS-state schema version (--token-store). Bump ONLY when the snapshot
+# layout changes incompatibly — an unrecognized version starts empty rather
+# than guessing at field meanings, which forces a fleet-wide re-auth, so an
+# ADDITIVE field must keep the version (the record validators below tolerate
+# unknown fields precisely so additive changes stay non-breaking).
 _STATE_VERSION = 1
 
 
@@ -753,6 +755,9 @@ def _valid_client_record(v: Any) -> bool:
 
 
 def _valid_code_record(v: Any) -> bool:
+    # "resource" must be PRESENT (None is fine): the exchange path reads
+    # entry["resource"] by subscript, so a key dropped by a foreign writer
+    # must fail validation here, not KeyError the token endpoint later.
     return (
         isinstance(v, dict)
         and isinstance(v.get("client_id"), str)
@@ -761,39 +766,106 @@ def _valid_code_record(v: Any) -> bool:
         and isinstance(v.get("user"), str)
         and bool(v["user"])
         and isinstance(v.get("scope"), str)
-        and _opt_str(v.get("resource"))
+        and "resource" in v
+        and _opt_str(v["resource"])
         and _finite_num(v.get("expires_at"))
     )
 
 
 def _valid_grant_record(v: Any) -> bool:
-    """An access- or refresh-token record (both share one shape)."""
+    """An access- or refresh-token record (both share one shape).
+
+    "resource" and "family" must be PRESENT (None is fine): the refresh path
+    subscripts entry["resource"], so absence must be rejected at load time.
+    """
     return (
         isinstance(v, dict)
         and isinstance(v.get("user"), str)
         and bool(v["user"])
         and isinstance(v.get("client_id"), str)
         and isinstance(v.get("scope"), str)
-        and _opt_str(v.get("resource"))
-        and _opt_str(v.get("family"))
+        and "resource" in v
+        and _opt_str(v["resource"])
+        and "family" in v
+        and _opt_str(v["family"])
         and _finite_num(v.get("expires_at"))
     )
 
 
 def _valid_tombstone_record(v: Any) -> bool:
+    # "family" must be PRESENT (None is fine): the replay-detection path
+    # subscripts tomb["family"] — a missing key would 500 the token endpoint
+    # AND skip the RFC-mandated family revocation on the theft signal.
     return (
         isinstance(v, dict)
-        and _opt_str(v.get("family"))
+        and "family" in v
+        and _opt_str(v["family"])
         and _finite_num(v.get("consumed_at"))
         and _finite_num(v.get("expires_at"))
     )
 
 
+def _mkdir_private(directory: Path) -> None:
+    """Create ``directory`` (and any missing ancestors) at 0o700, umask-proof.
+
+    ``Path.mkdir(parents=True)`` creates the INTERMEDIATE directories at the
+    umask default (commonly 0o755), which would leave a credential file's
+    enclosing tree group/other-traversable — the same reasoning as
+    token_store._ensure_store_dir. Only directories we create are tightened;
+    a pre-existing directory is left untouched.
+    """
+    for ancestor in (*reversed(directory.parents), directory):
+        if not ancestor.exists():
+            try:
+                os.mkdir(ancestor, 0o700)
+            except FileExistsError:
+                pass  # a concurrent process created it; leave its mode alone
+
+
+def _acquire_store_lock(store_path: Path) -> Any:
+    """Take a process-lifetime exclusive advisory lock guarding a token store.
+
+    Two serve processes pointed at one --token-store would silently
+    last-writer-wins clobber each other's snapshots — losing freshly issued
+    tokens AND replay-detection tombstones (a revocation hole) — so the
+    second process must be refused loudly at startup. The lock lives on a
+    SIDECAR (``<store>.lock``) rather than the store file itself because
+    flock binds to the inode and every persist ``os.replace``s the store: a
+    lock on the store file would silently evaporate at the first write.
+
+    Returns an open fd the caller must keep alive for the process lifetime
+    (or None on a platform with neither fcntl nor msvcrt — best-effort, like
+    the client store's advisory lock). Raises OSError when another process
+    already holds the lock.
+    """
+    lock_path = store_path.with_name(store_path.name + ".lock")
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            import fcntl
+        except ImportError:
+            fcntl = None  # type: ignore[assignment]
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        try:
+            import msvcrt
+        except ImportError:
+            os.close(fd)
+            return None
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        return fd
+    except OSError:
+        os.close(fd)
+        raise
+
+
 class _OAuthProvider:
     """Minimal OAuth 2.1 Authorization Server: DCR + authorization-code + PKCE
-    + refresh, with opaque in-memory tokens (no crypto dependency).
+    + refresh, with opaque bearer tokens held in memory and optionally
+    persisted via --token-store (no crypto dependency).
 
-    All four stores share one lock; ThreadingHTTPServer serves each request on
+    All stores share one lock; ThreadingHTTPServer serves each request on
     its own thread. ``now`` is injectable so tests can drive TTL expiry without
     sleeping. ``public_url`` (bare origin) pins the issuer; when None the caller
     passes a per-request reflected origin into the metadata builders.
@@ -846,6 +918,10 @@ class _OAuthProvider:
         # keeps the pre-existing in-memory-only behavior.
         self._store_path = store_path
         self._warned_persist_failure = False
+        # serve_main parks the sidecar-lock fd here so the advisory lock
+        # (which guards against two processes sharing one store) stays alive
+        # exactly as long as the provider does.
+        self._store_lock_fd: Any = None
         if store_path is not None:
             self._load_state()
 
@@ -913,6 +989,17 @@ class _OAuthProvider:
                     if (key := _match_key(u, self.allowed_redirect_uris)) is not None
                 }
                 if not keys:
+                    # Name the client and the reason: this drop is usually an
+                    # OPERATOR change (an --allow-redirect-uri entry removed
+                    # or forgotten across the restart), not data decay, and
+                    # the affected remote client will look "connected with no
+                    # tools" — give the operator a breadcrumb that points at
+                    # the allowlist instead of a generic dropped-count.
+                    log(
+                        f"warning: dropping persisted client registration "
+                        f"{cid}: none of its redirect_uris match the loopback "
+                        "rule or the current --allow-redirect-uri allowlist"
+                    )
                     dropped += 1
                     continue
                 self._clients[cid] = {
@@ -936,20 +1023,9 @@ class _OAuthProvider:
             f"token(s), {len(self._clients)} client registration(s)"
         )
 
-    def _persist_locked(self) -> None:
-        """Snapshot all six stores to ``self._store_path`` (caller holds
-        ``self._lock``, which makes the snapshot point-in-time consistent and
-        serializes concurrent writers).
-
-        Failure is soft: the AS keeps serving from memory — availability over
-        durability — with a one-shot warning so the operator knows
-        restart-survival is off. Writes happen only on state mutations
-        (issuance, rotation, revocation, registration), never on the
-        read-heavy validation path.
-        """
-        if self._store_path is None:
-            return
-        snapshot = {
+    def _snapshot_locked(self) -> dict[str, Any]:
+        """The JSON-clean snapshot of all six stores (caller holds the lock)."""
+        return {
             "version": _STATE_VERSION,
             # redirect_keys are intentionally NOT serialized (derived state,
             # recomputed on load — see _load_state).
@@ -966,8 +1042,35 @@ class _OAuthProvider:
             "consumed_codes": self._consumed_codes,
             "consumed_refresh": self._consumed_refresh,
         }
+
+    def persist_now(self) -> None:
+        """Write the current state immediately, PROPAGATING any failure.
+
+        Called once at startup (after the restore) so a misconfigured
+        --token-store — an unwritable path, an existing directory, an
+        empty-basename path like ``.`` — fails fast at launch instead of
+        degrading silently to in-memory-only at the first token issuance
+        while the startup log claims persistence is on.
+        """
+        with self._lock:
+            if self._store_path is not None:
+                _atomic_write_json_file(self._store_path, self._snapshot_locked())
+
+    def _persist_locked(self) -> None:
+        """Snapshot all six stores to ``self._store_path`` (caller holds
+        ``self._lock``, which makes the snapshot point-in-time consistent and
+        serializes concurrent writers).
+
+        Failure is soft: the AS keeps serving from memory — availability over
+        durability — with a one-shot warning so the operator knows
+        restart-survival is off. Writes happen only on state mutations
+        (issuance, rotation, revocation, registration), never on the
+        read-heavy validation path.
+        """
+        if self._store_path is None:
+            return
         try:
-            _atomic_write_json_file(self._store_path, snapshot)
+            _atomic_write_json_file(self._store_path, self._snapshot_locked())
         except Exception as e:
             if not self._warned_persist_failure:
                 self._warned_persist_failure = True
@@ -2150,8 +2253,9 @@ def serve_main(argv: list[str]) -> None:
             "JSON file (created 0600) so they survive a serve restart. "
             "Without it every restart invalidates all issued tokens and every "
             "connected client must re-authorize. The file is credential "
-            "material -- guard it like a private key. Each serve process "
-            "needs its own path. Requires --enable-oauth."
+            "material — guard it like a private key. Each serve process "
+            "needs its own path (a sidecar .lock refuses accidental "
+            "sharing). Requires --enable-oauth."
         ),
     )
     parser.add_argument(
@@ -2258,15 +2362,24 @@ def serve_main(argv: list[str]) -> None:
         for u in allowed_redirect_uris:
             log(f"note: trusting exact redirect_uri {u!r} in addition to loopback")
         store_path = None
+        store_lock_fd = None  # held (referenced) for the process lifetime
         if args.token_store is not None:
             store_path = Path(args.token_store).expanduser()
             try:
                 # 0o700 like the client token-store directory: the file inside
                 # is credential material, so directories WE create are tight
                 # from the start (a pre-existing parent is left untouched).
-                store_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                _mkdir_private(store_path.parent)
             except OSError as e:
                 parser.error(f"--token-store: cannot create parent directory: {e}")
+            try:
+                store_lock_fd = _acquire_store_lock(store_path)
+            except OSError:
+                parser.error(
+                    f"--token-store: {store_path} is already in use by "
+                    "another serve process (each process needs its own path; "
+                    "sharing one store silently clobbers issued tokens)"
+                )
             log(
                 f"note: persisting issued OAuth state to {store_path} "
                 "(credential material; created 0600)"
@@ -2279,6 +2392,16 @@ def serve_main(argv: list[str]) -> None:
             allowed_redirect_uris=allowed_redirect_uris,
             store_path=store_path,
         )
+        if store_path is not None:
+            oauth._store_lock_fd = store_lock_fd
+            # Fail fast on an unwritable store (existing directory, read-only
+            # filesystem, empty-basename path): the first mutation-time write
+            # would otherwise soft-fail into in-memory-only mode right after
+            # the startup log promised persistence.
+            try:
+                oauth.persist_now()
+            except Exception as e:
+                parser.error(f"--token-store: cannot write {store_path}: {e}")
 
     serve(
         command,

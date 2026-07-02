@@ -2026,3 +2026,94 @@ def test_token_store_removed_allowlist_entry_stops_matching_after_restart(tmp_pa
         "code_challenge": challenge, "code_challenge_method": "S256",
     }, "alice", "https://gw.example")
     assert out["kind"] == "redirect" and "code=" in out["location"]
+
+def test_token_store_tombstone_missing_family_dropped(tmp_path):
+    # A tombstone without the "family" KEY (not merely None) must be dropped
+    # at load: the replay path subscripts tomb["family"], so trusting it
+    # would 500 the token endpoint and skip the family revocation.
+    path = tmp_path / "as-state.json"
+    path.write_text(json.dumps({
+        "version": 1,
+        "consumed_refresh": {
+            "rt-no-family": {"consumed_at": 1000.0, "expires_at": 4102444800.0},
+            "rt-ok": {"family": None, "consumed_at": 1000.0,
+                      "expires_at": 4102444800.0},
+        },
+        "refresh": {
+            "rt-no-resource": {"user": "alice", "client_id": "c", "scope": "",
+                               "family": None, "expires_at": 4102444800.0},
+        },
+    }), encoding="utf-8")
+    p = _provider(store_path=path)
+    assert set(p._consumed_refresh) == {"rt-ok"}
+    # A grant record missing the "resource" KEY is dropped for the same
+    # reason (the refresh path subscripts entry["resource"]).
+    assert p._refresh == {}
+
+
+def test_token_store_persist_now_raises_on_unwritable_path(tmp_path):
+    target = tmp_path / "занято"
+    target.mkdir()  # an existing directory: os.replace onto it must fail
+    p = _provider(store_path=target)
+    with pytest.raises(OSError):
+        p.persist_now()
+
+
+def test_token_store_persist_now_creates_file_at_startup(tmp_path):
+    path = tmp_path / "as-state.json"
+    p = _provider(store_path=path)
+    p.persist_now()
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 1
+
+
+def test_serve_main_token_store_unwritable_fails_fast(tmp_path):
+    # A --token-store pointing at an existing directory must abort startup
+    # (parser.error), not silently run in-memory-only after logging that
+    # persistence is on.
+    target = tmp_path / "state-dir"
+    target.mkdir()
+    with pytest.raises(SystemExit):
+        server.serve_main([
+            "--enable-oauth", "--dev-user", "a",
+            "--token-store", str(target), "--", "true",
+        ])
+
+
+@pytest.mark.skipif(
+    not hasattr(server.os, "O_NOFOLLOW") and sys.platform != "win32",
+    reason="needs an advisory-lock primitive",
+)
+def test_token_store_sidecar_lock_refuses_second_holder(tmp_path):
+    path = tmp_path / "as-state.json"
+    fd1 = server._acquire_store_lock(path)
+    if fd1 is None:
+        pytest.skip("no lock primitive on this platform")
+    try:
+        with pytest.raises(OSError):
+            server._acquire_store_lock(path)
+    finally:
+        os.close(fd1)
+    # Released: a new holder succeeds.
+    fd2 = server._acquire_store_lock(path)
+    assert fd2 is not None
+    os.close(fd2)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_token_store_mkdir_private_tightens_intermediates(tmp_path):
+    deep = tmp_path / "a" / "b" / "c"
+    server._mkdir_private(deep)
+    for d in (tmp_path / "a", tmp_path / "a" / "b", deep):
+        assert stat.S_IMODE(os.stat(d).st_mode) == 0o700
+
+
+def test_token_store_allowlist_drop_warning_names_client(tmp_path, capsys):
+    path = tmp_path / "as-state.json"
+    allowed = "https://client.example/cb"
+    p1 = _provider(store_path=path, allowed_redirect_uris=frozenset({allowed}))
+    status, reg = p1.register(json.dumps({"redirect_uris": [allowed]}).encode())
+    assert status == 201
+    _provider(store_path=path)  # restart without the allowlist entry
+    err = capsys.readouterr().err
+    assert "dropping persisted client registration" in err
+    assert reg["client_id"] in err

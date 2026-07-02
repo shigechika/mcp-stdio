@@ -361,7 +361,11 @@ separator is supported).
     vanish). Refresh-token reuse detection and grant-family revocation
     survive the restart too — the consumption ledger is part of the persisted
     state. The file is credential material: guard it like a private key, and
-    give each `serve` process its own path. Requires `--enable-oauth` (#277).
+    give each `serve` process its own path — a sidecar `.lock` file refuses a
+    second process at startup (sharing one store would silently clobber
+    issued tokens), and the path is probe-written at launch so a
+    misconfigured target fails the start instead of silently disabling
+    persistence. Requires `--enable-oauth` (#277).
   - *Path-scoped issuer* — `--public-url` retains a path, so several
     `--enable-oauth` backends can share one host behind a reverse proxy, each
     under its own prefix (e.g. `--public-url https://gw.example.org/team-a`
