@@ -2754,6 +2754,38 @@ class TestParseWwwAuthenticateScope:
         header = 'Basic realm="private"'
         assert _parse_www_authenticate_scope(header) is None
 
+    def test_decoy_param_before_real_scope(self):
+        """A param name merely ending in "scope" must not shadow the real one.
+
+        Same defect class as modelcontextprotocol/python-sdk#3009: without a
+        token boundary, error_scope="decoy" satisfies the scope= pattern first.
+        """
+        header = (
+            'Bearer error="insufficient_scope", error_scope="decoy", '
+            'scope="mcp:read hr:read"'
+        )
+        assert _parse_www_authenticate_scope(header) == "mcp:read hr:read"
+
+    def test_decoy_param_only_is_not_scope(self):
+        """error_scope alone must not be mistaken for a scope parameter."""
+        header = 'Bearer error="insufficient_scope", error_scope="decoy"'
+        assert _parse_www_authenticate_scope(header) is None
+
+    def test_unquoted_decoy_param_before_real_scope(self):
+        """Unquoted form: error_scope=decoy must not shadow scope=mcp:read."""
+        header = "Bearer error=insufficient_scope, error_scope=decoy, scope=mcp:read"
+        assert _parse_www_authenticate_scope(header) == "mcp:read"
+
+    def test_decoy_error_param_not_triggered(self):
+        """my_error="insufficient_scope" is not the error parameter."""
+        header = 'Bearer my_error="insufficient_scope", scope="mcp:read"'
+        assert _parse_www_authenticate_scope(header) is None
+
+    def test_error_value_prefix_not_matched(self):
+        """error="insufficient_scope_extended" is a different error code."""
+        header = 'Bearer error="insufficient_scope_extended", scope="mcp:read"'
+        assert _parse_www_authenticate_scope(header) is None
+
 
 class TestStepUpScopeChallenge:
     """403 insufficient_scope handling in run()."""

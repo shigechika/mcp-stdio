@@ -5401,6 +5401,37 @@ class TestParseResourceMetadataHint:
         header = "Basic realm=example"
         assert _parse_resource_metadata_hint(header) is None
 
+    def test_decoy_param_before_real_value(self):
+        """A param name merely ending in "resource_metadata" must not win.
+
+        Same defect class as modelcontextprotocol/python-sdk#3009: without a
+        token boundary, x_resource_metadata= satisfies the pattern first.
+        """
+        header = (
+            'Bearer x_resource_metadata="https://decoy.example.com/prm", '
+            'resource_metadata="https://resource.example.com/prm"'
+        )
+        assert (
+            _parse_resource_metadata_hint(header)
+            == "https://resource.example.com/prm"
+        )
+
+    def test_decoy_param_only_returns_none(self):
+        """x_resource_metadata alone is not a resource_metadata hint."""
+        header = 'Bearer x_resource_metadata="https://decoy.example.com/prm"'
+        assert _parse_resource_metadata_hint(header) is None
+
+    def test_unquoted_decoy_param_before_real_value(self):
+        """Unquoted form: the decoy param must not shadow the real one."""
+        header = (
+            "Bearer x_resource_metadata=https://decoy.example.com/prm, "
+            "resource_metadata=https://resource.example.com/prm"
+        )
+        assert (
+            _parse_resource_metadata_hint(header)
+            == "https://resource.example.com/prm"
+        )
+
 
 # --- _validate_prm_hint_url ---
 

@@ -314,8 +314,11 @@ def _validate_auth_server_url(auth_server_url: str, mcp_server_url: str) -> bool
     return True
 
 
-_RESOURCE_METADATA_QUOTED_RE = re.compile(r'resource_metadata\s*=\s*"([^"]+)"')
-_RESOURCE_METADATA_UNQUOTED_RE = re.compile(r"resource_metadata\s*=\s*([^\s,\"]+)")
+# (?<![\w-]) rejects a longer auth-param name that merely ends in the target
+# (x_resource_metadata= must not satisfy resource_metadata=). Same defect
+# class as modelcontextprotocol/python-sdk#3009.
+_RESOURCE_METADATA_QUOTED_RE = re.compile(r'(?<![\w-])resource_metadata\s*=\s*"([^"]+)"')
+_RESOURCE_METADATA_UNQUOTED_RE = re.compile(r"(?<![\w-])resource_metadata\s*=\s*([^\s,\"]+)")
 
 
 def _parse_resource_metadata_hint(header: str | None) -> str | None:

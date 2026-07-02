@@ -612,9 +612,13 @@ class _StreamResult:
         self.retry_after = retry_after
 
 
-_INSUFFICIENT_SCOPE_RE = re.compile(r'error\s*=\s*"?insufficient_scope"?')
-_SCOPE_QUOTED_RE = re.compile(r'scope\s*=\s*"([^"]*)"')
-_SCOPE_UNQUOTED_RE = re.compile(r'scope\s*=\s*([^,\s]+)')
+# (?<![\w-]) rejects a longer auth-param name that merely ends in the target
+# (error_scope= must not satisfy scope=); (?![\w-]) likewise stops the value
+# match at a token boundary (insufficient_scope_extended is not a match).
+# Same defect class as modelcontextprotocol/python-sdk#3009.
+_INSUFFICIENT_SCOPE_RE = re.compile(r'(?<![\w-])error\s*=\s*"?insufficient_scope"?(?![\w-])')
+_SCOPE_QUOTED_RE = re.compile(r'(?<![\w-])scope\s*=\s*"([^"]*)"')
+_SCOPE_UNQUOTED_RE = re.compile(r'(?<![\w-])scope\s*=\s*([^,\s]+)')
 
 
 def _parse_www_authenticate_scope(header: str | None) -> str | None:
