@@ -1553,6 +1553,57 @@ def test_register_still_rejects_non_allowlisted_https_redirect():
         assert r.json()["error"] == "invalid_redirect_uri"
 
 
+def test_register_logs_rejected_redirect_uri(capsys):
+    """#286: a rejected DCR redirect_uri is logged so an operator can see exactly
+    what to allowlist -- the wire response is only an opaque 400."""
+    prov = _provider(allowed_redirect_uris=frozenset({_ALLOWED_HTTPS}))
+    rejected = "https://evil.example.com/callback"
+    status, body = prov.register(json.dumps({"redirect_uris": [rejected]}).encode())
+    assert status == 400
+    assert body["error"] == "invalid_redirect_uri"
+    err = capsys.readouterr().err
+    assert "rejected DCR redirect_uri" in err
+    assert rejected in err
+
+
+def test_rejected_redirect_uri_log_is_crlf_safe(capsys):
+    """#286: a CR/LF-bearing redirect_uri is escaped (repr), so it cannot forge a
+    second log line (log injection)."""
+    prov = _provider()
+    status, _ = prov.register(
+        json.dumps({"redirect_uris": ["https://evil.example/a\r\nINJECTED line"]}).encode()
+    )
+    assert status == 400
+    err = capsys.readouterr().err
+    injected_lines = [ln for ln in err.splitlines() if "INJECTED" in ln]
+    # The raw newline is escaped, so INJECTED stays on the warning line rather
+    # than starting a forged line of its own.
+    assert injected_lines
+    assert all("rejected DCR redirect_uri" in ln for ln in injected_lines)
+
+
+def test_authorize_logs_rejected_redirect_uri(capsys):
+    """#286: the /authorize path also logs a rejected redirect_uri (registered a
+    client, then authorized with a different, non-allowlisted redirect_uri)."""
+    prov = _provider()
+    status, reg = prov.register(json.dumps({"redirect_uris": [_REDIRECT]}).encode())
+    assert status == 201
+    capsys.readouterr()  # drop registration output
+    mismatched = "https://evil.example.com/callback"
+    out = prov.authorize(
+        {
+            "client_id": reg["client_id"], "response_type": "code",
+            "redirect_uri": mismatched, "code_challenge": "x",
+            "code_challenge_method": "S256",
+        },
+        "alice", "https://gw.example",
+    )
+    assert out["kind"] == "bad_request"
+    err = capsys.readouterr().err
+    assert "rejected authorize redirect_uri" in err
+    assert mismatched in err
+
+
 def test_authorize_and_token_exchange_succeed_for_allowlisted_https_redirect():
     with _run(oauth=_provider(allowed_redirect_uris=frozenset({_ALLOWED_HTTPS}))) as (base, _):
         cid, verifier, challenge, code, tok = _full_flow(base, redirect=_ALLOWED_HTTPS)
