@@ -74,6 +74,24 @@ itself expires or is revoked.
 Every flag: `mcp-stdio --help`, or the
 [README](https://github.com/shigechika/mcp-stdio#readme).
 
+## Example: Xquik
+
+Xquik is a remote X/Twitter MCP server for search, extraction, account
+monitoring, webhooks, and write workflows. It uses the static bearer-token
+path, so check it first with:
+
+```bash
+MCP_BEARER_TOKEN=YOUR_XQUIK_API_KEY mcp-stdio --check https://xquik.com/mcp
+```
+
+Claude Code:
+
+```bash
+claude mcp add xquik \
+  -e MCP_BEARER_TOKEN=YOUR_XQUIK_API_KEY \
+  -- mcp-stdio https://xquik.com/mcp
+```
+
 ## Troubleshooting quickies
 
 - **Browser never opens** — the authorize URL is printed to stderr; open it

@@ -74,6 +74,24 @@ OAuth ログイン、トークン交換、MCP `initialize` の往復——そし
 全フラグは `mcp-stdio --help` か
 [README](https://github.com/shigechika/mcp-stdio#readme) へ。
 
+## 例：Xquik
+
+Xquik は X/Twitter の検索、抽出、アカウント監視、webhook、投稿ワークフローに
+対応するリモート MCP サーバーです。静的 Bearer トークンの経路を使うため、
+まず次のように確認します：
+
+```bash
+MCP_BEARER_TOKEN=YOUR_XQUIK_API_KEY mcp-stdio --check https://xquik.com/mcp
+```
+
+Claude Code：
+
+```bash
+claude mcp add xquik \
+  -e MCP_BEARER_TOKEN=YOUR_XQUIK_API_KEY \
+  -- mcp-stdio https://xquik.com/mcp
+```
+
 ## トラブルシュートの早見
 
 - **ブラウザが開かない** — authorize URL は stderr に出力されています。
