@@ -654,6 +654,20 @@ def _match_key(uri: str, allowed_redirects: frozenset[str]) -> tuple[Any, ...] |
     return None
 
 
+def _log_safe_uri(value: Any, *, max_len: int = 200) -> str:
+    """Render a client-proposed redirect_uri for a diagnostic log line.
+
+    ``repr`` escapes control characters (CR/LF in particular) so a hostile value
+    cannot inject a forged log line, while keeping the URL human-readable so an
+    operator can copy it into ``--allow-redirect-uri``. The length bound stops a
+    client writing an unbounded line. A rejected redirect_uri is not a secret and
+    not an issued credential, so surfacing it leaks nothing (#286).
+    """
+    if isinstance(value, str) and len(value) > max_len:
+        value = value[:max_len] + "..."
+    return repr(value)[:max_len + 8]
+
+
 def _normalize_public_url(url: str) -> str:
     """Normalize --public-url to a canonical issuer ``scheme://host[:port][/path]``.
 
@@ -1134,6 +1148,15 @@ class _OAuthProvider:
         for u in uris:
             key = _match_key(u, self.allowed_redirect_uris) if isinstance(u, str) else None
             if key is None:
+                # Surface the rejected value so an operator can see exactly what to
+                # allowlist. Without this the client only gets an opaque 400 and the
+                # server logs a bare status line, leaving the offending redirect_uri
+                # invisible (#286). It is client-proposed and non-secret.
+                log(
+                    f"warning: rejected DCR redirect_uri {_log_safe_uri(u)}: "
+                    "not an RFC 8252 loopback URI and not in the "
+                    "--allow-redirect-uri allowlist"
+                )
                 return bad_redirect(_redirect_err)
             keys.add(key)
         client_id = secrets.token_urlsafe(32)
@@ -1180,6 +1203,14 @@ class _OAuthProvider:
             return {"kind": "bad_request", "message": "unknown or missing client_id"}
         rk = _match_key(redirect_uri, self.allowed_redirect_uris)
         if rk is None or rk not in client["redirect_keys"]:
+            # Same diagnostic as register() for the /authorize path (#286): the
+            # redirect_uri is not registered for this client or no longer matches
+            # the allowlist. Value is client-proposed and non-secret.
+            log(
+                f"warning: rejected authorize redirect_uri {_log_safe_uri(redirect_uri)} "
+                f"for client {cid[:8]}...: not registered for this client or not in "
+                "the --allow-redirect-uri allowlist"
+            )
             return {"kind": "bad_request", "message": "invalid redirect_uri"}
 
         state = params.get("state", "")
