@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.26.0](https://github.com/shigechika/mcp-stdio/compare/v0.25.1...v0.26.0) (2026-07-04)
+
+
+### Features
+
+* **serve:** log the rejected redirect_uri on invalid_redirect_uri ([#287](https://github.com/shigechika/mcp-stdio/issues/287)) ([cc9b0bb](https://github.com/shigechika/mcp-stdio/commit/cc9b0bbb6936839225906345b07d01277adab7d1))
+
 ## [0.25.1](https://github.com/shigechika/mcp-stdio/compare/v0.25.0...v0.25.1) (2026-07-02)
 
 
