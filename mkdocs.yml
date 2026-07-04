@@ -62,3 +62,5 @@ nav:
   - Guides:
       - Connect to a remote MCP server: guides/connect-remote.md
       - Publish your stdio server: guides/serve.md
+  - Troubleshooting: troubleshooting.md
+  - Reference: reference.md
