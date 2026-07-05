@@ -66,7 +66,7 @@ OAuth ログイン、トークン交換、MCP `initialize` の往復——そし
 |---|---|
 | OAuth なし、静的 Bearer トークン | `MCP_BEARER_TOKEN=… mcp-stdio https://…/mcp` |
 | スコープを追加したい | `--oauth-scope "openid offline_access mcp:tools"` |
-| このマシンにブラウザがない（SSH 先、コンテナ） | `--oauth-device` — 手元のスマホ / PC でユーザーコードを入力してログイン |
+| このマシンにブラウザがない（SSH 先、コンテナ） | `--oauth-device` — [ヘッドレスログイン](device-flow.ja.md)を参照 |
 | サーバーが OIDC の `id_token` を要求する（Google IAP、AWS） | `--oauth-use-id-token` |
 | legacy SSE サーバー（2024-11-05 トランスポート） | `--transport sse` |
 | 社内プロキシ | 標準の `HTTPS_PROXY` / `NO_PROXY` 環境変数がそのまま効きます |

@@ -61,6 +61,7 @@ nav:
   - Two ways to use it: modes.md
   - Guides:
       - Connect to a remote MCP server: guides/connect-remote.md
+      - Headless login (device flow): guides/device-flow.md
       - Publish your stdio server: guides/serve.md
   - Troubleshooting: troubleshooting.md
   - Reference: reference.md

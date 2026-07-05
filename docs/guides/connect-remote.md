@@ -66,7 +66,7 @@ itself expires or is revoked.
 |---|---|
 | Static bearer token, no OAuth | `MCP_BEARER_TOKEN=… mcp-stdio https://…/mcp` |
 | Extra scopes | `--oauth-scope "openid offline_access mcp:tools"` |
-| No browser on this machine (SSH box, container) | `--oauth-device` — login happens on your phone/laptop via a user code |
+| No browser on this machine (SSH box, container) | `--oauth-device` — see [Headless login](device-flow.md) |
 | The server insists on the OIDC `id_token` (Google IAP, AWS) | `--oauth-use-id-token` |
 | Legacy SSE server (2024-11-05 transport) | `--transport sse` |
 | Corporate proxy | honored via standard `HTTPS_PROXY` / `NO_PROXY` env vars |
