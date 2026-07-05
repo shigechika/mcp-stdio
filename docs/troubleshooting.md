@@ -179,7 +179,7 @@ Use the Device Authorization Grant (RFC 8628) instead:
 mcp-stdio --oauth-device https://your-server.example.com/mcp
 ```
 
-This prints a user code (e.g., `ABCD-1234`). Open it in your browser on any device and confirm. After that, mcp-stdio completes the OAuth flow on the SSH box without needing a local display.
+This prints a user code (e.g., `ABCD-1234`). Open it in your browser on any device and confirm. After that, mcp-stdio completes the OAuth flow on the SSH box without needing a local display. See [Headless login](guides/device-flow.md) for the full walkthrough, including how long you have to confirm and what happens if you don't.
 
 ## Still stuck?
 

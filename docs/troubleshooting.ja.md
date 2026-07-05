@@ -179,7 +179,7 @@ Claude Code の [#34498](https://github.com/anthropics/claude-code/issues/34498)
 mcp-stdio --oauth-device https://your-server.example.com/mcp
 ```
 
-ユーザーコード（例：`ABCD-1234`）が出力されます。任意のデバイスのブラウザでそれを開いて確認します。その後、mcp-stdio は SSH ボックスで OAuth フローを完了します（ローカルディスプレイは不要）。
+ユーザーコード（例：`ABCD-1234`）が出力されます。任意のデバイスのブラウザでそれを開いて確認します。その後、mcp-stdio は SSH ボックスで OAuth フローを完了します（ローカルディスプレイは不要）。承認までの制限時間やタイムアウト時の挙動を含む完全な手順は[ヘッドレスログイン](guides/device-flow.ja.md)を参照してください。
 
 ## それでも解決しない場合
 
