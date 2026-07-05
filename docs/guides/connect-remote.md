@@ -78,8 +78,9 @@ Every flag: `mcp-stdio --help`, or the
 
 - **Browser never opens** — the authorize URL is printed to stderr; open it
   manually (the client's MCP log shows it).
-- **Login loops or `AADSTS…` errors on Microsoft Entra ID** — set an explicit
-  `--oauth-scope`; see the WORKAROUNDS entries for the exact error code.
+- **`AADSTS9010010` on Microsoft Entra ID** — some Entra ID configurations
+  reject the `resource` parameter outright; add `--no-resource-indicator`.
+  See [Troubleshooting](../troubleshooting.md#aadsts9010010-on-microsoft-entra-id).
 - **Worked yesterday, `401` today** — the server may have rotated its keys or
   revoked the grant. Delete the server's entry from
   `~/.config/mcp-stdio/tokens.json` and let it re-authorize.

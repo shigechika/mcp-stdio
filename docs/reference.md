@@ -20,7 +20,7 @@ Arguments:
 | `--oauth-device` | — | Enable OAuth 2.1 Device Authorization Grant (RFC 8628, headless) |
 | `--client-id ID` | `MCP_OAUTH_CLIENT_ID` | Pre-registered OAuth client ID (skips Dynamic Client Registration) |
 | `--client-metadata-url URL` | — | HTTPS URL of a Client ID Metadata Document to use as client_id instead of DCR |
-| `--oauth-scope SCOPE` | — | OAuth scope to request (repeatable) |
+| `--oauth-scope SCOPE` | — | OAuth scope(s) to request, space-separated in one value (e.g. `"openid offline_access"`) |
 | `--oauth-use-id-token` | — | Present the OIDC id_token as the Bearer credential instead of access_token (AWS Bedrock / Cognito) |
 | `--oauth-eager` | — | Cold-start: answer initialize locally and run interactive OAuth in the background, so a long login does not exceed the client's ~60 s timeout |
 | `--oauth-refresh-leeway SECONDS` | `MCP_OAUTH_REFRESH_LEEWAY` | Proactively refresh tokens this many seconds before expiry (default: 60) |
@@ -113,10 +113,9 @@ mcp-stdio implements the following specifications:
 
 ### MCP (Model Context Protocol)
 
-- [MCP 2025-11-25 Specification](https://modelcontextprotocol.io/specification/2025-11-25/)
-  - Streamable HTTP transport (current)
-  - SSE transport (legacy, MCP 2024-11-05)
-  - Authorization spec
+- Streamable HTTP transport (current, spec rev 2025-06-18) — negotiated `MCP-Protocol-Version` is captured from `initialize` and sent on every subsequent request
+- SSE transport (legacy, MCP 2024-11-05)
+- Client ID Metadata Documents (MCP 2025-11-25 draft extension) — see the OAuth section below
 
 ### OAuth 2.1 & OpenID Connect
 
@@ -158,8 +157,8 @@ mcp-stdio implements the following specifications:
 
 ### HTTP & Resilience
 
-- [RFC 7230](https://www.rfc-editor.org/rfc/rfc7230) HTTP/1.1 Message Syntax and Routing
-  - Retry-After header parsing (delta-seconds and HTTP-date formats)
+- [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110) HTTP Semantics
+  - §10.2.3 `Retry-After` header parsing (delta-seconds and HTTP-date formats; formerly RFC 7231 §7.1.3)
 
 - HTTP 429 (Too Many Requests) and 503 (Service Unavailable) — honors Retry-After up to 60 seconds
 
@@ -211,13 +210,13 @@ mcp-stdio works around these issues at the wire level where possible.
 | Code | Meaning |
 |------|---------|
 | `0` | Success |
-| `1` | General error (invalid arguments, connection failure, etc.) |
-| `2` | OAuth timeout or user cancelled |
+| `1` | Runtime error (connection failure, OAuth authentication failure, misconfiguration detected at startup) |
+| `2` | Invalid command-line arguments (standard `argparse` usage error) |
+| `130` | Interrupted (Ctrl-C / `SIGINT`) |
 
 ---
 
 ## Logging
 
-- All errors and diagnostics are written to stderr
-- Requests to the remote server are logged with query strings redacted
-- Token exchange details are logged in verbose output
+- All diagnostics are written to stderr. The relay's own connection/retry/reconnect messages are prefixed `[mcp-stdio]`; startup and OAuth error/warning messages print as bare `error: ...` / `warning: ...` lines instead
+- There is currently no separate verbose/debug logging mode — the stderr output above is all there is

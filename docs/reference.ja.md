@@ -20,7 +20,7 @@ Arguments:
 | `--oauth-device` | — | OAuth 2.1 デバイス認可グラント（RFC 8628、ヘッドレス） |
 | `--client-id ID` | `MCP_OAUTH_CLIENT_ID` | 事前登録済み OAuth クライアント ID（Dynamic Client Registration をスキップ） |
 | `--client-metadata-url URL` | — | Dynamic Client Registration の代わりに使用するクライアント ID メタデータドキュメントの HTTPS URL |
-| `--oauth-scope SCOPE` | — | リクエストする OAuth スコープ（繰り返し可能） |
+| `--oauth-scope SCOPE` | — | リクエストする OAuth スコープ。複数指定する場合は1つの値の中でスペース区切り（例：`"openid offline_access"`） |
 | `--oauth-use-id-token` | — | アクセストークンの代わりに OIDC id_token をベアラー認証情報として提示（AWS Bedrock / Cognito） |
 | `--oauth-eager` | — | コールドスタート：initialize をローカルで応答し、バックグラウンドでインタラクティブ OAuth を実行。長いログインがクライアントの約 60 秒のタイムアウトを超えない |
 | `--oauth-refresh-leeway SECONDS` | `MCP_OAUTH_REFRESH_LEEWAY` | トークン有効期限の何秒前にプロアクティブにリフレッシュするか（デフォルト: 60） |
@@ -113,10 +113,9 @@ mcp-stdio は以下の仕様を実装しています：
 
 ### MCP（Model Context Protocol）
 
-- [MCP 2025-11-25 仕様](https://modelcontextprotocol.io/specification/2025-11-25/)
-  - Streamable HTTP トランスポート（現在）
-  - SSE トランスポート（レガシー、MCP 2024-11-05）
-  - 認可仕様
+- Streamable HTTP トランスポート（現行、spec rev 2025-06-18）— `initialize` でネゴシエートされた `MCP-Protocol-Version` を以後のすべてのリクエストに付与
+- SSE トランスポート（レガシー、MCP 2024-11-05）
+- クライアント ID メタデータドキュメント（MCP 2025-11-25 のドラフト拡張）— 詳細は下記 OAuth セクションを参照
 
 ### OAuth 2.1 & OpenID Connect
 
@@ -158,8 +157,8 @@ mcp-stdio は以下の仕様を実装しています：
 
 ### HTTP & レジリエンス
 
-- [RFC 7230](https://www.rfc-editor.org/rfc/rfc7230) HTTP/1.1 メッセージ構文とルーティング
-  - Retry-After ヘッダーの解析（delta-seconds および HTTP-date 形式）
+- [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110) HTTP セマンティクス
+  - §10.2.3 `Retry-After` ヘッダーの解析（delta-seconds および HTTP-date 形式；旧 RFC 7231 §7.1.3）
 
 - HTTP 429（Too Many Requests）および 503（Service Unavailable）— 最大 60 秒まで Retry-After を尊重
 
@@ -211,13 +210,13 @@ mcp-stdio は可能な限りワイヤーレベルでこれらの問題を回避�
 | コード | 意味 |
 |--------|------|
 | `0` | 成功 |
-| `1` | 一般エラー（無効な引数、接続失敗など） |
-| `2` | OAuth タイムアウトまたはユーザーがキャンセル |
+| `1` | 実行時エラー（接続失敗、OAuth 認証失敗、起動時に検出された設定不備など） |
+| `2` | コマンドライン引数が不正（標準的な `argparse` の使用方法エラー） |
+| `130` | 中断（Ctrl-C / `SIGINT`） |
 
 ---
 
 ## ログ
 
-- すべてのエラーと診断情報は stderr に書き込まれます
-- リモートサーバーへのリクエストはクエリ文字列を編集してログされます
-- トークン交換の詳細は詳細出力でログされます
+- 診断情報はすべて stderr に書き込まれます。relay 自身の接続・リトライ・再接続メッセージには `[mcp-stdio]` プレフィックスが付きますが、起動時や OAuth のエラー・警告メッセージは `error: ...` / `warning: ...` という素のプレフィックスで出力されます
+- 現時点で個別の verbose/debug ログモードはありません — 上記の stderr 出力がすべてです
