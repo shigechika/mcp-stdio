@@ -29,21 +29,23 @@ Uses **hatchling** as the build backend (`build-backend = "hatchling.build"` in 
 
 ## Architecture
 
-A minimal stdio-to-HTTP gateway for MCP (Model Context Protocol) servers — translates between stdio JSON-RPC framing and the two MCP HTTP transports (Streamable HTTP and legacy SSE). Only runtime dependency is **httpx**.
+A bidirectional stdio ↔ HTTP gateway for MCP (Model Context Protocol) servers — translates between stdio JSON-RPC framing and MCP HTTP transports (Streamable HTTP and legacy SSE). Supports both client mode (relaying requests to remote servers) and server mode (exposing local servers over HTTP). Minimal runtime dependencies.
 
 Four modules under `src/mcp_stdio/`:
 
 - **`relay.py`** — Two transport implementations sharing stdin/stdout plumbing (file name kept for import compatibility):
-  - `run()` — Streamable HTTP transport (MCP current spec, default). Reads JSON-RPC from stdin line-by-line, streams POST to the remote URL via httpx, parses JSON or SSE responses, writes to stdout. Handles retry with backoff (3 attempts), session ID tracking (`Mcp-Session-Id` header), 404-based session recovery, and 401-based token refresh.
-  - `run_sse()` — SSE transport (MCP 2024-11-05 legacy). Spawns a daemon reader thread that maintains a long-lived `GET /sse` connection, parses `endpoint`/`message` events per the WHATWG SSE spec, and resolves the POST endpoint URL (possibly relative). The main thread reads stdin and POSTs to that endpoint. Auto-reconnects on stream disconnect, synthesizing a `-32000` error for every request whose reply was still in flight on the dropped stream (tracked in `_SseState.pending`, drained by `_drain_pending`; cancelled ids are skipped).
-  - Both paths enforce the MCP cancellation spec's receiver-side SHOULD (and shield the client from canceller-side bugs) via a shared `_CancelTracker` + `_emit` gate: ids seen in `notifications/cancelled` on stdin are tracked with a 60 s TTL, and any late JSON-RPC response for a tracked id is dropped before it reaches stdout. Disable with `--no-cancel-filter`.
-  - Signal handlers (`signal.signal`) are set from the main thread only — the SSE reader runs in a daemon thread so pytest tests must drive `run_sse` from the main thread.
-- **`cli.py`** — argparse-based CLI. Builds headers, resolves `MCP_BEARER_TOKEN` / `MCP_OAUTH_CLIENT_ID` env vars, runs the OAuth flow before relay if `--oauth` or `--oauth-device` is set, and dispatches to `run()` or `run_sse()` based on `--transport`.
-- **`oauth.py`** — OAuth 2.1 client: RFC 9728/8414 discovery, RFC 7591 dynamic client registration, RFC 7636 PKCE, RFC 8707 resource indicators, authorization code flow with localhost callback server, RFC 8628 device authorization grant, RFC 9470 step-up authorization, token exchange and refresh.
-- **`token_store.py`** — Token persistence in `~/.config/mcp-stdio/tokens.json` (0o600). Stores per-server-URL tokens with client credentials and endpoint URLs for refresh. Migrates legacy `~/.mcp-stdio/` tokens on first read.
+  - `run()` — Streamable HTTP transport (MCP current spec, default). Reads JSON-RPC from stdin line-by-line, streams POST to the remote URL via httpx, parses JSON or SSE responses, writes to stdout
+  - `run_sse()` — SSE transport (MCP 2024-11-05 legacy). Spawns a daemon reader thread that maintains a long-lived `GET /sse` connection, parses `endpoint`/`message` events per the WHATWG SSE spec, writes to stdout
+  - Both paths enforce the MCP cancellation spec's receiver-side SHOULD (and shield the client from canceller-side bugs) via a shared `_CancelTracker` + `_emit` gate: ids seen in `notifications/cancelled` are tracked and late responses are dropped before reaching the client
+  - Signal handlers (`signal.signal`) are set from the main thread only — the SSE reader runs in a daemon thread so pytest tests must drive `run_sse` from the main thread
+- **`cli.py`** — argparse-based CLI for client mode. Builds headers, resolves `MCP_BEARER_TOKEN` / `MCP_OAUTH_CLIENT_ID` env vars, runs the OAuth flow before relay if `--oauth` or `--oauth-device` is set, dispatches to `relay.run()` or `relay.run_sse()` based on `--transport`
+- **`serve_cli.py`** — argparse-based CLI for server mode. Spawns a local stdio MCP server as a child process and exposes it over HTTP with optional Bearer token or embedded OAuth 2.1 AS; supports multi-session isolation and per-user binding when OAuth is enabled
+- **`serve.py`** — HTTP server (stdlib `http.server`). Implements Streamable HTTP request/response semantics, session management (`Mcp-Session-Id`), per-session child process spawning, optional Bearer token validation, and embedded OAuth 2.1 AS (PKCE, DCR, refresh, RFC 9728 Protected Resource Metadata, RFC 8707 resource indicators, RFC 9207 iss parameter)
+- **`oauth.py`** — OAuth 2.1 client: RFC 9728/8414 discovery, RFC 7591 dynamic client registration, RFC 7636 PKCE, RFC 8707 resource indicators, authorization code flow with localhost callback support, RFC 8628 device authorization grant, token refresh, and proactive refresh
+- **`token_store.py`** — Token persistence in `~/.config/mcp-stdio/tokens.json` (0o600). Stores per-server-URL tokens with client credentials and endpoint URLs for refresh. Migrates legacy `~/.mcp-stdio/tokens.json`
 
-Entry point: `mcp-stdio` command → `mcp_stdio.cli:main`.
+Entry point: `mcp-stdio` command → `mcp_stdio.cli:main` (client mode) or `mcp-stdio serve` → `mcp_stdio.serve_cli:main` (server mode).
 
 ## Release
 
-Releases are driven by **release-please** (Conventional Commits) — do not tag `v*` by hand. Pushing commits to `main` updates a standing "release PR" that bumps `__version__` (`src/mcp_stdio/__init__.py`) and `CHANGELOG.md`. Merging that PR creates the `v*` tag and a GitHub Release (via a PAT so downstream workflows fire). The `release: published` event then runs the publish pipeline: test → build → TestPyPI → PyPI → MCP Registry → GitHub Release assets → Homebrew tap update. The `server.json` version is patched from the git tag at publish time.
+Releases are driven by **release-please** (Conventional Commits) — do not tag `v*` by hand. Pushing commits to `main` updates a standing "release PR" that bumps `__version__` (`src/mcp_stdio/__init__.py`) and generates a changelog entry.
