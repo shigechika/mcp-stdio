@@ -4495,23 +4495,39 @@ class TestCheckConnectionSse:
 
     def test_sse_server_notification_before_response_is_skipped(self, httpx_mock):
         """A server-initiated notification on the stream is not mistaken for the
-        initialize response — the probe keeps reading until the real result."""
+        initialize response — the probe keeps reading until the real result.
+
+        The stream holds the final INIT_RESULT event until the endpoint POST
+        has been observed, so the mocked POST is deterministically requested
+        before check_connection returns and closes the client. Without this,
+        the reader thread could reach INIT_RESULT and return before the
+        background POST thread's request landed, leaving the POST mock
+        'mocked but not requested' — a flaky pytest_httpx teardown error
+        (intermittently failed CI on windows-latest, see issue #300)."""
+        post_attempted = threading.Event()
         notif = '{"jsonrpc":"2.0","method":"notifications/message","params":{}}'
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages\n\n"
+            yield f"event: message\ndata: {notif}\n\n".encode()
+            post_attempted.wait(timeout=3)
+            yield f"event: message\ndata: {self._INIT_RESULT}\n\n".encode()
+
         httpx_mock.add_response(
             url=self.SSE_URL,
             method="GET",
-            stream=IteratorStream(
-                [
-                    b"event: endpoint\ndata: /messages\n\n",
-                    f"event: message\ndata: {notif}\n\n".encode(),
-                    f"event: message\ndata: {self._INIT_RESULT}\n\n".encode(),
-                ]
-            ),
+            stream=IteratorStream(sse_gen()),
             headers={"content-type": "text/event-stream"},
         )
-        httpx_mock.add_response(
-            url="https://example.com/messages", method="POST", status_code=202
+
+        def on_post(request: httpx.Request) -> httpx.Response:
+            post_attempted.set()
+            return httpx.Response(status_code=202)
+
+        httpx_mock.add_callback(
+            on_post, url="https://example.com/messages", method="POST"
         )
+
         assert (
             check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
             is True
