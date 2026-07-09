@@ -4524,7 +4524,9 @@ class TestCheckConnectionSse:
             post_attempted.set()
             return httpx.Response(status_code=202)
 
-        httpx_mock.add_callback(on_post, url="https://example.com/messages")
+        httpx_mock.add_callback(
+            on_post, url="https://example.com/messages", method="POST"
+        )
 
         assert (
             check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
