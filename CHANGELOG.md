@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.26.1](https://github.com/shigechika/mcp-stdio/compare/v0.26.0...v0.26.1) (2026-07-09)
+
+
+### Bug Fixes
+
+* synchronize POST thread in flaky SSE notification test ([#301](https://github.com/shigechika/mcp-stdio/issues/301)) ([527308d](https://github.com/shigechika/mcp-stdio/commit/527308d47c858fc2871a502dd65018f9fc071fd9))
+
 ## [0.26.0](https://github.com/shigechika/mcp-stdio/compare/v0.25.1...v0.26.0) (2026-07-04)
 
 
