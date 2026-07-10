@@ -113,6 +113,28 @@ def test_no_cross_session_id_leak(gateway):
     assert ra["result"]["pid"] != rb["result"]["pid"]
 
 
+def test_reused_id_same_session_no_cross_wire(gateway):
+    # A client that reuses JSON-RPC id=1 across sequential requests on ONE
+    # session (claude-ai-mcp#539: some clients pin id=1 for every call) must get
+    # each request's OWN response, never a stale/cross-wired one. serve
+    # correlates responses per session-child by id and pops the pending id on
+    # each reply, so sequential reuse is unambiguous. (A reused *in-flight* id is
+    # a client bug; send_request fails it safely — earlier waiter times out — and
+    # never misdelivers, so no cross-wire either way.)
+    url, _ = gateway
+    sid, _ = _init(url)
+    r1 = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo", "params": {"n": 1}}, sid).json()
+    r2 = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo", "params": {"n": 2}}, sid).json()
+    r3 = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo", "params": {"n": 3}}, sid).json()
+    assert r1["id"] == 1 and r2["id"] == 1 and r3["id"] == 1
+    assert r1["result"]["echoed"] == {"n": 1}
+    assert r2["result"]["echoed"] == {"n": 2}
+    assert r3["result"]["echoed"] == {"n": 3}
+    # Same session -> same child throughout (session state persists across the
+    # reused id, unlike a client that mints a fresh session per call).
+    assert r1["result"]["pid"] == r2["result"]["pid"] == r3["result"]["pid"]
+
+
 def test_notification_returns_202(gateway):
     url, _ = gateway
     sid, _ = _init(url)
