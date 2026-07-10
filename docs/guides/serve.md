@@ -80,7 +80,7 @@ a crossover.
   session by JSON-RPC id and are never cross-wired: a client that reuses an id
   *sequentially* is matched correctly, and a second request reusing an id
   already *in flight* on the same session is rejected (`409`, since MCP requires
-  request ids to be unique within a session) rather than silently delivered the
+  request ids to be unique within a session) rather than silently delivering the
   wrong reply. serve cannot make a client that mints a brand-new session id on
   every call persist state — that is the client's own behavior.
 

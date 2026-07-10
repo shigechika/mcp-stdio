@@ -1991,7 +1991,7 @@ class _Handler(BaseHTTPRequestHandler):
                     409,
                     _error_body(
                         "JSON-RPC id already in flight on this session; "
-                        "request ids must be unique within a session",
+                        "use a distinct id per outstanding request",
                         req_id,
                     ),
                 )
