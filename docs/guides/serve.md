@@ -73,6 +73,14 @@ a crossover.
 - Treat `--token-store`'s file like a private key. It is created `0600` in
   a `0700` directory.
 - Every request is logged to stderr with query strings redacted.
+- Session handling is strict and lifecycle-correct: requests route by
+  `Mcp-Session-Id` only (never by JSON-RPC request id), each session has its
+  own child, and responses are correlated per session so they are never
+  cross-wired between requests — even when a client reuses the same id on every
+  call. A fresh `initialize` mints a new session; an unknown or terminated id
+  returns `404` for a clean re-initialize. This sidesteps a class of
+  remote-connector session bugs. It cannot make a client that mints a brand-new
+  session id on every call persist state — that is the client's own behavior.
 
 Real-world reference: this is the exact setup used to publish several
 stdio MCP servers under one host, surviving routine redeploys without
