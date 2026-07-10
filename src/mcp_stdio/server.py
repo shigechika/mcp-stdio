@@ -118,6 +118,18 @@ def _error_body(message: str, req_id: Any = None) -> str:
     )
 
 
+class _DuplicateInFlightId(Exception):
+    """A request reused a JSON-RPC id already in flight on the same session.
+
+    MCP 2025-06-18 (Base Protocol > Messages > Requests) requires that "The
+    request ID MUST NOT have been previously used by the requestor within the
+    same session." Two requests sharing an id *in flight at once* cannot be
+    correlated — the backend's two replies both carry that id — so serve rejects
+    the second instead of overwriting the pending slot (which would cross-wire
+    the first reply to the second waiter).
+    """
+
+
 class BackendProcess:
     """Manage one stdio MCP child process and route its output by JSON-RPC id.
 
@@ -225,8 +237,15 @@ class BackendProcess:
         with self._lock:
             if self._closed.is_set():
                 return None
-            # Reuse-of-an-in-flight-id is a client bug; last writer wins and the
-            # earlier waiter will time out. Acceptable: one client per session.
+            # MCP forbids reusing a request id within a session; two requests
+            # sharing an id *in flight at once* are unambiguously non-compliant
+            # and cannot be correlated (both replies carry that id). Overwriting
+            # the pending slot would cross-wire the first reply to the second
+            # waiter, so reject the duplicate. Sequential reuse (the id already
+            # popped on completion) is not a collision here and stays tolerated,
+            # so lenient real-world clients that pin one id keep working.
+            if req_id in self._pending:
+                raise _DuplicateInFlightId(req_id)
             self._pending[req_id] = slot
         if not self._write(line):
             with self._lock:
@@ -1959,9 +1978,24 @@ class _Handler(BaseHTTPRequestHandler):
                     stale.shutdown()
                 self._send_json(503, _error_body("backend unavailable", req_id))
                 return
-            line = backend.send_request(
-                json.dumps(msg), req_id, _BACKEND_RESPONSE_TIMEOUT_SECS
-            )
+            try:
+                line = backend.send_request(
+                    json.dumps(msg), req_id, _BACKEND_RESPONSE_TIMEOUT_SECS
+                )
+            except _DuplicateInFlightId:
+                # Client reused a JSON-RPC id already in flight on this session
+                # (MCP forbids id reuse within a session). It cannot be
+                # correlated, so reject it rather than cross-wire a reply. 409
+                # Conflict: the id conflicts with an in-flight request.
+                self._send_json(
+                    409,
+                    _error_body(
+                        "JSON-RPC id already in flight on this session; "
+                        "request ids must be unique within a session",
+                        req_id,
+                    ),
+                )
+                return
             if line is None:
                 if is_init:
                     # The freshly-spawned child never answered initialize, so it
