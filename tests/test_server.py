@@ -113,14 +113,17 @@ def test_no_cross_session_id_leak(gateway):
     assert ra["result"]["pid"] != rb["result"]["pid"]
 
 
-def test_reused_id_same_session_no_cross_wire(gateway):
-    # A client that reuses JSON-RPC id=1 across sequential requests on ONE
+def test_reused_id_sequential_same_session(gateway):
+    # A client that reuses JSON-RPC id=1 across SEQUENTIAL requests on ONE
     # session (claude-ai-mcp#539: some clients pin id=1 for every call) must get
-    # each request's OWN response, never a stale/cross-wired one. serve
-    # correlates responses per session-child by id and pops the pending id on
-    # each reply, so sequential reuse is unambiguous. (A reused *in-flight* id is
-    # a client bug; send_request fails it safely — earlier waiter times out — and
-    # never misdelivers, so no cross-wire either way.)
+    # each request's OWN response. serve correlates responses per session-child
+    # by id and pops the pending id on each reply, so sequential reuse (one
+    # request outstanding at a time) is unambiguous. NB: two requests with the
+    # SAME id in flight AT ONCE are ambiguous by construction — the backend's two
+    # replies both carry that id — and send_request resolves _pending[req_id]
+    # last-writer-wins, so one caller can receive the other's reply (a real
+    # cross-wire, not a safe timeout). This test covers only the well-defined
+    # sequential case; ids must be unique per outstanding request.
     url, _ = gateway
     sid, _ = _init(url)
     r1 = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo", "params": {"n": 1}}, sid).json()
