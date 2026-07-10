@@ -74,13 +74,17 @@ a crossover.
   a `0700` directory.
 - Every request is logged to stderr with query strings redacted.
 - Session handling is strict and lifecycle-correct: requests route by
-  `Mcp-Session-Id` only (never by JSON-RPC request id), each session has its
-  own child, and responses are correlated per session so they are never
-  cross-wired between requests — even when a client reuses the same id on every
-  call. A fresh `initialize` mints a new session; an unknown or terminated id
-  returns `404` for a clean re-initialize. This sidesteps a class of
-  remote-connector session bugs. It cannot make a client that mints a brand-new
-  session id on every call persist state — that is the client's own behavior.
+  `Mcp-Session-Id` only (never by JSON-RPC request id), and each session has its
+  own child. A fresh `initialize` mints a new session; an unknown or terminated
+  id returns `404` for a clean re-initialize. Responses are correlated within a
+  session by JSON-RPC id, so a client that reuses an id *sequentially* (one
+  request outstanding at a time) is matched correctly. Two requests carrying the
+  *same* id in flight at once on one session are ambiguous by construction (the
+  backend's two replies both carry that id and cannot be told apart) — serve
+  resolves the pending id last-writer-wins, so one caller can receive the
+  other's reply; keep JSON-RPC ids unique per outstanding request. serve cannot
+  make a client that mints a brand-new session id on every call persist state —
+  that is the client's own behavior.
 
 Real-world reference: this is the exact setup used to publish several
 stdio MCP servers under one host, surviving routine redeploys without
