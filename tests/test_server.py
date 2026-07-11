@@ -138,6 +138,43 @@ def test_reused_id_sequential_same_session(gateway):
     assert r1["result"]["pid"] == r2["result"]["pid"] == r3["result"]["pid"]
 
 
+def test_duplicate_in_flight_id_rejected():
+    # Two requests sharing a JSON-RPC id IN FLIGHT at once on one session-child
+    # are ambiguous — both backend replies carry that id. MCP 2025-06-18 forbids
+    # reusing a request id within a session, so serve rejects the second rather
+    # than overwriting the pending slot, which would cross-wire the first reply
+    # to the second waiter (claude-ai-mcp#539). The first request (noreply) is
+    # given a long timeout so it stays reliably in flight for the whole test
+    # (a short timeout could pop _pending before the duplicate runs under heavy
+    # CI load and mask the collision); shutdown() then unblocks it.
+    proc = server.BackendProcess(_BACKEND)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            first = ex.submit(
+                proc.send_request,
+                json.dumps({"jsonrpc": "2.0", "id": 1, "method": "noreply"}),
+                1,
+                30.0,
+            )
+            # Wait until the first request is registered in flight.
+            for _ in range(600):
+                with proc._lock:
+                    if 1 in proc._pending:
+                        break
+                time.sleep(0.005)
+            else:  # pragma: no cover - defensive
+                pytest.fail("first request never registered in flight")
+            with pytest.raises(server._DuplicateInFlightId):
+                proc.send_request(
+                    json.dumps({"jsonrpc": "2.0", "id": 1, "method": "echo"}), 1, 1.0
+                )
+            # Unblock the long-timeout first waiter (fail-all wakes it -> None).
+            proc.shutdown()
+            assert first.result() is None
+    finally:
+        proc.shutdown()
+
+
 def test_notification_returns_202(gateway):
     url, _ = gateway
     sid, _ = _init(url)
