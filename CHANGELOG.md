@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.26.2](https://github.com/shigechika/mcp-stdio/compare/v0.26.1...v0.26.2) (2026-07-11)
+
+
+### Bug Fixes
+
+* **serve:** reject a JSON-RPC id already in flight on the same session ([#307](https://github.com/shigechika/mcp-stdio/issues/307)) ([fa4e937](https://github.com/shigechika/mcp-stdio/commit/fa4e937128d0984cc5ab33639fc838df74c64990))
+
 ## [0.26.1](https://github.com/shigechika/mcp-stdio/compare/v0.26.0...v0.26.1) (2026-07-09)
 
 
