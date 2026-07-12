@@ -73,35 +73,39 @@ jobs:
         run: |
           set -euo pipefail
           gh pr edit "$PR" --repo "$REPO" --add-reviewer "@copilot"
-          # Confirm a Copilot review_requested event actually landed. The
+          # Confirm a Copilot review_requested event actually landed. The PR
           # timeline is the reliable source: requested_reviewers drops the
-          # Copilot bot once it reviews, but the timeline event persists.
-          # --paginate because our event is the NEWEST and the timeline is
-          # returned oldest-first, so on a long timeline it lands on the last
-          # page. Match with a bash test, not `grep -q`, whose early exit could
-          # SIGPIPE gh api and, under pipefail, fake a non-zero.
+          # Copilot bot once it reviews, but the timeline event persists. It is
+          # an issues-namespace endpoint (a PR is an issue), readable with this
+          # repo's pull-request access. --paginate because our event is the
+          # NEWEST and the timeline is oldest-first, so on a long timeline it
+          # lands on the last page.
           #
           # Distinguish a failed query from "Copilot absent": capture gh api's
           # own exit status via the `if` (no `|| true` masking) so a persistent
-          # timeline-read failure is reported as such, not miscredited to a
+          # read failure is reported as its own cause, not miscredited to a
           # missing Copilot seat.
           query_ok=false
           for attempt in 1 2 3; do
             if logins=$(gh api --paginate "repos/$REPO/issues/$PR/timeline?per_page=100" \
                           --jq '.[] | select(.event=="review_requested") | .requested_reviewer.login'); then
               query_ok=true
-              if [[ "${logins,,}" == *copilot* ]]; then
-                echo "Copilot review requested."
-                exit 0
-              fi
+              # Exact per-login match (not a substring) so a reviewer whose name
+              # merely contains "copilot" cannot satisfy the check.
+              while IFS= read -r login; do
+                if [ "${login,,}" = copilot ]; then
+                  echo "Copilot review requested."
+                  exit 0
+                fi
+              done <<< "$logins"
             else
-              echo "warning: timeline query failed on attempt $attempt; retrying"
+              echo "::warning::timeline query failed on attempt $attempt; retrying"
             fi
             sleep 5
           done
           if [ "$query_ok" = true ]; then
             echo "::error::Copilot was not requested — COPILOT_REVIEW_TOKEN may lack Copilot access or be expired."
           else
-            echo "::error::Could not read the PR timeline to confirm the request — COPILOT_REVIEW_TOKEN may lack read access to this repository's pull requests."
+            echo "::error::Could not read the PR timeline after 3 attempts — a transient GitHub API error, or COPILOT_REVIEW_TOKEN lacking read access to this repository."
           fi
           exit 1
