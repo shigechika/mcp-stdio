@@ -4257,8 +4257,13 @@ class TestCheckConnectionSse:
 
         def sse_gen():
             yield b"event: endpoint\ndata: /messages?sid=xyz\n\n"
-            post_attempted.wait(timeout=3)
-            yield f"event: message\ndata: {self._INIT_RESULT}\n\n".encode()
+            # Release the result ONLY once the POST has actually been observed.
+            # If it is somehow not seen within the timeout, do not yield the
+            # result — let the stream end so check_connection returns False and
+            # the test fails deterministically, rather than yielding INIT_RESULT
+            # early and reintroducing the race this guard exists to remove.
+            if post_attempted.wait(timeout=3):
+                yield f"event: message\ndata: {self._INIT_RESULT}\n\n".encode()
 
         httpx_mock.add_response(
             url=self.SSE_URL,
