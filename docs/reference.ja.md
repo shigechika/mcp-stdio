@@ -27,6 +27,7 @@ Arguments:
 | `--no-proactive-refresh` | — | OAuth トークンをプロアクティブにリフレッシュするバックグラウンドタイマーを無効化 |
 | `--oauth-timeout SECONDS` | — | インタラクティブ OAuth フロー（ブラウザコールバック/デバイスコード確認）がタイムアウトするまでの秒数（デフォルト: 120） |
 | `--no-resource-indicator` | — | すべての OAuth リクエストから RFC 8707 resource パラメータを省略。それを拒否する認可サーバー用（例：api:// スコープ付き Microsoft Entra ID） |
+| `--oauth-resource URI` | — | server-URL 由来の値の代わりに、この RFC 8707 resource 値をすべての OAuth リクエストで送る。特定の resource 識別子を要求する AS（例：Entra ID の App ID URI `api://<app-id>`）用。トークンストアに永続化。`--no-resource-indicator` とは排他 |
 
 ### トランスポート
 

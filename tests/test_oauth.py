@@ -119,6 +119,48 @@ class TestResourceIndicator:
         assert _resource_indicator(url) == expected
 
 
+class TestEffectiveResource:
+    """_effective_resource resolves the three RFC 8707 resource states (#309)."""
+
+    def test_omitted_when_indicator_off(self):
+        from mcp_stdio.oauth import _effective_resource
+
+        # --no-resource-indicator wins, and a stray oauth_resource is ignored
+        # (the CLI makes them mutually exclusive, but be defensive).
+        assert (
+            _effective_resource(
+                "https://h/mcp", resource_indicator=False, oauth_resource=None
+            )
+            is None
+        )
+        assert (
+            _effective_resource(
+                "https://h/mcp", resource_indicator=False, oauth_resource="api://x"
+            )
+            is None
+        )
+
+    def test_custom_value_when_set(self):
+        from mcp_stdio.oauth import _effective_resource
+
+        assert (
+            _effective_resource(
+                "https://h/mcp", resource_indicator=True, oauth_resource="api://x"
+            )
+            == "api://x"
+        )
+
+    def test_server_derived_when_unset(self):
+        from mcp_stdio.oauth import _effective_resource
+
+        assert (
+            _effective_resource(
+                "https://h/mcp", resource_indicator=True, oauth_resource=None
+            )
+            == "https://h/mcp"
+        )
+
+
 class TestAuthorizationBaseUrl:
     def test_strips_path(self):
         assert (
@@ -985,6 +1027,34 @@ class TestDiscoverMetadata:
         client = httpx.Client()
         meta = discover_oauth_metadata("https://api.example.com/mcp", client)
         assert meta.authorization_endpoint == "https://auth.example.com/authorize"
+
+    def test_rfc9728_resource_match_against_oauth_resource_override(
+        self, httpx_mock, capsys
+    ):
+        """With --oauth-resource, the §3.3 check compares the PRM resource against
+        the operator-declared value, so a PRM advertising the App ID URI matches
+        (no spurious mismatch warning) even though it differs from the server URL
+        (#309)."""
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-protected-resource/mcp",
+            json={
+                "resource": "api://app-id-guid",  # matches the override, not the URL
+                "authorization_servers": ["https://auth.example.com"],
+            },
+        )
+        httpx_mock.add_response(
+            url="https://auth.example.com/.well-known/oauth-authorization-server",
+            json={
+                "authorization_endpoint": "https://auth.example.com/authorize",
+                "token_endpoint": "https://auth.example.com/token",
+            },
+        )
+        client = httpx.Client()
+        meta = discover_oauth_metadata(
+            "https://api.example.com/mcp", client, oauth_resource="api://app-id-guid"
+        )
+        assert meta.authorization_endpoint == "https://auth.example.com/authorize"
+        assert "§3.3 resource mismatch" not in capsys.readouterr().err
 
     def test_rfc9728_resource_match_ignores_userinfo_in_server_url(
         self, httpx_mock, capsys
@@ -2057,6 +2127,42 @@ class TestRefreshCachedToken:
         req = httpx_mock.get_requests()[0]
         assert b"resource=https%3A%2F%2Fapi.example.com%2Fmcp" in req.content
         assert data.no_resource_indicator is False
+
+    def test_refresh_sends_and_persists_custom_oauth_resource(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """oauth_resource sends a custom RFC 8707 resource on refresh, not the
+        server-URL-derived one, and persists it for future refreshes (#309)."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        from mcp_stdio.token_store import save_token
+
+        save_token(
+            "https://api.example.com/mcp",
+            TokenData(
+                access_token="old_at",
+                refresh_token="rt123",
+                expires_at=time.time() - 10,
+                client_id="cid",
+                token_endpoint="https://auth.example.com/token",
+                authorization_endpoint="https://auth.example.com/authorize",
+                oauth_resource="api://app-id-guid",
+            ),
+        )
+        httpx_mock.add_response(
+            url="https://auth.example.com/token",
+            json={"access_token": "new_at", "expires_in": 3600},
+        )
+        client = httpx.Client()
+        data = refresh_cached_token("https://api.example.com/mcp", client)
+        assert data is not None
+        req = httpx_mock.get_requests()[0]
+        # The custom value is sent, NOT the server-URL-derived resource.
+        assert b"resource=api%3A%2F%2Fapp-id-guid" in req.content
+        assert b"resource=https%3A%2F%2Fapi.example.com" not in req.content
+        assert data.oauth_resource == "api://app-id-guid"
 
 
 # --- _token_response_to_data ---
@@ -3913,7 +4019,7 @@ class TestStepUpAuthorize:
             token_endpoint="https://as.example/token",
         )
 
-        def fake_discover(server_url, client, www_authenticate=None):
+        def fake_discover(server_url, client, www_authenticate=None, oauth_resource=None):
             discover_hints.append(www_authenticate)
             return sentinel_md
 

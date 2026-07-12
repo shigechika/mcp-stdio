@@ -95,6 +95,25 @@ _HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _HEADER_VALUE_FORBIDDEN = ("\r", "\n", "\0")
 
 
+def _rfc8707_resource(value: str) -> str:
+    """Validate an RFC 8707 §2 ``resource`` URI for ``--oauth-resource``.
+
+    Must be an absolute URI (has a scheme) and MUST NOT include a fragment
+    (RFC 8707 §2). The scheme is intentionally not constrained to http(s):
+    Microsoft Entra ID's App ID URI is ``api://<app-id>``.
+    """
+    parsed = urlparse(value)
+    if not parsed.scheme:
+        raise argparse.ArgumentTypeError(
+            f"--oauth-resource must be an absolute URI with a scheme (got {value!r})"
+        )
+    if parsed.fragment:
+        raise argparse.ArgumentTypeError(
+            "--oauth-resource must not include a fragment (RFC 8707 §2)"
+        )
+    return value
+
+
 def _bearer_header_value(token: str) -> str:
     """Build a ``Bearer <token>`` Authorization value, rejecting CR/LF/NUL.
 
@@ -315,6 +334,7 @@ def _build_cold_start_login(
     device_flow: bool,
     refresh_leeway: float,
     resource_indicator: bool,
+    oauth_resource: str | None,
     oauth_timeout: float,
     timeout_connect: float,
     timeout_read: float,
@@ -351,6 +371,7 @@ def _build_cold_start_login(
                 device_flow=device_flow,
                 refresh_leeway=refresh_leeway,
                 resource_indicator=resource_indicator,
+                oauth_resource=oauth_resource,
                 timeout=oauth_timeout,
                 interactive=True,  # cold-start: run the full browser/device flow
             )
@@ -441,6 +462,22 @@ def _main() -> None:
             "Entra ID v2 when using api:// scopes (AADSTS9010010). "
             "The setting is persisted in the token store so proactive "
             "refreshes and step-up flows behave consistently."
+        ),
+    )
+    parser.add_argument(
+        "--oauth-resource",
+        default=None,
+        type=_rfc8707_resource,
+        metavar="URI",
+        help=(
+            "Send this exact value as the RFC 8707 resource on every OAuth "
+            "request (authorization, token exchange, refresh, device flow), "
+            "instead of the value derived from the server URL. Required for AS "
+            "that demand a specific resource identifier, e.g. Microsoft Entra "
+            "ID's App ID URI api://<app-id-guid> (which returns AADSTS9010010 "
+            "when the resource is anything else). Persisted in the token store "
+            "so refresh and step-up stay consistent. Mutually exclusive with "
+            "--no-resource-indicator. Only used with --oauth / --oauth-device."
         ),
     )
     parser.add_argument(
@@ -657,6 +694,15 @@ def _main() -> None:
         )
         sys.exit(1)
 
+    # --no-resource-indicator omits the RFC 8707 resource; --oauth-resource sets
+    # a specific value. Requesting both is contradictory.
+    if args.no_resource_indicator and args.oauth_resource is not None:
+        print(
+            "error: --no-resource-indicator and --oauth-resource are mutually exclusive",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # Resolve --client-id: the explicit flag wins; otherwise the env var. The
     # warning below only counts an EXPLICIT --client-id (args.client_id is not
     # None), so an ambient MCP_OAUTH_CLIENT_ID does not trip it.
@@ -679,13 +725,14 @@ def _main() -> None:
         or args.client_metadata_url is not None
         or args.oauth_scope
         or args.no_resource_indicator
+        or args.oauth_resource is not None
         or args.oauth_use_id_token
         or args.oauth_eager
     ):
         print(
             "warning: --client-id / --client-metadata-url / --oauth-scope / "
-            "--no-resource-indicator / --oauth-use-id-token / --oauth-eager "
-            "are ignored without --oauth or --oauth-device",
+            "--no-resource-indicator / --oauth-resource / --oauth-use-id-token / "
+            "--oauth-eager are ignored without --oauth or --oauth-device",
             file=sys.stderr,
         )
 
@@ -823,6 +870,7 @@ def _main() -> None:
                 device_flow=args.oauth_device,
                 refresh_leeway=args.oauth_refresh_leeway,
                 resource_indicator=not args.no_resource_indicator,
+                oauth_resource=args.oauth_resource,
                 timeout=args.oauth_timeout,
                 interactive=not eager,
             )
@@ -840,6 +888,7 @@ def _main() -> None:
                     device_flow=args.oauth_device,
                     refresh_leeway=args.oauth_refresh_leeway,
                     resource_indicator=not args.no_resource_indicator,
+                    oauth_resource=args.oauth_resource,
                     oauth_timeout=args.oauth_timeout,
                     timeout_connect=args.timeout_connect,
                     timeout_read=args.timeout_read,

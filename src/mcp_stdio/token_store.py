@@ -153,6 +153,10 @@ class TokenData:
     token_endpoint_auth_method: str = "none"
     # Suppress RFC 8707 resource parameter (for AS that reject it, e.g. Entra ID v2)
     no_resource_indicator: bool = False
+    # Custom RFC 8707 resource value (--oauth-resource): sent verbatim instead of
+    # the server-URL-derived value — e.g. an Entra ID App ID URI api://<app-id>
+    # (#309). Mutually exclusive with no_resource_indicator. None = derive from URL.
+    oauth_resource: str | None = None
     # RFC 9207 §3 authorization_response_iss_parameter_supported. Persisted so a
     # step-up that reconstructs OAuthMetadata from this cached entry can keep the
     # §2.4 missing-iss MUST-reject active instead of silently defaulting to off.
@@ -886,6 +890,7 @@ def load_token(server_url: str) -> TokenData | None:
         "registration_endpoint",
         "issuer",
         "token_endpoint_auth_method",
+        "oauth_resource",
     ):
         value = getattr(td, field)
         if value is not None and not isinstance(value, str):

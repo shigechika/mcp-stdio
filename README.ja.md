@@ -225,6 +225,11 @@ mcp-stdio [OPTIONS] URL
                          Entra ID v2 など、resource パラメータを拒否する AS
                          （AADSTS9010010）で必要。トークンストアに永続化され、
                          proactive refresh や step-up フローでも一貫して適用される
+  --oauth-resource URI   server-URL 由来の値の代わりに、この RFC 8707 resource
+                         値をすべての OAuth リクエストで送る。特定の resource
+                         識別子を要求する AS（例: Microsoft Entra ID の App ID
+                         URI api://<app-id>）で必要。トークンストアに永続化。
+                         --no-resource-indicator とは排他
   -H, --header 'Key: Value'  カスタムヘッダー（複数指定可）
   --transport {streamable-http,sse}
                          トランスポート種別（デフォルト: streamable-http）

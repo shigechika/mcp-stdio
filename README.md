@@ -228,6 +228,12 @@ Options:
                          Microsoft Entra ID v2 with api:// scopes (AADSTS9010010).
                          Persisted in the token store so proactive refreshes
                          and step-up flows stay consistent
+  --oauth-resource URI   Send this exact RFC 8707 resource value on every OAuth
+                         request instead of the server-URL-derived one. Required
+                         for AS that demand a specific resource identifier, e.g.
+                         Microsoft Entra ID's App ID URI api://<app-id>. Persisted
+                         in the token store. Mutually exclusive with
+                         --no-resource-indicator
   -H, --header 'Key: Value'  Custom header (can be repeated)
   --transport {streamable-http,sse}
                          Transport type (default: streamable-http)
