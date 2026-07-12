@@ -1319,6 +1319,77 @@ class TestClientMetadataUrlFlag:
             main()
         assert mock_ensure.call_args.kwargs["resource_indicator"] is False
 
+    def test_oauth_resource_passes_value(self):
+        """--oauth-resource propagates the value to ensure_token as oauth_resource."""
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--oauth",
+                    "--oauth-resource",
+                    "api://app-id-guid",
+                    "https://example.com/mcp",
+                ],
+            ),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        assert mock_ensure.call_args.kwargs["oauth_resource"] == "api://app-id-guid"
+
+    def test_oauth_resource_default_none(self):
+        """Without --oauth-resource, oauth_resource=None reaches ensure_token."""
+        with (
+            patch("sys.argv", ["mcp-stdio", "--oauth", "https://example.com/mcp"]),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        assert mock_ensure.call_args.kwargs["oauth_resource"] is None
+
+    def test_oauth_resource_conflicts_with_no_resource_indicator(self, capsys):
+        """--oauth-resource and --no-resource-indicator are mutually exclusive."""
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--oauth",
+                    "--no-resource-indicator",
+                    "--oauth-resource",
+                    "api://x",
+                    "https://example.com/mcp",
+                ],
+            ),
+            pytest.raises(SystemExit),
+        ):
+            main()
+        assert "mutually exclusive" in capsys.readouterr().err
+
+    def test_oauth_resource_validator_accepts_app_id_uri(self):
+        from mcp_stdio.cli import _rfc8707_resource
+
+        assert _rfc8707_resource("api://app-id-guid") == "api://app-id-guid"
+
+    def test_oauth_resource_validator_rejects_fragment(self):
+        import argparse
+
+        from mcp_stdio.cli import _rfc8707_resource
+
+        with pytest.raises(argparse.ArgumentTypeError):
+            _rfc8707_resource("api://x#frag")
+
+    def test_oauth_resource_validator_rejects_relative(self):
+        import argparse
+
+        from mcp_stdio.cli import _rfc8707_resource
+
+        with pytest.raises(argparse.ArgumentTypeError):
+            _rfc8707_resource("not-a-uri")
+
 
 class _SpyClient:
     """httpx.Client stand-in that records close() and construction kwargs."""

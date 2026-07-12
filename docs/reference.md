@@ -27,6 +27,7 @@ Arguments:
 | `--no-proactive-refresh` | — | Disable the background timer that refreshes the OAuth token before it expires |
 | `--oauth-timeout SECONDS` | — | Seconds to wait for the interactive OAuth flow (browser callback / device-code confirmation) before giving up (default: 120) |
 | `--no-resource-indicator` | — | Omit the RFC 8707 resource parameter from all OAuth requests. Required for some authorization servers that reject it (e.g. Microsoft Entra ID with api:// scopes) |
+| `--oauth-resource URI` | — | Send this exact RFC 8707 resource value on every OAuth request instead of the server-URL-derived one. Required for AS that demand a specific resource identifier, e.g. Entra ID's App ID URI `api://<app-id>`. Persisted in the token store. Mutually exclusive with `--no-resource-indicator` |
 
 ### Transport
 

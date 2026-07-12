@@ -177,6 +177,36 @@ class TestLoadSaveDelete:
         store_file.write_text(_json.dumps(raw))
         assert load_token("https://example.com/mcp") is None
 
+    def test_oauth_resource_round_trips(self, tmp_path, monkeypatch):
+        """#309: oauth_resource survives a save/load round-trip; a legacy store
+        that predates the field loads with the default None (backward compat);
+        a type-broken value degrades the whole entry to None."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        save_token(
+            "https://example.com/mcp",
+            TokenData(access_token="tok", oauth_resource="api://app-id-guid"),
+        )
+        loaded = load_token("https://example.com/mcp")
+        assert loaded is not None and loaded.oauth_resource == "api://app-id-guid"
+
+        import json as _json
+
+        raw = _json.loads(store_file.read_text())
+        key = next(iter(raw))
+        # A legacy entry written before the field existed loads with None.
+        del raw[key]["oauth_resource"]
+        store_file.write_text(_json.dumps(raw))
+        legacy = load_token("https://example.com/mcp")
+        assert legacy is not None and legacy.oauth_resource is None
+
+        # A type-broken value rejects the whole entry (load None → re-auth).
+        raw[key]["oauth_resource"] = 123
+        store_file.write_text(_json.dumps(raw))
+        assert load_token("https://example.com/mcp") is None
+
     def test_load_missing(self, tmp_path, monkeypatch):
         store_file = tmp_path / "tokens.json"
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)

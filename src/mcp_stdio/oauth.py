@@ -174,6 +174,31 @@ def _resource_indicator(server_url: str) -> str:
     return resource
 
 
+def _effective_resource(
+    server_url: str,
+    *,
+    resource_indicator: bool,
+    oauth_resource: str | None,
+) -> str | None:
+    """Resolve the RFC 8707 ``resource`` value to send on OAuth requests.
+
+    Three states, mirroring the CLI:
+
+    - ``resource_indicator`` False (``--no-resource-indicator``) → ``None`` (omit).
+    - ``oauth_resource`` set (``--oauth-resource``) → sent verbatim, e.g. an
+      Entra ID App ID URI ``api://<app-id>`` that the AS requires instead of the
+      server URL (#309).
+    - otherwise → the server-URL-derived value (:func:`_resource_indicator`).
+
+    ``--no-resource-indicator`` and ``--oauth-resource`` are mutually exclusive
+    (enforced at the CLI), so ``oauth_resource`` is consulted only when
+    ``resource_indicator`` is True.
+    """
+    if not resource_indicator:
+        return None
+    return oauth_resource or _resource_indicator(server_url)
+
+
 # Default ports used when normalising a parsed URL into a RFC 6454 origin
 # tuple for comparison. Any scheme outside this table falls through as None,
 # which is fine — we only reach the cross-origin check after scheme has
@@ -606,6 +631,7 @@ def discover_oauth_metadata(
     server_url: str,
     client: httpx.Client,
     www_authenticate: str | None = None,
+    oauth_resource: str | None = None,
 ) -> OAuthMetadata:
     """Discover OAuth authorization server metadata.
 
@@ -689,7 +715,11 @@ def discover_oauth_metadata(
         # server_url would emit a misleading §3.3 mismatch warning whenever the
         # operator passed `https://user:pass@host/mcp` against a correct PRM
         # advertising `https://host/mcp`.
-        expected_resource = _resource_indicator(server_url)
+        # With --oauth-resource the operator has declared the resource identity
+        # explicitly (e.g. an Entra ID App ID URI), which is exactly what a
+        # compliant PRM would advertise — compare against that so a deliberate
+        # override does not emit a spurious §3.3 mismatch warning.
+        expected_resource = oauth_resource or _resource_indicator(server_url)
         if (
             isinstance(prm_resource, str)
             and prm_resource.rstrip("/") != expected_resource.rstrip("/")
@@ -1351,6 +1381,7 @@ def _token_response_to_data(
     client_secret_expires_at: float | None = None,
     auth_method: str = "none",
     no_resource_indicator: bool = False,
+    oauth_resource: str | None = None,
 ) -> TokenData:
     """Convert a raw token response to TokenData.
 
@@ -1443,6 +1474,7 @@ def _token_response_to_data(
         issuer=metadata.issuer,
         token_endpoint_auth_method=auth_method,
         no_resource_indicator=no_resource_indicator,
+        oauth_resource=oauth_resource,
         # Persist the RFC 9207 §3 flag so a later step-up that reconstructs
         # metadata from this cached entry keeps the §2.4 missing-iss MUST-reject
         # active (otherwise it silently defaults off).
@@ -1483,6 +1515,7 @@ def refresh_cached_token(
         return None
     auth_method = cached.token_endpoint_auth_method
     no_resource_indicator = cached.no_resource_indicator
+    oauth_resource = cached.oauth_resource
     try:
         raw = refresh_access_token(
             cached.token_endpoint,
@@ -1490,7 +1523,11 @@ def refresh_cached_token(
             cached.client_secret,
             cached.refresh_token,
             client,
-            resource=None if no_resource_indicator else _resource_indicator(server_url),
+            resource=_effective_resource(
+                server_url,
+                resource_indicator=not no_resource_indicator,
+                oauth_resource=oauth_resource,
+            ),
             auth_method=auth_method,
         )
     except Exception as e:
@@ -1526,6 +1563,7 @@ def refresh_cached_token(
             client_secret_expires_at=cached.client_secret_expires_at,
             auth_method=auth_method,
             no_resource_indicator=no_resource_indicator,
+            oauth_resource=oauth_resource,
         )
     except Exception as e:
         # a non-compliant 200 token response MISSING access_token
@@ -1580,6 +1618,7 @@ def _run_authorization_flow(
     scope: str | None = None,
     timeout: float = 120,
     resource_indicator: bool = True,
+    oauth_resource: str | None = None,
 ) -> TokenData:
     """Run the browser-based authorization code flow.
 
@@ -1660,8 +1699,13 @@ def _run_authorization_flow(
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
         }
-        if resource_indicator:
-            params["resource"] = _resource_indicator(server_url)
+        res = _effective_resource(
+            server_url,
+            resource_indicator=resource_indicator,
+            oauth_resource=oauth_resource,
+        )
+        if res is not None:
+            params["resource"] = res
         if scope:
             params["scope"] = scope
 
@@ -1771,7 +1815,11 @@ def _run_authorization_flow(
         code_verifier,
         redirect_uri,
         client,
-        resource=_resource_indicator(server_url) if resource_indicator else None,
+        resource=_effective_resource(
+            server_url,
+            resource_indicator=resource_indicator,
+            oauth_resource=oauth_resource,
+        ),
         auth_method=auth_method,
     )
     data = _token_response_to_data(
@@ -1799,6 +1847,7 @@ def _run_authorization_flow(
         client_secret_expires_at=cse_at,
         auth_method=auth_method,
         no_resource_indicator=not resource_indicator,
+        oauth_resource=oauth_resource,
     )
     save_token(server_url, data)
     log("OAuth token obtained and saved")
@@ -1815,6 +1864,7 @@ def _run_device_authorization_flow(
     client_metadata_url: str | None = None,
     scope: str | None = None,
     resource_indicator: bool = True,
+    oauth_resource: str | None = None,
     timeout: float | None = None,
 ) -> TokenData:
     """Run RFC 8628 Device Authorization Grant flow.
@@ -1866,8 +1916,13 @@ def _run_device_authorization_flow(
 
     # Step 1: Device Authorization Request (RFC 8628 §3.1)
     da_params: dict[str, str] = {}
-    if resource_indicator:
-        da_params["resource"] = _resource_indicator(server_url)
+    da_res = _effective_resource(
+        server_url,
+        resource_indicator=resource_indicator,
+        oauth_resource=oauth_resource,
+    )
+    if da_res is not None:
+        da_params["resource"] = da_res
     if scope:
         da_params["scope"] = scope
     da_headers: dict[str, str] = {
@@ -2057,6 +2112,7 @@ def _run_device_authorization_flow(
                 client_secret_expires_at=cse_at,
                 auth_method=auth_method,
                 no_resource_indicator=not resource_indicator,
+                oauth_resource=oauth_resource,
             )
             save_token(server_url, data)
             log("device flow token obtained and saved")
@@ -2125,6 +2181,7 @@ def ensure_token(
     device_flow: bool = False,
     refresh_leeway: float = 60.0,
     resource_indicator: bool = True,
+    oauth_resource: str | None = None,
     interactive: bool = True,
 ) -> TokenData | None:
     """Ensure a valid access token is available.
@@ -2161,6 +2218,31 @@ def ensure_token(
     """
     cached = load_token(server_url)
     if cached and cached.access_token:
+        # Reconcile the persisted RFC 8707 resource settings to the CURRENT CLI
+        # intent (--oauth-resource / --no-resource-indicator) so a changed flag
+        # takes effect on the next refresh/step-up — and on the refresh attempt
+        # just below — instead of only after the cached token expires. The flags
+        # are supplied on the command line every run, so they reflect current
+        # intent; persisting here keeps the store authoritative for the flag-free
+        # refresh/step-up paths that read it back. Only the resource-selection
+        # fields change (never the token itself), and we re-save only on an
+        # actual difference so an unchanged invocation does not rewrite the store.
+        desired_no_ri = not resource_indicator
+        if (
+            cached.no_resource_indicator != desired_no_ri
+            or cached.oauth_resource != oauth_resource
+        ):
+            cached.no_resource_indicator = desired_no_ri
+            cached.oauth_resource = oauth_resource
+            # Best-effort persist: the reconcile is a convenience, and the cached
+            # access_token is already valid, so a store-write failure must NOT
+            # fail a request this path previously always served. Degrade to the
+            # in-memory reconciled token (refresh below re-reads the store, so it
+            # would still use the old settings until the next successful save).
+            try:
+                save_token(server_url, cached)
+            except OSError as e:
+                log(f"warning: could not persist reconciled resource settings: {e}")
         if cached.expires_at is None or cached.expires_at > time.time() + refresh_leeway:
             log("using cached OAuth token")
             return cached
@@ -2186,7 +2268,12 @@ def ensure_token(
     # a non-standard URL advertise it here, letting us skip the well-known
     # guessing. Best-effort — failures silently fall back to normal discovery.
     www_authenticate = _probe_www_authenticate(server_url, client)
-    metadata = discover_oauth_metadata(server_url, client, www_authenticate=www_authenticate)
+    metadata = discover_oauth_metadata(
+        server_url,
+        client,
+        www_authenticate=www_authenticate,
+        oauth_resource=oauth_resource,
+    )
     if device_flow:
         return _run_device_authorization_flow(
             server_url,
@@ -2197,6 +2284,7 @@ def ensure_token(
             client_metadata_url=client_metadata_url,
             scope=scope,
             resource_indicator=resource_indicator,
+            oauth_resource=oauth_resource,
             # honour --oauth-timeout for the device-code wait too,
             # matching the auth-code branch below and the CLI help text.
             timeout=timeout,
@@ -2211,6 +2299,7 @@ def ensure_token(
         scope=scope,
         timeout=timeout,
         resource_indicator=resource_indicator,
+        oauth_resource=oauth_resource,
     )
 
 
@@ -2260,6 +2349,9 @@ def step_up_authorize(
     cached TokenData; if the cache is gone (rare), discovery is rerun.
     """
     cached = load_token(server_url)
+    # Reproduce the persisted RFC 8707 resource override (--oauth-resource) on the
+    # step-up's re-discovery and re-authorization, mirroring no_resource_indicator.
+    oauth_resource = cached.oauth_resource if cached else None
 
     scope_parts: set[str] = set()
     if cached and cached.scope:
@@ -2312,7 +2404,10 @@ def step_up_authorize(
         #
         www_authenticate = _probe_www_authenticate(server_url, client)
         metadata = discover_oauth_metadata(
-            server_url, client, www_authenticate=www_authenticate
+            server_url,
+            client,
+            www_authenticate=www_authenticate,
+            oauth_resource=oauth_resource,
         )
 
     resource_indicator = not (cached.no_resource_indicator if cached else False)
@@ -2324,4 +2419,5 @@ def step_up_authorize(
         scope=merged_scope or None,
         timeout=timeout,
         resource_indicator=resource_indicator,
+        oauth_resource=oauth_resource,
     )
