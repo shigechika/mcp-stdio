@@ -20,7 +20,7 @@ Arguments:
 | `--oauth-device` | — | Enable OAuth 2.1 Device Authorization Grant (RFC 8628, headless) |
 | `--client-id ID` | `MCP_OAUTH_CLIENT_ID` | Pre-registered OAuth client ID (skips Dynamic Client Registration) |
 | `--client-metadata-url URL` | — | HTTPS URL of a Client ID Metadata Document to use as client_id instead of DCR |
-| `--oauth-scope SCOPE` | — | OAuth scope(s) to request, space-separated in one value (e.g. `"openid offline_access"`) |
+| `--oauth-scope SCOPE` | — | OAuth scope(s) to request, space-separated in one value (e.g. `"openid offline_access"`). When the server grants a scope that differs from this request, mcp-stdio logs `authorization server granted scope: …` to stderr |
 | `--oauth-use-id-token` | — | Present the OIDC id_token as the Bearer credential instead of access_token (AWS Bedrock / Cognito) |
 | `--oauth-eager` | — | Cold-start: answer initialize locally and run interactive OAuth in the background, so a long login does not exceed the client's ~60 s timeout |
 | `--oauth-refresh-leeway SECONDS` | `MCP_OAUTH_REFRESH_LEEWAY` | Proactively refresh tokens this many seconds before expiry (default: 60) |
