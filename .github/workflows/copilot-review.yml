@@ -1,0 +1,46 @@
+name: Request Copilot review
+
+# Automatically request a GitHub Copilot code review on new pull requests,
+# EXCEPT the release PRs that release-please keeps open. Copilot review is a
+# metered premium request, and a release PR is only a version bump plus a
+# generated CHANGELOG — reviewing it every release wastes credits with nothing
+# to catch.
+#
+# This replaces the repository ruleset "Copilot review for default branch".
+# A ruleset (or the equivalent repo setting) can only match on the PR's *base*
+# branch, so it cannot skip PRs by head branch — every PR into main, including
+# release-please's, gets reviewed. release-please PRs are also authored by a
+# real user (a PAT), not a bot, so they cannot be excluded by author either.
+# Moving the request into a workflow lets us gate on the head branch name.
+#
+# pull_request_target (not pull_request) is deliberate: on a fork PR the
+# pull_request token is read-only, so it could not request a reviewer, and
+# external contributions would silently lose Copilot review. pull_request_target
+# runs with the base repository's write token, so fork PRs are covered too. It
+# is safe here because this workflow never checks out or executes the PR's code
+# — it only passes the PR number to the API — so none of the usual
+# pull_request_target code-injection risks apply.
+
+on:
+  pull_request_target:
+    types: [opened, ready_for_review]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  request:
+    # Skip release-please PRs (credit saving) and drafts (reviewed once marked
+    # ready via the ready_for_review trigger above).
+    if: >-
+      github.event.pull_request.draft == false &&
+      !startsWith(github.event.pull_request.head.ref, 'release-please--')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request review from Copilot
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method POST \
+            "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/requested_reviewers" \
+            -f "reviewers[]=copilot-pull-request-reviewer[bot]"
