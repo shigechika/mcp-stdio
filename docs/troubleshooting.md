@@ -121,7 +121,7 @@ See Claude Code [#34498](https://github.com/anthropics/claude-code/issues/34498)
 **Cause:** The authorization server may have rejected your requested scope and granted a smaller one.
 
 **Solution:**
-1. Run mcp-stdio in the foreground and watch stderr: when the authorization server returns a scope different from the one requested, mcp-stdio logs `authorization server granted scope: …` (per RFC 6749 §5.1, a token response only includes `scope` when it differs from the request). If you see no such line, the server granted exactly what you asked for — check its own logs or admin console to confirm.
+1. Run mcp-stdio in the foreground and watch stderr: when the authorization server returns a scope different from the one requested, mcp-stdio logs `authorization server granted scope: …` (per RFC 6749 §5.1, a token response only includes `scope` when it differs from the request). If you see no such line, the server most likely granted what you asked for — but a non-conformant server may omit `scope` even on a downgrade, so confirm against its own logs or admin console before ruling scope out.
 2. If the server downgraded your scope, check the authorization server's policy or contact the server operator.
 3. Some servers support **step-up authorization**: if a tool call needs a broader scope, the server returns `403 insufficient_scope` with the required scopes listed, and mcp-stdio automatically re-authorizes for the union of the granted and required scopes (RFC 9470), then retries the call. Note that some MCP clients do not automatically retry a tool call after mcp-stdio completes a step-up in the background (Claude Code [#44652](https://github.com/anthropics/claude-code/issues/44652)) — if the call still reports an error, try it again once.
 
