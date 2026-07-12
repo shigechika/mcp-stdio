@@ -20,10 +20,15 @@ name: Request Copilot review
 # is safe here because this workflow never checks out or executes the PR's code
 # — it only passes the PR number to the API — so none of the usual
 # pull_request_target code-injection risks apply.
+#
+# The release-please skip is scoped to same-repo PRs: release-please only ever
+# creates branches in this repository, and on a fork the author controls
+# head.ref, so a fork PR named "release-please--…" must NOT be allowed to skip
+# review. Requiring head.repo == this repo closes that bypass.
 
 on:
   pull_request_target:
-    types: [opened, ready_for_review]
+    types: [opened, reopened, ready_for_review]
 
 permissions:
   pull-requests: write
@@ -31,10 +36,13 @@ permissions:
 jobs:
   request:
     # Skip release-please PRs (credit saving) and drafts (reviewed once marked
-    # ready via the ready_for_review trigger above).
+    # ready via the ready_for_review trigger above). The release-please match is
+    # scoped to same-repo branches so a fork PR cannot skip review by naming its
+    # branch "release-please--…".
     if: >-
       github.event.pull_request.draft == false &&
-      !startsWith(github.event.pull_request.head.ref, 'release-please--')
+      !(github.event.pull_request.head.repo.full_name == github.repository &&
+        startsWith(github.event.pull_request.head.ref, 'release-please--'))
     runs-on: ubuntu-latest
     steps:
       - name: Request review from Copilot
