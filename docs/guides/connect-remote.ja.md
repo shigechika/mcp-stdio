@@ -78,9 +78,10 @@ OAuth ログイン、トークン交換、MCP `initialize` の往復——そし
 
 - **ブラウザが開かない** — authorize URL は stderr に出力されています。
   手動で開いてください（クライアントの MCP ログに出ます）。
-- **Microsoft Entra ID で `AADSTS9010010`** — 一部の Entra ID 構成は
-  `resource` パラメータそのものを拒否します。`--no-resource-indicator` を
-  追加してください。詳細は[トラブルシューティング](../troubleshooting.ja.md#microsoft-entra-id-aadsts9010010)を参照。
+- **Microsoft Entra ID で `AADSTS9010010`** — 導出した `resource` が Entra の
+  期待するトークン audience と一致していません。App ID URI を
+  `--oauth-resource api://<app-id>` で送るか、`--no-resource-indicator` で
+  パラメータを落としてください。詳細は[トラブルシューティング](../troubleshooting.ja.md#microsoft-entra-id-aadsts9010010)を参照。
 - **昨日まで動いていたのに今日は `401`** — サーバー側で鍵のローテートや
   グラントの失効があったかもしれません。`~/.config/mcp-stdio/tokens.json`
   から該当サーバーのエントリを消して、再認可させてください。

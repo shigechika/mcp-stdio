@@ -48,14 +48,22 @@ Some MCP clients have their own history of not re-invoking their auth header cal
 
 **Problem:** Authorization fails with `AADSTS9010010` ("audience validation failed") when connecting through Microsoft Entra ID with `api://` scopes.
 
-**Cause:** Some Entra ID configurations reject the RFC 8707 `resource` parameter outright.
+**Cause:** By default mcp-stdio derives the RFC 8707 `resource` parameter from the server URL. Entra ID validates that value as the token audience and rejects it when it does not match what the app registration expects.
 
-**Solution:**
-```bash
-mcp-stdio --oauth --no-resource-indicator https://your-server.example.com/mcp
-```
+**Solution:** pick the remedy that matches your Entra ID app registration.
 
-This omits the `resource` parameter from every OAuth request (authorization, token exchange, refresh, and device flow).
+- **Entra expects a specific App ID URI** (most common) — send it verbatim so the audience matches:
+  ```bash
+  mcp-stdio --oauth --oauth-resource api://<app-id> https://your-server.example.com/mcp
+  ```
+  The value is used on every OAuth request (authorization, token exchange, refresh, and device flow) and persisted in the token store.
+
+- **Entra rejects the `resource` parameter outright** — omit it entirely:
+  ```bash
+  mcp-stdio --oauth --no-resource-indicator https://your-server.example.com/mcp
+  ```
+
+The two flags are mutually exclusive: `--oauth-resource` sends a specific value, `--no-resource-indicator` sends none.
 
 ## Tool and resource issues
 
