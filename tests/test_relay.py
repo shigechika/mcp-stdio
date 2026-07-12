@@ -4243,26 +4243,38 @@ class TestCheckConnectionSse:
     )
 
     def test_sse_handshake_success(self, httpx_mock):
-        """endpoint event → POST initialize → response on the stream → True."""
-        # The GET stream carries the endpoint bootstrap and then the
-        # initialize response (legacy SSE delivers POST responses on the
-        # stream, not in the POST body).
+        """endpoint event → POST initialize → response on the stream → True.
+
+        The GET stream holds the INIT_RESULT event until the endpoint POST has
+        been observed, so the mocked POST is deterministically requested before
+        check_connection returns and closes the client. Without this, the reader
+        thread could reach INIT_RESULT and return before the background POST
+        thread's request landed — leaving the POST 'mocked but not requested'
+        and `len(posts) == 1` failing (a thread-scheduling race that surfaced
+        reliably on the Python 3.14 runner; same class as #300/#301). Legacy SSE
+        delivers POST responses on the stream, not in the POST body."""
+        post_attempted = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sid=xyz\n\n"
+            post_attempted.wait(timeout=3)
+            yield f"event: message\ndata: {self._INIT_RESULT}\n\n".encode()
+
         httpx_mock.add_response(
             url=self.SSE_URL,
             method="GET",
-            stream=IteratorStream(
-                [
-                    b"event: endpoint\ndata: /messages?sid=xyz\n\n",
-                    f"event: message\ndata: {self._INIT_RESULT}\n\n".encode(),
-                ]
-            ),
+            stream=IteratorStream(sse_gen()),
             headers={"content-type": "text/event-stream"},
         )
-        httpx_mock.add_response(
-            url="https://example.com/messages?sid=xyz",
-            method="POST",
-            status_code=202,
+
+        def on_post(request: httpx.Request) -> httpx.Response:
+            post_attempted.set()
+            return httpx.Response(status_code=202)
+
+        httpx_mock.add_callback(
+            on_post, url="https://example.com/messages?sid=xyz", method="POST"
         )
+
         assert (
             check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
             is True
