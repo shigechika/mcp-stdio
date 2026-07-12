@@ -16,9 +16,9 @@ name: Request Copilot review
 # The request is made with a Copilot-enabled user PAT (secret
 # COPILOT_REVIEW_TOKEN), NOT the Actions GITHUB_TOKEN: github-actions[bot] has
 # no Copilot seat, so `gh pr edit --add-reviewer @copilot` returns success but
-# silently attaches nothing under GITHUB_TOKEN (verified on #316). The PAT must
-# be a fine-grained token owned by a user with Copilot access, scoped to this
-# repo, with Pull requests: read and write.
+# silently attaches nothing under GITHUB_TOKEN. The PAT must be a fine-grained
+# token owned by a user with Copilot access, scoped to this repo, with Pull
+# requests: read and write.
 #
 # pull_request_target (not pull_request) is deliberate on two counts: on a fork
 # PR the pull_request token is read-only AND its secrets are withheld, so the
@@ -73,22 +73,35 @@ jobs:
         run: |
           set -euo pipefail
           gh pr edit "$PR" --repo "$REPO" --add-reviewer "@copilot"
+          # Confirm a Copilot review_requested event actually landed. The
+          # timeline is the reliable source: requested_reviewers drops the
+          # Copilot bot once it reviews, but the timeline event persists.
+          # --paginate because our event is the NEWEST and the timeline is
+          # returned oldest-first, so on a long timeline it lands on the last
+          # page. Match with a bash test, not `grep -q`, whose early exit could
+          # SIGPIPE gh api and, under pipefail, fake a non-zero.
+          #
+          # Distinguish a failed query from "Copilot absent": capture gh api's
+          # own exit status via the `if` (no `|| true` masking) so a persistent
+          # timeline-read failure is reported as such, not miscredited to a
+          # missing Copilot seat.
+          query_ok=false
           for attempt in 1 2 3; do
-            # --paginate: the review_requested we just added is the NEWEST event,
-            # and the timeline is returned oldest-first, so on a PR with many
-            # events it lands on the last page — page 1 alone would miss it.
-            # Capture the output and match with a bash test rather than piping
-            # into `grep -q`, whose early exit could SIGPIPE gh api and, under
-            # pipefail, flip the result to a false negative. `|| true` keeps a
-            # transient gh error from aborting the retry loop via set -e.
-            logins=$(gh api --paginate "repos/$REPO/issues/$PR/timeline?per_page=100" \
-                       --jq '.[] | select(.event=="review_requested") | .requested_reviewer.login' \
-                     || true)
-            if [[ "${logins,,}" == *copilot* ]]; then
-              echo "Copilot review requested."
-              exit 0
+            if logins=$(gh api --paginate "repos/$REPO/issues/$PR/timeline?per_page=100" \
+                          --jq '.[] | select(.event=="review_requested") | .requested_reviewer.login'); then
+              query_ok=true
+              if [[ "${logins,,}" == *copilot* ]]; then
+                echo "Copilot review requested."
+                exit 0
+              fi
+            else
+              echo "warning: timeline query failed on attempt $attempt; retrying"
             fi
             sleep 5
           done
-          echo "::error::Copilot was not requested — COPILOT_REVIEW_TOKEN may lack Copilot access or be expired."
+          if [ "$query_ok" = true ]; then
+            echo "::error::Copilot was not requested — COPILOT_REVIEW_TOKEN may lack Copilot access or be expired."
+          else
+            echo "::error::Could not read the PR timeline to confirm the request — COPILOT_REVIEW_TOKEN may lack read access to this repository's pull requests."
+          fi
           exit 1
