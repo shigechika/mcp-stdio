@@ -74,9 +74,17 @@ jobs:
           set -euo pipefail
           gh pr edit "$PR" --repo "$REPO" --add-reviewer "@copilot"
           for attempt in 1 2 3; do
-            if gh api "repos/$REPO/issues/$PR/timeline" \
-                 --jq '.[] | select(.event=="review_requested") | .requested_reviewer.login' \
-               | grep -qi copilot; then
+            # --paginate: the review_requested we just added is the NEWEST event,
+            # and the timeline is returned oldest-first, so on a PR with many
+            # events it lands on the last page — page 1 alone would miss it.
+            # Capture the output and match with a bash test rather than piping
+            # into `grep -q`, whose early exit could SIGPIPE gh api and, under
+            # pipefail, flip the result to a false negative. `|| true` keeps a
+            # transient gh error from aborting the retry loop via set -e.
+            logins=$(gh api --paginate "repos/$REPO/issues/$PR/timeline?per_page=100" \
+                       --jq '.[] | select(.event=="review_requested") | .requested_reviewer.login' \
+                     || true)
+            if [[ "${logins,,}" == *copilot* ]]; then
               echo "Copilot review requested."
               exit 0
             fi
