@@ -48,14 +48,22 @@ rm ~/.config/mcp-stdio/tokens.json
 
 **問題：** `api://` スコープを使う Microsoft Entra ID 経由の接続で、認可が `AADSTS9010010`（audience 検証失敗）で失敗します。
 
-**原因：** 一部の Entra ID 構成は RFC 8707 の `resource` パラメータそのものを拒否します。
+**原因：** mcp-stdio は既定で RFC 8707 の `resource` パラメータをサーバー URL から導出します。Entra ID はその値をトークンの audience として検証するため、アプリ登録が期待する値と一致しないと拒否します。
 
-**解決方法：**
-```bash
-mcp-stdio --oauth --no-resource-indicator https://your-server.example.com/mcp
-```
+**解決方法：** Entra ID のアプリ登録に合わせて対処を選びます。
 
-これにより、認可・トークン交換・リフレッシュ・デバイスフローのすべての OAuth リクエストから `resource` パラメータが省略されます。
+- **Entra が特定の App ID URI を期待する場合**（最も一般的）— audience が一致するよう、その値をそのまま送ります：
+  ```bash
+  mcp-stdio --oauth --oauth-resource api://<app-id> https://your-server.example.com/mcp
+  ```
+  この値は認可・トークン交換・リフレッシュ・デバイスフローのすべての OAuth リクエストで使われ、トークンストアに永続化されます。
+
+- **Entra が `resource` パラメータそのものを拒否する場合** — 完全に省略します：
+  ```bash
+  mcp-stdio --oauth --no-resource-indicator https://your-server.example.com/mcp
+  ```
+
+2 つのフラグは排他です：`--oauth-resource` は特定の値を送り、`--no-resource-indicator` は何も送りません。
 
 ## ツールとリソースの問題
 
