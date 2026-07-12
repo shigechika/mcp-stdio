@@ -1466,9 +1466,16 @@ def _token_response_to_data(
     # granted scope, so steady-state refreshes do not spam stderr. Without this,
     # a silently narrowed grant only shows up as a later "insufficient scope"
     # failure (see the "OAuth scope not being honored" troubleshooting entry).
+    #
+    # Compare as sets: RFC 6749 §3.3 scope is space-delimited and
+    # order-insensitive, so a reordered-but-identical scope is not a change
+    # worth reporting. The isinstance guard also keeps a malformed non-string
+    # scope from crashing .split() or logging a list repr.
     granted_scope = raw.get("scope")
-    if granted_scope and granted_scope != previous_scope:
-        log(f"authorization server granted scope: {granted_scope}")
+    if isinstance(granted_scope, str) and granted_scope.split():
+        _prev = previous_scope if isinstance(previous_scope, str) else ""
+        if set(granted_scope.split()) != set(_prev.split()):
+            log(f"authorization server granted scope: {granted_scope}")
 
     return TokenData(
         access_token=raw["access_token"],
