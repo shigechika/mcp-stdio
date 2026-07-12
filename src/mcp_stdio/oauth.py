@@ -2234,7 +2234,15 @@ def ensure_token(
         ):
             cached.no_resource_indicator = desired_no_ri
             cached.oauth_resource = oauth_resource
-            save_token(server_url, cached)
+            # Best-effort persist: the reconcile is a convenience, and the cached
+            # access_token is already valid, so a store-write failure must NOT
+            # fail a request this path previously always served. Degrade to the
+            # in-memory reconciled token (refresh below re-reads the store, so it
+            # would still use the old settings until the next successful save).
+            try:
+                save_token(server_url, cached)
+            except OSError as e:
+                log(f"warning: could not persist reconciled resource settings: {e}")
         if cached.expires_at is None or cached.expires_at > time.time() + refresh_leeway:
             log("using cached OAuth token")
             return cached

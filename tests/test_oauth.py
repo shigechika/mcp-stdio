@@ -3014,6 +3014,37 @@ class TestEnsureToken:
         assert persisted.no_resource_indicator is True
         assert persisted.oauth_resource is None
 
+    def test_cache_hit_reconcile_save_failure_still_returns_cached(
+        self, tmp_path, monkeypatch
+    ):
+        """#309: a store-write failure while reconciling resource settings on a
+        cache hit must NOT fail the request — the still-valid cached token is
+        returned (with the in-memory reconciled setting)."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        from mcp_stdio.token_store import save_token
+
+        save_token(
+            "https://example.com/mcp",
+            TokenData(access_token="cached_at", expires_at=time.time() + 3600),
+        )
+
+        def boom(*_a, **_k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr("mcp_stdio.oauth.save_token", boom)
+        client = httpx.Client()
+        data = ensure_token(
+            "https://example.com/mcp",
+            client,
+            oauth_resource="api://app-id-guid",
+            interactive=False,
+        )
+        assert data is not None and data.access_token == "cached_at"
+        assert data.oauth_resource == "api://app-id-guid"  # in-memory reconciled
+
     def test_expired_cached_token_without_refresh_token_skips_refresh(
         self, tmp_path, monkeypatch
     ):
