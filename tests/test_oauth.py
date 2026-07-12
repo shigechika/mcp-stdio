@@ -2190,6 +2190,34 @@ class TestTokenResponseToData:
         )
         assert data.scope == "read"
 
+    def test_logs_granted_scope_when_it_differs(self, capsys):
+        """RFC 6749 §5.1: a response scope differing from the request (here, from
+        the previously granted scope) is surfaced on stderr so a silent
+        downgrade is visible."""
+        raw = {"access_token": "at", "scope": "read"}
+        _token_response_to_data(
+            raw, self.META, "cid", None, previous_scope="read write"
+        )
+        assert "authorization server granted scope: read" in capsys.readouterr().err
+
+    def test_no_log_when_granted_scope_matches_previous(self, capsys):
+        """A steady-state refresh that re-echoes the same granted scope must not
+        spam stderr — only a change is worth logging."""
+        raw = {"access_token": "at", "scope": "read write"}
+        _token_response_to_data(
+            raw, self.META, "cid", None, previous_scope="read write"
+        )
+        assert "granted scope" not in capsys.readouterr().err
+
+    def test_no_log_when_scope_omitted(self, capsys):
+        """No response scope (RFC 6749 §5.1: identical to the request) → nothing
+        to report."""
+        raw = {"access_token": "at", "expires_in": 3600}
+        _token_response_to_data(
+            raw, self.META, "cid", None, previous_scope="read write"
+        )
+        assert "granted scope" not in capsys.readouterr().err
+
     def test_missing_access_token_raises(self):
         """#15: a token response without access_token (RFC 6749 §5.1 REQUIRED)
         must fail loudly, not build a credential-less TokenData."""

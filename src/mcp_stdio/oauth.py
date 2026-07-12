@@ -1458,13 +1458,25 @@ def _token_response_to_data(
     _idt = raw.get("id_token")
     id_token = _idt if isinstance(_idt, str) and _idt else previous_id_token
 
+    # RFC 6749 §5.1 makes the response ``scope`` OPTIONAL only when it is
+    # identical to the requested scope; "otherwise, REQUIRED". So an explicit
+    # ``scope`` here signals that the authorization server granted something
+    # different from what was requested (typically a downgrade). Surface it so
+    # this is not invisible — but stay quiet when it matches the previously
+    # granted scope, so steady-state refreshes do not spam stderr. Without this,
+    # a silently narrowed grant only shows up as a later "insufficient scope"
+    # failure (see the "OAuth scope not being honored" troubleshooting entry).
+    granted_scope = raw.get("scope")
+    if granted_scope and granted_scope != previous_scope:
+        log(f"authorization server granted scope: {granted_scope}")
+
     return TokenData(
         access_token=raw["access_token"],
         token_type=token_type,
         expires_at=expires_at,
         refresh_token=raw.get("refresh_token") or previous_refresh_token,
         id_token=id_token,
-        scope=raw.get("scope") or previous_scope,
+        scope=granted_scope or previous_scope,
         client_id=client_id,
         client_secret=client_secret,
         client_secret_expires_at=client_secret_expires_at,
