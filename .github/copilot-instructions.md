@@ -12,11 +12,22 @@ that remote servers expose:
 
 **This repo implements zero MCP tools of its own.** There is no FastMCP, no
 `@mcp.tool()` decorator, nothing that "wraps a tool return value" — do not
-review this code as if it were an MCP tool server. Its entire job is to
-faithfully relay a stdio stream to/from an HTTP endpoint, plus a full OAuth
-2.1 client (`oauth.py`) and on-disk token cache (`token_store.py`) to
-authenticate against that endpoint. Other modules: `cli.py` (argparse
-entry point, `mcp-stdio` → `mcp_stdio.cli:main`).
+review this code as if it were an MCP tool server. It works in **two
+directions**:
+
+- **relay** (the original job, `relay.py`) — faithfully relays a stdio stream
+  to/from a remote HTTP endpoint (client side: stdin/stdout in, HTTP out),
+  plus a full OAuth 2.1 client (`oauth.py`) and on-disk token cache
+  (`token_store.py`) to authenticate against that endpoint.
+- **serve** (`server.py`, `mcp-stdio serve`) — the mirror image (server side:
+  HTTP in, stdio out): spawns a local stdio MCP server as a child process per
+  session and publishes it as a Streamable HTTP endpoint so clients that
+  can't spawn the server locally can reach it over the network. Stdlib-only
+  (`http.server` + `subprocess`); optional layered auth (open / static bearer
+  / embedded OAuth 2.1 authorization server). See Review focus §5.
+
+Other modules: `cli.py` (argparse entry point, `mcp-stdio` →
+`mcp_stdio.cli:main`; also dispatches `serve` to `server.py`).
 
 Only runtime dependency: `httpx`. Build backend: `hatchling`.
 
@@ -31,16 +42,20 @@ pytest tests/ -v
 CI (`.github/workflows/test.yml`) runs `pytest tests/ -v` on Python 3.10–3.14
 on `ubuntu-latest`, plus a dedicated `windows-latest` / Python 3.12 job. The
 Windows job exists specifically to smoke-test the stdio newline handling
-(see "Windows CRLF" below) — it is not there for general cross-platform
-coverage, so don't suggest dropping it as redundant.
+(see the "## Windows" section in `WORKAROUNDS.md`) — it is not there for
+general cross-platform coverage, so don't suggest dropping it as redundant.
 
 ## Review focus
 
-### 1. Stdout hygiene — the single highest-value thing to get right here
+### 1. Stdout hygiene (relay mode) — the single highest-value thing to get right here
 
-Because this process's stdout *is* the JSON-RPC wire to the MCP host, any
-stray byte on stdout corrupts the protocol. The codebase already has the
-correct, verified pattern — preserve it, don't reinvent it:
+Because the relay process's stdout *is* the JSON-RPC wire to the MCP host,
+any stray byte on stdout corrupts the protocol. (This applies to the
+**relay** path — `relay.py`, `oauth.py`, `cli.py`. In `serve` mode the
+process's stdout is *not* the wire — the wires there are each backend
+child's stdin/stdout and the HTTP socket — so §5 governs that code, not this
+rule.) The codebase already has the correct, verified pattern — preserve it,
+don't reinvent it:
 
 - `log(msg)` (module-level in `relay.py`) writes exclusively to
   `sys.stderr` via `print(f"[mcp-stdio] {msg}", file=sys.stderr, flush=True)`.
@@ -126,6 +141,35 @@ Three that are easy to accidentally regress in a routine-looking diff:
   every subsequent request. A refactor of the request-building code in `run()`
   that drops this header on any request type would break session-aware
   servers even though `initialize` itself still succeeds.
+
+### 5. Serve mode (`server.py`) — auth, sessions, and Host-header hygiene
+
+`mcp-stdio serve` (dispatched from `cli.py` when `argv[1] == "serve"`) is the
+repo's largest module and its only network-listening / credential-issuing
+surface. The stdout-hygiene rule of §1 does **not** apply here — in serve
+mode the process's stdout is not the protocol wire; the wires are each
+backend child's stdin/stdout and the HTTP socket. The highest-stakes review
+targets:
+
+- **Layered auth.** Open by default; `--auth-token` adds a static-bearer
+  Resource Server gate; `--enable-oauth` adds an *embedded OAuth 2.1
+  authorization server* (issues tokens, optionally persisted to a 0o600 file
+  via `--token-store`). The static bearer should be passed via the
+  `MCP_STDIO_SERVE_TOKEN` env var rather than `--auth-token`, because the
+  flag is visible in `ps` (`_SERVE_TOKEN_ENV`). Flag a diff that logs a
+  bearer/OAuth token, prints one, widens the `--token-store` file mode, or
+  weakens a token/PKCE check — same standard as §2.
+- **Session lifecycle.** One backend child process per MCP session
+  (`SessionRegistry`, keyed on `Mcp-Session-Id`): the transport mints a
+  session id on `initialize`, returns 404 on an unknown id, terminates on
+  DELETE, and serves server-initiated messages over a GET SSE stream. Flag a
+  diff that lets one session's child answer another session's request, leaks
+  a child on teardown, or drops the 404-on-unknown-id guard.
+- **Host-header sanitization.** Incoming `Host` / `X-Forwarded-Host` values
+  are filtered through `_HOST_ALLOWED` before being echoed into the
+  `WWW-Authenticate` challenge or the Protected Resource Metadata JSON, to
+  block header injection. Flag a diff that uses a raw/unsanitized Host value
+  in those responses.
 
 ## Out of scope
 
