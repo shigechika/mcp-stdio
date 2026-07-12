@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.28.0](https://github.com/shigechika/mcp-stdio/compare/v0.27.0...v0.28.0) (2026-07-12)
+
+
+### Features
+
+* **oauth:** log the scope granted by the authorization server ([#316](https://github.com/shigechika/mcp-stdio/issues/316)) ([9866721](https://github.com/shigechika/mcp-stdio/commit/9866721b0e1d00f8fed2f911f2cda1e55a3472c9))
+
 ## [0.27.0](https://github.com/shigechika/mcp-stdio/compare/v0.26.2...v0.27.0) (2026-07-12)
 
 
