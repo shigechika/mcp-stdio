@@ -20,7 +20,7 @@ Arguments:
 | `--oauth-device` | — | OAuth 2.1 デバイス認可グラント（RFC 8628、ヘッドレス） |
 | `--client-id ID` | `MCP_OAUTH_CLIENT_ID` | 事前登録済み OAuth クライアント ID（Dynamic Client Registration をスキップ） |
 | `--client-metadata-url URL` | — | Dynamic Client Registration の代わりに使用するクライアント ID メタデータドキュメントの HTTPS URL |
-| `--oauth-scope SCOPE` | — | リクエストする OAuth スコープ。複数指定する場合は1つの値の中でスペース区切り（例：`"openid offline_access"`）。サーバーがこのリクエストと異なるスコープを付与した場合、mcp-stdio は `authorization server granted scope: …` を stderr にログ出力します |
+| `--oauth-scope SCOPE` | — | リクエストする OAuth スコープ。複数指定する場合は1つの値の中でスペース区切り（例：`"openid offline_access"`）。付与されたスコープが以前に付与されたものと異なる場合（例：ダウングレード）、mcp-stdio は `authorization server granted scope: …` を stderr にログ出力します（変化しないリフレッシュでは出力しません） |
 | `--oauth-use-id-token` | — | アクセストークンの代わりに OIDC id_token をベアラー認証情報として提示（AWS Bedrock / Cognito） |
 | `--oauth-eager` | — | コールドスタート：initialize をローカルで応答し、バックグラウンドでインタラクティブ OAuth を実行。長いログインがクライアントの約 60 秒のタイムアウトを超えない |
 | `--oauth-refresh-leeway SECONDS` | `MCP_OAUTH_REFRESH_LEEWAY` | トークン有効期限の何秒前にプロアクティブにリフレッシュするか（デフォルト: 60） |
