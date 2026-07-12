@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.27.0](https://github.com/shigechika/mcp-stdio/compare/v0.26.2...v0.27.0) (2026-07-12)
+
+
+### Features
+
+* **oauth:** add --oauth-resource to send a custom RFC 8707 resource value ([#310](https://github.com/shigechika/mcp-stdio/issues/310)) ([7b4d66e](https://github.com/shigechika/mcp-stdio/commit/7b4d66ee2f1b2391eb7b71243111e886d051497d))
+
 ## [0.26.2](https://github.com/shigechika/mcp-stdio/compare/v0.26.1...v0.26.2) (2026-07-11)
 
 
