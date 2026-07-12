@@ -48,7 +48,13 @@ jobs:
       - name: Request review from Copilot
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api --method POST \
-            "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/requested_reviewers" \
-            -f "reviewers[]=copilot-pull-request-reviewer[bot]"
+          # The PR number is an integer, but pass it via env rather than
+          # interpolating into the run script, per the workflow-injection guard.
+          PR: ${{ github.event.pull_request.number }}
+        # Use `gh pr edit --add-reviewer @copilot`, NOT the REST
+        # requested_reviewers endpoint: that endpoint returns 200 but silently
+        # ignores the Copilot bot login, leaving the PR with no reviewer. The
+        # documented handle is @copilot, and gh resolves it via the GraphQL
+        # requestReviews mutation, which exits non-zero if it cannot — so a
+        # broken request fails the step loudly instead of no-op'ing green.
+        run: gh pr edit "$PR" --repo "${{ github.repository }}" --add-reviewer "@copilot"
