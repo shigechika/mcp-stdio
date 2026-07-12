@@ -13,13 +13,20 @@ name: Request Copilot review
 # real user (a PAT), not a bot, so they cannot be excluded by author either.
 # Moving the request into a workflow lets us gate on the head branch name.
 #
-# pull_request_target (not pull_request) is deliberate: on a fork PR the
-# pull_request token is read-only, so it could not request a reviewer, and
-# external contributions would silently lose Copilot review. pull_request_target
-# runs with the base repository's write token, so fork PRs are covered too. It
-# is safe here because this workflow never checks out or executes the PR's code
-# — it only passes the PR number to the API — so none of the usual
-# pull_request_target code-injection risks apply.
+# The request is made with a Copilot-enabled user PAT (secret
+# COPILOT_REVIEW_TOKEN), NOT the Actions GITHUB_TOKEN: github-actions[bot] has
+# no Copilot seat, so `gh pr edit --add-reviewer @copilot` returns success but
+# silently attaches nothing under GITHUB_TOKEN (verified on #316). The PAT must
+# be a fine-grained token owned by a user with Copilot access, scoped to this
+# repo, with Pull requests: read and write.
+#
+# pull_request_target (not pull_request) is deliberate on two counts: on a fork
+# PR the pull_request token is read-only AND its secrets are withheld, so the
+# PAT would be unavailable and external contributions would silently lose
+# Copilot review. pull_request_target exposes secrets and runs with write
+# access, so fork PRs are covered too. It is safe here because this workflow
+# never checks out or executes the PR's code — it only passes the PR number to
+# the API — so none of the usual pull_request_target code-injection risks apply.
 #
 # The release-please skip is scoped to same-repo PRs: release-please only ever
 # creates branches in this repository, and on a fork the author controls
@@ -30,8 +37,9 @@ on:
   pull_request_target:
     types: [opened, reopened, ready_for_review]
 
-permissions:
-  pull-requests: write
+# The default GITHUB_TOKEN is unused (the step authenticates with the PAT), so
+# it needs no permissions.
+permissions: {}
 
 jobs:
   request:
@@ -47,14 +55,32 @@ jobs:
     steps:
       - name: Request review from Copilot
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # The PR number is an integer, but pass it via env rather than
-          # interpolating into the run script, per the workflow-injection guard.
+          GH_TOKEN: ${{ secrets.COPILOT_REVIEW_TOKEN }}
+          # Pass PR number and repo via env rather than interpolating into the
+          # run script, per the workflow-injection guard. (Both are trusted —
+          # an integer and owner/repo — but this keeps the pattern uniform.)
           PR: ${{ github.event.pull_request.number }}
-        # Use `gh pr edit --add-reviewer @copilot`, NOT the REST
-        # requested_reviewers endpoint: that endpoint returns 200 but silently
-        # ignores the Copilot bot login, leaving the PR with no reviewer. The
-        # documented handle is @copilot, and gh resolves it via the GraphQL
-        # requestReviews mutation, which exits non-zero if it cannot — so a
-        # broken request fails the step loudly instead of no-op'ing green.
-        run: gh pr edit "$PR" --repo "${{ github.repository }}" --add-reviewer "@copilot"
+          REPO: ${{ github.repository }}
+        # Use `gh pr edit --add-reviewer @copilot` (the documented handle), NOT
+        # the REST requested_reviewers endpoint, which returns 200 but silently
+        # ignores the Copilot bot login. Even gh's request can attach nothing if
+        # the token lacks a Copilot seat, so afterwards confirm a Copilot
+        # review_requested event actually landed and fail loudly otherwise — a
+        # Copilot review that is already present (idempotent re-request) or one
+        # that has already been submitted still leaves this event, so the check
+        # is stable across re-fires. This turns a silent green no-op into a
+        # visible red.
+        run: |
+          set -euo pipefail
+          gh pr edit "$PR" --repo "$REPO" --add-reviewer "@copilot"
+          for attempt in 1 2 3; do
+            if gh api "repos/$REPO/issues/$PR/timeline" \
+                 --jq '.[] | select(.event=="review_requested") | .requested_reviewer.login' \
+               | grep -qi copilot; then
+              echo "Copilot review requested."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Copilot was not requested — COPILOT_REVIEW_TOKEN may lack Copilot access or be expired."
+          exit 1
