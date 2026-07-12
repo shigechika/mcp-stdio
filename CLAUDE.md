@@ -19,7 +19,7 @@ pytest tests/ -v
 
 # Run a single test file or class
 pytest tests/test_relay.py -v
-pytest tests/test_relay.py::TestSendRequest -v
+pytest tests/test_relay.py::TestWriteLine -v
 
 # Build package
 pip install build && python -m build
@@ -29,9 +29,14 @@ Uses **hatchling** as the build backend (`build-backend = "hatchling.build"` in 
 
 ## Architecture
 
-A minimal stdio-to-HTTP gateway for MCP (Model Context Protocol) servers — translates between stdio JSON-RPC framing and the two MCP HTTP transports (Streamable HTTP and legacy SSE). Only runtime dependency is **httpx**.
+A gateway between stdio JSON-RPC framing and MCP's HTTP transports, in **both directions**:
 
-Four modules under `src/mcp_stdio/`:
+- **relay** (the original job, `relay.py`) — the client side (stdin/stdout in, HTTP out): translates a local stdio MCP host to a remote Streamable HTTP or legacy SSE server.
+- **serve** (`server.py`, `mcp-stdio serve`) — the mirror image, the server side (HTTP in, stdio out): publishes a locally-spawned stdio MCP server as a Streamable HTTP endpoint.
+
+Only runtime dependency is **httpx** (the `serve` path is stdlib-only).
+
+The substantive modules under `src/mcp_stdio/`:
 
 - **`relay.py`** — Two transport implementations sharing stdin/stdout plumbing (file name kept for import compatibility):
   - `run()` — Streamable HTTP transport (MCP current spec, default). Reads JSON-RPC from stdin line-by-line, streams POST to the remote URL via httpx, parses JSON or SSE responses, writes to stdout. Handles retry with backoff (3 attempts), session ID tracking (`Mcp-Session-Id` header), 404-based session recovery, and 401-based token refresh.
@@ -41,9 +46,10 @@ Four modules under `src/mcp_stdio/`:
 - **`cli.py`** — argparse-based CLI. Builds headers, resolves `MCP_BEARER_TOKEN` / `MCP_OAUTH_CLIENT_ID` env vars, runs the OAuth flow before relay if `--oauth` or `--oauth-device` is set, and dispatches to `run()` or `run_sse()` based on `--transport`.
 - **`oauth.py`** — OAuth 2.1 client: RFC 9728/8414 discovery, RFC 7591 dynamic client registration, RFC 7636 PKCE, RFC 8707 resource indicators, authorization code flow with localhost callback server, RFC 8628 device authorization grant, RFC 9470 step-up authorization, token exchange and refresh.
 - **`token_store.py`** — Token persistence in `~/.config/mcp-stdio/tokens.json` (0o600). Stores per-server-URL tokens with client credentials and endpoint URLs for refresh. Migrates legacy `~/.mcp-stdio/` tokens on first read.
+- **`server.py`** — the `mcp-stdio serve` reverse gateway (dispatched from `cli.py` when `argv[1] == "serve"`). Spawns one backend stdio child process per MCP session (`SessionRegistry`, keyed on `Mcp-Session-Id`) and exposes them over a stdlib `http.server` Streamable HTTP endpoint (session minted on `initialize`, 404 on an unknown id, DELETE to terminate, GET SSE for server-initiated messages). Auth is optional and layered: open by default, `--auth-token` (or the `MCP_STDIO_SERVE_TOKEN` env var, preferred so the token isn't exposed in `ps`) for a static bearer, or `--enable-oauth` for an embedded OAuth 2.1 authorization server with optional `--token-store` persistence. Incoming `Host`/`X-Forwarded-Host` values are sanitized against `_HOST_ALLOWED` before they reach the `WWW-Authenticate` challenge / metadata responses. Stdlib only — adds no runtime dependency.
 
-Entry point: `mcp-stdio` command → `mcp_stdio.cli:main`.
+Entry point: `mcp-stdio` command → `mcp_stdio.cli:main` (which also dispatches `serve` to `server.py`).
 
 ## Release
 
-Releases are driven by **release-please** (Conventional Commits) — do not tag `v*` by hand. Pushing commits to `main` updates a standing "release PR" that bumps `__version__` (`src/mcp_stdio/__init__.py`) and `CHANGELOG.md`. Merging that PR creates the `v*` tag and a GitHub Release (via a PAT so downstream workflows fire). The `release: published` event then runs the publish pipeline: test → build → TestPyPI → PyPI → MCP Registry → GitHub Release assets → Homebrew tap update. The `server.json` version is patched from the git tag at publish time.
+Releases are driven by **release-please** (Conventional Commits) — do not tag `v*` by hand. Pushing commits to `main` updates a standing "release PR" that bumps `__version__` (`src/mcp_stdio/__init__.py`) and `CHANGELOG.md`. Merging that PR creates the `v*` tag and a GitHub Release (via a PAT so downstream workflows fire). The `release: published` event then runs the publish pipeline: test → build → TestPyPI → PyPI → MCP Registry → Homebrew tap update (jobs `test`/`build`/`testpypi`/`publish`/`mcp-registry`/`notify-homebrew` in `release.yml`); the GitHub Release itself is created by release-please, not this pipeline. The `server.json` version is patched from the git tag at publish time.
