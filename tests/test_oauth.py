@@ -2955,6 +2955,65 @@ class TestEnsureToken:
         data = ensure_token("https://example.com/mcp", client)
         assert data.access_token == "cached_at"
 
+    def test_cache_hit_reconciles_new_oauth_resource(self, tmp_path, monkeypatch):
+        """#309: adding --oauth-resource while a fresh token is cached persists the
+        override on the cache hit, so the next refresh/step-up uses it instead of
+        waiting for the token to expire."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        from mcp_stdio.token_store import load_token, save_token
+
+        save_token(
+            "https://example.com/mcp",
+            TokenData(access_token="cached_at", expires_at=time.time() + 3600),
+        )
+        client = httpx.Client()
+        data = ensure_token(
+            "https://example.com/mcp",
+            client,
+            oauth_resource="api://app-id-guid",
+            interactive=False,
+        )
+        assert data is not None and data.access_token == "cached_at"
+        assert data.oauth_resource == "api://app-id-guid"
+        # Persisted, so the flag-free refresh/step-up paths read it back.
+        assert load_token("https://example.com/mcp").oauth_resource == "api://app-id-guid"
+
+    def test_cache_hit_switch_to_no_resource_indicator_clears_override(
+        self, tmp_path, monkeypatch
+    ):
+        """#309: switching from --oauth-resource to --no-resource-indicator on a
+        fresh cached token reconciles both fields — omit wins, override cleared."""
+        store_file = tmp_path / "tokens.json"
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
+
+        from mcp_stdio.token_store import load_token, save_token
+
+        save_token(
+            "https://example.com/mcp",
+            TokenData(
+                access_token="cached_at",
+                expires_at=time.time() + 3600,
+                oauth_resource="api://app-id-guid",
+            ),
+        )
+        client = httpx.Client()
+        data = ensure_token(
+            "https://example.com/mcp",
+            client,
+            resource_indicator=False,  # --no-resource-indicator
+            interactive=False,
+        )
+        assert data is not None
+        assert data.no_resource_indicator is True
+        assert data.oauth_resource is None
+        persisted = load_token("https://example.com/mcp")
+        assert persisted.no_resource_indicator is True
+        assert persisted.oauth_resource is None
+
     def test_expired_cached_token_without_refresh_token_skips_refresh(
         self, tmp_path, monkeypatch
     ):

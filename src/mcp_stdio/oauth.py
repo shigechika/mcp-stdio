@@ -2218,6 +2218,23 @@ def ensure_token(
     """
     cached = load_token(server_url)
     if cached and cached.access_token:
+        # Reconcile the persisted RFC 8707 resource settings to the CURRENT CLI
+        # intent (--oauth-resource / --no-resource-indicator) so a changed flag
+        # takes effect on the next refresh/step-up — and on the refresh attempt
+        # just below — instead of only after the cached token expires. The flags
+        # are supplied on the command line every run, so they reflect current
+        # intent; persisting here keeps the store authoritative for the flag-free
+        # refresh/step-up paths that read it back. Only the resource-selection
+        # fields change (never the token itself), and we re-save only on an
+        # actual difference so an unchanged invocation does not rewrite the store.
+        desired_no_ri = not resource_indicator
+        if (
+            cached.no_resource_indicator != desired_no_ri
+            or cached.oauth_resource != oauth_resource
+        ):
+            cached.no_resource_indicator = desired_no_ri
+            cached.oauth_resource = oauth_resource
+            save_token(server_url, cached)
         if cached.expires_at is None or cached.expires_at > time.time() + refresh_leeway:
             log("using cached OAuth token")
             return cached
