@@ -157,9 +157,24 @@ def _enforce_lf_stdio() -> None:
 _enforce_lf_stdio()
 
 
+# Matches URL userinfo (``scheme://user:pass@``) anywhere in a string.
+_USERINFO_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^/?#@\s]*@")
+
+
+def scrub_secrets(text: str) -> str:
+    """Strip URL userinfo from arbitrary text before it is logged.
+
+    Direct URL logging goes through ``redact_url``, but URLs also reach the
+    log via exception messages (httpx puts ``request.url`` — including any
+    ``user:pass@`` userinfo — into its error text). This backstop removes the
+    userinfo from any URL embedded anywhere in a log line.
+    """
+    return _USERINFO_RE.sub(r"\1", text)
+
+
 def log(msg: str) -> None:
     """Log to stderr (visible in Claude Desktop/Code logs)."""
-    print(f"[mcp-stdio] {msg}", file=sys.stderr, flush=True)
+    print(f"[mcp-stdio] {scrub_secrets(msg)}", file=sys.stderr, flush=True)
 
 
 def redact_url(url: str) -> str:
