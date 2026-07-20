@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.28.1](https://github.com/shigechika/mcp-stdio/compare/v0.28.0...v0.28.1) (2026-07-20)
+
+
+### Bug Fixes
+
+* make scrub_secrets regex linear (polynomial-ReDoS) ([#325](https://github.com/shigechika/mcp-stdio/issues/325)) ([20f6e25](https://github.com/shigechika/mcp-stdio/commit/20f6e256441ebeff2cdc7b78a6c871f31116e4d0))
+* redact credentials from upstream URL before logging ([#322](https://github.com/shigechika/mcp-stdio/issues/322)) ([bf181fa](https://github.com/shigechika/mcp-stdio/commit/bf181fac9fc73c013d0b1c2dc37831134991ea4a))
+* scrub URL userinfo at the log() sink (covers exception paths) ([#324](https://github.com/shigechika/mcp-stdio/issues/324)) ([6488aee](https://github.com/shigechika/mcp-stdio/commit/6488aee64064863a5f38a64f83202d4c5e7ca6d9))
+
 ## [0.28.0](https://github.com/shigechika/mcp-stdio/compare/v0.27.0...v0.28.0) (2026-07-12)
 
 
