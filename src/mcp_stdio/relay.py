@@ -170,11 +170,13 @@ def redact_url(url: str) -> str:
     """
     try:
         parts = urlsplit(url)
+        host = parts.hostname or ""
+        port = parts.port  # SplitResult.port raises ValueError on a bad port
     except ValueError:
         return "<url>"
-    netloc = parts.hostname or ""
-    if parts.port is not None:
-        netloc = f"{netloc}:{parts.port}"
+    if ":" in host:  # IPv6 literal — .hostname drops the brackets, restore them
+        host = f"[{host}]"
+    netloc = f"{host}:{port}" if port is not None else host
     suffix = "?<redacted>" if parts.query else ""
     return f"{parts.scheme}://{netloc}{parts.path}{suffix}"
 

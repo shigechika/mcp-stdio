@@ -33,3 +33,15 @@ def test_userinfo_and_query_together():
 
 def test_malformed_returns_placeholder():
     assert redact_url("http://[::1") == "<url>"
+
+
+def test_ipv6_host_keeps_brackets():
+    assert redact_url("https://[::1]:8443/mcp") == "https://[::1]:8443/mcp"
+    # userinfo stripped, brackets preserved
+    assert redact_url("https://u:pw@[2001:db8::1]/x") == "https://[2001:db8::1]/x"
+
+
+def test_bad_port_does_not_crash():
+    # SplitResult.port raises ValueError for a non-numeric port; must not
+    # propagate out of redact_url (it is called from a logging path)
+    assert redact_url("https://host:notaport/x") == "<url>"
