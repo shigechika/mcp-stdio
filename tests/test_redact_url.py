@@ -23,9 +23,11 @@ def test_plain_url_unchanged():
 
 
 def test_userinfo_and_query_together():
-    out = redact_url("https://u:p@example.com:9000/x?token=t")
-    assert "p" not in out.split("example.com")[0].replace("https://", "")
-    assert "t" not in out
+    # use distinctive secret values that are not substrings of the output
+    # markers (e.g. "redacted") to avoid false collisions in the assertions
+    out = redact_url("https://user:SECRETPW@example.com:9000/x?token=SECRETTOK")
+    assert "SECRETPW" not in out
+    assert "SECRETTOK" not in out
     assert out == "https://example.com:9000/x?<redacted>"
 
 
