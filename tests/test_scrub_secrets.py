@@ -28,3 +28,15 @@ def test_plain_text_unchanged():
 
 def test_url_without_userinfo_unchanged():
     assert scrub_secrets("GET https://host.example/mcp") == "GET https://host.example/mcp"
+
+
+def test_linear_time_on_adversarial_input():
+    # regression for py/polynomial-redos: a long "://<many non-@>" with no '@'
+    # must not blow up (was O(n^2) with the greedy scheme-prefix variant)
+    import time
+
+    payload = "x://" + ("a" * 200_000)
+    t0 = time.perf_counter()
+    out = scrub_secrets(payload)
+    assert time.perf_counter() - t0 < 1.0
+    assert out == payload  # nothing to redact, returned unchanged

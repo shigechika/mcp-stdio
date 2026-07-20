@@ -157,8 +157,12 @@ def _enforce_lf_stdio() -> None:
 _enforce_lf_stdio()
 
 
-# Matches URL userinfo (``scheme://user:pass@``) anywhere in a string.
-_USERINFO_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^/?#@\s]*@")
+# Matches the userinfo of a URL: the ``//user:pass@`` between the scheme
+# separator and the host. Anchored on the literal ``://`` and a required
+# trailing ``@`` with a single non-backtracking ``[^/@\s]*`` in between, so it
+# stays linear (no polynomial-ReDoS from a greedy scheme prefix scanned at
+# every position).
+_USERINFO_RE = re.compile(r"://[^/@\s]*@")
 
 
 def scrub_secrets(text: str) -> str:
@@ -169,7 +173,7 @@ def scrub_secrets(text: str) -> str:
     ``user:pass@`` userinfo — into its error text). This backstop removes the
     userinfo from any URL embedded anywhere in a log line.
     """
-    return _USERINFO_RE.sub(r"\1", text)
+    return _USERINFO_RE.sub("://", text)
 
 
 def log(msg: str) -> None:
