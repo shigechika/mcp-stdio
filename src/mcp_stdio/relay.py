@@ -162,6 +162,23 @@ def log(msg: str) -> None:
     print(f"[mcp-stdio] {msg}", file=sys.stderr, flush=True)
 
 
+def redact_url(url: str) -> str:
+    """Return a URL safe for logging: strip userinfo and query.
+
+    The upstream URL may carry credentials (``https://user:pass@host`` or a
+    bearer token in the query string), so we log only scheme/host/port/path.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "<url>"
+    netloc = parts.hostname or ""
+    if parts.port is not None:
+        netloc = f"{netloc}:{parts.port}"
+    suffix = "?<redacted>" if parts.query else ""
+    return f"{parts.scheme}://{netloc}{parts.path}{suffix}"
+
+
 # Serializes writes to stdout. ``run_sse`` drives two writers — the SSE
 # reader thread (message events via ``_emit``) and the main loop (error
 # responses) — and ``print`` is not atomic across the content and its
@@ -1711,7 +1728,7 @@ def _check_connection_sse(
                     pass
 
     try:
-        log(f"testing SSE connection to {url}")
+        log(f"testing SSE connection to {redact_url(url)}")
         with client.stream("GET", url, headers=headers) as resp:
             holder["resp"] = resp
             if resp.status_code != 200:
@@ -1808,7 +1825,7 @@ def check_connection(
     )
 
     try:
-        log(f"testing connection to {url}")
+        log(f"testing connection to {redact_url(url)}")
         resp = client.post(url, content=initialize_msg, headers=headers)
 
         if resp.status_code != 200:
@@ -2093,7 +2110,7 @@ def run(
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    log(f"connecting to {url}")
+    log(f"connecting to {redact_url(url)}")
 
     session_id: str | None = None
     # Negotiated MCP protocol version, captured from the InitializeResult and
@@ -2955,7 +2972,7 @@ def run_sse(
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    log(f"connecting to {url} (SSE transport)")
+    log(f"connecting to {redact_url(url)} (SSE transport)")
 
     # SSE GET is long-lived. Give it its own read timeout so a half-open
     # TCP connection (silent mid-tool-call) surfaces as a ReadTimeout
