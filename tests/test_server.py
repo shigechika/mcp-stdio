@@ -446,6 +446,92 @@ def test_serve_main_rejects_non_finite_idle_ttl():
             server.serve_main(["--session-idle-ttl", bad, "--", "true"])
 
 
+def test_serve_main_rejects_negative_max_sessions_per_owner():
+    with pytest.raises(SystemExit):
+        server.serve_main(["--max-sessions-per-owner", "-1", "--", "true"])
+
+
+def test_per_owner_reclaims_prior_session_on_reinit():
+    # With a per-owner cap of 1, a fresh create for the same owner evicts that
+    # owner's prior session (the ghost a reconnecting client leaves behind) and
+    # shuts its child down.
+    reg = server.SessionRegistry(_BACKEND, max_sessions_per_owner=1)
+    try:
+        sid1, backend1 = reg.create(owner="alice")
+        sid2, backend2 = reg.create(owner="alice")
+        assert sid1 != sid2
+        assert reg.count == 1
+        assert reg.get(sid1, "alice") is None        # prior session reclaimed
+        assert reg.get(sid2, "alice") is not None     # new session live
+        assert backend1.closed                        # its child was torn down
+        assert not backend2.closed
+    finally:
+        reg.shutdown_all()
+
+
+def test_per_owner_lru_evicts_least_recently_active():
+    # Cap of 2: the third create evicts the LEAST recently active of the owner's
+    # sessions, not an arbitrary one.
+    clock = [1000.0]
+    reg = server.SessionRegistry(
+        _BACKEND, max_sessions_per_owner=2, now=lambda: clock[0]
+    )
+    try:
+        sid1, _ = reg.create(owner="alice")   # last_active 1000
+        clock[0] += 10
+        sid2, _ = reg.create(owner="alice")   # last_active 1010
+        clock[0] += 10
+        assert reg.get(sid1, "alice") is not None  # touch sid1 -> 1020
+        clock[0] += 10
+        sid3, _ = reg.create(owner="alice")   # now sid2 (1010) is the LRU
+        assert reg.count == 2
+        assert reg.get(sid2, "alice") is None       # LRU evicted
+        assert reg.get(sid1, "alice") is not None   # recently touched survives
+        assert reg.get(sid3, "alice") is not None
+    finally:
+        reg.shutdown_all()
+
+
+def test_per_owner_does_not_touch_other_owners():
+    # alice re-initializing never disturbs bob's session.
+    reg = server.SessionRegistry(_BACKEND, max_sessions_per_owner=1)
+    try:
+        _, _ = reg.create(owner="alice")
+        sid_bob, _ = reg.create(owner="bob")
+        reg.create(owner="alice")             # reclaims alice's, not bob's
+        assert reg.get(sid_bob, "bob") is not None
+        assert reg.count == 2                  # one alice + one bob
+    finally:
+        reg.shutdown_all()
+
+
+def test_per_owner_exempts_static_and_open_gateway():
+    # owner None (open gateway) and the shared static-token principal are NOT
+    # capped: many distinct clients legitimately share them.
+    reg = server.SessionRegistry(_BACKEND, max_sessions_per_owner=1)
+    try:
+        reg.create(owner=None)
+        reg.create(owner=None)
+        reg.create(owner=server._STATIC_PRINCIPAL)
+        reg.create(owner=server._STATIC_PRINCIPAL)
+        assert reg.count == 4                  # none reclaimed
+    finally:
+        reg.shutdown_all()
+
+
+def test_per_owner_disabled_by_default():
+    # Default (0) preserves today's behavior: same-owner sessions coexist.
+    reg = server.SessionRegistry(_BACKEND)
+    try:
+        sid1, _ = reg.create(owner="alice")
+        sid2, _ = reg.create(owner="alice")
+        assert reg.count == 2
+        assert reg.get(sid1, "alice") is not None
+        assert reg.get(sid2, "alice") is not None
+    finally:
+        reg.shutdown_all()
+
+
 def test_idle_eviction_disabled_keeps_live_session():
     # ttl=0 disables idle eviction: a live, arbitrarily-idle session survives.
     clock = [1000.0]

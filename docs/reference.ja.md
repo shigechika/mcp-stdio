@@ -105,6 +105,7 @@ Arguments:
 |--------|-----------|------|
 | `--max-sessions N` | `100` | 最大同時セッション数；上限を超えた initialize は `503` を取得します |
 | `--session-idle-ttl SECONDS` | `0`（無効） | アイドルタイムアウト；非アクティブ後にセッションと子を削除。DELETE なしで接続を切ったクライアントがスロットをピンしない |
+| `--max-sessions-per-owner N` | `0`（無効） | 新しい initialize 時に、その OAuth ユーザーの古いセッションを `N` 件まで LRU で削除し、DELETE せず再接続するクライアントが残したゴーストを回収。static-token と open-gateway のセッションは対象外 |
 
 ---
 

@@ -386,6 +386,7 @@ class SessionRegistry:
         *,
         max_sessions: int = _DEFAULT_MAX_SESSIONS,
         idle_ttl: float = 0.0,
+        max_sessions_per_owner: int = 0,
         now: Any = time.monotonic,
     ) -> None:
         if not command:
@@ -393,6 +394,7 @@ class SessionRegistry:
         self._command = command
         self._max = max_sessions
         self._idle_ttl = idle_ttl
+        self._max_per_owner = max_sessions_per_owner
         self._now = now
         self._lock = threading.Lock()
         self._sessions: dict[str, _Session] = {}
@@ -416,16 +418,47 @@ class SessionRegistry:
         # MCP spec: the session id SHOULD be globally unique and
         # cryptographically secure, and MUST contain only visible ASCII.
         sid = secrets.token_hex(16)
+        reclaimed: list[tuple[str, BackendProcess]] = []
         with self._lock:
+            # Per-owner reclamation: when this owner re-initializes (e.g. a
+            # remote connector that opens a fresh session per reconnect without
+            # DELETEing the old one), LRU-evict its prior sessions down to
+            # max_per_owner - 1 so the new one lands at exactly the cap. This
+            # reclaims ghost sessions deterministically at reconnect time,
+            # independent of the idle reaper, so a short idle TTL is no longer
+            # the only thing keeping ghosts from filling --max-sessions. Only
+            # real per-user (OAuth) owners are capped; the shared static-token
+            # principal and the open-gateway (None) owner are exempt, since many
+            # distinct clients legitimately share them.
+            if (
+                self._max_per_owner > 0
+                and owner is not None
+                and owner != _STATIC_PRINCIPAL
+            ):
+                owned = sorted(
+                    (
+                        (s, sess)
+                        for s, sess in self._sessions.items()
+                        if sess.owner == owner
+                    ),
+                    key=lambda item: item[1].last_active,
+                )
+                excess = len(owned) - (self._max_per_owner - 1)
+                for s, sess in owned[: max(0, excess)]:
+                    del self._sessions[s]
+                    reclaimed.append((s, sess.backend))
             # Re-check the cap: a burst of concurrent creates could have filled
             # it while we were spawning. Over the cap -> drop the just-spawned
             # child rather than exceed the bound.
             over_cap = len(self._sessions) >= self._max
             if not over_cap:
                 self._sessions[sid] = _Session(backend, self._now(), owner)
+        # shutdown() (terminate -> wait) runs OUTSIDE the lock so it never
+        # serializes other sessions' creation or routing.
+        for s, be in reclaimed:
+            be.shutdown()
+            log(f"reclaimed prior session {s[:8]}... on owner re-initialize")
         if over_cap:
-            # shutdown() (terminate -> wait) runs OUTSIDE the lock so it never
-            # serializes other sessions' creation or routing.
             backend.shutdown()
             return None
         return sid, backend
@@ -2118,6 +2151,7 @@ def build_server(
     oauth: _OAuthProvider | None = None,
     max_sessions: int = _DEFAULT_MAX_SESSIONS,
     idle_ttl: float = 0.0,
+    max_sessions_per_owner: int = 0,
 ) -> tuple[ThreadingHTTPServer, SessionRegistry]:
     """Construct the HTTP server and session registry without running the loop.
 
@@ -2134,7 +2168,10 @@ def build_server(
     ``registry.start_reaper()``.
     """
     registry = SessionRegistry(
-        command, max_sessions=max_sessions, idle_ttl=idle_ttl
+        command,
+        max_sessions=max_sessions,
+        idle_ttl=idle_ttl,
+        max_sessions_per_owner=max_sessions_per_owner,
     )
     handler = type(
         "_BoundHandler",
@@ -2162,6 +2199,7 @@ def serve(
     oauth: _OAuthProvider | None = None,
     max_sessions: int = _DEFAULT_MAX_SESSIONS,
     idle_ttl: float = 0.0,
+    max_sessions_per_owner: int = 0,
 ) -> None:
     """Run the reverse gateway until interrupted.
 
@@ -2180,6 +2218,7 @@ def serve(
         oauth=oauth,
         max_sessions=max_sessions,
         idle_ttl=idle_ttl,
+        max_sessions_per_owner=max_sessions_per_owner,
     )
     registry.start_reaper()
 
@@ -2203,10 +2242,13 @@ def serve(
         modes.append("embedded OAuth AS")
     auth_state = " + ".join(modes) if modes else "no auth"
     ttl_state = f"idle-ttl {idle_ttl:g}s" if idle_ttl > 0 else "no idle eviction"
+    per_owner_state = (
+        f", max {max_sessions_per_owner}/owner" if max_sessions_per_owner > 0 else ""
+    )
     log(
         f"serving {' '.join(command)} at "
         f"http://{host}:{port}{mcp_path} ({auth_state}; "
-        f"max {max_sessions} sessions, {ttl_state})"
+        f"max {max_sessions} sessions{per_owner_state}, {ttl_state})"
     )
     try:
         httpd.serve_forever()
@@ -2346,6 +2388,22 @@ def serve_main(argv: list[str]) -> None:
         ),
     )
     parser.add_argument(
+        "--max-sessions-per-owner",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Cap concurrent sessions per authenticated OAuth user: on a new "
+            "initialize the user's older sessions are LRU-evicted down to this "
+            "count, reclaiming ghost sessions left by a client that reconnects "
+            "without DELETE. This decouples ghost reclamation from the idle "
+            "reaper, so a longer --session-idle-ttl no longer risks ghosts "
+            "filling --max-sessions. 0 (default) disables per-owner capping. "
+            "Only affects OAuth-bound sessions; the shared static-token "
+            "principal and open-gateway sessions are exempt."
+        ),
+    )
+    parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
         help="backend stdio MCP server command (after the options)",
@@ -2397,6 +2455,8 @@ def serve_main(argv: list[str]) -> None:
         parser.error("--max-sessions must be >= 1")
     if args.session_idle_ttl < 0 or not math.isfinite(args.session_idle_ttl):
         parser.error("--session-idle-ttl must be a non-negative, finite number")
+    if args.max_sessions_per_owner < 0:
+        parser.error("--max-sessions-per-owner must be >= 0")
     if args.enable_oauth:
         public_url = None
         if args.public_url is not None:
@@ -2477,4 +2537,5 @@ def serve_main(argv: list[str]) -> None:
         oauth=oauth,
         max_sessions=args.max_sessions,
         idle_ttl=args.session_idle_ttl,
+        max_sessions_per_owner=args.max_sessions_per_owner,
     )
