@@ -519,6 +519,49 @@ def test_per_owner_exempts_static_and_open_gateway():
         reg.shutdown_all()
 
 
+def test_per_owner_reclaims_under_saturated_global_cap():
+    # Regression for the ordering bug: per-owner reclamation must run BEFORE the
+    # global-cap check, so an owner whose OWN ghost fills the only slot still
+    # reconnects instead of getting locked out until the idle reaper fires.
+    reg = server.SessionRegistry(
+        _BACKEND, max_sessions=1, max_sessions_per_owner=1
+    )
+    try:
+        sid1, backend1 = reg.create(owner="alice")   # fills the single slot
+        assert reg.count == 1
+        created = reg.create(owner="alice")           # global cap saturated...
+        assert created is not None                    # ...but alice's ghost is
+        sid2, _ = created                             # reclaimed, so this wins
+        assert sid1 != sid2
+        assert reg.count == 1
+        assert reg.get(sid1, "alice") is None         # old slot reclaimed
+        assert reg.get(sid2, "alice") is not None
+        assert backend1.closed
+    finally:
+        reg.shutdown_all()
+
+
+def test_per_owner_reclaims_under_saturation_with_other_owners():
+    # Saturated by two distinct owners: alice re-initializing reclaims her own
+    # session (not bob's) and lands the new one, staying within max_sessions.
+    reg = server.SessionRegistry(
+        _BACKEND, max_sessions=2, max_sessions_per_owner=1
+    )
+    try:
+        sid_a1, _ = reg.create(owner="alice")
+        sid_b, _ = reg.create(owner="bob")
+        assert reg.count == 2                          # saturated
+        created = reg.create(owner="alice")
+        assert created is not None
+        sid_a2, _ = created
+        assert reg.count == 2
+        assert reg.get(sid_a1, "alice") is None        # alice's old one gone
+        assert reg.get(sid_b, "bob") is not None       # bob untouched
+        assert reg.get(sid_a2, "alice") is not None
+    finally:
+        reg.shutdown_all()
+
+
 def test_per_owner_disabled_by_default():
     # Default (0) preserves today's behavior: same-owner sessions coexist.
     reg = server.SessionRegistry(_BACKEND)

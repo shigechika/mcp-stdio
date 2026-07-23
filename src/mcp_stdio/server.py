@@ -409,27 +409,19 @@ class SessionRegistry:
         Returns ``(session_id, backend)``, or ``None`` when the concurrent-
         session cap is reached (the caller then responds 503).
         """
-        with self._lock:
-            if len(self._sessions) >= self._max:
-                return None
-        # Spawn outside the lock: a Popen exec must not serialize other
-        # sessions' creation or routing.
-        backend = BackendProcess(self._command)
-        # MCP spec: the session id SHOULD be globally unique and
-        # cryptographically secure, and MUST contain only visible ASCII.
-        sid = secrets.token_hex(16)
+        # Per-owner reclamation runs BEFORE the global-cap check so a returning
+        # owner reclaims its OWN ghost sessions even when --max-sessions is
+        # saturated. That ordering is the point: a remote connector that opens a
+        # fresh session per reconnect without DELETEing the old one leaves
+        # ghosts; if the cap check ran first, a client whose own ghosts fill the
+        # cap would be locked out until the idle reaper fires — exactly what this
+        # feature promises to prevent. LRU-evict this owner's sessions down to
+        # max_per_owner - 1 so the new one lands at exactly the cap. Only real
+        # per-user (OAuth) owners are capped; the shared static-token principal
+        # and the open-gateway (None) owner are exempt, since many distinct
+        # clients legitimately share them.
         reclaimed: list[tuple[str, BackendProcess]] = []
         with self._lock:
-            # Per-owner reclamation: when this owner re-initializes (e.g. a
-            # remote connector that opens a fresh session per reconnect without
-            # DELETEing the old one), LRU-evict its prior sessions down to
-            # max_per_owner - 1 so the new one lands at exactly the cap. This
-            # reclaims ghost sessions deterministically at reconnect time,
-            # independent of the idle reaper, so a short idle TTL is no longer
-            # the only thing keeping ghosts from filling --max-sessions. Only
-            # real per-user (OAuth) owners are capped; the shared static-token
-            # principal and the open-gateway (None) owner are exempt, since many
-            # distinct clients legitimately share them.
             if (
                 self._max_per_owner > 0
                 and owner is not None
@@ -447,17 +439,27 @@ class SessionRegistry:
                 for s, sess in owned[: max(0, excess)]:
                     del self._sessions[s]
                     reclaimed.append((s, sess.backend))
+            at_cap = len(self._sessions) >= self._max
+        # shutdown() (terminate -> wait) runs OUTSIDE the lock so it never
+        # serializes other sessions' creation or routing.
+        for s, be in reclaimed:
+            be.shutdown()
+            log(f"reclaimed prior session {s[:8]}... on owner re-initialize")
+        if at_cap:
+            return None
+        # Spawn outside the lock: a Popen exec must not serialize other
+        # sessions' creation or routing.
+        backend = BackendProcess(self._command)
+        # MCP spec: the session id SHOULD be globally unique and
+        # cryptographically secure, and MUST contain only visible ASCII.
+        sid = secrets.token_hex(16)
+        with self._lock:
             # Re-check the cap: a burst of concurrent creates could have filled
             # it while we were spawning. Over the cap -> drop the just-spawned
             # child rather than exceed the bound.
             over_cap = len(self._sessions) >= self._max
             if not over_cap:
                 self._sessions[sid] = _Session(backend, self._now(), owner)
-        # shutdown() (terminate -> wait) runs OUTSIDE the lock so it never
-        # serializes other sessions' creation or routing.
-        for s, be in reclaimed:
-            be.shutdown()
-            log(f"reclaimed prior session {s[:8]}... on owner re-initialize")
         if over_cap:
             backend.shutdown()
             return None
