@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.29.0](https://github.com/shigechika/mcp-stdio/compare/v0.28.1...v0.29.0) (2026-07-23)
+
+
+### Features
+
+* **serve:** --max-sessions-per-owner for ghost session reclamation ([#329](https://github.com/shigechika/mcp-stdio/issues/329)) ([f16ce0b](https://github.com/shigechika/mcp-stdio/commit/f16ce0b56838f891dcb3cbed741c0b2bb37f637a))
+
 ## [0.28.1](https://github.com/shigechika/mcp-stdio/compare/v0.28.0...v0.28.1) (2026-07-20)
 
 
