@@ -339,9 +339,13 @@ mcp-stdio --oauth http://127.0.0.1:8080/mcp
 Options: `--host` (default `127.0.0.1`), `--port` (default `8080`), `--path`
 (default `/mcp`), `--auth-token TOKEN` (or `MCP_STDIO_SERVE_TOKEN`, preferred);
 session limits `--max-sessions N` (default `100`; an `initialize` past the cap
-gets `503`) and `--session-idle-ttl SECONDS` (evict a session and its child
+gets `503`), `--session-idle-ttl SECONDS` (evict a session and its child
 after this much inactivity so a client that disconnects without `DELETE` does
-not pin a slot; `0` = disabled, the default); and for the embedded AS:
+not pin a slot; `0` = disabled, the default), and `--max-sessions-per-owner N`
+(on a new `initialize`, LRU-evict that OAuth user's older sessions down to `N`,
+reclaiming ghosts left by a client that reconnects without `DELETE`; `0` =
+disabled, the default; static-token and open-gateway sessions are exempt); and
+for the embedded AS:
 `--enable-oauth`, `--public-url URL` (pins the issuer; recommended behind a
 proxy), `--trusted-user-header HEADER`, `--dev-user USER` (insecure, testing
 only), `--access-token-ttl SECONDS`, `--allow-redirect-uri URL` (repeatable;
@@ -421,7 +425,7 @@ Gateway (bound to loopback, behind the proxy):
 mcp-stdio serve --enable-oauth \
   --public-url https://mcp.example.org \
   --trusted-user-header X-Forwarded-User \
-  --max-sessions 200 --session-idle-ttl 900 \
+  --max-sessions 200 --session-idle-ttl 900 --max-sessions-per-owner 1 \
   --host 127.0.0.1 --port 8080 -- python -m my_mcp_server
 ```
 
@@ -430,6 +434,12 @@ mcp-stdio serve --enable-oauth \
   trusts it only because the proxy strips any client-supplied copy.
 - `--max-sessions` caps concurrent per-user children; `--session-idle-ttl`
   reclaims a child after a user disconnects without sending `DELETE`.
+- `--max-sessions-per-owner` reclaims a user's *previous* sessions the moment
+  they re-initialize, so a client that reconnects without `DELETE` (common for
+  hosted connectors) no longer leaves ghosts. Because ghosts are reclaimed at
+  reconnect rather than only by the idle reaper, a longer `--session-idle-ttl`
+  no longer risks ghosts filling `--max-sessions` — which lets an interactive
+  client with pauses avoid frequent re-initialization.
 
 Each user points their client at the gateway, runs the OAuth flow once, and is
 served by a dedicated child:

@@ -105,6 +105,7 @@ Arguments:
 |------|---------|-------------|
 | `--max-sessions N` | `100` | Maximum concurrent sessions; an initialize past the cap gets `503` |
 | `--session-idle-ttl SECONDS` | `0` (disabled) | Idle timeout; evict a session and its child after this much inactivity so a client that disconnects without DELETE does not pin a slot |
+| `--max-sessions-per-owner N` | `0` (disabled) | On a new initialize, LRU-evict that OAuth user's older sessions down to `N`, reclaiming ghosts left by a client that reconnects without DELETE; static-token and open-gateway sessions are exempt |
 
 ---
 
