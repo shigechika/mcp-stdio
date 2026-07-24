@@ -164,7 +164,9 @@ class BackendProcess:
         )
         self._lock = threading.Lock()
         self._write_lock = threading.Lock()
-        # id -> single-slot holder {"event": Event, "line": str|None}
+        # id -> shared slot {"event": Event, "line": str|None,
+        # "request_line": str, "waiters": int}; retired by its LAST waiter
+        # (same-payload retries piggyback on one slot, see send_request).
         self._pending: dict[Any, dict[str, Any]] = {}
         # Server-initiated messages (requests/notifications) awaiting an SSE
         # consumer. Unbounded queue is acceptable for one client per session;
@@ -232,6 +234,40 @@ class BackendProcess:
             # the client.
             self.server_initiated.put(line)
 
+    @staticmethod
+    def _same_request(a: str, b: str) -> bool:
+        """Whether two serialized request lines carry the same message.
+
+        Byte equality first (the common case: one client re-firing the exact
+        line), falling back to parsed equality so a retry re-serialized with a
+        different key order or number formatting still matches.
+        """
+        if a == b:
+            return True
+        try:
+            return json.loads(a) == json.loads(b)
+        except (json.JSONDecodeError, TypeError):
+            return False
+
+    def _detach(self, req_id: Any, slot: dict[str, Any]) -> str | None:
+        """Drop one waiter from ``slot``; the LAST one out retires it.
+
+        Waiter-counted retirement keeps the slot registered while any
+        piggybacked retry is still waiting, so a reply arriving after the
+        first caller's own timeout still reaches the remaining waiter(s)
+        instead of leaking to SSE, ``_fail_all`` can still wake them, and
+        ``has_pending`` keeps the idle reaper away.
+
+        Returns the response line if it has arrived (read under the lock, so
+        a reply landing between this waiter's ``wait()`` expiry and now is
+        still honored), else ``None``.
+        """
+        with self._lock:
+            slot["waiters"] -= 1
+            if slot["waiters"] <= 0 and self._pending.get(req_id) is slot:
+                self._pending.pop(req_id, None)
+            return slot["line"]
+
     def send_request(self, line: str, req_id: Any, timeout: float) -> str | None:
         """Forward a request line and block for its response.
 
@@ -240,15 +276,23 @@ class BackendProcess:
         unambiguously non-compliant and cannot be correlated (both replies
         would carry that id) — that case still raises
         :class:`_DuplicateInFlightId`. But a same-id request with the SAME
-        payload arriving while the first is still outstanding is a client-side
-        retry (observed after gateway restarts / idle-reclaim: the client's
-        reconnect burst re-fires a request whose id collides with itself), not
-        a protocol violation. Piggyback the retry onto the original's pending
-        slot — both callers then observe the one backend reply — instead of
-        sending a second copy to the backend or rejecting it with 409.
+        payload (compared parsed, so a re-serialized retry with different key
+        order still matches) arriving while the first is still outstanding is
+        a client-side retry (observed after gateway restarts / idle-reclaim:
+        the client's reconnect burst re-fires a request whose id collides
+        with itself), not a protocol violation. Piggyback the retry onto the
+        original's pending slot — every waiter still attached when the reply
+        arrives observes that one backend reply — instead of sending a second
+        copy to the backend or rejecting it with 409. Each waiter keeps its
+        OWN deadline: one whose timeout expires before the reply lands gets
+        ``None`` while a later-attached waiter can still succeed.
+
         Sequential reuse (the id already popped on completion) is not a
-        collision here and stays tolerated, so lenient real-world clients that
-        pin one id keep working.
+        collision here and stays tolerated, so lenient real-world clients
+        that pin one id keep working. Consequently a same-payload retry that
+        lands just AFTER the first copy completed is indistinguishable from
+        legitimate sequential reuse and is dispatched anew — callers of
+        non-idempotent methods must not rely on this window being deduplicated.
 
         Returns the backend's response line, or ``None`` on timeout / backend
         death (the caller then synthesizes a JSON-RPC error).
@@ -258,35 +302,28 @@ class BackendProcess:
                 return None
             existing = self._pending.get(req_id)
             if existing is not None:
-                if existing["request_line"] != line:
+                if not self._same_request(existing["request_line"], line):
                     raise _DuplicateInFlightId(req_id)
                 # `slot` is the SAME dict object already in `_pending`, so the
                 # `_route()` write to slot["line"] / slot["event"].set() below
                 # is visible here too, whichever caller reads it first.
                 slot = existing
-                owns_slot = False
+                slot["waiters"] += 1
+                dispatch = False
             else:
                 slot = {
                     "event": threading.Event(),
                     "line": None,
                     "request_line": line,
+                    "waiters": 1,
                 }
                 self._pending[req_id] = slot
-                owns_slot = True
-        if owns_slot and not self._write(line):
-            with self._lock:
-                if self._pending.get(req_id) is slot:
-                    self._pending.pop(req_id, None)
+                dispatch = True
+        if dispatch and not self._write(line):
+            self._detach(req_id, slot)
             return None
-        ok = slot["event"].wait(timeout)
-        if owns_slot:
-            # Only the request that registered the slot retires it — a
-            # piggybacked retry popping it could drop a THIRD, still-attaching
-            # caller's only reference to the shared slot.
-            with self._lock:
-                if self._pending.get(req_id) is slot:
-                    self._pending.pop(req_id, None)
-        return slot["line"] if ok else None
+        slot["event"].wait(timeout)
+        return self._detach(req_id, slot)
 
     def send_oneway(self, line: str) -> bool:
         """Forward a notification or a client->server response (no reply)."""
