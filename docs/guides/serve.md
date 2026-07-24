@@ -79,10 +79,22 @@ a crossover.
   id returns `404` for a clean re-initialize. Responses are correlated within a
   session by JSON-RPC id and are never cross-wired: a client that reuses an id
   *sequentially* is matched correctly, and a second request reusing an id
-  already *in flight* on the same session is rejected (`409`, since MCP requires
-  request ids to be unique within a session) rather than silently delivering the
-  wrong reply. serve cannot make a client that mints a brand-new session id on
-  every call persist state — that is the client's own behavior.
+  already *in flight* on the same session with a DIFFERENT payload is rejected
+  (`409`, since MCP requires request ids to be unique within a session) rather
+  than silently delivering the wrong reply. A same-id request with the SAME
+  payload (compared as parsed JSON, so a re-serialized retry with a different
+  key order still matches) arriving while the first is still outstanding — the
+  shape seen when a client's reconnect burst re-fires a request against itself
+  right after a restart or idle-reclaim — is instead treated as a retry: it is
+  piggybacked onto the in-flight request, and every waiter still attached when
+  the reply arrives gets that same `200` reply, not `409`. Two caveats: each
+  waiter keeps its own deadline (a caller whose timeout expires before the
+  shared reply lands gets its own `504` while a later-attached retry can still
+  succeed), and a retry landing just *after* the first copy completed is
+  indistinguishable from legitimate sequential id reuse, so it is dispatched
+  anew — do not rely on that window being deduplicated for non-idempotent
+  calls. serve cannot make a client that mints a brand-new session id on every
+  call persist state — that is the client's own behavior.
 
 Real-world reference: this is the exact setup used to publish several
 stdio MCP servers under one host, surviving routine redeploys without

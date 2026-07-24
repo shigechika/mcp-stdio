@@ -4,6 +4,11 @@ Reads newline-delimited JSON-RPC from stdin and reacts:
 
 - ``initialize`` (request)      -> an InitializeResult with protocolVersion
 - ``echo`` (request)            -> result {"echoed": <params>, "pid": <os pid>}
+- ``slow_echo`` (request)       -> like ``echo``, after a sleep (default 0.3s,
+  override with params {"delay": <seconds>}); lets a test keep the request in
+  flight long enough to send a duplicate-id retry. Its result also carries
+  ``calls`` (a per-process invocation counter) so a test can prove exactly how
+  many copies of the request reached the backend.
 - ``noreply`` (request)         -> never responds (drives the timeout path)
 - ``trigger_push`` (notification) -> emits a server-initiated notification
 - ``exit`` (any)                -> the process exits
@@ -15,6 +20,7 @@ script path by the tests.
 import json
 import os
 import sys
+import time
 
 
 def _send(obj: dict) -> None:
@@ -23,6 +29,7 @@ def _send(obj: dict) -> None:
 
 
 def main() -> None:
+    slow_echo_calls = 0
     while True:
         line = sys.stdin.readline()
         if line == "":
@@ -56,6 +63,21 @@ def main() -> None:
                     "jsonrpc": "2.0",
                     "id": mid,
                     "result": {"echoed": msg.get("params"), "pid": os.getpid()},
+                }
+            )
+        elif method == "slow_echo" and "id" in msg:
+            slow_echo_calls += 1
+            params = msg.get("params") or {}
+            time.sleep(params.get("delay", 0.3))
+            _send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": mid,
+                    "result": {
+                        "echoed": msg.get("params"),
+                        "pid": os.getpid(),
+                        "calls": slow_echo_calls,
+                    },
                 }
             )
         elif method == "noreply" and "id" in msg:
