@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.29.1](https://github.com/shigechika/mcp-stdio/compare/v0.29.0...v0.29.1) (2026-07-24)
+
+
+### Bug Fixes
+
+* piggyback same-payload duplicate in-flight requests instead of 409 ([#332](https://github.com/shigechika/mcp-stdio/issues/332)) ([a8a7a09](https://github.com/shigechika/mcp-stdio/commit/a8a7a099fc0b113a82421110a987ea9deb3d0406))
+
 ## [0.29.0](https://github.com/shigechika/mcp-stdio/compare/v0.28.1...v0.29.0) (2026-07-23)
 
 
