@@ -139,14 +139,17 @@ def test_reused_id_sequential_same_session(gateway):
 
 
 def test_duplicate_in_flight_id_rejected():
-    # Two requests sharing a JSON-RPC id IN FLIGHT at once on one session-child
-    # are ambiguous — both backend replies carry that id. MCP 2025-06-18 forbids
-    # reusing a request id within a session, so serve rejects the second rather
-    # than overwriting the pending slot, which would cross-wire the first reply
-    # to the second waiter (claude-ai-mcp#539). The first request (noreply) is
-    # given a long timeout so it stays reliably in flight for the whole test
-    # (a short timeout could pop _pending before the duplicate runs under heavy
-    # CI load and mask the collision); shutdown() then unblocks it.
+    # Two requests sharing a JSON-RPC id IN FLIGHT at once on one session-child,
+    # with DIFFERENT payloads, are ambiguous — both backend replies carry that
+    # id. MCP 2025-06-18 forbids reusing a request id within a session, so serve
+    # rejects the second rather than overwriting the pending slot, which would
+    # cross-wire the first reply to the second waiter (claude-ai-mcp#539). A
+    # SAME-payload duplicate is a different case — see
+    # test_duplicate_in_flight_id_same_payload_piggybacks below (mcp-stdio#331).
+    # The first request (noreply) is given a long timeout so it stays reliably
+    # in flight for the whole test (a short timeout could pop _pending before
+    # the duplicate runs under heavy CI load and mask the collision);
+    # shutdown() then unblocks it.
     proc = server.BackendProcess(_BACKEND)
     try:
         with ThreadPoolExecutor(max_workers=1) as ex:
@@ -173,6 +176,63 @@ def test_duplicate_in_flight_id_rejected():
             assert first.result() is None
     finally:
         proc.shutdown()
+
+
+def test_duplicate_in_flight_id_same_payload_piggybacks():
+    # mcp-stdio#331: after a gateway restart / idle-reclaim, a client's
+    # reconnect burst can re-fire a request whose id collides with itself
+    # while the first copy is still outstanding. Since the payload is IDENTICAL
+    # (a retry, not a protocol violation), the second call must piggyback on
+    # the first's pending slot and get the SAME backend reply — not 409 — and
+    # the backend must see only ONE copy of the request (slow_echo sleeps
+    # 0.3s; two SERIAL dispatches would take ~0.6s+, one shared dispatch
+    # completes in ~0.3s regardless of how many callers are waiting on it).
+    proc = server.BackendProcess(_BACKEND)
+    try:
+        line = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "slow_echo", "params": {"n": 1}}
+        )
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            start = time.monotonic()
+            first = ex.submit(proc.send_request, line, 1, 5.0)
+            # Wait until the first request is registered in flight.
+            for _ in range(600):
+                with proc._lock:
+                    if 1 in proc._pending:
+                        break
+                time.sleep(0.005)
+            else:  # pragma: no cover - defensive
+                pytest.fail("first request never registered in flight")
+            second = ex.submit(proc.send_request, line, 1, 5.0)
+            r1, r2 = first.result(), second.result()
+            elapsed = time.monotonic() - start
+        assert r1 is not None and r2 is not None
+        assert r1 == r2  # both observed the one backend reply
+        assert elapsed < 0.5, f"expected one shared 0.3s dispatch, took {elapsed:.2f}s"
+        # The slot must be retired after both callers are done (no leak).
+        with proc._lock:
+            assert 1 not in proc._pending
+    finally:
+        proc.shutdown()
+
+
+def test_duplicate_in_flight_id_same_payload_returns_200_over_http(gateway):
+    # HTTP-level counterpart of test_duplicate_in_flight_id_same_payload_piggybacks:
+    # a client that fires the identical request twice under one id while the
+    # first is still outstanding (the mcp-stdio#331 reconnect-burst shape) must
+    # get 200 with the SAME result both times, never the 409 a genuinely
+    # different duplicate payload still gets.
+    url, _ = gateway
+    sid, _ = _init(url)
+    msg = {"jsonrpc": "2.0", "id": 1, "method": "slow_echo", "params": {"n": 1}}
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f1 = ex.submit(_post, url, msg, sid)
+        time.sleep(0.05)  # let the first request register in flight
+        f2 = ex.submit(_post, url, msg, sid)
+        r1, r2 = f1.result(), f2.result()
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert r1.json() == r2.json()
 
 
 def test_notification_returns_202(gateway):

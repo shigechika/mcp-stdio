@@ -119,7 +119,8 @@ def _error_body(message: str, req_id: Any = None) -> str:
 
 
 class _DuplicateInFlightId(Exception):
-    """A request reused a JSON-RPC id already in flight on the same session.
+    """A request reused a JSON-RPC id already in flight on the same session
+    with a payload that DIFFERS from the one already outstanding.
 
     MCP 2025-06-18 (Base Protocol > Messages > Requests) requires that "The
     request ID MUST NOT have been previously used by the requestor within the
@@ -127,6 +128,11 @@ class _DuplicateInFlightId(Exception):
     correlated — the backend's two replies both carry that id — so serve rejects
     the second instead of overwriting the pending slot (which would cross-wire
     the first reply to the second waiter).
+
+    A same-id request with the SAME payload is treated differently: it is a
+    client-side retry (e.g. the reconnect burst racing its own re-init), not a
+    protocol violation, and is piggybacked onto the in-flight request's slot
+    instead of raising this (see :meth:`BackendProcess.send_request`).
     """
 
 
@@ -229,31 +235,57 @@ class BackendProcess:
     def send_request(self, line: str, req_id: Any, timeout: float) -> str | None:
         """Forward a request line and block for its response.
 
+        MCP forbids reusing a request id within a session; two requests
+        sharing an id *in flight at once* with DIFFERENT payloads are
+        unambiguously non-compliant and cannot be correlated (both replies
+        would carry that id) — that case still raises
+        :class:`_DuplicateInFlightId`. But a same-id request with the SAME
+        payload arriving while the first is still outstanding is a client-side
+        retry (observed after gateway restarts / idle-reclaim: the client's
+        reconnect burst re-fires a request whose id collides with itself), not
+        a protocol violation. Piggyback the retry onto the original's pending
+        slot — both callers then observe the one backend reply — instead of
+        sending a second copy to the backend or rejecting it with 409.
+        Sequential reuse (the id already popped on completion) is not a
+        collision here and stays tolerated, so lenient real-world clients that
+        pin one id keep working.
+
         Returns the backend's response line, or ``None`` on timeout / backend
         death (the caller then synthesizes a JSON-RPC error).
         """
-        event = threading.Event()
-        slot = {"event": event, "line": None}
         with self._lock:
             if self._closed.is_set():
                 return None
-            # MCP forbids reusing a request id within a session; two requests
-            # sharing an id *in flight at once* are unambiguously non-compliant
-            # and cannot be correlated (both replies carry that id). Overwriting
-            # the pending slot would cross-wire the first reply to the second
-            # waiter, so reject the duplicate. Sequential reuse (the id already
-            # popped on completion) is not a collision here and stays tolerated,
-            # so lenient real-world clients that pin one id keep working.
-            if req_id in self._pending:
-                raise _DuplicateInFlightId(req_id)
-            self._pending[req_id] = slot
-        if not self._write(line):
+            existing = self._pending.get(req_id)
+            if existing is not None:
+                if existing["request_line"] != line:
+                    raise _DuplicateInFlightId(req_id)
+                # `slot` is the SAME dict object already in `_pending`, so the
+                # `_route()` write to slot["line"] / slot["event"].set() below
+                # is visible here too, whichever caller reads it first.
+                slot = existing
+                owns_slot = False
+            else:
+                slot = {
+                    "event": threading.Event(),
+                    "line": None,
+                    "request_line": line,
+                }
+                self._pending[req_id] = slot
+                owns_slot = True
+        if owns_slot and not self._write(line):
             with self._lock:
-                self._pending.pop(req_id, None)
+                if self._pending.get(req_id) is slot:
+                    self._pending.pop(req_id, None)
             return None
-        ok = event.wait(timeout)
-        with self._lock:
-            self._pending.pop(req_id, None)
+        ok = slot["event"].wait(timeout)
+        if owns_slot:
+            # Only the request that registered the slot retires it — a
+            # piggybacked retry popping it could drop a THIRD, still-attaching
+            # caller's only reference to the shared slot.
+            with self._lock:
+                if self._pending.get(req_id) is slot:
+                    self._pending.pop(req_id, None)
         return slot["line"] if ok else None
 
     def send_oneway(self, line: str) -> bool:
@@ -2019,7 +2051,8 @@ class _Handler(BaseHTTPRequestHandler):
                 )
             except _DuplicateInFlightId:
                 # Client reused a JSON-RPC id already in flight on this session
-                # (MCP forbids id reuse within a session). It cannot be
+                # with a DIFFERENT payload (a same-payload retry is piggybacked
+                # by send_request instead of raising). It cannot be
                 # correlated, so reject it rather than cross-wire a reply. 409
                 # Conflict: the id conflicts with an in-flight request.
                 self._send_json(

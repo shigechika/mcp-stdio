@@ -4,6 +4,8 @@ Reads newline-delimited JSON-RPC from stdin and reacts:
 
 - ``initialize`` (request)      -> an InitializeResult with protocolVersion
 - ``echo`` (request)            -> result {"echoed": <params>, "pid": <os pid>}
+- ``slow_echo`` (request)       -> like ``echo``, after a brief sleep (lets a
+  test keep the request in flight long enough to send a duplicate-id retry)
 - ``noreply`` (request)         -> never responds (drives the timeout path)
 - ``trigger_push`` (notification) -> emits a server-initiated notification
 - ``exit`` (any)                -> the process exits
@@ -15,6 +17,7 @@ script path by the tests.
 import json
 import os
 import sys
+import time
 
 
 def _send(obj: dict) -> None:
@@ -51,6 +54,15 @@ def main() -> None:
         elif method == "echo" and "id" in msg:
             # pid lets a test prove two sessions hit two distinct child
             # processes (no cross-session response leakage).
+            _send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": mid,
+                    "result": {"echoed": msg.get("params"), "pid": os.getpid()},
+                }
+            )
+        elif method == "slow_echo" and "id" in msg:
+            time.sleep(0.3)
             _send(
                 {
                     "jsonrpc": "2.0",
