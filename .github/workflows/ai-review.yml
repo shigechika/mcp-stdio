@@ -1,0 +1,149 @@
+name: AI review
+
+# First-pass AI code review via a self-hosted OpenAI-compatible endpoint
+# (Azure AI Foundry v1 API). Fleet-rolled-out from jquants-mcp #532/#533,
+# where it was multi-agent reviewed and hardened. The prompt steers the model
+# toward repository-guidance violations, cross-file consistency and security.
+#
+# Advisory only: every failure path soft-fails so this job can never block a
+# PR. Skips release-please version bumps (same-repo scoped — a fork controls
+# head.ref, so branch names must not dodge review) plus Dependabot bumps —
+# mechanical diffs aren't worth review tokens. Uses plain pull_request, NOT
+# pull_request_target: this job checks out and reads repo files, so _target
+# would be the classic pwn-request antipattern. Consequence: fork PRs get no
+# secrets and therefore no AI review — accepted.
+#
+# Secrets (the endpoint hostname is deliberately kept out of this public
+# repo — treat it like a credential):
+#   AI_REVIEW_ENDPOINT  resource root, e.g. https://<resource>.services.ai.azure.com
+#   AI_REVIEW_API_KEY   API key for that resource
+# Optional repository variable:
+#   AI_REVIEW_MODEL     deployment name (default: gpt-5.6-sol)
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write # post the review comment
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    if: >-
+      ${{ !github.event.pull_request.draft &&
+          !(github.event.pull_request.head.repo.full_name == github.repository &&
+            startsWith(github.event.pull_request.head.ref, 'release-please--')) &&
+          github.event.pull_request.user.login != 'dependabot[bot]' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Request AI review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENDPOINT: ${{ secrets.AI_REVIEW_ENDPOINT }}
+          API_KEY: ${{ secrets.AI_REVIEW_API_KEY }}
+          MODEL: ${{ vars.AI_REVIEW_MODEL || 'gpt-5.6-sol' }}
+          PR: ${{ github.event.pull_request.number }}
+          # Via env, not inline ${{ }} in run:, so a crafted title can't
+          # inject shell (same hygiene as the other workflows here).
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if [ -z "$ENDPOINT" ] || [ -z "$API_KEY" ]; then
+            # Also the fork-PR path: secrets are absent there by design.
+            echo "::warning::AI_REVIEW_ENDPOINT / AI_REVIEW_API_KEY not set — skipping AI review"
+            exit 0
+          fi
+
+          # Secret masking is exact-substring: the registered secret includes
+          # the scheme, so a bare-host occurrence (e.g. curl's own error text)
+          # would NOT be masked. Register the bare host as an extra mask.
+          bare_host=$(printf '%s' "$ENDPOINT" | sed -E 's#^[a-zA-Z]+://##; s#[/:].*$##')
+          if [ -n "$bare_host" ]; then echo "::add-mask::$bare_host"; fi
+
+          # Normalize to the resource ROOT: the v1 route lives directly under
+          # the host, so an Azure AI Foundry *project* URL
+          # (https://host/api/projects/xxx) in the secret must be reduced to
+          # scheme+host — the same pitfall the summarizer hit before.
+          ENDPOINT=$(printf '%s' "$ENDPOINT" | sed -E 's#^([a-zA-Z]+://[^/]+).*#\1#')
+
+          # The default run shell is bash with errexit+pipefail, so guard the
+          # prompt-building calls too — a transient GitHub API error must
+          # degrade the prompt, not fail the job (advisory-only contract).
+          {
+            echo "PR title: $TITLE"
+            echo
+            echo "PR description:"
+            gh pr view "$PR" --json body -q .body 2>/dev/null | head -c 4000 || true
+            echo
+            for f in CLAUDE.md AGENTS.md .github/copilot-instructions.md; do
+              if [ -f "$f" ]; then
+                echo "=== Repository guidance: $f ==="
+                head -c 8000 "$f"
+                echo
+              fi
+            done
+            echo "=== Unified diff ==="
+            gh pr diff "$PR" 2>/dev/null | head -c 100000 || true
+          } > prompt.txt
+
+          # If gh pr diff failed above, the marker is the last line — nothing
+          # to review; skip rather than send an empty diff to the model.
+          if [ "$(tail -n 1 prompt.txt)" = "=== Unified diff ===" ]; then
+            echo "::warning::could not fetch the PR diff (GitHub API error?) — skipping AI review"
+            exit 0
+          fi
+
+          system='You are reviewing a pull request for this repository.
+          Focus on: real bugs and logic errors introduced by the diff,
+          violations of the repository guidance included in the prompt,
+          cross-file inconsistencies, and security issues. Do NOT report
+          style nitpicks, formatting, or anything a linter, typechecker or
+          test suite would catch. For each finding cite the file and the
+          diff hunk it occurs in, and briefly give the concrete failure
+          scenario. If you find nothing significant, say so in one short
+          paragraph — do not invent findings. Respond in the primary
+          language of the PR description. Keep the review under 500 words.'
+
+          jq -n --arg model "$MODEL" --arg system "$system" \
+                --rawfile user prompt.txt \
+                '{model: $model,
+                  messages: [{role: "system", content: $system},
+                             {role: "user", content: $user}]}' > payload.json || {
+            echo "::warning::failed to build request payload — skipping AI review"
+            exit 0
+          }
+
+          # stderr is dropped: curl's own error text prints the bare endpoint
+          # host, which the add-mask above should catch but belt-and-braces.
+          resp=$(curl -fsS -m 300 --retry 2 --retry-delay 5 --retry-all-errors \
+                   -H "Authorization: Bearer $API_KEY" \
+                   -H "Content-Type: application/json" \
+                   -d @payload.json \
+                   "${ENDPOINT%/}/openai/v1/chat/completions" 2>/dev/null) || {
+            echo "::warning::AI review request failed — skipping"
+            exit 0
+          }
+          review=$(printf '%s' "$resp" | jq -r '.choices[0].message.content // empty' 2>/dev/null) || {
+            echo "::warning::unparseable AI review response — skipping"
+            exit 0
+          }
+          if [ -z "$review" ]; then
+            echo "::warning::empty AI review response — skipping"
+            exit 0
+          fi
+
+          {
+            echo "### AI review (${MODEL})"
+            echo
+            printf '%s\n' "$review"
+            echo
+            echo "<sub>Advisory first-pass review generated by ai-review.yml — verify findings before acting.</sub>"
+          } > comment.md
+          gh pr comment "$PR" --body-file comment.md \
+            || echo "::warning::failed to post AI review comment"
