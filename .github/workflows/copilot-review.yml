@@ -13,6 +13,14 @@ name: Request Copilot review
 # real user (a PAT), not a bot, so they cannot be excluded by author either.
 # Moving the request into a workflow lets us gate on the head branch name.
 #
+# Failure to attach Copilot is reported as a WARNING annotation and the job
+# exits green (soft-fail). It was originally a hard failure ("turn a silent
+# no-op into a visible red"), but a metered premium-request quota outage makes
+# the request fail for EVERY pull request, and a required red check then
+# blocks all merges until the quota resets (observed 2026-07-24). The warning
+# annotation keeps the signal visible on the PR without holding merges
+# hostage to Copilot availability.
+#
 # The request is made with a Copilot-enabled user PAT (secret
 # COPILOT_REVIEW_TOKEN), NOT the Actions GITHUB_TOKEN: github-actions[bot] has
 # no Copilot seat, so `gh pr edit --add-reviewer @copilot` returns success but
@@ -65,14 +73,17 @@ jobs:
         # the REST requested_reviewers endpoint, which returns 200 but silently
         # ignores the Copilot bot login. Even gh's request can attach nothing if
         # the token lacks a Copilot seat, so afterwards confirm a Copilot
-        # review_requested event actually landed and fail loudly otherwise — a
+        # review_requested event actually landed and warn otherwise — a
         # Copilot review that is already present (idempotent re-request) or one
         # that has already been submitted still leaves this event, so the check
-        # is stable across re-fires. This turns a silent green no-op into a
-        # visible red.
+        # is stable across re-fires. Absence is surfaced as a warning
+        # annotation, not a failure (see header).
         run: |
           set -euo pipefail
-          gh pr edit "$PR" --repo "$REPO" --add-reviewer "@copilot"
+          if ! gh pr edit "$PR" --repo "$REPO" --add-reviewer "@copilot"; then
+            echo "::warning::Could not request Copilot review (premium-request quota exhausted, or the token lacks Copilot access) — continuing without it."
+            exit 0
+          fi
           # Confirm a Copilot review_requested event actually landed. The PR
           # timeline is the reliable source: requested_reviewers drops the
           # Copilot bot once it reviews, but the timeline event persists. It is
@@ -104,8 +115,8 @@ jobs:
             sleep 5
           done
           if [ "$query_ok" = true ]; then
-            echo "::error::Copilot was not requested — COPILOT_REVIEW_TOKEN may lack Copilot access or be expired."
+            echo "::warning::Copilot was not requested — the premium-request quota may be exhausted, or COPILOT_REVIEW_TOKEN may lack Copilot access or be expired. Continuing without Copilot review."
           else
-            echo "::error::Could not read the PR timeline after 3 attempts — a transient GitHub API error, or COPILOT_REVIEW_TOKEN lacking read access to this repository."
+            echo "::warning::Could not read the PR timeline after 3 attempts — a transient GitHub API error, or COPILOT_REVIEW_TOKEN lacking read access. Continuing without confirming Copilot review."
           fi
-          exit 1
+          exit 0
