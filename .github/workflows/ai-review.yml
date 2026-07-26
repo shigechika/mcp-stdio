@@ -1,9 +1,9 @@
 name: AI review
 
 # First-pass AI code review via a self-hosted OpenAI-compatible endpoint
-# (Azure AI Foundry v1 API). Fleet-rolled-out from jquants-mcp #532/#533,
-# where it was multi-agent reviewed and hardened. The prompt steers the model
-# toward repository-guidance violations, cross-file consistency and security.
+# (Azure AI Foundry v1 API). The prompt steers the model toward
+# repository-guidance violations, cross-file consistency and security, which
+# is a deliberately different lens from a generic review pass.
 #
 # Advisory only: every failure path soft-fails so this job can never block a
 # PR. Skips release-please version bumps (same-repo scoped — a fork controls
