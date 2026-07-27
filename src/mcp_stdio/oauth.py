@@ -89,6 +89,13 @@ class OAuthMetadata:
     # RFC 8414 issuer identifier — used to validate the RFC 9207 ``iss``
     # parameter on the authorization response (AS mix-up defence).
     issuer: str | None = None
+    # True only when ``issuer`` was read from a metadata document that was
+    # actually fetched and validated. The 2026-07-28 authorization spec makes
+    # this the precondition for the RFC 9207 check: the comparison "provides no
+    # protection if the expected issuer was obtained from an unvalidated
+    # source". The synthesized-endpoint fallback sets an issuer without any
+    # metadata behind it, and must not claim that guarantee.
+    issuer_validated: bool = False
     # RFC 9207 §3 metadata flag. When the AS advertises this true, RFC 9207 §2.4
     # makes the client MUST reject an authorization response that lacks ``iss``.
     iss_parameter_supported: bool = False
@@ -555,6 +562,10 @@ def _parse_as_metadata_response(
         ),
         token_endpoint_auth_methods_supported=methods if isinstance(methods, list) else None,
         issuer=issuer or auth_server_base,
+        # This object is built from a fetched, origin-checked metadata
+        # document, so the issuer is anchored well enough for the byte-exact
+        # RFC 9207 comparison the spec requires.
+        issuer_validated=True,
         # RFC 9207 §3: a true value makes a missing `iss` on the
         # authorization response a MUST-reject (§2.4). Coerce strictly to
         # bool so a non-bool JSON value cannot accidentally enable the
@@ -1137,6 +1148,14 @@ def _make_callback_handler(
                 # on error responses; an error callback WITHOUT the matching
                 # state is an unauthenticated abort attempt, not a real AS error.
                 result.state = params.get("state", [None])[0]
+                # iss is captured here too, not just on the code branch: the
+                # 2026-07-28 authorization spec applies the RFC 9207 §2.4
+                # validation to error responses as well, and says that on
+                # mismatch the client MUST NOT act on or display `error`,
+                # `error_description` or `error_uri`. Leaving it unset made that
+                # comparison unreachable — an error response always looked like
+                # one with no iss at all.
+                result.iss = params.get("iss", [None])[0]
                 result.error = params["error"][0]  # gating field — set LAST
             elif "code" in params:
                 result.state = params.get("state", [None])[0]
@@ -1778,48 +1797,56 @@ def _run_authorization_flow(
     if not secrets.compare_digest(cb_result.state or "", state):
         raise RuntimeError("OAuth state mismatch — possible CSRF attack")
 
-    if cb_result.error:
-        raise RuntimeError(f"OAuth error: {_sanitize_oauth_error(cb_result.error)}")
-
-    # RFC 9207 §2.4: if the authorization response carries an `iss` parameter,
-    # the client MUST validate it against the issuer the metadata was fetched
-    # from. This is the AS mix-up defence — it stops a code issued by AS-A from
-    # being exchanged at AS-B. On the metadata path both values come from the
-    # same AS (its metadata `issuer` and its callback `iss`) so they are
-    # byte-identical and the comparison is exact. The trailing-slash tolerance
-    # below is a no-op there, but matters on the PHASE-3 fallback
-    # where `metadata.issuer` is a SYNTHESIZED guess (`as_base`, an origin with
-    # no path/slash): a real AS whose issuer is `https://as/` would otherwise
-    # false-mismatch and block a legitimate flow. A genuine mix-up always differs
-    # by HOST, which rstrip does not mask, so the defence is preserved.
+    # RFC 9207 §2.4 runs BEFORE the error branch below. The 2026-07-28
+    # authorization spec applies this validation equally to error responses and
+    # says that on mismatch the client MUST NOT act on or display `error`,
+    # `error_description` or `error_uri` — so surfacing the error first would
+    # both skip the check and print attacker-supplied text. The state check
+    # above stays first: its comment explains that it is what binds the error
+    # path against a local process griefing the flow, and that reasoning is
+    # unaffected by the ordering here.
     #
-    # Honest deviation note: RFC 9207 §2.4 specifies a SIMPLE
-    # STRING comparison (RFC 3986 §6.2.1), i.e. byte-exact. The rstrip("/")
-    # tolerance is a deliberate, security-preserving relaxation of that letter
-    # (same spirit as the RFC 9728 §3.3 / RFC 8414 §3.3 warn-and-continue
-    # relaxations) — it only collapses a trailing slash, never a host/scheme/port
-    # difference, so no mix-up the strict comparison would catch slips through.
+    # This is the AS mix-up defence: it stops a code issued by AS-A from being
+    # exchanged at AS-B.
     #
-    # §2.4 has a SECOND MUST: a client MUST reject a response that OMITS `iss`
-    # from an AS that advertises iss support (the RFC 9207 §3 metadata flag) —
-    # otherwise a mix-up attacker could simply strip `iss` to silence the compare
-    # above. Enforce that when the AS advertised support. (When it did NOT
-    # advertise, a missing `iss` is accepted: PKCE + state already cover the
-    # common attacks, so this whole check is defence-in-depth.)
+    # §2.4's other MUST: reject a response that OMITS `iss` when the AS
+    # advertises iss support (the RFC 9207 §3 metadata flag), or a mix-up
+    # attacker could simply strip `iss` to silence the comparison. When the AS
+    # did NOT advertise, a missing `iss` is accepted — PKCE and state already
+    # cover the common attacks, so this whole check is defence-in-depth.
     if metadata.iss_parameter_supported and cb_result.iss is None:
         raise RuntimeError(
             "OAuth issuer missing (RFC 9207 §2.4) — the authorization server "
             "advertises iss support but its response omitted iss; possible AS "
             "mix-up attack"
         )
-    if (
-        cb_result.iss is not None
-        and metadata.issuer
-        and cb_result.iss.rstrip("/") != metadata.issuer.rstrip("/")
-    ):
-        raise RuntimeError(
-            "OAuth issuer mismatch (RFC 9207) — possible AS mix-up attack"
-        )
+    if cb_result.iss is not None and metadata.issuer:
+        if metadata.issuer_validated:
+            # Byte-exact, per RFC 3986 §6.2.1 simple string comparison. The spec
+            # spells out what must NOT be normalized first: scheme or host case
+            # folding, default-port elision, trailing slash, percent-encoding.
+            # Both values come from the same AS on this path — its metadata
+            # `issuer` and its callback `iss` — so an exact match is what a
+            # correct server produces.
+            mismatch = cb_result.iss != metadata.issuer
+        else:
+            # No metadata was validated (the synthesized-endpoint fallback), so
+            # `metadata.issuer` is a guess: `as_base`, an origin with no path or
+            # trailing slash. The spec is explicit that the comparison "provides
+            # no protection if the expected issuer was obtained from an
+            # unvalidated source", so this is NOT the RFC 9207 check and is not
+            # held to its byte-exactness — it is a weaker origin check kept
+            # because it still catches a mix-up, which always differs by HOST.
+            # Byte-exactness here would only false-mismatch a real AS whose
+            # issuer carries a trailing slash and block a legitimate flow.
+            mismatch = cb_result.iss.rstrip("/") != metadata.issuer.rstrip("/")
+        if mismatch:
+            raise RuntimeError(
+                "OAuth issuer mismatch (RFC 9207) — possible AS mix-up attack"
+            )
+
+    if cb_result.error:
+        raise RuntimeError(f"OAuth error: {_sanitize_oauth_error(cb_result.error)}")
 
     code = cb_result.auth_code
     if code is None:  # -O-safe; the callback error path raises before here
