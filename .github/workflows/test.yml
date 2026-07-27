@@ -6,6 +6,27 @@ on:
   pull_request:
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # Pinned, not floating: a ruff release that adds a rule to its default
+      # set would otherwise turn this gate red on a commit that changed
+      # nothing. Bumping it is then a deliberate PR with the new findings
+      # visible in the diff.
+      - name: Install ruff
+        run: pip install ruff==0.16.0
+
+      # check only — see ruff.toml for why `ruff format` is not gated here.
+      - name: Lint
+        run: ruff check .
+
   test:
     runs-on: ${{ matrix.os }}
     strategy:
