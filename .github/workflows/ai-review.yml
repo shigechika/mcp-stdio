@@ -9,9 +9,13 @@ name: AI review
 # PR. Skips release-please version bumps (same-repo scoped — a fork controls
 # head.ref, so branch names must not dodge review) plus Dependabot bumps —
 # mechanical diffs aren't worth review tokens. Uses plain pull_request, NOT
-# pull_request_target: this job checks out and reads repo files, so _target
-# would be the classic pwn-request antipattern. Consequence: fork PRs get no
-# secrets and therefore no AI review — accepted.
+# pull_request_target: _target would run with secrets against an
+# attacker-controlled head, the classic pwn-request antipattern. Consequence:
+# fork PRs get no secrets and therefore no AI review — accepted.
+#
+# Nothing from the PR head is read as a file: the diff and description come
+# from the API, and repository guidance is fetched at the base revision. The
+# job therefore does not check out at all.
 #
 # Secrets (the endpoint hostname is deliberately kept out of this public
 # repo — treat it like a credential):
@@ -47,8 +51,6 @@ jobs:
             startsWith(github.event.pull_request.head.ref, 'release-please--')) &&
           github.event.pull_request.user.login != 'dependabot[bot]' }}
     steps:
-      - uses: actions/checkout@v7
-
       - name: Request AI review
         env:
           GH_TOKEN: ${{ github.token }}
@@ -56,6 +58,13 @@ jobs:
           API_KEY: ${{ secrets.AI_REVIEW_API_KEY }}
           MODEL: ${{ vars.AI_REVIEW_MODEL || 'gpt-5.6-sol' }}
           PR: ${{ github.event.pull_request.number }}
+          # gh resolves the target repo from the local git remote; with no
+          # checkout there is none, so every `gh pr ...` call below would fail
+          # to find the PR. GH_REPO makes the resolution explicit.
+          GH_REPO: ${{ github.repository }}
+          # Guidance is read at the BASE revision, never the PR head — see the
+          # loop below for why.
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           # Via env, not inline ${{ }} in run:, so a crafted title can't
           # inject shell (same hygiene as the other workflows here).
           TITLE: ${{ github.event.pull_request.title }}
@@ -87,11 +96,46 @@ jobs:
             echo "PR description:"
             gh pr view "$PR" --json body -q .body 2>/dev/null | head -c 4000 || true
             echo
+            # Read guidance from the BASE revision over the API, not from a
+            # checked-out working tree. Two reasons, both about the PR head
+            # being attacker-controlled on a same-repo branch (where secrets
+            # ARE present):
+            #
+            #   * `[ -f "$f" ]` follows symlinks, so a PR replacing CLAUDE.md
+            #     with a link to /proc/self/environ put this step's environment
+            #     — API_KEY, GH_TOKEN — into the prompt, and a crafted title
+            #     could ask the model to repeat it in its public comment.
+            #   * Guidance from the head is guidance the PR can rewrite: the
+            #     file telling the model what to enforce must not be editable
+            #     by the change being reviewed.
+            #
+            # What the type filter actually excludes: the Contents API returns
+            # type "symlink" only when the target is NOT a normal file in the
+            # repository — which is the case that mattered, since a link to
+            # /proc/self/environ is dropped. A link to another tracked file
+            # comes back as that file's content and is accepted: reading at the
+            # base revision means such a link is already merged and reviewed,
+            # and its target is repository content either way.
+            #
+            # A file over 1 MiB comes back with encoding "none" and no content,
+            # so it is skipped rather than truncated. Said in the filter rather
+            # than left implicit; the largest guidance file here is 22 KB.
+            #
+            # A PR that legitimately adds guidance sees it applied once merged,
+            # which is the intended trade.
             for f in CLAUDE.md AGENTS.md .github/copilot-instructions.md; do
-              if [ -f "$f" ]; then
+              # `|| true` sits INSIDE the substitution so the captured prefix
+              # survives. Under pipefail a head that stops early SIGPIPEs
+              # base64, and an outer `|| body=""` would then discard the 8000
+              # bytes already read — turning "truncate it" into "guidance
+              # silently absent". head -c also keeps the limit in BYTES: a bash
+              # substring counts characters, roughly 3x more for CJK guidance.
+              body=$(gh api "repos/$GH_REPO/contents/$f?ref=$BASE_SHA" \
+                       --jq 'select(.type=="file" and .encoding=="base64") | .content' 2>/dev/null \
+                     | tr -d '\n' | base64 -d 2>/dev/null | head -c 8000 || true)
+              if [ -n "$body" ]; then
                 echo "=== Repository guidance: $f ==="
-                head -c 8000 "$f"
-                echo
+                printf '%s\n' "$body"
               fi
             done
             echo "=== Unified diff ==="
