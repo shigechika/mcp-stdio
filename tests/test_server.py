@@ -170,10 +170,14 @@ def test_duplicate_in_flight_id_rejected():
                 30.0,
             )
             _wait_in_flight(proc, 1)
-            with pytest.raises(server._DuplicateInFlightId):
+            with pytest.raises(server._DuplicateInFlightId) as excinfo:
                 proc.send_request(
                     json.dumps({"jsonrpc": "2.0", "id": 1, "method": "echo"}), 1, 1.0
                 )
+            # The exception names both colliding calls so the HTTP handler can
+            # log which methods shared the id (bare 409s are undiagnosable).
+            assert excinfo.value.in_flight_method == "noreply"
+            assert excinfo.value.rejected_method == "echo"
             # Unblock the long-timeout first waiter (fail-all wakes it -> None).
             proc.shutdown()
             assert first.result() is None
@@ -297,6 +301,45 @@ def test_duplicate_in_flight_id_same_payload_returns_200_over_http(gateway):
     assert r2.status_code == 200
     assert r1.json() == r2.json()
     assert r1.json()["result"]["calls"] == 1
+
+
+def test_duplicate_in_flight_id_different_payload_409_and_logged(gateway, capsys):
+    # HTTP-level counterpart of test_duplicate_in_flight_id_rejected, plus the
+    # diagnostic contract: the access log alone shows a bare 409 and cannot
+    # tell which two calls collided (needed live 2026-07-27 to tell "client
+    # re-fired a request" from "two gateway-side nodes share an id counter"),
+    # so the rejection must log the conflicting id and both methods on ONE
+    # line — injection-safe even for a hostile method name.
+    url, registry = gateway
+    sid, _ = _init(url)
+    backend = registry.get(sid)
+    first = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "slow_echo",
+        "params": {"delay": 1.0},
+    }
+    hostile = {"jsonrpc": "2.0", "id": 1, "method": "echo\nforged"}
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        f1 = ex.submit(_post, url, first, sid)
+        for _ in range(600):
+            if backend.has_pending:
+                break
+            time.sleep(0.005)
+        else:  # pragma: no cover - defensive
+            pytest.fail("first request never registered in flight")
+        r2 = _post(url, hostile, sid)
+        r1 = f1.result()
+    assert r2.status_code == 409
+    assert r1.status_code == 200  # the in-flight request is unaffected
+    err = capsys.readouterr().err
+    hits = [ln for ln in err.splitlines() if "duplicate in-flight id" in ln]
+    # Exactly one line: the CR/LF in the hostile method must not split it.
+    assert len(hits) == 1
+    assert "duplicate in-flight id 1 on session" in hits[0]
+    assert "in-flight='slow_echo'" in hits[0]
+    assert "rejected='echo\\nforged'" in hits[0]
+    assert "-> 409" in hits[0]
 
 
 def test_notification_returns_202(gateway):
