@@ -7373,3 +7373,147 @@ class TestDeviceAuthStepOneBasicAuth:
         assert da_req.headers.get("authorization") == f"Basic {expected}"
         assert b"client_id" not in da_req.content
         assert b"client_secret" not in da_req.content
+
+
+# --- RFC 9207 iss validation, 2026-07-28 authorization spec (#340) ---
+
+
+class TestIssValidation:
+    """The `iss` checks in `_run_authorization_flow`.
+
+    The 2026-07-28 authorization spec pins RFC 9207 §2.4 into a four-row table
+    and adds two requirements this code did not meet: the validation applies to
+    ERROR responses too (and on mismatch the client MUST NOT act on or display
+    `error`), and the comparison is byte-exact — no scheme/host case folding,
+    default-port elision, trailing-slash or percent-encoding normalization.
+    """
+
+    MCP_URL = "https://api.example.com/mcp"
+    ISSUER = "https://as.example.com"
+
+    def _meta(self, *, issuer, validated, iss_supported=True):
+        return OAuthMetadata(
+            authorization_endpoint="https://as.example.com/authorize",
+            token_endpoint="https://as.example.com/token",
+            issuer=issuer,
+            issuer_validated=validated,
+            iss_parameter_supported=iss_supported,
+        )
+
+    def _drive(self, monkeypatch, tmp_path, *, params, meta):
+        """Answer the callback with `params` and return the raised error."""
+        from urllib.parse import parse_qs, urlencode, urlparse
+        from urllib.request import urlopen
+
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr(
+            "mcp_stdio.token_store._STORE_FILE", tmp_path / "tokens.json"
+        )
+
+        def fake_open(auth_url: str) -> bool:
+            q = parse_qs(urlparse(auth_url).query)
+            redirect_uri = q["redirect_uri"][0]
+            sent = dict(params)
+            sent["state"] = q["state"][0]  # a compliant AS echoes state
+
+            def hit_callback() -> None:
+                try:
+                    urlopen(f"{redirect_uri}?{urlencode(sent)}", timeout=5).read()
+                except Exception:
+                    pass
+
+            threading.Thread(target=hit_callback, daemon=True).start()
+            return True
+
+        monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", fake_open)
+        # Exception, not RuntimeError: when the iss check lets the response
+        # through, the flow proceeds to the token request against a host that is
+        # not mocked here, and the connection error is itself the evidence that
+        # it got past the check.
+        with pytest.raises(Exception) as excinfo:
+            _run_authorization_flow(
+                self.MCP_URL,
+                httpx.Client(),
+                metadata=meta,
+                cached=TokenData(
+                    access_token="stale",
+                    client_id="cid",
+                    token_endpoint="https://as.example.com/token",
+                    authorization_endpoint="https://as.example.com/authorize",
+                ),
+                timeout=5,
+            )
+        return str(excinfo.value)
+
+    def test_error_response_is_not_shown_when_iss_mismatches(
+        self, monkeypatch, tmp_path
+    ):
+        """A mismatched iss must win over the AS-supplied error text.
+
+        The checks used to run after the error branch, so an error response was
+        surfaced without either iss check running — and its text was printed.
+        """
+        msg = self._drive(
+            monkeypatch,
+            tmp_path,
+            params={
+                "error": "access_denied",
+                "error_description": "attacker-controlled-text",
+                "iss": "https://evil.example.com",
+            },
+            meta=self._meta(issuer=self.ISSUER, validated=True),
+        )
+        assert "issuer mismatch" in msg
+        assert "access_denied" not in msg
+        assert "attacker-controlled-text" not in msg
+
+    def test_error_response_without_iss_is_rejected_when_advertised(
+        self, monkeypatch, tmp_path
+    ):
+        """The missing-iss MUST-reject also applies to an error response."""
+        msg = self._drive(
+            monkeypatch,
+            tmp_path,
+            params={"error": "access_denied", "error_description": "nope"},
+            meta=self._meta(issuer=self.ISSUER, validated=True),
+        )
+        assert "issuer missing" in msg
+        assert "access_denied" not in msg
+
+    def test_validated_issuer_is_compared_byte_exactly(self, monkeypatch, tmp_path):
+        """A trailing slash is a mismatch: the spec forbids normalizing it."""
+        msg = self._drive(
+            monkeypatch,
+            tmp_path,
+            params={"code": "c", "iss": self.ISSUER + "/"},
+            meta=self._meta(issuer=self.ISSUER, validated=True),
+        )
+        assert "issuer mismatch" in msg
+
+    def test_synthesized_issuer_keeps_the_slash_tolerance(
+        self, monkeypatch, tmp_path
+    ):
+        """The fallback issuer is a guess, so it is not held to byte-exactness.
+
+        No metadata was validated there — the spec says the comparison gives no
+        protection anyway — and being strict would only false-mismatch a real
+        AS whose issuer carries a trailing slash. Reaching the token request
+        (which is not mocked here) proves the iss check let it through.
+        """
+        msg = self._drive(
+            monkeypatch,
+            tmp_path,
+            params={"code": "c", "iss": self.ISSUER + "/"},
+            meta=self._meta(issuer=self.ISSUER, validated=False),
+        )
+        assert "issuer mismatch" not in msg
+
+    def test_missing_iss_is_accepted_when_not_advertised(self, monkeypatch, tmp_path):
+        """Row four of the table: not advertised and absent — proceed."""
+        msg = self._drive(
+            monkeypatch,
+            tmp_path,
+            params={"code": "c"},
+            meta=self._meta(issuer=self.ISSUER, validated=True, iss_supported=False),
+        )
+        assert "issuer" not in msg
