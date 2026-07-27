@@ -109,20 +109,30 @@ jobs:
             #     file telling the model what to enforce must not be editable
             #     by the change being reviewed.
             #
-            # `select(.type=="file")` drops symlink and directory entries, so a
-            # symlink committed to the repo yields nothing rather than its
-            # target's content. A PR that legitimately adds guidance sees it
-            # applied once merged, which is the intended trade.
+            # What the type filter actually excludes: the Contents API returns
+            # type "symlink" only when the target is NOT a normal file in the
+            # repository — which is the case that mattered, since a link to
+            # /proc/self/environ is dropped. A link to another tracked file
+            # comes back as that file's content and is accepted: reading at the
+            # base revision means such a link is already merged and reviewed,
+            # and its target is repository content either way.
+            #
+            # A file over 1 MiB comes back with encoding "none" and no content,
+            # so it is skipped rather than truncated. Said in the filter rather
+            # than left implicit; the largest guidance file here is 22 KB.
+            #
+            # A PR that legitimately adds guidance sees it applied once merged,
+            # which is the intended trade.
             for f in CLAUDE.md AGENTS.md .github/copilot-instructions.md; do
-              # Truncated with a substring expansion, not `| head -c`: under
-              # pipefail a head that stops early SIGPIPEs base64, the pipeline
-              # reports failure, and `|| body=""` then discards the prefix that
-              # was captured — turning "too long, truncate it" into "guidance
-              # silently absent".
+              # `|| true` sits INSIDE the substitution so the captured prefix
+              # survives. Under pipefail a head that stops early SIGPIPEs
+              # base64, and an outer `|| body=""` would then discard the 8000
+              # bytes already read — turning "truncate it" into "guidance
+              # silently absent". head -c also keeps the limit in BYTES: a bash
+              # substring counts characters, roughly 3x more for CJK guidance.
               body=$(gh api "repos/$GH_REPO/contents/$f?ref=$BASE_SHA" \
-                       --jq 'select(.type=="file") | .content' 2>/dev/null \
-                     | tr -d '\n' | base64 -d 2>/dev/null) || body=""
-              body=${body:0:8000}
+                       --jq 'select(.type=="file" and .encoding=="base64") | .content' 2>/dev/null \
+                     | tr -d '\n' | base64 -d 2>/dev/null | head -c 8000 || true)
               if [ -n "$body" ]; then
                 echo "=== Repository guidance: $f ==="
                 printf '%s\n' "$body"
