@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.30.0](https://github.com/shigechika/mcp-stdio/compare/v0.29.1...v0.30.0) (2026-07-27)
+
+
+### Features
+
+* **serve:** log conflicting id and methods on duplicate-id 409 ([#337](https://github.com/shigechika/mcp-stdio/issues/337)) ([bd5a1fe](https://github.com/shigechika/mcp-stdio/commit/bd5a1fe6e8a154a480598d0bf316fcfd07ee4d95))
+
+
+### Bug Fixes
+
+* **ci:** read AI-review guidance from the base revision, drop the checkout ([#343](https://github.com/shigechika/mcp-stdio/issues/343)) ([af37ceb](https://github.com/shigechika/mcp-stdio/commit/af37cebaad31d9b9a4476c4ab847260742659953))
+
 ## [0.29.1](https://github.com/shigechika/mcp-stdio/compare/v0.29.0...v0.29.1) (2026-07-24)
 
 

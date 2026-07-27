@@ -1,0 +1,27 @@
+# Lint only, with the rule set stated explicitly rather than inherited.
+#
+# `select` is pinned because ruff's DEFAULT set is not stable across releases:
+# 0.16 widened it (UP, B, SIM, BLE, RUF …), so a repository relying on the
+# default would go red on a ruff upgrade without a line of its own code
+# changing. Pinning the ruff version alone does not fix that — it only defers
+# it to the day someone bumps the pin. Naming the rules makes every addition a
+# deliberate opt-in with the new findings visible in that PR's diff.
+#
+# These four are ruff's historical default and are clean across this repository
+# today, so the CI gate added alongside this file starts green.
+#
+# `ruff format` is deliberately NOT gated. This codebase is hand-wrapped at
+# roughly 88 columns and ruff's formatter does not reproduce that style at any
+# width: 12 files / ~2300 lines change at 88, 10 files / ~3800 at 120, where it
+# collapses deliberately split f-strings back onto single long lines. Adopting
+# it means a reformat commit across a security-sensitive OAuth module, which is
+# a separate decision from turning linting on, not a side effect of it.
+#
+# line-length is left at ruff's default for the same reason: writing 120 here
+# would sit in the repo as a loaded gun, waiting for someone to run
+# `ruff format` and rewrite the file layout.
+
+target-version = "py310"
+
+[lint]
+select = ["E4", "E7", "E9", "F"]
