@@ -81,7 +81,8 @@ a crossover.
   *sequentially* is matched correctly, and a second request reusing an id
   already *in flight* on the same session with a DIFFERENT payload is rejected
   (`409`, since MCP requires request ids to be unique within a session) rather
-  than silently delivering the wrong reply. A same-id request with the SAME
+  than silently delivering the wrong reply; each such rejection is logged to
+  stderr with the conflicting id and both requests' methods. A same-id request with the SAME
   payload (compared as parsed JSON, so a re-serialized retry with a different
   key order still matches) arriving while the first is still outstanding — the
   shape seen when a client's reconnect burst re-fires a request against itself

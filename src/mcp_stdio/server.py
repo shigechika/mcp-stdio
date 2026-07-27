@@ -133,7 +133,22 @@ class _DuplicateInFlightId(Exception):
     client-side retry (e.g. the reconnect burst racing its own re-init), not a
     protocol violation, and is piggybacked onto the in-flight request's slot
     instead of raising this (see :meth:`BackendProcess.send_request`).
+
+    Carries both requests' ``method`` names so the HTTP handler can log which
+    two calls collided — the one datum that distinguishes "one client re-fired
+    a request" from "two gateway-side nodes share an id counter" when a 409 is
+    investigated after the fact.
     """
+
+    def __init__(
+        self,
+        req_id: Any,
+        in_flight_method: str | None = None,
+        rejected_method: str | None = None,
+    ) -> None:
+        super().__init__(req_id)
+        self.in_flight_method = in_flight_method
+        self.rejected_method = rejected_method
 
 
 class BackendProcess:
@@ -249,6 +264,15 @@ class BackendProcess:
         except (json.JSONDecodeError, TypeError):
             return False
 
+    @staticmethod
+    def _request_method(line: str) -> str | None:
+        """Best-effort ``method`` of a serialized request line, for diagnostics."""
+        try:
+            method = json.loads(line).get("method")
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            return None
+        return method if isinstance(method, str) else None
+
     def _detach(self, req_id: Any, slot: dict[str, Any]) -> str | None:
         """Drop one waiter from ``slot``; the LAST one out retires it.
 
@@ -303,7 +327,11 @@ class BackendProcess:
             existing = self._pending.get(req_id)
             if existing is not None:
                 if not self._same_request(existing["request_line"], line):
-                    raise _DuplicateInFlightId(req_id)
+                    raise _DuplicateInFlightId(
+                        req_id,
+                        in_flight_method=self._request_method(existing["request_line"]),
+                        rejected_method=self._request_method(line),
+                    )
                 # `slot` is the SAME dict object already in `_pending`, so the
                 # `_route()` write to slot["line"] / slot["event"].set() below
                 # is visible here too, whichever caller reads it first.
@@ -2086,12 +2114,21 @@ class _Handler(BaseHTTPRequestHandler):
                 line = backend.send_request(
                     json.dumps(msg), req_id, _BACKEND_RESPONSE_TIMEOUT_SECS
                 )
-            except _DuplicateInFlightId:
+            except _DuplicateInFlightId as exc:
                 # Client reused a JSON-RPC id already in flight on this session
                 # with a DIFFERENT payload (a same-payload retry is piggybacked
                 # by send_request instead of raising). It cannot be
                 # correlated, so reject it rather than cross-wire a reply. 409
-                # Conflict: the id conflicts with an in-flight request.
+                # Conflict: the id conflicts with an in-flight request. Log the
+                # collision (id + both methods, client-controlled so rendered
+                # via _log_safe_uri) — the access log alone shows a bare 409
+                # and cannot tell which two calls collided.
+                log(
+                    f"duplicate in-flight id {_log_safe_uri(req_id)} on session "
+                    f"{self._session_id[:8]}...: "
+                    f"in-flight={_log_safe_uri(exc.in_flight_method)} "
+                    f"rejected={_log_safe_uri(exc.rejected_method)} -> 409"
+                )
                 self._send_json(
                     409,
                     _error_body(
