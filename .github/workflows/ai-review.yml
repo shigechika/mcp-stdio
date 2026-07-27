@@ -113,8 +113,10 @@ jobs:
           test suite would catch. For each finding cite the file and the
           diff hunk it occurs in, and briefly give the concrete failure
           scenario. If you find nothing significant, say so in one short
-          paragraph — do not invent findings. Respond in the primary
-          language of the PR description. Keep the review under 500 words.'
+          paragraph — do not invent findings. Write the review in English,
+          whatever language the PR description is in: this is a public
+          repository and the review is published with it. Keep the review
+          under 500 words.'
 
           jq -n --arg model "$MODEL" --arg system "$system" \
                 --rawfile user prompt.txt \
