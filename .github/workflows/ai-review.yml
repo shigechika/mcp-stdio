@@ -22,7 +22,13 @@ name: AI review
 
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review]
+    # synchronize (a push to the PR branch) is included so a follow-up commit
+    # addressing review findings is re-reviewed instead of silently going
+    # unchecked — without it the only way to re-run was closing and reopening
+    # the PR by hand, which nobody remembers to do. The concurrency group
+    # below cancels a run still in flight when the next push lands, so a burst
+    # of commits costs roughly one review, not one per commit.
+    types: [opened, reopened, ready_for_review, synchronize]
 
 permissions:
   contents: read
