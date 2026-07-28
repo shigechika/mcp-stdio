@@ -3515,6 +3515,7 @@ class TestEnsureToken:
                 client_id="cached_cid",
                 token_endpoint="https://example.com/token",
                 authorization_endpoint="https://example.com/authorize",
+                issuer="https://example.com",
                 registration_endpoint="https://example.com/register",
             ),
         )
@@ -4292,6 +4293,7 @@ class TestStepUpAuthorize:
                 # Unsafe: non-loopback cleartext HTTP — must NOT be reused.
                 token_endpoint="http://evil.example.com/token",
                 authorization_endpoint="http://evil.example.com/authorize",
+                issuer="https://example.com",
             ),
         )
         self._drive_callback(monkeypatch)
@@ -5596,6 +5598,7 @@ class TestRfc9207IssValidation:
             client_id="cid",  # reused → no DCR
             token_endpoint="https://ex.com/token",
             authorization_endpoint="https://ex.com/authorize",
+            issuer="https://ex.com",
         )
         client = httpx.Client()
         data = _run_authorization_flow(
@@ -7443,6 +7446,10 @@ class TestIssValidation:
                     client_id="cid",
                     token_endpoint="https://as.example.com/token",
                     authorization_endpoint="https://as.example.com/authorize",
+                    # Bound to the AS under test. Without it the credentials
+                    # read as unbound and the flow re-registers instead of
+                    # reaching the iss checks these tests are about.
+                    issuer=meta.issuer,
                 ),
                 timeout=5,
             )
@@ -7584,11 +7591,13 @@ class TestCredentialsBindToIssuer:
         )
         assert out is None
 
-    def test_unknown_issuer_is_not_treated_as_a_mismatch(self):
-        """An entry written before the issuer was persisted has None.
+    def test_unbound_credentials_are_discarded_not_trusted(self):
+        """An entry from before issuer persistence is unbound, not matching.
 
-        Inventing a mismatch from missing data would throw away working
-        credentials and force a re-registration on every run.
+        Missing binding data cannot establish that the credential belongs to
+        the discovered issuer, so keeping it would send an old secret to a new
+        token endpoint — the case this guards. The cost is one re-registration,
+        not a recurring one; see test_rebinding_is_one_time.
         """
         cached = self._cached(self.AS_OLD)
         cached.issuer = None
@@ -7596,18 +7605,50 @@ class TestCredentialsBindToIssuer:
             oauth._cached_credentials_for_issuer(
                 cached, self._meta(self.AS_NEW), client_id_override=None
             )
-            is cached
+            is None
         )
-        # …and the same when discovery could not determine one.
-        cached2 = self._cached(self.AS_OLD)
+
+    def test_unknown_discovered_issuer_leaves_the_cache_alone(self):
+        """Nothing to bind against, and discarding would never converge.
+
+        Unlike an unbound cache entry this cannot be repaired by
+        re-registering: with no discovered issuer there is none to record, so
+        every run would discard again.
+        """
+        cached = self._cached(self.AS_OLD)
         meta = self._meta(self.AS_NEW)
         meta.issuer = None
         assert (
-            oauth._cached_credentials_for_issuer(
-                cached2, meta, client_id_override=None
-            )
-            is cached2
+            oauth._cached_credentials_for_issuer(cached, meta, client_id_override=None)
+            is cached
         )
+
+    def test_rebinding_is_one_time(self):
+        """The flow records the issuer, so the discard does not repeat.
+
+        Reads the persist site rather than driving a browser flow: the claim is
+        that TokenData is written with metadata.issuer, which is what makes the
+        next run a match instead of another discard.
+        """
+        src = inspect.getsource(oauth._token_response_to_data)
+        assert "issuer=metadata.issuer" in src
+        rebound = self._cached(self.AS_NEW)
+        assert (
+            oauth._cached_credentials_for_issuer(
+                rebound, self._meta(self.AS_NEW), client_id_override=None
+            )
+            is rebound
+        )
+
+    def test_pre_registered_id_is_not_accused_when_the_cache_is_unbound(self, capsys):
+        """"Unbound" is not evidence of a different server, so do not claim it."""
+        cached = self._cached(self.AS_OLD)
+        cached.issuer = None
+        out = oauth._cached_credentials_for_issuer(
+            cached, self._meta(self.AS_NEW), client_id_override="operator-supplied"
+        )
+        assert out is cached
+        assert "different authorization server" not in capsys.readouterr().err
 
     def test_pre_registered_id_warns_but_is_honoured(self, capsys):
         """The spec says surface an error, not override the operator.

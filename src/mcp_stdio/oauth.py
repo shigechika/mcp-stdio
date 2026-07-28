@@ -1673,33 +1673,53 @@ def _cached_credentials_for_issuer(
       resolves on demand. No re-registration, so this function is not consulted
       for it: the caller resolves CIMD before falling back to the cache.
 
-    A comparison is only made when both issuers are known. An entry written
-    before the issuer was persisted has None, and inventing a mismatch from
-    that would throw away working credentials over missing data.
+    An entry written before the issuer was persisted carries None, and that is
+    treated as unbound rather than as matching: missing binding data cannot
+    establish that the credential belongs to the discovered issuer, and keeping
+    it would send an old secret to a new token endpoint in exactly the case
+    this guards. The cost is one re-registration, not a recurring one — the
+    flow persists metadata.issuer, so the next run compares two known values.
+
+    When the DISCOVERED issuer is unknown there is nothing to bind against, so
+    the cached entry is left alone; discarding on that would re-register on
+    every run without ever learning an issuer to record.
     """
-    if cached is None or not cached.issuer or not metadata.issuer:
+    if cached is None or not metadata.issuer:
         return cached
+    # Byte-exact, like the RFC 9207 check next to it: this decides whether
+    # credentials cross an authorization-server boundary, and a normalisation
+    # that called two issuers equal would defeat the point.
     if cached.issuer == metadata.issuer:
         return cached
 
     if client_id_override:
-        # Byte-exact, like the RFC 9207 check: this decides whether credentials
-        # cross an authorization-server boundary, and a normalisation that
-        # called two issuers equal would defeat the point.
-        log(
-            "warning: --client-id was registered with a different authorization "
-            "server than the one now discovered "
-            f"({cached.issuer!r} -> {metadata.issuer!r}); using it as instructed, "
-            "but the authorization server may reject it"
-        )
+        # An explicit instruction is honoured, but not silently: the spec asks
+        # for an error rather than silent use of mismatched credentials, and it
+        # does not ask the client to override what the operator specified. Only
+        # reported when the cached issuer is actually known — "unbound" is not
+        # evidence of a different server.
+        if cached.issuer:
+            log(
+                "warning: --client-id was registered with a different authorization "
+                "server than the one now discovered "
+                f"({cached.issuer!r} -> {metadata.issuer!r}); using it as instructed, "
+                "but the authorization server may reject it"
+            )
         return cached
 
     if cached.client_id:
-        log(
-            "authorization server changed "
-            f"({cached.issuer!r} -> {metadata.issuer!r}); discarding client "
-            "credentials registered with the previous one and re-registering"
-        )
+        if cached.issuer:
+            log(
+                "authorization server changed "
+                f"({cached.issuer!r} -> {metadata.issuer!r}); discarding client "
+                "credentials registered with the previous one and re-registering"
+            )
+        else:
+            log(
+                "cached client credentials are not bound to any authorization "
+                f"server; re-registering with {metadata.issuer!r} rather than "
+                "reusing them"
+            )
         return None
     return cached
 
