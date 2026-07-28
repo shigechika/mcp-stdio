@@ -7643,7 +7643,7 @@ class TestCredentialsBindToIssuer:
         )
 
     def test_pre_registered_id_is_not_accused_when_the_cache_is_unbound(self, capsys):
-        """"Unbound" is not evidence of a different server, so do not claim it."""
+        """An unbound cache is not evidence of a different server."""
         cached = self._cached(self.AS_OLD)
         cached.issuer = None
         out = oauth._cached_credentials_for_issuer(
