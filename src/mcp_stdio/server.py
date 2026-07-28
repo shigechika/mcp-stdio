@@ -498,9 +498,7 @@ class SessionRegistry:
         self._reaper: threading.Thread | None = None
         self._reaper_stop = threading.Event()
 
-    def create(
-        self, owner: str | None = None
-    ) -> tuple[str, BackendProcess] | None:
+    def create(self, owner: str | None = None) -> tuple[str, BackendProcess] | None:
         """Spawn a child for a new session, optionally bound to ``owner``.
 
         Returns ``(session_id, backend)``, or ``None`` when the concurrent-
@@ -620,9 +618,7 @@ class SessionRegistry:
                 # Don't idle-reap a session with a request in flight: a slow
                 # tool call (up to the backend-response timeout) is not idleness.
                 idle = (
-                    ttl > 0
-                    and now - sess.last_active > ttl
-                    and not backend.has_pending
+                    ttl > 0 and now - sess.last_active > ttl and not backend.has_pending
                 )
                 if backend.closed or idle:
                     del self._sessions[sid]
@@ -766,7 +762,9 @@ def _validate_allowed_redirect_uri(uri: str) -> str:
     except ValueError as e:
         raise ValueError(f"{uri!r}: {e}") from e
     if p.scheme != "https":
-        raise ValueError(f"{uri!r}: must be an https:// URL (never http for a non-loopback redirect)")
+        raise ValueError(
+            f"{uri!r}: must be an https:// URL (never http for a non-loopback redirect)"
+        )
     if not p.hostname:
         raise ValueError(f"{uri!r}: missing host")
     if p.username or p.password or "@" in p.netloc:
@@ -816,7 +814,7 @@ def _log_safe_uri(value: Any, *, max_len: int = 200) -> str:
     """
     if isinstance(value, str) and len(value) > max_len:
         value = value[:max_len] + "..."
-    return repr(value)[:max_len + 8]
+    return repr(value)[: max_len + 8]
 
 
 def _normalize_public_url(url: str) -> str:
@@ -854,7 +852,9 @@ def _normalize_public_url(url: str) -> str:
         raise ValueError("public-url has an invalid port") from e
     hostpart = f"[{host}]" if ":" in host else host
     default_port = 80 if p.scheme == "http" else 443
-    netloc = hostpart if (port is None or port == default_port) else f"{hostpart}:{port}"
+    netloc = (
+        hostpart if (port is None or port == default_port) else f"{hostpart}:{port}"
+    )
     # Retain the path as the issuer prefix; strip only a trailing slash so
     # "https://host/a/" and "https://host/a" canonicalize identically and a bare
     # "https://host/" collapses to the bare origin (unchanged legacy behavior).
@@ -1277,9 +1277,10 @@ class _OAuthProvider:
             # redirection URI value; prefer it over the generic metadata error.
             return 400, {"error": "invalid_redirect_uri", "error_description": desc}
 
-        _redirect_err = (
-            "redirect_uris must be loopback http URLs"
-            + (" or an operator-allowlisted https URL" if self.allowed_redirect_uris else "")
+        _redirect_err = "redirect_uris must be loopback http URLs" + (
+            " or an operator-allowlisted https URL"
+            if self.allowed_redirect_uris
+            else ""
         )
 
         try:
@@ -1297,7 +1298,11 @@ class _OAuthProvider:
             return bad("redirect_uris must be a non-empty array")
         keys = set()
         for u in uris:
-            key = _match_key(u, self.allowed_redirect_uris) if isinstance(u, str) else None
+            key = (
+                _match_key(u, self.allowed_redirect_uris)
+                if isinstance(u, str)
+                else None
+            )
             if key is None:
                 # Surface the rejected value so an operator can see exactly what to
                 # allowlist. Without this the client only gets an opaque 400 and the
@@ -1377,18 +1382,27 @@ class _OAuthProvider:
             # cannot shadow it (urlencode emits both verbatim regardless).
             if issuer.startswith("https://"):
                 query = {**query, "iss": issuer}
-            return {"kind": "redirect", "location": redirect_uri + "?" + urlencode(query)}
+            return {
+                "kind": "redirect",
+                "location": redirect_uri + "?" + urlencode(query),
+            }
 
         if params.get("response_type") != "code":
             return redirect({"error": "unsupported_response_type"})
         challenge = params.get("code_challenge", "")
         if not challenge:
             return redirect(
-                {"error": "invalid_request", "error_description": "code_challenge required"}
+                {
+                    "error": "invalid_request",
+                    "error_description": "code_challenge required",
+                }
             )
         if params.get("code_challenge_method") != "S256":
             return redirect(
-                {"error": "invalid_request", "error_description": "code_challenge_method must be S256"}
+                {
+                    "error": "invalid_request",
+                    "error_description": "code_challenge_method must be S256",
+                }
             )
         if not user:
             # Fail closed: never mint a code for an empty/anonymous user.
@@ -1424,13 +1438,19 @@ class _OAuthProvider:
         if not grant:
             # RFC 6749 Sec. 5.2: a missing required parameter is invalid_request,
             # not unsupported_grant_type (which is for an unrecognized value).
-            return 400, {"error": "invalid_request", "error_description": "missing grant_type"}
+            return 400, {
+                "error": "invalid_request",
+                "error_description": "missing grant_type",
+            }
         return 400, {"error": "unsupported_grant_type"}
 
     def _token_auth_code(self, form: dict[str, str]) -> tuple[int, dict[str, Any]]:
         code = form.get("code", "")
         if not code:
-            return 400, {"error": "invalid_request", "error_description": "missing code"}
+            return 400, {
+                "error": "invalid_request",
+                "error_description": "missing code",
+            }
         now = self._now()
         with self._lock:
             # Single-use: POP before validating so a replay / concurrent
@@ -1468,29 +1488,53 @@ class _OAuthProvider:
                     "error": "invalid_grant",
                     "error_description": "authorization code already used; issued tokens revoked",
                 }
-            return 400, {"error": "invalid_grant", "error_description": "unknown or used code"}
+            return 400, {
+                "error": "invalid_grant",
+                "error_description": "unknown or used code",
+            }
         if entry["expires_at"] < now:
             return 400, {"error": "invalid_grant", "error_description": "code expired"}
         if form.get("client_id") != entry["client_id"]:
-            return 400, {"error": "invalid_grant", "error_description": "client_id mismatch"}
+            return 400, {
+                "error": "invalid_grant",
+                "error_description": "client_id mismatch",
+            }
         if form.get("redirect_uri") != entry["redirect_uri"]:
-            return 400, {"error": "invalid_grant", "error_description": "redirect_uri mismatch"}
+            return 400, {
+                "error": "invalid_grant",
+                "error_description": "redirect_uri mismatch",
+            }
         verifier = form.get("code_verifier", "")
         if not _valid_code_verifier(verifier):
-            return 400, {"error": "invalid_request", "error_description": "invalid code_verifier"}
-        if not hmac.compare_digest(_pkce_s256_challenge(verifier), entry["code_challenge"]):
-            return 400, {"error": "invalid_grant", "error_description": "PKCE verification failed"}
+            return 400, {
+                "error": "invalid_request",
+                "error_description": "invalid code_verifier",
+            }
+        if not hmac.compare_digest(
+            _pkce_s256_challenge(verifier), entry["code_challenge"]
+        ):
+            return 400, {
+                "error": "invalid_grant",
+                "error_description": "PKCE verification failed",
+            }
         # Start a new grant family keyed by the code; tombstone the code under
         # the issue lock so a subsequent replay is detected and revoked.
         return self._issue(
-            entry["user"], entry["client_id"], entry["scope"], entry["resource"],
-            family=code, consumed_code=code,
+            entry["user"],
+            entry["client_id"],
+            entry["scope"],
+            entry["resource"],
+            family=code,
+            consumed_code=code,
         )
 
     def _token_refresh(self, form: dict[str, str]) -> tuple[int, dict[str, Any]]:
         rt = form.get("refresh_token", "")
         if not rt:
-            return 400, {"error": "invalid_request", "error_description": "missing refresh_token"}
+            return 400, {
+                "error": "invalid_request",
+                "error_description": "missing refresh_token",
+            }
         now = self._now()
         with self._lock:
             # Validate BEFORE mutating: only consume (rotate) the token once it
@@ -1520,19 +1564,29 @@ class _OAuthProvider:
                         "error": "invalid_grant",
                         "error_description": "refresh_token already rotated",
                     }
-                return 400, {"error": "invalid_grant", "error_description": "unknown refresh_token"}
+                return 400, {
+                    "error": "invalid_grant",
+                    "error_description": "unknown refresh_token",
+                }
             if entry["expires_at"] < now:
                 del self._refresh[rt]
                 self._persist_locked()
-                return 400, {"error": "invalid_grant", "error_description": "refresh_token expired"}
+                return 400, {
+                    "error": "invalid_grant",
+                    "error_description": "refresh_token expired",
+                }
             if form.get("client_id") != entry["client_id"]:
-                return 400, {"error": "invalid_grant", "error_description": "client_id mismatch"}
+                return 400, {
+                    "error": "invalid_grant",
+                    "error_description": "client_id mismatch",
+                }
             family = entry.get("family")
             # Rotate: tombstone the spent token (instead of a plain delete) so a
             # later replay of THIS value is detected as reuse above.
             del self._refresh[rt]
             self._consumed_refresh[rt] = {
-                "family": family, "consumed_at": now,
+                "family": family,
+                "consumed_at": now,
                 "expires_at": now + self.refresh_ttl,
             }
             # Persist the rotation before minting: a crash between this block
@@ -1540,7 +1594,10 @@ class _OAuthProvider:
             # replayable after a restart.
             self._persist_locked()
         return self._issue(
-            entry["user"], entry["client_id"], entry["scope"], entry["resource"],
+            entry["user"],
+            entry["client_id"],
+            entry["scope"],
+            entry["resource"],
             family=family,
         )
 
@@ -1567,26 +1624,35 @@ class _OAuthProvider:
         refresh = secrets.token_urlsafe(32)
         with self._lock:
             stores = (
-                self._access, self._refresh,
-                self._consumed_codes, self._consumed_refresh,
+                self._access,
+                self._refresh,
+                self._consumed_codes,
+                self._consumed_refresh,
             )
             if any(len(s) >= _STORE_CAP for s in stores):
                 self._gc_locked()
                 for s in stores:
                     self._evict_to_capacity_locked(s, _STORE_CAP)
             self._access[access] = {
-                "user": user, "client_id": client_id, "scope": scope,
-                "resource": resource, "family": family,
+                "user": user,
+                "client_id": client_id,
+                "scope": scope,
+                "resource": resource,
+                "family": family,
                 "expires_at": now + self.access_ttl,
             }
             self._refresh[refresh] = {
-                "user": user, "client_id": client_id, "scope": scope,
-                "resource": resource, "family": family,
+                "user": user,
+                "client_id": client_id,
+                "scope": scope,
+                "resource": resource,
+                "family": family,
                 "expires_at": now + self.refresh_ttl,
             }
             if consumed_code is not None:
                 self._consumed_codes[consumed_code] = {
-                    "family": family, "consumed_at": now,
+                    "family": family,
+                    "consumed_at": now,
                     "expires_at": now + self.refresh_ttl,
                 }
             self._persist_locked()
@@ -1652,7 +1718,9 @@ class _OAuthProvider:
         entry = self._live_entry(token, expected_resource)
         return entry.get("user") if entry is not None else None
 
-    def _evict_to_capacity_locked(self, store: dict[str, dict[str, Any]], cap: int) -> None:
+    def _evict_to_capacity_locked(
+        self, store: dict[str, dict[str, Any]], cap: int
+    ) -> None:
         """Hard-bound a TTL store: if still at the cap after GC, evict the
         soonest-expiring entries to make room. GC alone frees nothing when every
         entry is still live, so without this the cap is not a real bound."""
@@ -1666,8 +1734,11 @@ class _OAuthProvider:
     def _gc_locked(self) -> None:
         now = self._now()
         for store in (
-            self._codes, self._access, self._refresh,
-            self._consumed_codes, self._consumed_refresh,
+            self._codes,
+            self._access,
+            self._refresh,
+            self._consumed_codes,
+            self._consumed_refresh,
         ):
             for k in [k for k, v in store.items() if v["expires_at"] < now]:
                 del store[k]
@@ -1744,7 +1815,9 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Mcp-Session-Id", sid)
         self.end_headers()
 
-    def _send_oauth_json(self, status: int, body: str, *, no_store: bool = False) -> None:
+    def _send_oauth_json(
+        self, status: int, body: str, *, no_store: bool = False
+    ) -> None:
         """JSON response for OAuth endpoints (no Mcp-Session-Id header).
 
         ``no_store`` adds the RFC 6749 Sec. 5.1/5.2 cache headers required on
@@ -1812,9 +1885,7 @@ class _Handler(BaseHTTPRequestHandler):
         the ``Host`` header, then the bound socket. The host is sanitized so a
         hostile value cannot inject into the quoted challenge / JSON body.
         """
-        proto = (
-            self.headers.get("X-Forwarded-Proto", "").split(",")[0].strip().lower()
-        )
+        proto = self.headers.get("X-Forwarded-Proto", "").split(",")[0].strip().lower()
         if proto not in ("http", "https"):
             proto = "http"
         host = self.headers.get("X-Forwarded-Host", "").split(",")[0].strip()
@@ -1857,11 +1928,13 @@ class _Handler(BaseHTTPRequestHandler):
         self._principal = None
         auth = self.headers.get("Authorization", "")
         prefix = "Bearer "
-        token = auth[len(prefix):] if auth.startswith(prefix) else ""
+        token = auth[len(prefix) :] if auth.startswith(prefix) else ""
         if (
             self.auth_token is not None
             and token
-            and hmac.compare_digest(token.encode("utf-8"), self.auth_token.encode("utf-8"))
+            and hmac.compare_digest(
+                token.encode("utf-8"), self.auth_token.encode("utf-8")
+            )
         ):
             self._principal = _STATIC_PRINCIPAL
             return True
@@ -1925,7 +1998,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _serve_as_metadata(self) -> None:
         """RFC 8414 Authorization Server Metadata."""
-        self._send_oauth_json(200, json.dumps(self.oauth.metadata(self._effective_issuer())))
+        self._send_oauth_json(
+            200, json.dumps(self.oauth.metadata(self._effective_issuer()))
+        )
 
     def _resolve_user(self) -> str | None:
         """Identify the end user for /authorize. Fails closed.
@@ -2145,9 +2220,7 @@ class _Handler(BaseHTTPRequestHandler):
                     stale = self.registry.remove(self._session_id, user)
                     if stale is not None:
                         stale.shutdown()
-                self._send_json(
-                    504, _error_body("no response from backend", req_id)
-                )
+                self._send_json(504, _error_body("no response from backend", req_id))
                 return
             self._send_json(200, line)
         else:
@@ -2381,9 +2454,15 @@ def serve_main(argv: list[str]) -> None:
             "command follows the options."
         ),
     )
-    parser.add_argument("--host", default="127.0.0.1", help="bind host (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=8080, help="bind port (default: 8080)")
-    parser.add_argument("--path", default="/mcp", help="MCP endpoint path (default: /mcp)")
+    parser.add_argument(
+        "--host", default="127.0.0.1", help="bind host (default: 127.0.0.1)"
+    )
+    parser.add_argument(
+        "--port", type=int, default=8080, help="bind port (default: 8080)"
+    )
+    parser.add_argument(
+        "--path", default="/mcp", help="MCP endpoint path (default: /mcp)"
+    )
     parser.add_argument(
         "--auth-token",
         default=None,
@@ -2537,8 +2616,10 @@ def serve_main(argv: list[str]) -> None:
     # None = no auth, rather than enabling an impossible-to-satisfy gate.
     auth_token = args.auth_token
     if auth_token is not None:
-        log("warning: --auth-token is visible in `ps`; prefer "
-            f"{_SERVE_TOKEN_ENV} for production")
+        log(
+            "warning: --auth-token is visible in `ps`; prefer "
+            f"{_SERVE_TOKEN_ENV} for production"
+        )
     else:
         auth_token = os.environ.get(_SERVE_TOKEN_ENV)
     if not auth_token:

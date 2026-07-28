@@ -23,9 +23,11 @@ jobs:
       - name: Install ruff
         run: pip install ruff==0.16.0
 
-      # check only — see ruff.toml for why `ruff format` is not gated here.
       - name: Lint
         run: ruff check .
+
+      - name: Format
+        run: ruff format --check .
 
   test:
     runs-on: ${{ matrix.os }}

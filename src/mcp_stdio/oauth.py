@@ -16,7 +16,15 @@ import webbrowser
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
-from urllib.parse import ParseResult, parse_qs, quote, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.parse import (
+    ParseResult,
+    parse_qs,
+    quote,
+    urlencode,
+    urlparse,
+    urlsplit,
+    urlunsplit,
+)
 
 import httpx
 
@@ -284,8 +292,7 @@ def _validate_auth_server_url(auth_server_url: str, mcp_server_url: str) -> bool
         parsed = urlparse(auth_server_url)
     except Exception:
         log(
-            f"warning: malformed authorization_server URL "
-            f"{auth_server_url!r}, ignoring"
+            f"warning: malformed authorization_server URL {auth_server_url!r}, ignoring"
         )
         return False
 
@@ -376,7 +383,9 @@ def _validate_prm_hint_url(hint_url: str, server_url: str) -> bool:
         return False
 
     if parsed.scheme not in ("https", "http"):
-        log(f"warning: unsupported scheme in resource_metadata hint {hint_url!r}, ignoring")
+        log(
+            f"warning: unsupported scheme in resource_metadata hint {hint_url!r}, ignoring"
+        )
         return False
 
     if parsed.username is not None or parsed.password is not None:
@@ -560,7 +569,9 @@ def _parse_as_metadata_response(
             data.get("device_authorization_endpoint"),
             label="device_authorization_endpoint",
         ),
-        token_endpoint_auth_methods_supported=methods if isinstance(methods, list) else None,
+        token_endpoint_auth_methods_supported=methods
+        if isinstance(methods, list)
+        else None,
         issuer=issuer or auth_server_base,
         # This object is built from a fetched, origin-checked metadata
         # document, so the issuer is anchored well enough for the byte-exact
@@ -731,7 +742,10 @@ def discover_oauth_metadata(
         # compliant PRM would advertise — compare against that so a deliberate
         # override does not emit a spurious §3.3 mismatch warning.
         expected_resource = oauth_resource or _resource_indicator(server_url)
-        if (
+        # fmt: skip — the formatter splits this after `rstrip(`, stranding the
+        # "/" on its own line and hiding that the two sides are compared the
+        # same way. The hand-wrapped form below says that at a glance.
+        if (  # fmt: skip
             isinstance(prm_resource, str)
             and prm_resource.rstrip("/") != expected_resource.rstrip("/")
         ):
@@ -943,7 +957,10 @@ def register_client(
         body: dict[str, object] = {
             "client_name": "mcp-stdio",
             "application_type": "native",
-            "grant_types": ["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"],
+            "grant_types": [
+                "urn:ietf:params:oauth:grant-type:device_code",
+                "refresh_token",
+            ],
             "token_endpoint_auth_method": auth_method,
         }
     else:
@@ -1271,8 +1288,7 @@ def _parse_token_response(resp: httpx.Response) -> dict[str, Any]:
     # substring/list behaviour, or a later AttributeError on result.get.
     if not isinstance(result, dict):
         raise RuntimeError(
-            f"token endpoint returned a non-object JSON body "
-            f"({type(result).__name__})"
+            f"token endpoint returned a non-object JSON body ({type(result).__name__})"
         )
     _raise_for_body_error(result)
     return result
@@ -1520,9 +1536,7 @@ def _token_response_to_data(
     )
 
 
-def refresh_cached_token(
-    server_url: str, client: httpx.Client
-) -> TokenData | None:
+def refresh_cached_token(server_url: str, client: httpx.Client) -> TokenData | None:
     """Refresh the cached token for a server using its stored refresh_token.
 
     Returns updated TokenData on success, or None if no usable cached token
@@ -1534,10 +1548,7 @@ def refresh_cached_token(
     """
     cached = load_token(server_url)
     if not (
-        cached
-        and cached.refresh_token
-        and cached.token_endpoint
-        and cached.client_id
+        cached and cached.refresh_token and cached.token_endpoint and cached.client_id
     ):
         return None
     if _is_client_secret_expired(cached):
@@ -2135,7 +2146,7 @@ def _run_device_authorization_flow(
         1, min(_safe_int(da.get("expires_in"), 1800), _DEVICE_FLOW_MAX_LIFETIME_SECS)
     )
     # Honour the operator's --oauth-timeout as an UPPER bound on the human wait
-    #. The CLI help promises --oauth-timeout covers "device-code
+    # . The CLI help promises --oauth-timeout covers "device-code
     # confirmation", but it was never plumbed here, so the device flow silently
     # ran on the server-advertised lifetime alone. Clamp the effective poll
     # lifetime to min(timeout, expires_in) so the documented contract holds; a
@@ -2289,9 +2300,7 @@ def _run_device_authorization_flow(
             except Exception:
                 pass
             if desc:
-                raise RuntimeError(
-                    f"Device flow failed: {_sanitize_oauth_error(desc)}"
-                )
+                raise RuntimeError(f"Device flow failed: {_sanitize_oauth_error(desc)}")
             tok_resp.raise_for_status()  # 4xx/5xx with no body → honest HTTP error
             raise RuntimeError(
                 f"Device flow failed: unexpected HTTP {tok_resp.status_code} "
@@ -2300,9 +2309,7 @@ def _run_device_authorization_flow(
 
         _poll_sleep()
 
-    raise TimeoutError(
-        "Device authorization timed out. Please restart and try again."
-    )
+    raise TimeoutError("Device authorization timed out. Please restart and try again.")
 
 
 def ensure_token(
@@ -2378,7 +2385,10 @@ def ensure_token(
                 save_token(server_url, cached)
             except OSError as e:
                 log(f"warning: could not persist reconciled resource settings: {e}")
-        if cached.expires_at is None or cached.expires_at > time.time() + refresh_leeway:
+        if (
+            cached.expires_at is None
+            or cached.expires_at > time.time() + refresh_leeway
+        ):
             log("using cached OAuth token")
             return cached
 

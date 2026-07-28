@@ -10,16 +10,15 @@
 # These four are ruff's historical default and are clean across this repository
 # today, so the CI gate added alongside this file starts green.
 #
-# `ruff format` is deliberately NOT gated. This codebase is hand-wrapped at
-# roughly 88 columns and ruff's formatter does not reproduce that style at any
-# width: 12 files / ~2300 lines change at 88, 10 files / ~3800 at 120, where it
-# collapses deliberately split f-strings back onto single long lines. Adopting
-# it means a reformat commit across a security-sensitive OAuth module, which is
-# a separate decision from turning linting on, not a side effect of it.
+# `ruff format` is gated too, at ruff's default width. The codebase was already
+# hand-wrapped near 88 columns, so the default is what the code was reaching
+# for; naming a wider one would have made the formatter collapse deliberately
+# split f-strings onto single long lines.
 #
-# line-length is left at ruff's default for the same reason: writing 120 here
-# would sit in the repo as a loaded gun, waiting for someone to run
-# `ruff format` and rewrite the file layout.
+# One expression carries `# fmt: skip` (see oauth.py, the RFC 9728 §3.3
+# resource comparison) because the formatter's output there hides what the
+# code is doing. That is the exception, and it is annotated where it applies —
+# not a reason to leave the whole repository ungated.
 
 target-version = "py310"
 

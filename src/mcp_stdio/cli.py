@@ -18,6 +18,7 @@ from .relay import check_connection, run, run_sse
 if TYPE_CHECKING:
     from .token_store import TokenData
 
+
 def _non_negative_float(value: str) -> float:
     """argparse type for non-negative floats (rejects negative leeway)."""
     try:
@@ -167,8 +168,7 @@ def _parse_header(header: str) -> tuple[str, str]:
     value = value.strip()
     if not _HEADER_NAME_RE.match(key):
         print(
-            f"error: invalid header name {key!r} "
-            f"(must match RFC 7230 token grammar)",
+            f"error: invalid header name {key!r} (must match RFC 7230 token grammar)",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -197,7 +197,7 @@ def _build_token_refresher(
     and returns updated headers on success, or None on failure.
     """
     # Freeze a private copy of the operator-supplied base headers at build time
-    #. The relay passes the SAME live `headers` dict to both this
+    # . The relay passes the SAME live `headers` dict to both this
     # callback and the SSE reader thread; closing over the live object and
     # iterating it via dict(headers) would read it UNLOCKED, racing any future
     # reader-thread mutation (today none exists, so it is safe, but the relay's
@@ -926,7 +926,10 @@ def _main() -> None:
             # rebuild Authorization from the (eventually) cached token.
             if not (args.check or args.test):
                 token_refresher = _build_token_refresher(
-                    args.url, headers, args.timeout_connect, args.timeout_read,
+                    args.url,
+                    headers,
+                    args.timeout_connect,
+                    args.timeout_read,
                     use_id_token=args.oauth_use_id_token,
                 )
                 scope_upgrader = _build_scope_upgrader(
