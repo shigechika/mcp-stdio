@@ -2,12 +2,15 @@
 
 import base64
 import hashlib
+import inspect
 import json
 import threading
 import time
 
 import httpx
 import pytest
+
+from mcp_stdio import oauth
 
 from mcp_stdio.oauth import (
     CallbackResult,
@@ -7517,3 +7520,118 @@ class TestIssValidation:
             meta=self._meta(issuer=self.ISSUER, validated=True, iss_supported=False),
         )
         assert "issuer" not in msg
+
+
+# --- Authorization Server Binding, 2026-07-28 spec (#274) ---
+
+
+class TestCredentialsBindToIssuer:
+    """Persisted client credentials must not cross an authorization server.
+
+    The 2026-07-28 authorization spec's "Authorization Server Binding" section:
+    credentials from Dynamic Client Registration MUST be associated with the
+    issuer that issued them, MUST NOT be reused with a different authorization
+    server, and the client MUST re-register when the AS changes. Client ID
+    Metadata Documents are explicitly exempt — they are portable.
+    """
+
+    AS_OLD = "https://old-as.example.com"
+    AS_NEW = "https://new-as.example.com"
+
+    def _cached(self, issuer, client_id="dcr-client-id"):
+        return TokenData(
+            access_token="stale",
+            client_id=client_id,
+            client_secret="dcr-secret",
+            token_endpoint=f"{issuer}/token",
+            authorization_endpoint=f"{issuer}/authorize",
+            issuer=issuer,
+        )
+
+    def _meta(self, issuer):
+        return OAuthMetadata(
+            authorization_endpoint=f"{issuer}/authorize",
+            token_endpoint=f"{issuer}/token",
+            issuer=issuer,
+            issuer_validated=True,
+        )
+
+    def test_credentials_are_dropped_when_the_as_changes(self):
+        """The MUST: a new AS must not be handed the old AS's client_id."""
+        out = oauth._cached_credentials_for_issuer(
+            self._cached(self.AS_OLD), self._meta(self.AS_NEW), client_id_override=None
+        )
+        assert out is None  # caller falls through to re-registration
+
+    def test_credentials_survive_when_the_as_is_unchanged(self):
+        cached = self._cached(self.AS_OLD)
+        out = oauth._cached_credentials_for_issuer(
+            cached, self._meta(self.AS_OLD), client_id_override=None
+        )
+        assert out is cached
+
+    def test_a_trailing_slash_is_a_different_issuer(self):
+        """Byte-exact, like the RFC 9207 check.
+
+        This decides whether credentials cross an authorization-server
+        boundary; a normalisation that called two issuers equal would defeat
+        the point of the check.
+        """
+        out = oauth._cached_credentials_for_issuer(
+            self._cached(self.AS_OLD),
+            self._meta(self.AS_OLD + "/"),
+            client_id_override=None,
+        )
+        assert out is None
+
+    def test_unknown_issuer_is_not_treated_as_a_mismatch(self):
+        """An entry written before the issuer was persisted has None.
+
+        Inventing a mismatch from missing data would throw away working
+        credentials and force a re-registration on every run.
+        """
+        cached = self._cached(self.AS_OLD)
+        cached.issuer = None
+        assert (
+            oauth._cached_credentials_for_issuer(
+                cached, self._meta(self.AS_NEW), client_id_override=None
+            )
+            is cached
+        )
+        # …and the same when discovery could not determine one.
+        cached2 = self._cached(self.AS_OLD)
+        meta = self._meta(self.AS_NEW)
+        meta.issuer = None
+        assert (
+            oauth._cached_credentials_for_issuer(
+                cached2, meta, client_id_override=None
+            )
+            is cached2
+        )
+
+    def test_pre_registered_id_warns_but_is_honoured(self, capsys):
+        """The spec says surface an error, not override the operator.
+
+        --client-id is an explicit instruction; the mismatch is reported so it
+        is not silent, and the caller still uses what it was told to use.
+        """
+        cached = self._cached(self.AS_OLD)
+        out = oauth._cached_credentials_for_issuer(
+            cached, self._meta(self.AS_NEW), client_id_override="operator-supplied"
+        )
+        assert out is cached
+        err = capsys.readouterr().err
+        assert "different authorization server" in err
+        assert self.AS_NEW in err
+
+    def test_cimd_is_never_consulted_here(self):
+        """CIMD ids are portable, so the caller resolves them before the cache.
+
+        Pinning the call order rather than the helper: a regression that made a
+        CIMD client_id fall through to this function would silently force a
+        re-registration the spec says is unnecessary.
+        """
+        src = inspect.getsource(oauth._run_authorization_flow)
+        resolve = src.index("_resolve_cimd_client_id")
+        guard = src.index("_cached_credentials_for_issuer")
+        assert resolve < guard

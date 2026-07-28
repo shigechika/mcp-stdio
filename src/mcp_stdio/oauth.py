@@ -1645,6 +1645,65 @@ def _resolve_cimd_client_id(
     return client_metadata_url
 
 
+def _cached_credentials_for_issuer(
+    cached: TokenData | None,
+    metadata: OAuthMetadata,
+    *,
+    client_id_override: str | None,
+) -> TokenData | None:
+    """Drop cached client credentials that belong to a different AS.
+
+    2026-07-28 authorization spec, "Authorization Server Binding": credentials
+    obtained by Dynamic Client Registration MUST be associated with the issuer
+    that issued them, MUST NOT be reused with a different authorization server,
+    and the client MUST re-register when the AS changes. Returning None here
+    sends the caller down its registration branch, which is that re-registration.
+
+    Three kinds of client_id, and the spec treats them differently:
+
+    * **DCR-persisted** — the case this guards. The store keys entries by MCP
+      server URL, so a server that later delegates to a different AS would hand
+      the old AS's client_id to the new one.
+    * **Pre-registered** (``--client-id``) — inherently specific to one AS. The
+      spec says to surface an error rather than silently use it; the caller has
+      been told explicitly to use this id, so warn and let it proceed rather
+      than override the operator.
+    * **Client ID Metadata Documents** (``--client-metadata-url``) — explicitly
+      portable across authorization servers, since the id is a URL the AS
+      resolves on demand. No re-registration, so this function is not consulted
+      for it: the caller resolves CIMD before falling back to the cache.
+
+    A comparison is only made when both issuers are known. An entry written
+    before the issuer was persisted has None, and inventing a mismatch from
+    that would throw away working credentials over missing data.
+    """
+    if cached is None or not cached.issuer or not metadata.issuer:
+        return cached
+    if cached.issuer == metadata.issuer:
+        return cached
+
+    if client_id_override:
+        # Byte-exact, like the RFC 9207 check: this decides whether credentials
+        # cross an authorization-server boundary, and a normalisation that
+        # called two issuers equal would defeat the point.
+        log(
+            "warning: --client-id was registered with a different authorization "
+            "server than the one now discovered "
+            f"({cached.issuer!r} -> {metadata.issuer!r}); using it as instructed, "
+            "but the authorization server may reject it"
+        )
+        return cached
+
+    if cached.client_id:
+        log(
+            "authorization server changed "
+            f"({cached.issuer!r} -> {metadata.issuer!r}); discarding client "
+            "credentials registered with the previous one and re-registering"
+        )
+        return None
+    return cached
+
+
 def _run_authorization_flow(
     server_url: str,
     client: httpx.Client,
@@ -1693,6 +1752,11 @@ def _run_authorization_flow(
     redirect_uri = f"http://127.0.0.1:{port}/callback"
 
     cid = client_id_override or _resolve_cimd_client_id(client_metadata_url, metadata)
+    # Credentials from a previous authorization server must not be handed to a
+    # new one — see _cached_credentials_for_issuer.
+    cached = _cached_credentials_for_issuer(
+        cached, metadata, client_id_override=client_id_override
+    )
     csecret: str | None = None
     cse_at: float | None = None
     auth_method = "none"
@@ -1935,6 +1999,11 @@ def _run_device_authorization_flow(
         )
 
     cid = client_id_override or _resolve_cimd_client_id(client_metadata_url, metadata)
+    # Credentials from a previous authorization server must not be handed to a
+    # new one — see _cached_credentials_for_issuer.
+    cached = _cached_credentials_for_issuer(
+        cached, metadata, client_id_override=client_id_override
+    )
     csecret: str | None = None
     cse_at: float | None = None
     auth_method = "none"
