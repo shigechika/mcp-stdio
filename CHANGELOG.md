@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.30.1](https://github.com/shigechika/mcp-stdio/compare/v0.30.0...v0.30.1) (2026-07-28)
+
+
+### Bug Fixes
+
+* **oauth:** do not reuse client credentials across authorization servers ([#347](https://github.com/shigechika/mcp-stdio/issues/347)) ([5309a58](https://github.com/shigechika/mcp-stdio/commit/5309a58bb3482d186bfa3a52ec2aa7d285ab53ad))
+* **oauth:** validate iss before acting on an error response, compare exactly ([#344](https://github.com/shigechika/mcp-stdio/issues/344)) ([f97865a](https://github.com/shigechika/mcp-stdio/commit/f97865af6d18f2cf4aa276ecba19edf1b93fe9a6))
+
 ## [0.30.0](https://github.com/shigechika/mcp-stdio/compare/v0.29.1...v0.30.0) (2026-07-27)
 
 
