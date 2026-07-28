@@ -299,14 +299,10 @@ class TestFetchAuthServerMetadataIssuer:
         )
 
         server_url = "https://ex.com/mcp?tenant=x"
-        well_known = _build_well_known_url(
-            server_url, "oauth-authorization-server"
-        )
+        well_known = _build_well_known_url(server_url, "oauth-authorization-server")
         # Metadata advertises the query-stripped issuer (the conformant value)
         # and no endpoints, so they are synthesized from the base.
-        httpx_mock.add_response(
-            url=well_known, json={"issuer": "https://ex.com/mcp"}
-        )
+        httpx_mock.add_response(url=well_known, json={"issuer": "https://ex.com/mcp"})
         client = httpx.Client()
         meta = _fetch_authorization_server_metadata(server_url, client)
 
@@ -351,9 +347,7 @@ class TestDiscoverMetadata:
         assert meta.token_endpoint == "https://api.example.com/tok"
         assert meta.registration_endpoint == "https://api.example.com/reg"
 
-    def test_default_endpoints_no_double_slash_for_trailing_slash_as(
-        self, httpx_mock
-    ):
+    def test_default_endpoints_no_double_slash_for_trailing_slash_as(self, httpx_mock):
         """An AS advertised with a trailing slash whose metadata omits the
         endpoints must yield single-slash default endpoints, not '//authorize'."""
         server_url = "https://mcp.example.com/mcp"
@@ -919,10 +913,7 @@ class TestDiscoverMetadata:
         # TEARDOWN, where _fetch_authorization_server_metadata's broad except
         # cannot swallow it (a local run passed without this; see).
         httpx_mock.add_response(
-            url=(
-                "https://api.example.com/.well-known/"
-                "oauth-authorization-server/mcp"
-            ),
+            url=("https://api.example.com/.well-known/oauth-authorization-server/mcp"),
             status_code=404,
         )
         client = httpx.Client()
@@ -1079,9 +1070,7 @@ class TestDiscoverMetadata:
             },
         )
         client = httpx.Client()
-        meta = discover_oauth_metadata(
-            "https://user:pass@api.example.com/mcp", client
-        )
+        meta = discover_oauth_metadata("https://user:pass@api.example.com/mcp", client)
         assert meta.authorization_endpoint == "https://auth.example.com/authorize"
         # No spurious §3.3 mismatch warning despite the userinfo in server_url.
         assert "resource mismatch" not in capsys.readouterr().err
@@ -1148,7 +1137,9 @@ class TestDiscoverMetadata:
         Repro: mcp-stdio --oauth-device --client-id x http://keycloak/realms/test
         """
         # No PRM (Keycloak doesn't implement RFC 9728)
-        self._mock_no_prm(httpx_mock, base="https://keycloak.example.com", path="/realms/test")
+        self._mock_no_prm(
+            httpx_mock, base="https://keycloak.example.com", path="/realms/test"
+        )
         # Host-root AS metadata: 404
         httpx_mock.add_response(
             url="https://keycloak.example.com/.well-known/oauth-authorization-server",
@@ -1168,9 +1159,18 @@ class TestDiscoverMetadata:
         meta = discover_oauth_metadata(
             "https://keycloak.example.com/realms/test", client
         )
-        assert meta.authorization_endpoint == "https://keycloak.example.com/realms/test/protocol/openid-connect/auth"
-        assert meta.token_endpoint == "https://keycloak.example.com/realms/test/protocol/openid-connect/token"
-        assert meta.device_authorization_endpoint == "https://keycloak.example.com/realms/test/protocol/openid-connect/auth/device"
+        assert (
+            meta.authorization_endpoint
+            == "https://keycloak.example.com/realms/test/protocol/openid-connect/auth"
+        )
+        assert (
+            meta.token_endpoint
+            == "https://keycloak.example.com/realms/test/protocol/openid-connect/token"
+        )
+        assert (
+            meta.device_authorization_endpoint
+            == "https://keycloak.example.com/realms/test/protocol/openid-connect/auth/device"
+        )
 
     def test_path_scoped_issuer_does_not_shadow_host_root_match(self, httpx_mock):
         """#53: when host-root AS metadata succeeds, path-scoped probe is not called."""
@@ -1212,7 +1212,10 @@ class TestDiscoverMetadata:
         )
         client = httpx.Client()
         meta = discover_oauth_metadata("https://auth.example.com", client)
-        assert meta.authorization_endpoint == "https://auth.example.com/oauth2/v2.0/authorize"
+        assert (
+            meta.authorization_endpoint
+            == "https://auth.example.com/oauth2/v2.0/authorize"
+        )
         assert meta.token_endpoint == "https://auth.example.com/oauth2/v2.0/token"
 
     def test_openid_configuration_fallback_path_append(self, httpx_mock):
@@ -1255,6 +1258,7 @@ class TestDiscoverMetadata:
         OIDC path-append candidate to be the match so its construction is
         exercised directly."""
         from mcp_stdio.oauth import _fetch_authorization_server_metadata
+
         captured: dict = {}
 
         class _CaptureClient:
@@ -1352,16 +1356,12 @@ class TestRegisterClient:
             ),
         ],
     )
-    def test_non_string_dcr_credentials_raise_clear_error(
-        self, httpx_mock, reg, match
-    ):
+    def test_non_string_dcr_credentials_raise_clear_error(self, httpx_mock, reg, match):
         """: a non-conformant AS returning a non-string client_id /
         client_secret must raise an actionable RFC 7591 ValueError here, not an
         opaque TypeError deep in quote() during HTTP Basic auth (or a silently
         str-coerced client_id in the authorize URL)."""
-        httpx_mock.add_response(
-            url="https://api.example.com/register", json=reg
-        )
+        httpx_mock.add_response(url="https://api.example.com/register", json=reg)
         meta = OAuthMetadata(
             authorization_endpoint="https://api.example.com/authorize",
             token_endpoint="https://api.example.com/token",
@@ -1727,9 +1727,7 @@ class TestExchangeCode:
                 client,
             )
 
-    def test_token_exchange_4xx_without_error_body_raises_http_error(
-        self, httpx_mock
-    ):
+    def test_token_exchange_4xx_without_error_body_raises_http_error(self, httpx_mock):
         """A 4xx whose body is NOT an RFC 6749 §5.2 error (no `error` key) falls
         through to raise_for_status — an honest, generic HTTP error."""
         httpx_mock.add_response(
@@ -1797,9 +1795,9 @@ class TestRefreshToken:
 
     def test_invalid_grant(self, httpx_mock):
         """Refresh token expired or revoked — an RFC 6749 §5.2 error body (here
-        with no error_description) surfaces the `error` code as a RuntimeError
-. On the refresh path refresh_cached_token catches it and
-        degrades to None, exactly as it did for the prior HTTPStatusError."""
+                with no error_description) surfaces the `error` code as a RuntimeError
+        . On the refresh path refresh_cached_token catches it and
+                degrades to None, exactly as it did for the prior HTTPStatusError."""
         httpx_mock.add_response(
             url="https://api.example.com/token",
             status_code=400,
@@ -1864,9 +1862,7 @@ class TestRefreshCachedToken:
     is sent regardless of call site — a regression previously let the
     relay path skip it."""
 
-    def test_sends_rfc8707_resource_indicator(
-        self, tmp_path, monkeypatch, httpx_mock
-    ):
+    def test_sends_rfc8707_resource_indicator(self, tmp_path, monkeypatch, httpx_mock):
         store_file = tmp_path / "tokens.json"
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
         monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
@@ -2035,9 +2031,7 @@ class TestRefreshCachedToken:
         client = httpx.Client()
         assert refresh_cached_token("https://api.example.com/mcp", client) is None
 
-    def test_returns_none_when_client_secret_expired(
-        self, tmp_path, monkeypatch
-    ):
+    def test_returns_none_when_client_secret_expired(self, tmp_path, monkeypatch):
         store_file = tmp_path / "tokens.json"
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
         monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
@@ -2230,9 +2224,7 @@ class TestTokenResponseToData:
     def test_no_log_for_non_string_scope(self, capsys):
         """A malformed non-string scope must not crash .split() or log a repr."""
         raw = {"access_token": "at", "scope": ["read", "write"]}
-        _token_response_to_data(
-            raw, self.META, "cid", None, previous_scope="read"
-        )
+        _token_response_to_data(raw, self.META, "cid", None, previous_scope="read")
         assert "granted scope" not in capsys.readouterr().err
 
     def test_missing_access_token_raises(self):
@@ -2288,9 +2280,7 @@ class TestTokenResponseToData:
         data = _token_response_to_data({"access_token": "at"}, meta, "cid", None)
         assert data.iss_parameter_supported is True
         # Default (metadata flag absent) stays False.
-        plain = _token_response_to_data(
-            {"access_token": "at"}, self.META, "cid", None
-        )
+        plain = _token_response_to_data({"access_token": "at"}, self.META, "cid", None)
         assert plain.iss_parameter_supported is False
 
     def test_full_response(self):
@@ -3024,7 +3014,9 @@ class TestEnsureToken:
         assert data is not None and data.access_token == "cached_at"
         assert data.oauth_resource == "api://app-id-guid"
         # Persisted, so the flag-free refresh/step-up paths read it back.
-        assert load_token("https://example.com/mcp").oauth_resource == "api://app-id-guid"
+        assert (
+            load_token("https://example.com/mcp").oauth_resource == "api://app-id-guid"
+        )
 
     def test_cache_hit_switch_to_no_resource_indicator_clears_override(
         self, tmp_path, monkeypatch
@@ -3169,10 +3161,7 @@ class TestEnsureToken:
             client_metadata_url="https://app.example.com/client.json",
         )
         assert data.access_token == "tok"
-        assert (
-            captured["client_metadata_url"]
-            == "https://app.example.com/client.json"
-        )
+        assert captured["client_metadata_url"] == "https://app.example.com/client.json"
 
     def test_refresh_leeway_zero_uses_actual_expiry(self, tmp_path, monkeypatch):
         """#56: refresh_leeway=0 disables proactive refresh — token valid until literal expiry.
@@ -3484,9 +3473,7 @@ class TestEnsureToken:
         # Verify stale token was cleared
         assert load_token("https://example.com/mcp") is None
 
-    def test_double_401_recovers_via_full_flow(
-        self, tmp_path, monkeypatch, httpx_mock
-    ):
+    def test_double_401_recovers_via_full_flow(self, tmp_path, monkeypatch, httpx_mock):
         """mcp-remote #256 regression: when both access_token and refresh_token
         are invalid server-side, the full authorization flow must run and
         exchange the new code. mcp-remote gets stuck because the callback code
@@ -3594,9 +3581,7 @@ class TestEnsureToken:
         assert b"grant_type=authorization_code" in token_calls[1].content
         assert b"code=the_code" in token_calls[1].content
         # RFC 8707 resource indicator must be sent on the code exchange too.
-        assert (
-            b"resource=https%3A%2F%2Fexample.com%2Fmcp" in token_calls[1].content
-        )
+        assert b"resource=https%3A%2F%2Fexample.com%2Fmcp" in token_calls[1].content
 
         # The cached client_id is reused — no DCR retry on the rejected token.
         register_calls = [
@@ -3729,7 +3714,8 @@ class TestEnsureToken:
 
         # Code exchange must not contain resource=
         token_calls = [
-            r for r in httpx_mock.get_requests()
+            r
+            for r in httpx_mock.get_requests()
             if str(r.url) == "https://example.com/token"
         ]
         assert len(token_calls) == 1
@@ -3737,6 +3723,7 @@ class TestEnsureToken:
 
         # Persisted token retains the flag for future refreshes
         from mcp_stdio.token_store import load_token
+
         stored = load_token("https://example.com/mcp")
         assert stored.no_resource_indicator is True
 
@@ -3752,16 +3739,12 @@ class TestClientSecretExpiry:
 
     def test_is_expired_future(self):
         """Future timestamp → not expired."""
-        data = TokenData(
-            access_token="at", client_secret_expires_at=time.time() + 3600
-        )
+        data = TokenData(access_token="at", client_secret_expires_at=time.time() + 3600)
         assert _is_client_secret_expired(data) is False
 
     def test_is_expired_past(self):
         """Past timestamp → expired."""
-        data = TokenData(
-            access_token="at", client_secret_expires_at=time.time() - 3600
-        )
+        data = TokenData(access_token="at", client_secret_expires_at=time.time() - 3600)
         assert _is_client_secret_expired(data) is True
 
     def test_expired_secret_skips_refresh_and_clears_token(
@@ -3821,7 +3804,8 @@ class TestClientSecretExpiry:
 
         # /token should NOT have been called for refresh (secret expired)
         token_calls = [
-            r for r in httpx_mock.get_requests()
+            r
+            for r in httpx_mock.get_requests()
             if str(r.url) == "https://example.com/token"
         ]
         assert len(token_calls) == 0
@@ -3922,7 +3906,8 @@ class TestClientSecretExpiry:
 
         # Verify /register WAS called (new registration, not cached reuse)
         register_calls = [
-            r for r in httpx_mock.get_requests()
+            r
+            for r in httpx_mock.get_requests()
             if str(r.url) == "https://example.com/register"
         ]
         assert len(register_calls) == 1
@@ -4024,9 +4009,7 @@ class TestStepUpAuthorize:
         self, tmp_path, monkeypatch, httpx_mock
     ):
         """Challenge scopes are merged with the previously granted scopes."""
-        self._cached_token(
-            tmp_path, monkeypatch, scope="mcp:connect mcp:tools:read"
-        )
+        self._cached_token(tmp_path, monkeypatch, scope="mcp:connect mcp:tools:read")
         self._drive_callback(monkeypatch)
 
         # Token exchange returns upgraded token
@@ -4116,9 +4099,7 @@ class TestStepUpAuthorize:
         ]
         assert len(token_calls) == 1
         # RFC 8707 resource indicator on the code exchange
-        assert (
-            b"resource=https%3A%2F%2Fexample.com%2Fmcp" in token_calls[0].content
-        )
+        assert b"resource=https%3A%2F%2Fexample.com%2Fmcp" in token_calls[0].content
         # The grant is authorization_code (full flow), not refresh_token
         assert b"grant_type=authorization_code" in token_calls[0].content
 
@@ -4154,7 +4135,9 @@ class TestStepUpAuthorize:
             token_endpoint="https://as.example/token",
         )
 
-        def fake_discover(server_url, client, www_authenticate=None, oauth_resource=None):
+        def fake_discover(
+            server_url, client, www_authenticate=None, oauth_resource=None
+        ):
             discover_hints.append(www_authenticate)
             return sentinel_md
 
@@ -4208,7 +4191,8 @@ class TestStepUpAuthorize:
         assert data.access_token == "upgraded_at"
 
         token_calls = [
-            r for r in httpx_mock.get_requests()
+            r
+            for r in httpx_mock.get_requests()
             if str(r.url) == "https://example.com/token"
         ]
         assert len(token_calls) == 1
@@ -4217,9 +4201,7 @@ class TestStepUpAuthorize:
         # (verified indirectly — if it included an unrecognised param the AS
         # would reject state, so a successful exchange proves it was absent)
 
-    def test_rediscovers_when_cache_is_empty(
-        self, tmp_path, monkeypatch, httpx_mock
-    ):
+    def test_rediscovers_when_cache_is_empty(self, tmp_path, monkeypatch, httpx_mock):
         """If the cache is gone, discovery runs before the auth flow."""
         store_file = tmp_path / "tokens.json"
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
@@ -4516,9 +4498,7 @@ class TestValidateAuthServerUrl:
         ValueError escape and abort the discovery walk."""
         assert _validate_auth_server_url(bad, self.SERVER_URL) is False
 
-    def test_discover_skips_plaintext_auth_server_and_tries_fallback(
-        self, httpx_mock
-    ):
+    def test_discover_skips_plaintext_auth_server_and_tries_fallback(self, httpx_mock):
         """End-to-end: PRM advertises an HTTP auth server → validation
         rejects → discovery falls back to the base host for AS metadata."""
         server_url = "https://mcp.example.com/mcp"
@@ -4621,7 +4601,9 @@ class TestValidateEndpointUrl:
         )
 
     def test_plaintext_http_public_host_rejected(self, capsys):
-        assert _validate_endpoint_url("http://evil.example/token", label="token") is None
+        assert (
+            _validate_endpoint_url("http://evil.example/token", label="token") is None
+        )
         assert "cleartext" in capsys.readouterr().err
 
     def test_non_http_scheme_rejected(self, capsys):
@@ -4692,9 +4674,7 @@ class TestStateCsrfCheck:
 
     SERVER_URL = "https://example.com/mcp"
 
-    def test_state_mismatch_raises_csrf_error(
-        self, tmp_path, monkeypatch, httpx_mock
-    ):
+    def test_state_mismatch_raises_csrf_error(self, tmp_path, monkeypatch, httpx_mock):
         """An attacker-supplied state at the callback must raise RuntimeError."""
         from urllib.parse import parse_qs, urlparse
         from urllib.request import urlopen
@@ -4708,10 +4688,7 @@ class TestStateCsrfCheck:
         httpx_mock.add_response(url="https://example.com/mcp", status_code=401)
         # Discovery + registration mocks so we reach the auth-URL stage
         httpx_mock.add_response(
-            url=(
-                "https://example.com/.well-known/"
-                "oauth-protected-resource/mcp"
-            ),
+            url=("https://example.com/.well-known/oauth-protected-resource/mcp"),
             status_code=404,
         )
         httpx_mock.add_response(
@@ -4762,9 +4739,7 @@ class TestStateCsrfCheck:
         ]
         assert token_calls == []
 
-    def test_absent_state_raises_csrf_error(
-        self, tmp_path, monkeypatch, httpx_mock
-    ):
+    def test_absent_state_raises_csrf_error(self, tmp_path, monkeypatch, httpx_mock):
         """: a callback delivering ?code= with NO state parameter must
         still raise 'state mismatch' (not crash compare_digest with None). Pins
         the `cb_result.state or ''` defensive coalesce."""
@@ -4777,10 +4752,7 @@ class TestStateCsrfCheck:
 
         httpx_mock.add_response(url="https://example.com/mcp", status_code=401)
         httpx_mock.add_response(
-            url=(
-                "https://example.com/.well-known/"
-                "oauth-protected-resource/mcp"
-            ),
+            url=("https://example.com/.well-known/oauth-protected-resource/mcp"),
             status_code=404,
         )
         httpx_mock.add_response(
@@ -4828,9 +4800,7 @@ class TestStateCsrfCheck:
         ]
         assert token_calls == []
 
-    def test_uses_constant_time_comparison(
-        self, tmp_path, monkeypatch, httpx_mock
-    ):
+    def test_uses_constant_time_comparison(self, tmp_path, monkeypatch, httpx_mock):
         """: the CSRF state check goes through secrets.compare_digest
         on the PRODUCTION path, not ==.
 
@@ -4916,9 +4886,7 @@ class TestScopeOmittedWhenUnset:
 
     SERVER_URL = "https://example.com/mcp"
 
-    def test_authorize_url_has_no_scope_param(
-        self, tmp_path, monkeypatch, httpx_mock
-    ):
+    def test_authorize_url_has_no_scope_param(self, tmp_path, monkeypatch, httpx_mock):
         from urllib.parse import parse_qs, urlparse
         from urllib.request import urlopen
 
@@ -4928,10 +4896,7 @@ class TestScopeOmittedWhenUnset:
 
         httpx_mock.add_response(url="https://example.com/mcp", status_code=401)
         httpx_mock.add_response(
-            url=(
-                "https://example.com/.well-known/"
-                "oauth-protected-resource/mcp"
-            ),
+            url=("https://example.com/.well-known/oauth-protected-resource/mcp"),
             status_code=404,
         )
         httpx_mock.add_response(
@@ -4982,9 +4947,7 @@ class TestScopeOmittedWhenUnset:
         assert len(captured_auth_urls) == 1
         # keep_blank_values: parse_qs would otherwise DROP an empty `scope=`,
         # letting exactly the empty-param regression this test pins slip by.
-        q = parse_qs(
-            urlparse(captured_auth_urls[0]).query, keep_blank_values=True
-        )
+        q = parse_qs(urlparse(captured_auth_urls[0]).query, keep_blank_values=True)
         assert "scope" not in q
         # Positive control: the URL is fully formed otherwise.
         assert q["resource"] == [self.SERVER_URL]
@@ -5042,9 +5005,7 @@ class TestAuthorizationFlowFailurePaths:
         assert "state=%3Credacted%3E" in err
         assert real_state not in err
 
-    def test_callback_error_with_matching_state_raises_oauth_error(
-        self, monkeypatch
-    ):
+    def test_callback_error_with_matching_state_raises_oauth_error(self, monkeypatch):
         """A LEGITIMATE error callback echoes `state` (RFC 6749 §4.1.2.1) →
         surfaces the OAuth error, no code exchange. (: state is now
         validated before the error is acted on.)"""
@@ -5254,9 +5215,7 @@ class TestClientIdMetadataDocument:
                 timeout=0.3,
             )
         assert captured["client_id"] == self.URL
-        assert (
-            "client_id_metadata_document_supported" in capsys.readouterr().err
-        )
+        assert "client_id_metadata_document_supported" in capsys.readouterr().err
 
     def test_explicit_client_id_override_wins(self, monkeypatch):
         """--client-id (a pre-registered id) outranks --client-metadata-url
@@ -5325,9 +5284,7 @@ class TestClientIdMetadataDocument:
 
             return ClientRegistration(client_id="dcr-cid")
 
-        monkeypatch.setattr(
-            "mcp_stdio.oauth.register_client", fake_register_client
-        )
+        monkeypatch.setattr("mcp_stdio.oauth.register_client", fake_register_client)
         with pytest.raises(TimeoutError):
             _run_authorization_flow(
                 "https://ex.com/mcp",
@@ -5698,16 +5655,14 @@ class TestParseResourceMetadataHint:
         """Unquoted resource_metadata (some servers omit quotes)."""
         header = "Bearer resource_metadata=https://resource.example.com/prm"
         assert (
-            _parse_resource_metadata_hint(header)
-            == "https://resource.example.com/prm"
+            _parse_resource_metadata_hint(header) == "https://resource.example.com/prm"
         )
 
     def test_with_other_params(self):
         """resource_metadata combined with other Bearer parameters."""
         header = 'Bearer realm="example", resource_metadata="https://resource.example.com/prm", error="invalid_token"'
         assert (
-            _parse_resource_metadata_hint(header)
-            == "https://resource.example.com/prm"
+            _parse_resource_metadata_hint(header) == "https://resource.example.com/prm"
         )
 
     def test_no_resource_metadata(self):
@@ -5757,8 +5712,7 @@ class TestParseResourceMetadataHint:
             "resource_metadata=https://resource.example.com/prm"
         )
         assert (
-            _parse_resource_metadata_hint(header)
-            == "https://resource.example.com/prm"
+            _parse_resource_metadata_hint(header) == "https://resource.example.com/prm"
         )
 
     def test_value_inside_other_param_ignored(self):
@@ -5772,8 +5726,7 @@ class TestParseResourceMetadataHint:
         """Auth-param names are case-insensitive (RFC 9110 §11.2)."""
         header = 'Bearer Resource_Metadata="https://resource.example.com/prm"'
         assert (
-            _parse_resource_metadata_hint(header)
-            == "https://resource.example.com/prm"
+            _parse_resource_metadata_hint(header) == "https://resource.example.com/prm"
         )
 
 
@@ -5784,7 +5737,9 @@ class TestValidatePrmHintUrl:
     SERVER = "https://api.example.com/mcp"
 
     def test_https_same_origin_valid(self):
-        assert _validate_prm_hint_url("https://api.example.com/prm", self.SERVER) is True
+        assert (
+            _validate_prm_hint_url("https://api.example.com/prm", self.SERVER) is True
+        )
 
     def test_https_cross_origin_valid_with_warning(self, capsys):
         result = _validate_prm_hint_url("https://other.example.com/prm", self.SERVER)
@@ -5799,7 +5754,9 @@ class TestValidatePrmHintUrl:
         assert result is True
 
     def test_http_non_loopback_rejected(self):
-        assert _validate_prm_hint_url("http://api.example.com/prm", self.SERVER) is False
+        assert (
+            _validate_prm_hint_url("http://api.example.com/prm", self.SERVER) is False
+        )
 
     def test_unsupported_scheme_rejected(self):
         assert _validate_prm_hint_url("ftp://api.example.com/prm", self.SERVER) is False
@@ -6174,9 +6131,7 @@ class TestDeviceAuthorizationFlow:
                 MCP_URL, client, metadata=_device_meta(), cached=None
             )
 
-    def test_poll_2xx_non_json_body_fast_fails(
-        self, httpx_mock, tmp_path, monkeypatch
-    ):
+    def test_poll_2xx_non_json_body_fast_fails(self, httpx_mock, tmp_path, monkeypatch):
         """: a non-200 2xx poll response (e.g. 202) with a non-JSON
         body is non-compliant (RFC 8628 §3.5 mandates 200 or 400+error) and
         retrying it never resolves — so the loop FAST-FAILS by name instead of
@@ -6269,7 +6224,9 @@ class TestDeviceAuthorizationFlow:
         assert f"giving up in {_DEVICE_FLOW_MAX_LIFETIME_SECS}s" in err
         assert "999999999" not in err
 
-    def test_verification_uri_complete_printed(self, httpx_mock, tmp_path, monkeypatch, capsys):
+    def test_verification_uri_complete_printed(
+        self, httpx_mock, tmp_path, monkeypatch, capsys
+    ):
         """verification_uri_complete is shown when present — AND the user_code is
         STILL displayed for the user to confirm it matches (RFC 8628 §3.3.1 MUST,
         anti-phishing / device disambiguation)."""
@@ -6288,14 +6245,18 @@ class TestDeviceAuthorizationFlow:
         )
 
         client = httpx.Client()
-        _run_device_authorization_flow(MCP_URL, client, metadata=_device_meta(), cached=None)
+        _run_device_authorization_flow(
+            MCP_URL, client, metadata=_device_meta(), cached=None
+        )
         err = capsys.readouterr().err
         assert "https://example.com/activate?code=ABCD-1234" in err
         # RFC 8628 §3.3.1: the user_code MUST still be shown even with the
         # complete URI, so the user can verify it against the authorizing page.
         assert "ABCD-1234" in err
 
-    def test_user_code_printed_without_complete_uri(self, httpx_mock, tmp_path, monkeypatch, capsys):
+    def test_user_code_printed_without_complete_uri(
+        self, httpx_mock, tmp_path, monkeypatch, capsys
+    ):
         """When verification_uri_complete is absent, user_code is shown separately."""
         self._patch_store(tmp_path, monkeypatch)
 
@@ -6307,7 +6268,9 @@ class TestDeviceAuthorizationFlow:
         )
 
         client = httpx.Client()
-        _run_device_authorization_flow(MCP_URL, client, metadata=_device_meta(), cached=None)
+        _run_device_authorization_flow(
+            MCP_URL, client, metadata=_device_meta(), cached=None
+        )
         err = capsys.readouterr().err
         assert "ABCD-1234" in err
         assert "https://example.com/activate" in err
@@ -6334,7 +6297,9 @@ class TestDeviceAuthorizationFlow:
         )
 
         client = httpx.Client()
-        _run_device_authorization_flow(MCP_URL, client, metadata=_device_meta(), cached=None)
+        _run_device_authorization_flow(
+            MCP_URL, client, metadata=_device_meta(), cached=None
+        )
 
         # slow_down fires on the first poll: interval becomes 6, then sleep(6).
         # Second poll succeeds immediately (no sleep).
@@ -6362,7 +6327,9 @@ class TestDeviceAuthorizationFlow:
         )
 
         client = httpx.Client()
-        _run_device_authorization_flow(MCP_URL, client, metadata=_device_meta(), cached=None)
+        _run_device_authorization_flow(
+            MCP_URL, client, metadata=_device_meta(), cached=None
+        )
         assert slept and all(s <= 60 for s in slept)
 
     def test_expired_token_raises(self, httpx_mock, tmp_path, monkeypatch):
@@ -6459,7 +6426,9 @@ class TestDeviceAuthorizationFlow:
         )
 
         client = httpx.Client()
-        _run_device_authorization_flow(MCP_URL, client, metadata=_device_meta(), cached=None)
+        _run_device_authorization_flow(
+            MCP_URL, client, metadata=_device_meta(), cached=None
+        )
 
         dcr_req = httpx_mock.get_requests()[0]
         assert dcr_req.url.path == "/register"
@@ -6469,7 +6438,9 @@ class TestDeviceAuthorizationFlow:
         # SEP-837: the headless device-flow client is also "native".
         assert body["application_type"] == "native"
 
-    def test_device_flow_preserves_cached_id_token(self, httpx_mock, tmp_path, monkeypatch):
+    def test_device_flow_preserves_cached_id_token(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
         """#59: a device-flow re-auth whose token response omits id_token keeps the
         cached id_token, so --oauth-use-id-token survives (matches refresh path)."""
         self._patch_store(tmp_path, monkeypatch)
@@ -6487,7 +6458,9 @@ class TestDeviceAuthorizationFlow:
         assert data.access_token == "acc"
         assert data.id_token == "cached-idt"
 
-    def test_da_request_includes_resource_indicator(self, httpx_mock, tmp_path, monkeypatch):
+    def test_da_request_includes_resource_indicator(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
         """Device Authorization Request must include resource parameter (RFC 8707)."""
         self._patch_store(tmp_path, monkeypatch)
 
@@ -6499,17 +6472,18 @@ class TestDeviceAuthorizationFlow:
         )
 
         client = httpx.Client()
-        _run_device_authorization_flow(MCP_URL, client, metadata=_device_meta(), cached=None)
+        _run_device_authorization_flow(
+            MCP_URL, client, metadata=_device_meta(), cached=None
+        )
 
         reqs = httpx_mock.get_requests()
         da_req = next(r for r in reqs if str(r.url).startswith(DEVICE_AUTH_URL))
         from urllib.parse import parse_qs
+
         body = parse_qs(da_req.content.decode())
         assert body.get("resource") == [MCP_URL]
 
-    def test_da_request_omits_scope_when_unset(
-        self, httpx_mock, tmp_path, monkeypatch
-    ):
+    def test_da_request_omits_scope_when_unset(self, httpx_mock, tmp_path, monkeypatch):
         """No scope configured -> no scope param at all (never an empty
         ``scope=``). Guards the failure class of claude-code#72440, where a
         v2.1.196 regression sent no scope on the unset path and Microsoft
@@ -6531,6 +6505,7 @@ class TestDeviceAuthorizationFlow:
         reqs = httpx_mock.get_requests()
         da_req = next(r for r in reqs if str(r.url).startswith(DEVICE_AUTH_URL))
         from urllib.parse import parse_qs
+
         # keep_blank_values: parse_qs would otherwise DROP an empty `scope=`,
         # letting exactly the empty-param regression this test pins slip by.
         body = parse_qs(da_req.content.decode(), keep_blank_values=True)
@@ -6668,9 +6643,7 @@ class TestDeviceAuthorizationFlow:
                 MCP_URL, client, metadata=_device_meta(), cached=None
             )
 
-    def test_unsafe_verification_uri_rejected(
-        self, httpx_mock, tmp_path, monkeypatch
-    ):
+    def test_unsafe_verification_uri_rejected(self, httpx_mock, tmp_path, monkeypatch):
         """A non-http(s) / cleartext verification_uri must be rejected, not
         presented to the user as an 'Open:' phishing target."""
         self._patch_store(tmp_path, monkeypatch)
@@ -6792,9 +6765,7 @@ class TestDeviceAuthorizationFlow:
                 MCP_URL, client, metadata=_device_meta(), cached=None, timeout=99999
             )
 
-    def test_poll_network_error_is_retried(
-        self, httpx_mock, tmp_path, monkeypatch
-    ):
+    def test_poll_network_error_is_retried(self, httpx_mock, tmp_path, monkeypatch):
         """A transient network error during polling must not abort the flow —
         the loop logs, sleeps, and continues to the next poll."""
         self._patch_store(tmp_path, monkeypatch)
@@ -6887,7 +6858,9 @@ class TestEnsureTokenDeviceFlow:
             },
         )
 
-    def test_device_flow_flag_routes_to_device_flow(self, httpx_mock, tmp_path, monkeypatch):
+    def test_device_flow_flag_routes_to_device_flow(
+        self, httpx_mock, tmp_path, monkeypatch
+    ):
         """ensure_token with device_flow=True uses Device Authorization Grant."""
         self._patch_store(tmp_path, monkeypatch)
 
@@ -6969,23 +6942,40 @@ class TestPickTokenEndpointAuthMethod:
         assert _pick_token_endpoint_auth_method([]) == "none"
 
     def test_prefers_none_over_post(self):
-        assert _pick_token_endpoint_auth_method(["none", "client_secret_post"]) == "none"
+        assert (
+            _pick_token_endpoint_auth_method(["none", "client_secret_post"]) == "none"
+        )
 
     def test_prefers_none_over_basic(self):
-        assert _pick_token_endpoint_auth_method(["client_secret_basic", "none"]) == "none"
+        assert (
+            _pick_token_endpoint_auth_method(["client_secret_basic", "none"]) == "none"
+        )
 
     def test_prefers_post_over_basic(self):
-        assert _pick_token_endpoint_auth_method(["client_secret_basic", "client_secret_post"]) == "client_secret_post"
+        assert (
+            _pick_token_endpoint_auth_method(
+                ["client_secret_basic", "client_secret_post"]
+            )
+            == "client_secret_post"
+        )
 
     def test_selects_client_secret_basic_when_only_option(self):
-        assert _pick_token_endpoint_auth_method(["client_secret_basic"]) == "client_secret_basic"
+        assert (
+            _pick_token_endpoint_auth_method(["client_secret_basic"])
+            == "client_secret_basic"
+        )
 
     def test_selects_client_secret_post(self):
-        assert _pick_token_endpoint_auth_method(["client_secret_post"]) == "client_secret_post"
+        assert (
+            _pick_token_endpoint_auth_method(["client_secret_post"])
+            == "client_secret_post"
+        )
 
     def test_falls_back_to_none_for_unsupported_methods(self, capsys):
         """AS that only advertises private_key_jwt → warn + default none."""
-        result = _pick_token_endpoint_auth_method(["private_key_jwt", "tls_client_auth"])
+        result = _pick_token_endpoint_auth_method(
+            ["private_key_jwt", "tls_client_auth"]
+        )
         assert result == "none"
         # warning should have been emitted
         captured = capsys.readouterr()
@@ -7012,11 +7002,17 @@ class TestDiscoverMetadataAuthMethods:
             json={
                 "authorization_endpoint": "https://example.com/authorize",
                 "token_endpoint": "https://example.com/token",
-                "token_endpoint_auth_methods_supported": ["client_secret_basic", "none"],
+                "token_endpoint_auth_methods_supported": [
+                    "client_secret_basic",
+                    "none",
+                ],
             },
         )
         meta = discover_oauth_metadata("https://example.com/mcp", httpx.Client())
-        assert meta.token_endpoint_auth_methods_supported == ["client_secret_basic", "none"]
+        assert meta.token_endpoint_auth_methods_supported == [
+            "client_secret_basic",
+            "none",
+        ]
 
     def test_missing_field_is_none(self, httpx_mock):
         """Older AS metadata without the field → None (public client default)."""
@@ -7278,21 +7274,25 @@ class TestTokenEndpointAuthMethodPersistence:
         monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store)
 
         # Write a token entry WITHOUT token_endpoint_auth_method (legacy format)
-        store.write_text(_json.dumps({
-            "https://example.com/mcp": {
-                "access_token": "at",
-                "token_type": "Bearer",
-                "expires_at": None,
-                "refresh_token": "rt",
-                "scope": None,
-                "client_id": "cid",
-                "client_secret": None,
-                "client_secret_expires_at": None,
-                "token_endpoint": "https://example.com/token",
-                "authorization_endpoint": "https://example.com/authorize",
-                "registration_endpoint": None,
-            }
-        }))
+        store.write_text(
+            _json.dumps(
+                {
+                    "https://example.com/mcp": {
+                        "access_token": "at",
+                        "token_type": "Bearer",
+                        "expires_at": None,
+                        "refresh_token": "rt",
+                        "scope": None,
+                        "client_id": "cid",
+                        "client_secret": None,
+                        "client_secret_expires_at": None,
+                        "token_endpoint": "https://example.com/token",
+                        "authorization_endpoint": "https://example.com/authorize",
+                        "registration_endpoint": None,
+                    }
+                }
+            )
+        )
         loaded = load_token("https://example.com/mcp")
         assert loaded is not None
         assert loaded.token_endpoint_auth_method == "none"
@@ -7304,7 +7304,9 @@ class TestTokenEndpointAuthMethodPersistence:
         from mcp_stdio.token_store import save_token
 
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
-        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", tmp_path / "tokens.json")
+        monkeypatch.setattr(
+            "mcp_stdio.token_store._STORE_FILE", tmp_path / "tokens.json"
+        )
 
         save_token(
             "https://example.com/mcp",
@@ -7344,7 +7346,9 @@ class TestDeviceAuthStepOneBasicAuth:
     ):
         """client_secret_basic: DA request (Step 1) puts credentials in Authorization header."""
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
-        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", tmp_path / "tokens.json")
+        monkeypatch.setattr(
+            "mcp_stdio.token_store._STORE_FILE", tmp_path / "tokens.json"
+        )
 
         httpx_mock.add_response(url=DEVICE_AUTH_URL, json=_da_response())
         httpx_mock.add_response(
@@ -7490,9 +7494,7 @@ class TestIssValidation:
         )
         assert "issuer mismatch" in msg
 
-    def test_synthesized_issuer_keeps_the_slash_tolerance(
-        self, monkeypatch, tmp_path
-    ):
+    def test_synthesized_issuer_keeps_the_slash_tolerance(self, monkeypatch, tmp_path):
         """The fallback issuer is a guess, so it is not held to byte-exactness.
 
         No metadata was validated there — the spec says the comparison gives no

@@ -388,9 +388,7 @@ def _migrate_legacy_store() -> None:
         # could swap the inode, which is the self-induced dotfile-manager case.
         legacy_is_regular = False
         try:
-            _lfd = os.open(
-                _LEGACY_STORE_FILE, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK
-            )
+            _lfd = os.open(_LEGACY_STORE_FILE, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK)
         except OSError:
             _lfd = -1
         if _lfd >= 0:
@@ -674,7 +672,7 @@ def _atomic_write_json_file(path: Path, data: dict[str, Any]) -> None:
     # fail the write.
     try:
         # _O_NONBLOCK for consistency with every other os.open in this file
-        #. Harmless on a directory (a dir open never blocks), but
+        # . Harmless on a directory (a dir open never blocks), but
         # it keeps the defensive open discipline uniform so a future copy of
         # this pattern does not omit it where it DOES matter (FIFO at a path).
         dir_fd = os.open(str(path.parent), os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK)
@@ -729,20 +727,20 @@ def _write_store(data: dict[str, Any]) -> None:
 def _store_lock() -> Iterator[None]:
     """Best-effort advisory exclusive lock around a read-modify-write.
 
-    Serialises ``save_token`` / ``delete_token`` so updates to distinct server
-    keys merge rather than clobbering each other (last-writer-wins). Uses
-    ``fcntl.flock`` on POSIX and ``msvcrt`` on Windows; if no primitive is
-    available or acquisition fails, it proceeds without the lock (the operation
-    must never be blocked by lock trouble).
+        Serialises ``save_token`` / ``delete_token`` so updates to distinct server
+        keys merge rather than clobbering each other (last-writer-wins). Uses
+        ``fcntl.flock`` on POSIX and ``msvcrt`` on Windows; if no primitive is
+        available or acquisition fails, it proceeds without the lock (the operation
+        must never be blocked by lock trouble).
 
-    This is the PRIMARY serialisation mechanism and it covers BOTH concurrent
-    processes AND concurrent threads in one process: each call opens a fresh
-    ``os.open`` fd, and ``flock`` locks the open file description, so two
-    threads with their own fds block each other exactly like two processes
-. The unique temp-file suffix in ``_write_store`` is only the
-    backstop for the degraded no-lock path, NOT the in-process serialiser — do
-    not refactor this to a POSIX record lock (``lockf``/``fcntl.lockf``), which
-    is per-process and would silently stop serialising sibling threads.
+        This is the PRIMARY serialisation mechanism and it covers BOTH concurrent
+        processes AND concurrent threads in one process: each call opens a fresh
+        ``os.open`` fd, and ``flock`` locks the open file description, so two
+        threads with their own fds block each other exactly like two processes
+    . The unique temp-file suffix in ``_write_store`` is only the
+        backstop for the degraded no-lock path, NOT the in-process serialiser — do
+        not refactor this to a POSIX record lock (``lockf``/``fcntl.lockf``), which
+        is per-process and would silently stop serialising sibling threads.
     """
     _ensure_store_dir()
     # Derive the lock path from the current _STORE_DIR (not a module constant)
@@ -987,7 +985,6 @@ def delete_token(server_url: str) -> None:
                 # Exception so a non-OSError from _write_store's pre-try
                 # json.dumps also degrades. A later successful write reconciles.
                 print(
-                    f"warning: could not write token store ({e}); "
-                    f"token not deleted",
+                    f"warning: could not write token store ({e}); token not deleted",
                     file=sys.stderr,
                 )

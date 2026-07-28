@@ -4,7 +4,9 @@ from mcp_stdio.relay import redact_url
 
 
 def test_strips_userinfo():
-    assert redact_url("https://user:secret@example.com/mcp") == "https://example.com/mcp"
+    assert (
+        redact_url("https://user:secret@example.com/mcp") == "https://example.com/mcp"
+    )
 
 
 def test_redacts_query_string():
@@ -15,7 +17,9 @@ def test_redacts_query_string():
 
 
 def test_keeps_scheme_host_port_path():
-    assert redact_url("https://example.com:8443/relay") == "https://example.com:8443/relay"
+    assert (
+        redact_url("https://example.com:8443/relay") == "https://example.com:8443/relay"
+    )
 
 
 def test_plain_url_unchanged():

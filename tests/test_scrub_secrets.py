@@ -27,7 +27,9 @@ def test_plain_text_unchanged():
 
 
 def test_url_without_userinfo_unchanged():
-    assert scrub_secrets("GET https://host.example/mcp") == "GET https://host.example/mcp"
+    assert (
+        scrub_secrets("GET https://host.example/mcp") == "GET https://host.example/mcp"
+    )
 
 
 def test_linear_time_on_adversarial_input():

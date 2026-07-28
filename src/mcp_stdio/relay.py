@@ -102,9 +102,7 @@ def _tcp_keepalive_socket_options() -> list[tuple[int, int, int]]:
         # consistently with the Linux branch above.
         if not hasattr(socket, "TCP_KEEPALIVE"):
             return opts
-        opts.append(
-            (socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, _KEEPALIVE_IDLE_SECS)
-        )
+        opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, _KEEPALIVE_IDLE_SECS))
         if hasattr(socket, "TCP_KEEPINTVL"):
             opts.append(
                 (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KEEPALIVE_INTVL_SECS)
@@ -124,6 +122,7 @@ def _make_httpx_transport(*, tcp_keepalive: bool) -> httpx.HTTPTransport:
     """
     socket_options = _tcp_keepalive_socket_options() if tcp_keepalive else None
     return httpx.HTTPTransport(socket_options=socket_options)
+
 
 # MCP spec defines four paginated list methods. Some clients (notably
 # Claude Code, cf. anthropics/claude-code#39586) silently drop pages beyond
@@ -243,10 +242,16 @@ def _same_origin(url_a: str, url_b: str) -> bool:
     """Return True if two URLs share an RFC 6454 origin (scheme/host/port)."""
     try:
         a, b = urlsplit(url_a), urlsplit(url_b)
-        oa = (a.scheme, (a.hostname or "").lower(),
-              a.port if a.port is not None else _DEFAULT_SCHEME_PORTS.get(a.scheme))
-        ob = (b.scheme, (b.hostname or "").lower(),
-              b.port if b.port is not None else _DEFAULT_SCHEME_PORTS.get(b.scheme))
+        oa = (
+            a.scheme,
+            (a.hostname or "").lower(),
+            a.port if a.port is not None else _DEFAULT_SCHEME_PORTS.get(a.scheme),
+        )
+        ob = (
+            b.scheme,
+            (b.hostname or "").lower(),
+            b.port if b.port is not None else _DEFAULT_SCHEME_PORTS.get(b.scheme),
+        )
     except ValueError:
         return False
     return oa == ob
@@ -939,7 +944,9 @@ def _post_and_stream(
                 pv: str | None = None
                 content_type = resp.headers.get("content-type", "")
                 if "text/event-stream" in content_type:
-                    for event_type, payload in _iter_sse_events(_iter_sse_lines(resp.iter_text())):
+                    for event_type, payload in _iter_sse_events(
+                        _iter_sse_lines(resp.iter_text())
+                    ):
                         if event_type != "message":
                             continue
                         if capture_init and pv is None:
@@ -1062,9 +1069,7 @@ def _post_parsed(
                         session,
                         resp.status_code,
                         www_auth,
-                        retry_after=_parse_retry_after(
-                            resp.headers.get("retry-after")
-                        ),
+                        retry_after=_parse_retry_after(resp.headers.get("retry-after")),
                     )
                 log(
                     f"attempt {attempt}/{MAX_RETRIES} got HTTP "
@@ -1167,7 +1172,11 @@ def _normalize_null_arguments(line: str) -> str:
     if not isinstance(msg, dict) or msg.get("method") != "tools/call":
         return line
     params = msg.get("params")
-    if isinstance(params, dict) and "arguments" in params and params["arguments"] is None:
+    if (
+        isinstance(params, dict)
+        and "arguments" in params
+        and params["arguments"] is None
+    ):
         params["arguments"] = {}
         return json.dumps(msg)
     return line
@@ -1257,10 +1266,7 @@ def _paginate_and_stream(
         if stream is None:
             if page == 1:
                 return None  # error already printed
-            log(
-                f"pagination: page {page} exhausted retries, "
-                f"returning partial result"
-            )
+            log(f"pagination: page {page} exhausted retries, returning partial result")
             truncated = True
             pending_cursor = params.get("cursor")
             break
@@ -1336,10 +1342,7 @@ def _paginate_and_stream(
     else:
         truncated = True
         pending_cursor = params.get("cursor")
-        log(
-            f"pagination: reached MAX_LIST_PAGES={MAX_LIST_PAGES}, "
-            f"truncating results"
-        )
+        log(f"pagination: reached MAX_LIST_PAGES={MAX_LIST_PAGES}, truncating results")
 
     # Defensive only / unreachable in practice: the loop always
     # runs page 1, and every path that reaches here either early-returned or
@@ -1707,7 +1710,9 @@ def _check_connection_sse(
     )
 
     client = httpx.Client(
-        timeout=httpx.Timeout(connect=timeout_connect, read=timeout_read, write=30, pool=10)
+        timeout=httpx.Timeout(
+            connect=timeout_connect, read=timeout_read, write=30, pool=10
+        )
     )
 
     # The GET stream read blocks in the main thread; the POST runs in a helper
@@ -1842,7 +1847,9 @@ def check_connection(
     )
 
     client = httpx.Client(
-        timeout=httpx.Timeout(connect=timeout_connect, read=timeout_read, write=30, pool=10)
+        timeout=httpx.Timeout(
+            connect=timeout_connect, read=timeout_read, write=30, pool=10
+        )
     )
 
     try:
@@ -1994,11 +2001,7 @@ def _start_proactive_refresh(
     or when there is nothing to refresh (no OAuth: the refresher / expiry getter
     is ``None``).
     """
-    if not (
-        proactive_refresh
-        and refresher is not None
-        and expiry_getter is not None
-    ):
+    if not (proactive_refresh and refresher is not None and expiry_getter is not None):
         return None, None
     stop = threading.Event()
     thread = threading.Thread(
@@ -2146,7 +2149,7 @@ def run(
             read=timeout_read,
             write=timeout_write,
             pool=10,
-        )
+        ),
     )
 
     # ``run`` is otherwise single-threaded, but the proactive-refresh daemon
@@ -2274,7 +2277,13 @@ def run(
                         # PAGINATED_LIST_METHODS, so an initialize request can never
                         # take this branch — keep that invariant if the table grows.
                         return _paginate_and_stream(
-                            client, url, content, h, req_id, detected[1], tracker,
+                            client,
+                            url,
+                            content,
+                            h,
+                            req_id,
+                            detected[1],
+                            tracker,
                             has_id=req_has_id,
                         )
                     # Any `initialize` request is a capture point — not just the
@@ -2321,8 +2330,14 @@ def run(
                             if k.lower() != "mcp-protocol-version"
                         }
                     result = _post_and_stream(
-                        client, url, content, h, req_id, tracker,
-                        capture_init=capture_init, has_id=req_has_id,
+                        client,
+                        url,
+                        content,
+                        h,
+                        req_id,
+                        tracker,
+                        capture_init=capture_init,
+                        has_id=req_has_id,
                     )
                     if result is not None and result.protocol_version:
                         if result.protocol_version != protocol_version:
@@ -2365,13 +2380,12 @@ def run(
                 # consumes the id — adopting it would poison session_id for the next
                 # stdin line for nothing (one wasted round-trip until 404 self-heal).
                 feeds_recovery = (
-                    (result.status_code == 401 and token_refresher is not None)
-                    or (
-                        result.status_code == 403
-                        and scope_upgrader is not None
-                        and _parse_www_authenticate_scope(result.www_authenticate)
-                        is not None
-                    )
+                    result.status_code == 401 and token_refresher is not None
+                ) or (
+                    result.status_code == 403
+                    and scope_upgrader is not None
+                    and _parse_www_authenticate_scope(result.www_authenticate)
+                    is not None
                 )
                 # A 202-to-request is classified as an error below (req_202_hang)
                 # and synthesized into a JSON-RPC error, so — like a 4xx/5xx — its
@@ -2391,7 +2405,7 @@ def run(
                 # most once per stdin line. A 401/403 whose retry returns 404 flows
                 # into the 404 branch and recovers ONLY when a session_id was
                 # already established — the 404 branch is gated on `and session_id`
-                #. A COLD 404 (no session ever existed, e.g. the
+                # . A COLD 404 (no session ever existed, e.g. the
                 # initialize itself 401'd) is a genuine not-found, not a session
                 # expiry, so it correctly surfaces as a JSON-RPC error rather than
                 # re-initializing a session that never was. The converse does NOT
@@ -2462,7 +2476,9 @@ def run(
                     else:
                         log("token refresh failed, returning error")
                         if req_has_id:
-                            _write_line(_error_response("authentication failed", req_id))
+                            _write_line(
+                                _error_response("authentication failed", req_id)
+                            )
                         continue
 
                 # Insufficient scope (403) — step-up authorization and retry once
@@ -2500,7 +2516,9 @@ def run(
                         else:
                             log("step-up authorization failed, returning error")
                             if req_has_id:
-                                _write_line(_error_response("authorization failed", req_id))
+                                _write_line(
+                                    _error_response("authorization failed", req_id)
+                                )
                             continue
 
                 # Session expired (404) — reset, re-initialize, then retry
@@ -2745,8 +2763,7 @@ def _drain_pending(state: _SseState, tracker: _CancelTracker | None) -> None:
         try:
             _write_line(
                 _error_response(
-                    "SSE stream disconnected before response arrived; "
-                    "please retry",
+                    "SSE stream disconnected before response arrived; please retry",
                     rid,
                 )
             )
@@ -2796,6 +2813,7 @@ def _sse_reader_loop(
 
     Reconnects automatically on disconnect.
     """
+
     def stream_lost() -> None:
         """The shared disconnect sequence, identical at every reconnect site.
 
@@ -2837,7 +2855,9 @@ def _sse_reader_loop(
                         return
                     continue
 
-                for event_type, data in _iter_sse_events(_iter_sse_lines(resp.iter_text())):
+                for event_type, data in _iter_sse_events(
+                    _iter_sse_lines(resp.iter_text())
+                ):
                     if state.stop.is_set():
                         return
                     if event_type == "endpoint":
@@ -2848,7 +2868,9 @@ def _sse_reader_loop(
                         # would otherwise redirect every authenticated POST — and
                         # its Authorization header — to a different origin. Refuse
                         # a cross-origin endpoint when credentials would be sent.
-                        has_auth = any(k.lower() == "authorization" for k in req_headers)
+                        has_auth = any(
+                            k.lower() == "authorization" for k in req_headers
+                        )
                         if has_auth and not _same_origin(resolved, url):
                             log(
                                 f"warning: refusing cross-origin SSE endpoint "
@@ -3001,9 +3023,7 @@ def run_sse(
     # its own. Both ``None`` and ``0`` mean "disabled" — ``0`` is the CLI
     # escape hatch and ``None`` is the programmatic one. POST requests
     # use the separate timeout_read below.
-    effective_sse_read = (
-        None if sse_read_timeout in (None, 0) else sse_read_timeout
-    )
+    effective_sse_read = None if sse_read_timeout in (None, 0) else sse_read_timeout
     client = httpx.Client(
         transport=_make_httpx_transport(tcp_keepalive=tcp_keepalive),
         timeout=httpx.Timeout(
@@ -3011,7 +3031,7 @@ def run_sse(
             read=effective_sse_read,
             write=timeout_write,
             pool=10,
-        )
+        ),
     )
 
     tracker: _CancelTracker | None = _CancelTracker() if cancel_filter else None
@@ -3126,7 +3146,9 @@ def run_sse(
                         endpoint = state.endpoint_url
                     if endpoint is None:
                         if req_has_id:
-                            _write_line(_error_response("SSE endpoint unavailable", req_id))
+                            _write_line(
+                                _error_response("SSE endpoint unavailable", req_id)
+                            )
                         continue
 
                 # Track BEFORE the POST: on this transport the reply rides the
@@ -3233,7 +3255,9 @@ def run_sse(
                             # class this transport works around.
                             settled = tracked and not state.untrack(req_id)
                             if req_has_id and not settled:
-                                _write_line(_error_response("authentication failed", req_id))
+                                _write_line(
+                                    _error_response("authentication failed", req_id)
+                                )
                             continue
 
                     if resp.status_code == 403 and scope_upgrader:
@@ -3264,12 +3288,12 @@ def run_sse(
                                     ),
                                 )
                             else:
-                                log(
-                                    "step-up authorization failed, returning error"
-                                )
+                                log("step-up authorization failed, returning error")
                                 settled = tracked and not state.untrack(req_id)
                                 if req_has_id and not settled:
-                                    _write_line(_error_response("authorization failed", req_id))
+                                    _write_line(
+                                        _error_response("authorization failed", req_id)
+                                    )
                                 continue
 
                     if resp.status_code not in (200, 202):
@@ -3288,7 +3312,9 @@ def run_sse(
                         if req_has_id and not settled:
                             err_data = None
                             if resp.status_code in _RETRYABLE_RATE_LIMIT_STATUSES:
-                                secs = _parse_retry_after(resp.headers.get("retry-after"))
+                                secs = _parse_retry_after(
+                                    resp.headers.get("retry-after")
+                                )
                                 if secs is not None:
                                     err_data = {"retryAfter": secs}  # See #8.
                             _write_line(

@@ -234,7 +234,10 @@ class TestMain:
         """#296: --oauth-eager with a warm cache probes non-interactively and
         runs normally (cold_start_login None)."""
         with (
-            patch("sys.argv", ["mcp-stdio", "--oauth", "--oauth-eager", "https://example.com/mcp"]),
+            patch(
+                "sys.argv",
+                ["mcp-stdio", "--oauth", "--oauth-eager", "https://example.com/mcp"],
+            ),
             patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
             patch("mcp_stdio.cli.run") as mock_run,
         ):
@@ -249,7 +252,10 @@ class TestMain:
         """#296: --oauth-eager with a cold cache (non-interactive probe returns
         None) defers OAuth to a background cold_start_login passed to run()."""
         with (
-            patch("sys.argv", ["mcp-stdio", "--oauth", "--oauth-eager", "https://example.com/mcp"]),
+            patch(
+                "sys.argv",
+                ["mcp-stdio", "--oauth", "--oauth-eager", "https://example.com/mcp"],
+            ),
             patch("mcp_stdio.oauth.ensure_token", return_value=None) as mock_ensure,
             patch("mcp_stdio.cli.run") as mock_run,
         ):
@@ -263,8 +269,14 @@ class TestMain:
         with (
             patch(
                 "sys.argv",
-                ["mcp-stdio", "--oauth", "--oauth-eager", "--transport", "sse",
-                 "https://example.com/sse"],
+                [
+                    "mcp-stdio",
+                    "--oauth",
+                    "--oauth-eager",
+                    "--transport",
+                    "sse",
+                    "https://example.com/sse",
+                ],
             ),
             patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
             patch("mcp_stdio.cli.run_sse"),
@@ -356,9 +368,7 @@ class TestMain:
     def test_negative_timeouts_rejected(self, flag, capsys):
         """Negative duration flags are rejected at parse time, consistent with
         --oauth-refresh-leeway, instead of flowing into httpx.Timeout."""
-        with patch(
-            "sys.argv", ["mcp-stdio", flag, "-5", "https://example.com/mcp"]
-        ):
+        with patch("sys.argv", ["mcp-stdio", flag, "-5", "https://example.com/mcp"]):
             with pytest.raises(SystemExit) as exc_info:
                 main()
             assert exc_info.value.code == 2
@@ -381,9 +391,7 @@ class TestMain:
         silent hang). Every float flag must reject non-finite values at parse
         time. (-inf is omitted: argparse intercepts a leading '-' as an option
         before the validator runs; it is already caught by the < 0 guard.)"""
-        with patch(
-            "sys.argv", ["mcp-stdio", flag, value, "https://example.com/mcp"]
-        ):
+        with patch("sys.argv", ["mcp-stdio", flag, value, "https://example.com/mcp"]):
             with pytest.raises(SystemExit) as exc_info:
                 main()
             assert exc_info.value.code == 2
@@ -536,9 +544,7 @@ class TestMain:
         headers = mock_run.call_args.kwargs["headers"]
         assert "Authorization" not in headers
 
-    def test_explicit_authorization_header_with_oauth_warns(
-        self, monkeypatch, capsys
-    ):
+    def test_explicit_authorization_header_with_oauth_warns(self, monkeypatch, capsys):
         """#18: an explicit -H 'Authorization: ...' overridden by the OAuth token
         emits a stderr warning instead of silently discarding it."""
         monkeypatch.delenv("MCP_BEARER_TOKEN", raising=False)
@@ -738,9 +744,7 @@ class TestMain:
             main()
         assert "ignored without --oauth" in capsys.readouterr().err
 
-    def test_explicit_empty_client_id_without_oauth_warns(
-        self, monkeypatch, capsys
-    ):
+    def test_explicit_empty_client_id_without_oauth_warns(self, monkeypatch, capsys):
         """: an explicit `--client-id ''` (falsy) without an OAuth
         flow now trips the OAuth-only warning — the gate is presence-based
         (`is not None`), matching the --bearer-token discipline."""
@@ -855,7 +859,13 @@ class TestClientMetadataUrlFlag:
         with (
             patch(
                 "sys.argv",
-                ["mcp-stdio", "--oauth", "--client-metadata-url", url, "https://example.com/mcp"],
+                [
+                    "mcp-stdio",
+                    "--oauth",
+                    "--client-metadata-url",
+                    url,
+                    "https://example.com/mcp",
+                ],
             ),
             patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
             patch("mcp_stdio.cli.run"),
@@ -865,8 +875,7 @@ class TestClientMetadataUrlFlag:
         assert mock_ensure.call_args.kwargs["client_id"] == "env-cid"
         assert mock_ensure.call_args.kwargs["client_metadata_url"] == url
         assert (
-            "the pre-registered client_id takes precedence"
-            in capsys.readouterr().err
+            "the pre-registered client_id takes precedence" in capsys.readouterr().err
         )
 
     def test_empty_explicit_client_id_does_not_warn_and_metadata_url_wins(
@@ -920,7 +929,13 @@ class TestClientMetadataUrlFlag:
         with (
             patch(
                 "sys.argv",
-                ["mcp-stdio", "--oauth", "--client-metadata-url", url, "https://example.com/mcp"],
+                [
+                    "mcp-stdio",
+                    "--oauth",
+                    "--client-metadata-url",
+                    url,
+                    "https://example.com/mcp",
+                ],
             ),
             patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
             patch("mcp_stdio.cli.run"),
@@ -1004,9 +1019,7 @@ class TestClientMetadataUrlFlag:
     def test_check_flag_invokes_check_connection(self):
         """--check should call check_connection and exit with its result."""
         with (
-            patch(
-                "sys.argv", ["mcp-stdio", "https://example.com/mcp", "--check"]
-            ),
+            patch("sys.argv", ["mcp-stdio", "https://example.com/mcp", "--check"]),
             patch("mcp_stdio.cli.check_connection", return_value=True) as mock_check,
         ):
             with pytest.raises(SystemExit) as exc_info:
@@ -1048,9 +1061,7 @@ class TestClientMetadataUrlFlag:
     def test_test_flag_deprecated_alias_works(self, capsys):
         """--test still works for backward compatibility but emits a deprecation warning."""
         with (
-            patch(
-                "sys.argv", ["mcp-stdio", "https://example.com/mcp", "--test"]
-            ),
+            patch("sys.argv", ["mcp-stdio", "https://example.com/mcp", "--test"]),
             patch("mcp_stdio.cli.check_connection", return_value=True) as mock_check,
         ):
             with pytest.raises(SystemExit) as exc_info:
@@ -1064,9 +1075,7 @@ class TestClientMetadataUrlFlag:
     def test_check_flag_no_deprecation_warning(self, capsys):
         """--check (the new spelling) must NOT emit any deprecation warning."""
         with (
-            patch(
-                "sys.argv", ["mcp-stdio", "https://example.com/mcp", "--check"]
-            ),
+            patch("sys.argv", ["mcp-stdio", "https://example.com/mcp", "--check"]),
             patch("mcp_stdio.cli.check_connection", return_value=True),
         ):
             with pytest.raises(SystemExit):
@@ -1077,9 +1086,7 @@ class TestClientMetadataUrlFlag:
     def test_check_flag_failure_exits_nonzero(self):
         """--check exits with code 1 when check_connection returns False."""
         with (
-            patch(
-                "sys.argv", ["mcp-stdio", "https://example.com/mcp", "--check"]
-            ),
+            patch("sys.argv", ["mcp-stdio", "https://example.com/mcp", "--check"]),
             patch("mcp_stdio.cli.check_connection", return_value=False),
         ):
             with pytest.raises(SystemExit) as exc_info:
@@ -1438,9 +1445,7 @@ class TestBuildTokenRefresher:
             "mcp_stdio.oauth.refresh_cached_token",
             lambda url, client: TokenData(access_token="bad\r\nX-Inject: 1"),
         )
-        refresher = _build_token_refresher(
-            "https://example.com/mcp", {}, 10, 120
-        )
+        refresher = _build_token_refresher("https://example.com/mcp", {}, 10, 120)
         assert refresher() is None
         assert _SpyClient.instances[-1].closed
         assert "token refresh failed" in capsys.readouterr().err

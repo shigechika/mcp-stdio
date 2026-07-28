@@ -273,9 +273,10 @@ class TestLoadSaveDelete:
         # The intermediate dir we created is 0o700, not umask-loose.
         intermediate_mode = stat.S_IMODE(os.stat(tmp_path / "config").st_mode)
         assert intermediate_mode & (stat.S_IRWXG | stat.S_IRWXO) == 0
-        assert stat.S_IMODE(os.stat(store_dir).st_mode) & (
-            stat.S_IRWXG | stat.S_IRWXO
-        ) == 0
+        assert (
+            stat.S_IMODE(os.stat(store_dir).st_mode) & (stat.S_IRWXG | stat.S_IRWXO)
+            == 0
+        )
 
     @pytest.mark.skipif(
         sys.platform == "win32",
@@ -313,9 +314,7 @@ class TestLoadSaveDelete:
         assert load_token("https://a.com/mcp").access_token == "tok-a"
         assert load_token("https://b.com/mcp").access_token == "tok-b"
 
-    def test_save_token_write_failure_is_fail_soft(
-        self, tmp_path, monkeypatch, capsys
-    ):
+    def test_save_token_write_failure_is_fail_soft(self, tmp_path, monkeypatch, capsys):
         """: a _write_store OSError (full / read-only FS) must NOT
         propagate out of save_token — it warns and returns, so a refresh whose
         cache-write fails still yields a usable token instead of crashing the
@@ -361,9 +360,7 @@ class TestLoadSaveDelete:
         store_file.write_text("not json")
         assert load_token("https://example.com/mcp") is None
 
-    def test_corrupt_file_warns_once_on_read_path(
-        self, tmp_path, monkeypatch, capsys
-    ):
+    def test_corrupt_file_warns_once_on_read_path(self, tmp_path, monkeypatch, capsys):
         """: a corrupt store surfaces a one-time stderr warning on the
         pure READ path too (load_token), not only when a later save reaches the
         write path — otherwise a read-only invocation gives the operator zero
@@ -403,9 +400,7 @@ class TestLoadSaveDelete:
         sys.platform == "win32" or not hasattr(os, "mkfifo"),
         reason="os.mkfifo is POSIX-only",
     )
-    def test_load_fifo_store_returns_none_without_hanging(
-        self, tmp_path, monkeypatch
-    ):
+    def test_load_fifo_store_returns_none_without_hanging(self, tmp_path, monkeypatch):
         """: a FIFO (or other non-regular file) pre-planted at the
         store path must be refused (O_NONBLOCK open + fstat regular-file check),
         not read — an O_RDONLY read of a writer-less pipe would block forever and
@@ -503,8 +498,7 @@ class TestLoadSaveDelete:
         monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
 
         store_file.write_text(
-            '{"https://example.com/mcp": '
-            '{"access_token": "t", "expires_at": "soon"}}'
+            '{"https://example.com/mcp": {"access_token": "t", "expires_at": "soon"}}'
         )
         assert load_token("https://example.com/mcp") is None
 
@@ -539,9 +533,7 @@ class TestLoadSaveDelete:
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
         monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", store_file)
 
-        store_file.write_text(
-            '{"https://example.com/mcp": {"access_token": ["x"]}}'
-        )
+        store_file.write_text('{"https://example.com/mcp": {"access_token": ["x"]}}')
         assert load_token("https://example.com/mcp") is None
 
     def test_load_non_string_scope_returns_none(self, tmp_path, monkeypatch):
@@ -646,9 +638,7 @@ class TestLoadSaveDelete:
         assert load_token("https://c.com/mcp") is None
         assert "could not be read" in capsys.readouterr().err
 
-    def test_delete_aborts_when_store_unreadable(
-        self, tmp_path, monkeypatch, capsys
-    ):
+    def test_delete_aborts_when_store_unreadable(self, tmp_path, monkeypatch, capsys):
         """#3: delete must likewise abort on an unreadable store rather than
         overwrite it and lose the other servers' tokens."""
         store_file = tmp_path / "tokens.json"
@@ -736,9 +726,7 @@ class TestLoadSaveDelete:
                 return _BadReader(fd)
             return real_fdopen(fd, mode, *a, **k)
 
-        monkeypatch.setattr(
-            "mcp_stdio.token_store.os.fdopen", failing_read_fdopen
-        )
+        monkeypatch.setattr("mcp_stdio.token_store.os.fdopen", failing_read_fdopen)
         # Read path: mid-read OSError degrades to {} → load returns None.
         assert load_token("https://a.com/mcp") is None
         # Write path: mid-read OSError raises _StoreUnreadable → save aborts soft.
@@ -782,9 +770,7 @@ class TestLoadSaveDelete:
         sys.platform == "win32" or not hasattr(os, "mkfifo"),
         reason="os.mkfifo is POSIX-only",
     )
-    def test_lock_fifo_does_not_hang_and_proceeds(
-        self, tmp_path, monkeypatch, capsys
-    ):
+    def test_lock_fifo_does_not_hang_and_proceeds(self, tmp_path, monkeypatch, capsys):
         """: a FIFO planted at the lock path must NOT hang the save —
         an O_WRONLY open of a writer-less FIFO blocks forever WITHOUT O_NONBLOCK.
         With O_NONBLOCK the open returns ENXIO and the save degrades to an
@@ -996,9 +982,7 @@ class TestLoadSaveDelete:
 
 class TestNormalizeKey:
     def test_lowercases_host(self):
-        assert (
-            _normalize_key("https://Example.COM/mcp") == "https://example.com/mcp"
-        )
+        assert _normalize_key("https://Example.COM/mcp") == "https://example.com/mcp"
 
     def test_folds_default_port(self):
         assert _normalize_key("https://x.com:443/mcp") == "https://x.com/mcp"
@@ -1013,9 +997,7 @@ class TestNormalizeKey:
         assert _normalize_key("https://x.com/mcp///") == "https://x.com/mcp"
 
     def test_query_is_preserved_in_key(self):
-        assert (
-            _normalize_key("https://x.com/mcp?t=1") == "https://x.com/mcp?t=1"
-        )
+        assert _normalize_key("https://x.com/mcp?t=1") == "https://x.com/mcp?t=1"
 
     def test_non_http_returned_unchanged(self):
         assert _normalize_key("not a url") == "not a url"
@@ -1076,18 +1058,14 @@ class TestKeyNormalizationInStore:
         """An entry written by an older version under the verbatim URL is found
         via the raw-key fallback."""
         store_file = self._patch(tmp_path, monkeypatch)
-        store_file.write_text(
-            '{"https://x.com/mcp/": {"access_token": "legacy"}}'
-        )
+        store_file.write_text('{"https://x.com/mcp/": {"access_token": "legacy"}}')
         loaded = load_token("https://x.com/mcp/")
         assert loaded is not None and loaded.access_token == "legacy"
 
     def test_delete_removes_normalized_and_raw(self, tmp_path, monkeypatch):
         store_file = self._patch(tmp_path, monkeypatch)
         # Pre-seed a stale raw-key entry plus a normalized one.
-        store_file.write_text(
-            '{"https://x.com/mcp/": {"access_token": "raw"}}'
-        )
+        store_file.write_text('{"https://x.com/mcp/": {"access_token": "raw"}}')
         save_token("https://x.com/mcp", TokenData(access_token="norm"))
         delete_token("https://x.com/mcp/")
         assert load_token("https://x.com/mcp") is None
@@ -1477,7 +1455,9 @@ class TestLegacyMigration:
         legacy_dir.mkdir()
         legacy_file.write_text('{"https://example.com/mcp": {"access_token": "old"}}')
         new_dir.mkdir()
-        new_file.write_text("{}")  # empty-dict store, size 2 — NOT a completed migration
+        new_file.write_text(
+            "{}"
+        )  # empty-dict store, size 2 — NOT a completed migration
 
         monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", new_dir)
         monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", new_file)
@@ -1585,9 +1565,9 @@ class TestLegacyMigration:
         monkeypatch.setattr("mcp_stdio.token_store.os.chmod", spy_chmod)
         load_token("https://example.com/mcp")
 
-        assert any(
-            p == str(legacy_dir) and m == stat.S_IRWXU for p, m in chmodded
-        ), f"legacy dir was not tightened to 0o700; chmod calls: {chmodded!r}"
+        assert any(p == str(legacy_dir) and m == stat.S_IRWXU for p, m in chmodded), (
+            f"legacy dir was not tightened to 0o700; chmod calls: {chmodded!r}"
+        )
 
     @pytest.mark.skipif(
         sys.platform == "win32",
@@ -1657,9 +1637,7 @@ class TestLegacyMigration:
         loaded = load_token("https://example.com/mcp")
         assert loaded is not None and loaded.access_token == "new"
 
-    def test_post_rename_chmod_failure_completes_migration(
-        self, tmp_path, monkeypatch
-    ):
+    def test_post_rename_chmod_failure_completes_migration(self, tmp_path, monkeypatch):
         """A chmod failure after a successful rename must not abort or divert the
         migration into the copy-through recovery — the moved file stands."""
         if sys.platform == "win32":

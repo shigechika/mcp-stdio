@@ -113,8 +113,7 @@ class TestWriteLine:
 
         with patch("mcp_stdio.relay.sys.stdout", out):
             threads = [
-                threading.Thread(target=writer, args=(tag,))
-                for tag in ("a", "b")
+                threading.Thread(target=writer, args=(tag,)) for tag in ("a", "b")
             ]
             for t in threads:
                 t.start()
@@ -278,7 +277,9 @@ class TestPostAndStream:
             httpx_mock.add_exception(httpx.ConnectError("refused"))
         client = httpx.Client()
         with patch("mcp_stdio.relay.time.sleep"):
-            result = _post_and_stream(client, "https://example.com/mcp", '{"id":1}', {}, 1)
+            result = _post_and_stream(
+                client, "https://example.com/mcp", '{"id":1}', {}, 1
+            )
         assert result is None
 
     @pytest.mark.parametrize(
@@ -444,7 +445,7 @@ class TestPostAndStream:
         assert emitted["result"] == {"ok": True}
 
     def test_decoding_error_is_caught_not_crashed(self, httpx_mock):
-        """ HIGH: a 200 whose body fails to decode (bad
+        """HIGH: a 200 whose body fails to decode (bad
         Content-Encoding) raises httpx.DecodingError — a SIBLING of
         TransportError, not a subclass. It must be caught (now via HTTPError) and
         retried/surfaced, never propagate out and crash the gateway."""
@@ -705,12 +706,8 @@ class TestSameOrigin:
         """: a malformed URL (urlsplit/.port raises ValueError, e.g. a
         non-numeric port) must be treated as NOT same-origin — the conservative,
         fail-closed answer for the SSE cross-origin credential guard."""
-        assert not _same_origin(
-            "https://h.example:notaport/a", "https://h.example/b"
-        )
-        assert not _same_origin(
-            "https://h.example/a", "https://h.example:99999/b"
-        )
+        assert not _same_origin("https://h.example:notaport/a", "https://h.example/b")
+        assert not _same_origin("https://h.example/a", "https://h.example:99999/b")
 
 
 class TestExtractProtocolVersion:
@@ -841,11 +838,11 @@ class TestIterSseEvents:
         'message' when the event-type buffer is the empty string, so an
         explicitly-empty `event:` must NOT yield a ('', data) event that the
         message-only consumers then drop."""
-        assert list(_iter_sse_events(["event:", "data:hi", ""])) == [
-            ("message", "hi")
-        ]
+        assert list(_iter_sse_events(["event:", "data:hi", ""])) == [("message", "hi")]
         # An empty event: after a real one resets back to the default too.
-        assert list(_iter_sse_events(["event: ping", "data:a", "", "event:", "data:b", ""])) == [
+        assert list(
+            _iter_sse_events(["event: ping", "data:a", "", "event:", "data:b", ""])
+        ) == [
             ("ping", "a"),
             ("message", "b"),
         ]
@@ -891,9 +888,7 @@ class TestIterSseEvents:
         """End-to-end through _split_sse_text: a BOM-prefixed buffered body still
         yields the endpoint event."""
         body = "\ufeff" + "event: endpoint\ndata: /m\n\n"
-        assert list(_iter_sse_events(_split_sse_text(body))) == [
-            ("endpoint", "/m")
-        ]
+        assert list(_iter_sse_events(_split_sse_text(body))) == [("endpoint", "/m")]
 
 
 class TestSseLineSplitting:
@@ -955,7 +950,9 @@ class TestRun:
             text=body,
             headers={"content-type": "application/json"},
         )
-        output = self._run_with_stdin(httpx_mock, ['{"jsonrpc":"2.0","method":"init","id":1}'])
+        output = self._run_with_stdin(
+            httpx_mock, ['{"jsonrpc":"2.0","method":"init","id":1}']
+        )
         assert json.loads(output.strip()) == json.loads(body)
 
     def test_sse_response(self, httpx_mock):
@@ -964,7 +961,9 @@ class TestRun:
             text=sse_body,
             headers={"content-type": "text/event-stream"},
         )
-        output = self._run_with_stdin(httpx_mock, ['{"jsonrpc":"2.0","method":"init","id":1}'])
+        output = self._run_with_stdin(
+            httpx_mock, ['{"jsonrpc":"2.0","method":"init","id":1}']
+        )
         assert json.loads(output.strip())["id"] == 1
 
     def test_empty_lines_skipped(self, httpx_mock):
@@ -1121,9 +1120,7 @@ class TestRun:
         # The 403's "bad-rotated" was NOT adopted — request 3 still sends "good".
         assert reqs[2].headers.get("mcp-session-id") == "good"
 
-    def test_post_refresh_retry_terminal_error_session_id_not_adopted(
-        self, httpx_mock
-    ):
+    def test_post_refresh_retry_terminal_error_session_id_not_adopted(self, httpx_mock):
         """: the INLINE 401-retry session-id adoption must be gated
         too — a refreshed retry that returns a TERMINAL error (500) while echoing
         a rotated mcp-session-id must NOT carry that rejected id into the next
@@ -1165,9 +1162,7 @@ class TestRun:
         # Line 3's request (index 3) still carries "s1", not the 500's "bad-rotated".
         assert reqs[3].headers.get("mcp-session-id") == "s1"
 
-    def test_inline_401_retry_unparseable_403_session_id_not_adopted(
-        self, httpx_mock
-    ):
+    def test_inline_401_retry_unparseable_403_session_id_not_adopted(self, httpx_mock):
         """: the INLINE 401-retry re-adoption must require a PARSEABLE
         insufficient_scope challenge on a 403, mirroring the top-level
         feeds_recovery gate. A 401 retry that returns a 403 with a generic
@@ -1426,10 +1421,7 @@ class TestRun:
         notifications/initialized DOES carry the freshly negotiated version."""
         # initialize -> 200, negotiates a NEW version and assigns a session.
         httpx_mock.add_response(
-            text=(
-                '{"jsonrpc":"2.0","id":0,"result":'
-                '{"protocolVersion":"2025-06-18"}}'
-            ),
+            text=('{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-06-18"}}'),
             headers={
                 "content-type": "application/json",
                 "mcp-session-id": "sess-new",
@@ -1453,9 +1445,7 @@ class TestRun:
         assert negotiated == "2025-06-18"
         reqs = httpx_mock.get_requests()
         # The initialize POST (req 0) dropped the pinned header...
-        assert "mcp-protocol-version" not in {
-            k.lower() for k in reqs[0].headers.keys()
-        }
+        assert "mcp-protocol-version" not in {k.lower() for k in reqs[0].headers.keys()}
         # ...while notifications/initialized (req 1) carries the negotiated value.
         assert reqs[1].headers.get("mcp-protocol-version") == "2025-06-18"
 
@@ -1630,7 +1620,9 @@ class TestRun:
         for _ in range(3):
             httpx_mock.add_exception(httpx.ConnectError("refused"))
         with patch("mcp_stdio.relay.time.sleep"):
-            output = self._run_with_stdin(httpx_mock, ['{"jsonrpc":"2.0","method":"init","id":5}'])
+            output = self._run_with_stdin(
+                httpx_mock, ['{"jsonrpc":"2.0","method":"init","id":5}']
+            )
         result = json.loads(output.strip())
         assert result["error"]["code"] == -32000
         assert result["id"] == 5
@@ -1679,7 +1671,7 @@ class TestRun:
         assert output.strip() == ""
 
     def test_decoding_error_does_not_crash_loop(self, httpx_mock):
-        """ HIGH end-to-end: a request whose body fails to decode
+        """HIGH end-to-end: a request whose body fails to decode
         (bad Content-Encoding) must NOT crash run() — the client gets an error
         and the loop survives to process the next stdin line."""
         for _ in range(MAX_RETRIES):  # bad-gzip request 1 → DecodingError ×3
@@ -2268,9 +2260,9 @@ class TestRun:
             for m in msgs
         ), f"expected an internal-error response for id 1, got {msgs!r}"
         # The loop survived: the second request was still processed normally.
-        assert any(
-            m.get("id") == 2 and m.get("result", {}).get("ok") for m in msgs
-        ), f"loop did not survive to process id 2, got {msgs!r}"
+        assert any(m.get("id") == 2 and m.get("result", {}).get("ok") for m in msgs), (
+            f"loop did not survive to process id 2, got {msgs!r}"
+        )
 
     def test_unexpected_exception_on_notification_stays_silent(
         self, httpx_mock, monkeypatch
@@ -2303,9 +2295,7 @@ class TestRun:
         assert result["error"]["message"] == "HTTP 401"
         assert result["id"] == 1
 
-    def test_explicit_null_id_request_error_is_emitted_not_suppressed(
-        self, httpx_mock
-    ):
+    def test_explicit_null_id_request_error_is_emitted_not_suppressed(self, httpx_mock):
         """: a request with an EXPLICIT "id": null is a request, not a
         notification, so an unhandled non-2xx must still synthesize an error
         echoing "id": null — never silently drop it as if it were a notification.
@@ -2866,8 +2856,7 @@ class TestStepUpScopeChallenge:
             headers={
                 "content-type": "application/json",
                 "www-authenticate": (
-                    'Bearer error="insufficient_scope", '
-                    'scope="mcp:read hr:read"'
+                    'Bearer error="insufficient_scope", scope="mcp:read hr:read"'
                 ),
             },
         )
@@ -3085,7 +3074,11 @@ class TestRunNormalizeArguments:
     def _run(self, httpx_mock, stdin_lines, **kwargs):
         stdin_data = "\n".join(stdin_lines) + "\n"
         with patch("sys.stdin", StringIO(stdin_data)), patch("sys.stdout", StringIO()):
-            run("https://example.com/mcp", {"Content-Type": "application/json"}, **kwargs)
+            run(
+                "https://example.com/mcp",
+                {"Content-Type": "application/json"},
+                **kwargs,
+            )
 
     def test_default_rewrites_on_wire(self, httpx_mock):
         httpx_mock.add_response(
@@ -3094,7 +3087,9 @@ class TestRunNormalizeArguments:
         )
         self._run(
             httpx_mock,
-            ['{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"t","arguments":null}}'],
+            [
+                '{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"t","arguments":null}}'
+            ],
         )
         sent = json.loads(httpx_mock.get_requests()[0].read())
         assert sent["params"]["arguments"] == {}
@@ -3106,7 +3101,9 @@ class TestRunNormalizeArguments:
         )
         self._run(
             httpx_mock,
-            ['{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"t","arguments":null}}'],
+            [
+                '{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"t","arguments":null}}'
+            ],
             normalize_arguments=False,
         )
         sent = json.loads(httpx_mock.get_requests()[0].read())
@@ -3520,9 +3517,7 @@ class TestPagination:
         requests = httpx_mock.get_requests()
         assert requests[1].headers["authorization"] == "Bearer new-token"
 
-    def test_page1_404_reinitializes_then_replays_through_pagination(
-        self, httpx_mock
-    ):
+    def test_page1_404_reinitializes_then_replays_through_pagination(self, httpx_mock):
         """: a page-1 404 on a paginated method must cascade through the
         run() 404 branch — reinitialize, then RE-ENTER _paginate_and_stream with
         the fresh session and replay the full paginated fetch. Pins the
@@ -3551,10 +3546,7 @@ class TestPagination:
         httpx_mock.add_response(url=self.URL, status_code=404, text="")
         # Reinitialize: initialize -> 200 sess-new, then notifications/initialized.
         httpx_mock.add_response(
-            text=(
-                '{"jsonrpc":"2.0","id":0,"result":'
-                '{"protocolVersion":"2024-11-05"}}'
-            ),
+            text=('{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05"}}'),
             headers={"content-type": "application/json", "mcp-session-id": "sess-new"},
         )
         httpx_mock.add_response(status_code=202, text="")
@@ -3869,9 +3861,9 @@ class TestPagination:
         # No crash; both pages merged; page-2 POST carried cursor=42.
         assert [t["name"] for t in merged["result"]["tools"]] == ["a", "b"]
         assert "nextCursor" not in merged["result"]
-        assert json.loads(httpx_mock.get_requests()[1].content)["params"][
-            "cursor"
-        ] == 42
+        assert (
+            json.loads(httpx_mock.get_requests()[1].content)["params"]["cursor"] == 42
+        )
 
     def test_page2_nonlist_result_key_keeps_page1_and_merges_late_field(
         self, httpx_mock
@@ -3943,10 +3935,7 @@ class TestPagination:
         only on the paginated methods."""
         notif = '{"jsonrpc":"2.0","method":"notifications/message","params":{}}'
         result = '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}]}}'
-        body = (
-            f"event: message\ndata: {notif}\n\n"
-            f"event: message\ndata: {result}\n\n"
-        )
+        body = f"event: message\ndata: {notif}\n\nevent: message\ndata: {result}\n\n"
         httpx_mock.add_response(
             url=self.URL,
             text=body,
@@ -3970,7 +3959,7 @@ class TestPagination:
         is still parsed — pins the buffered-path non-message skip branch (the
         streaming path covers the equivalent case, the buffered path did not)."""
         result = '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}]}}'
-        body = "event: ping\ndata: {}\n\n" f"event: message\ndata: {result}\n\n"
+        body = f"event: ping\ndata: {{}}\n\nevent: message\ndata: {result}\n\n"
         httpx_mock.add_response(
             url=self.URL,
             text=body,
@@ -4175,9 +4164,7 @@ class TestCheckConnection:
                 },
             }
         )
-        httpx_mock.add_response(
-            text=body, headers={"content-type": "application/json"}
-        )
+        httpx_mock.add_response(text=body, headers={"content-type": "application/json"})
         assert check_connection(self.URL, dict(self.HEADERS)) is True
         err = capsys.readouterr().err
         assert "tools=yes" in err
@@ -4193,18 +4180,14 @@ class TestCheckConnection:
                 "result": {"protocolVersion": "2024-11-05", "capabilities": None},
             }
         )
-        httpx_mock.add_response(
-            text=body, headers={"content-type": "application/json"}
-        )
+        httpx_mock.add_response(text=body, headers={"content-type": "application/json"})
         assert check_connection(self.URL, dict(self.HEADERS)) is True
 
     def test_non_object_result_does_not_crash(self, httpx_mock):
         """A malformed server returning a scalar ``result`` is reported as
         reachable rather than crashing on attribute access."""
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "result": "ok"})
-        httpx_mock.add_response(
-            text=body, headers={"content-type": "application/json"}
-        )
+        httpx_mock.add_response(text=body, headers={"content-type": "application/json"})
         assert check_connection(self.URL, dict(self.HEADERS)) is True
 
     def test_connect_error_returns_false(self, httpx_mock):
@@ -4281,8 +4264,7 @@ class TestCheckConnectionSse:
         )
 
         assert (
-            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
-            is True
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse") is True
         )
         # The probe actually POSTed initialize to the resolved endpoint.
         posts = [r for r in httpx_mock.get_requests() if r.method == "POST"]
@@ -4307,8 +4289,7 @@ class TestCheckConnectionSse:
             url="https://example.com/messages", method="POST", status_code=202
         )
         assert (
-            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
-            is True
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse") is True
         )
         err = capsys.readouterr().err
         assert "sse-demo" in err
@@ -4334,8 +4315,7 @@ class TestCheckConnectionSse:
             url="https://example.com/messages", method="POST", status_code=202
         )
         assert (
-            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
-            is True
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse") is True
         )
 
     def test_sse_generic_exception_in_stream_returns_false(
@@ -4356,16 +4336,14 @@ class TestCheckConnectionSse:
 
         monkeypatch.setattr("mcp_stdio.relay._iter_sse_events", boom)
         assert (
-            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
-            is False
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse") is False
         )
 
     def test_sse_get_non_200_returns_false(self, httpx_mock):
         """The GET stream itself failing (e.g. 401) → False, no POST attempted."""
         httpx_mock.add_response(url=self.SSE_URL, method="GET", status_code=401)
         assert (
-            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
-            is False
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse") is False
         )
         assert not [r for r in httpx_mock.get_requests() if r.method == "POST"]
 
@@ -4387,8 +4365,7 @@ class TestCheckConnectionSse:
             url="https://example.com/messages", method="POST", status_code=202
         )
         assert (
-            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
-            is False
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse") is False
         )
 
     def test_sse_stream_ends_before_response_returns_false(self, httpx_mock):
@@ -4421,8 +4398,7 @@ class TestCheckConnectionSse:
 
         httpx_mock.add_callback(on_post, url="https://example.com/messages")
         assert (
-            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
-            is False
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse") is False
         )
 
     def test_sse_post_non_2xx_reports_post_failure(self, httpx_mock, capsys):
@@ -4449,13 +4425,10 @@ class TestCheckConnectionSse:
             post_attempted.set()
             return httpx.Response(status_code=500)
 
-        httpx_mock.add_callback(
-            on_post, url="https://example.com/messages?sid=abc"
-        )
+        httpx_mock.add_callback(on_post, url="https://example.com/messages?sid=abc")
 
         assert (
-            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
-            is False
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse") is False
         )
         err = capsys.readouterr().err
         assert "POST to SSE endpoint failed" in err
@@ -4482,13 +4455,10 @@ class TestCheckConnectionSse:
             post_attempted.set()
             raise httpx.ConnectError("connection refused", request=request)
 
-        httpx_mock.add_callback(
-            on_post, url="https://example.com/messages?sid=abc"
-        )
+        httpx_mock.add_callback(on_post, url="https://example.com/messages?sid=abc")
 
         assert (
-            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
-            is False
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse") is False
         )
         assert "POST to SSE endpoint failed" in capsys.readouterr().err
 
@@ -4546,8 +4516,7 @@ class TestCheckConnectionSse:
         )
 
         assert (
-            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
-            is True
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse") is True
         )
 
     def test_sse_message_before_endpoint_is_skipped(self, httpx_mock):
@@ -4571,8 +4540,7 @@ class TestCheckConnectionSse:
             url="https://example.com/messages", method="POST", status_code=202
         )
         assert (
-            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
-            is True
+            check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse") is True
         )
         # Exactly one POST, and only to the resolved endpoint (after it arrived).
         posts = [r for r in httpx_mock.get_requests() if r.method == "POST"]
@@ -5010,7 +4978,9 @@ class TestSseReaderLoop:
                 headers={"content-type": "text/event-stream"},
             )
 
-        httpx_mock.add_callback(get_callback, url=self.URL, method="GET", is_reusable=True)
+        httpx_mock.add_callback(
+            get_callback, url=self.URL, method="GET", is_reusable=True
+        )
 
         client = httpx.Client()
         try:
@@ -5259,9 +5229,7 @@ class TestProactiveRefresh:
                 stop.set()
             return None  # refresh unavailable / failed
 
-        _proactive_refresh_loop(
-            **self._loop_kwargs(refresher=refresher, stop=stop)
-        )
+        _proactive_refresh_loop(**self._loop_kwargs(refresher=refresher, stop=stop))
         assert len(calls) == 2
 
     def test_prestopped_returns_immediately(self):
@@ -5391,9 +5359,7 @@ class TestProactiveRefresh:
 
         headers = {"Content-Type": "application/json"}
         # _BlockingStdin releases (StopIteration) once the timer sets ``refreshed``.
-        stdin = _BlockingStdin(
-            '{"jsonrpc":"2.0","method":"init","id":1}', refreshed
-        )
+        stdin = _BlockingStdin('{"jsonrpc":"2.0","method":"init","id":1}', refreshed)
         stdout = StringIO()
         with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
             run(
@@ -5500,7 +5466,9 @@ class TestColdStartResponse:
         assert out["result"] == {key: []}
 
     def test_ping_returns_empty_result(self):
-        out = json.loads(_cold_start_response('{"jsonrpc":"2.0","id":3,"method":"ping"}', 3, True))
+        out = json.loads(
+            _cold_start_response('{"jsonrpc":"2.0","id":3,"method":"ping"}', 3, True)
+        )
         assert out["result"] == {}
 
     def test_tools_call_returns_not_ready_error(self):
@@ -5511,12 +5479,20 @@ class TestColdStartResponse:
 
     def test_notifications_are_swallowed(self):
         # notifications/initialized and any other notification -> no reply.
-        assert _cold_start_response(
-            '{"jsonrpc":"2.0","method":"notifications/initialized"}', None, False
-        ) is None
-        assert _cold_start_response(
-            '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}', None, False
-        ) is None
+        assert (
+            _cold_start_response(
+                '{"jsonrpc":"2.0","method":"notifications/initialized"}', None, False
+            )
+            is None
+        )
+        assert (
+            _cold_start_response(
+                '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}',
+                None,
+                False,
+            )
+            is None
+        )
 
 
 class TestColdStartLoop:
@@ -5530,7 +5506,11 @@ class TestColdStartLoop:
         httpx_mock.add_response(
             url=self.URL,
             headers={"mcp-session-id": "sess-1", "content-type": "application/json"},
-            json={"jsonrpc": "2.0", "id": 0, "result": {"protocolVersion": "2025-06-18"}},
+            json={
+                "jsonrpc": "2.0",
+                "id": 0,
+                "result": {"protocolVersion": "2025-06-18"},
+            },
         )
         httpx_mock.add_response(url=self.URL, status_code=202)
 
@@ -5616,7 +5596,8 @@ class TestRunColdStart:
             cold_start_login=lambda: None,  # OAuth never completes
         )
         by_id = {
-            m.get("id"): m for m in (json.loads(x) for x in out.splitlines() if x.strip())
+            m.get("id"): m
+            for m in (json.loads(x) for x in out.splitlines() if x.strip())
         }
         assert by_id[1]["result"]["capabilities"]["tools"]["listChanged"] is True
         assert by_id[1]["result"]["protocolVersion"] == "2025-06-18"
@@ -5666,9 +5647,7 @@ class TestRunSse:
             run_sse(self.URL, {"Content-Type": "application/json"})
         return stdout.getvalue()
 
-    def test_main_loop_unexpected_exception_degrades_request_to_error(
-        self, httpx_mock
-    ):
+    def test_main_loop_unexpected_exception_degrades_request_to_error(self, httpx_mock):
         """: an unexpected NON-httpx exception escaping the run_sse
         POST path must degrade the request-with-id to an 'internal relay error'
         JSON-RPC response and keep the loop alive — the SSE-main-loop analogue of
@@ -5797,10 +5776,10 @@ class TestRunSse:
         monkeypatch.setattr("mcp_stdio.relay.httpx.Client", _FakeClient)
 
         for supplied, expected_read in [
-            (None, 300),     # parameter default
-            (300, 300),      # explicit default
-            (60, 60),        # custom non-zero
-            (0, None),       # 0 disables
+            (None, 300),  # parameter default
+            (300, 300),  # explicit default
+            (60, 60),  # custom non-zero
+            (0, None),  # 0 disables
         ]:
             captured.clear()
             kwargs = {} if supplied is None else {"sse_read_timeout": supplied}
@@ -6242,9 +6221,7 @@ class TestRunSse:
             called.append(True)
             return {"Authorization": "Bearer x"}
 
-        stdin = _BlockingStdin(
-            '{"jsonrpc":"2.0","method":"t","id":3}\n', release_stdin
-        )
+        stdin = _BlockingStdin('{"jsonrpc":"2.0","method":"t","id":3}\n', release_stdin)
         stdout = StringIO()
         with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
             run_sse(self.URL, {}, scope_upgrader=mock_upgrader)
@@ -6282,9 +6259,7 @@ class TestRunSse:
         def mock_upgrader(_scope):
             return None  # user aborted / browser failed
 
-        stdin = _BlockingStdin(
-            '{"jsonrpc":"2.0","method":"t","id":4}\n', release_stdin
-        )
+        stdin = _BlockingStdin('{"jsonrpc":"2.0","method":"t","id":4}\n', release_stdin)
         stdout = StringIO()
         with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
             run_sse(self.URL, {}, scope_upgrader=mock_upgrader)
@@ -6581,7 +6556,6 @@ class TestTcpKeepaliveSocketOptions:
         assert opts == [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
 
 
-
 class TestMakeHttpxTransport:
     def test_enabled_injects_socket_options(self, monkeypatch):
         captured: list[object] = []
@@ -6596,9 +6570,7 @@ class TestMakeHttpxTransport:
         opts = captured[0]
         assert isinstance(opts, list)
         # SO_KEEPALIVE must always be present when enabled
-        assert any(
-            t[:2] == (socket.SOL_SOCKET, socket.SO_KEEPALIVE) for t in opts
-        )
+        assert any(t[:2] == (socket.SOL_SOCKET, socket.SO_KEEPALIVE) for t in opts)
 
     def test_disabled_passes_none(self, monkeypatch):
         captured: list[object] = []
@@ -6872,7 +6844,9 @@ class TestExtractCancelId:
     def test_ignores_malformed_json(self):
         # Passes the regex pre-check by having the method substring in
         # the raw text, but json.loads will fail.
-        assert _extract_cancel_id('{bad json "method":"notifications/cancelled"') is None
+        assert (
+            _extract_cancel_id('{bad json "method":"notifications/cancelled"') is None
+        )
 
     def test_ignores_missing_params(self):
         line = '{"jsonrpc":"2.0","method":"notifications/cancelled"}'
@@ -6894,12 +6868,8 @@ class TestExtractCancelId:
         )
         assert _extract_cancel_id(line) is None
 
-    @pytest.mark.parametrize(
-        "request_id", ['{"a":1}', "[1,2]", "{}", "[]"]
-    )
-    def test_non_scalar_request_id_returns_none_not_unhashable_crash(
-        self, request_id
-    ):
+    @pytest.mark.parametrize("request_id", ['{"a":1}', "[1,2]", "{}", "[]"])
+    def test_non_scalar_request_id_returns_none_not_unhashable_crash(self, request_id):
         """: a non-scalar requestId (object/array) is malformed AND
         unhashable, so returning it verbatim would make the caller's
         tracker.add(rid) raise TypeError on the stdin hot path. _extract_cancel_id
@@ -7076,8 +7046,7 @@ class TestEmit:
         t = _CancelTracker()
         t.add(1)
         merged = (
-            '{"jsonrpc":"2.0","id":1,'
-            '"result":{"tools":[{"name":"a"},{"name":"b"}]}}'
+            '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"},{"name":"b"}]}}'
         )
         _emit(merged, t)
         assert capsys.readouterr().out.strip() == ""  # cancelled → dropped
@@ -7147,9 +7116,7 @@ class TestRunCancelFilter:
         )
         assert '"keep":true' in output
 
-    def test_cancel_then_paginated_request_merged_result_is_forwarded(
-        self, httpx_mock
-    ):
+    def test_cancel_then_paginated_request_merged_result_is_forwarded(self, httpx_mock):
         """: closes the cancel x pagination coverage matrix end-to-end.
         A cancelled id reused by a paginated tools/list is a brand-new call: the
         request discards the tracked cancel before dispatch, so the MERGED
@@ -7235,9 +7202,9 @@ class TestRunCancelFilter:
         # the client is waiting for a response that never comes.
         lines = [x for x in output.strip().splitlines() if x]
         decoded = [json.loads(line) for line in lines]
-        assert any(
-            d.get("id") == 5 and "error" in d for d in decoded
-        ), f"synthesized error response missing from: {lines!r}"
+        assert any(d.get("id") == 5 and "error" in d for d in decoded), (
+            f"synthesized error response missing from: {lines!r}"
+        )
 
     def test_no_cancel_filter_lets_response_through(self, httpx_mock):
         httpx_mock.add_response(status_code=202, text="")  # cancel
@@ -7402,9 +7369,7 @@ class TestRunSseCancelFilter:
         )
         stdout = StringIO()
         with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
-            run_sse(
-                self.URL, {"Content-Type": "application/json"}, cancel_filter=False
-            )
+            run_sse(self.URL, {"Content-Type": "application/json"}, cancel_filter=False)
 
         # With the filter disabled the cancelled id is not tracked → delivered.
         assert "late" in stdout.getvalue()
@@ -7637,6 +7602,7 @@ class TestHandleRateLimit:
     def test_last_attempt_returns_none(self):
         # attempt == MAX_RETRIES means no more retries
         from mcp_stdio.relay import MAX_RETRIES
+
         assert _handle_rate_limit(self._Hdrs("5"), attempt=MAX_RETRIES) is None
 
 
@@ -7763,9 +7729,7 @@ class TestRun429Retry:
         assert err["id"] == 1 and "429" in err["error"]["message"]
         assert err["error"]["data"]["retryAfter"] == 120.0
 
-    def test_429_repeated_exhausts_retries_and_surfaces(
-        self, httpx_mock, monkeypatch
-    ):
+    def test_429_repeated_exhausts_retries_and_surfaces(self, httpx_mock, monkeypatch):
         slept: list[float] = []
         monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
 
@@ -7811,9 +7775,7 @@ class TestRun503Retry:
         slept: list[float] = []
         monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
 
-        httpx_mock.add_response(
-            status_code=503, headers={"retry-after": "2"}, text=""
-        )
+        httpx_mock.add_response(status_code=503, headers={"retry-after": "2"}, text="")
         httpx_mock.add_response(
             text='{"jsonrpc":"2.0","result":{"ok":true},"id":1}',
             headers={"content-type": "application/json"},
@@ -8205,9 +8167,7 @@ class TestPaginate429Retry:
         slept: list[float] = []
         monkeypatch.setattr("mcp_stdio.relay.time.sleep", lambda s: slept.append(s))
 
-        httpx_mock.add_response(
-            status_code=503, headers={"retry-after": "2"}, text=""
-        )
+        httpx_mock.add_response(status_code=503, headers={"retry-after": "2"}, text="")
         httpx_mock.add_response(
             text=json.dumps(
                 {
@@ -8224,6 +8184,7 @@ class TestPaginate429Retry:
         assert 2.0 in slept, f"expected a 2.0-second sleep, got {slept!r}"
         merged = json.loads(output.strip())
         assert [t["name"] for t in merged["result"]["tools"]] == ["t1"]
+
 
 # --- SSE in-flight drain (#272) ---
 
@@ -8264,9 +8225,7 @@ class TestSseInflightDrain:
 
     URL = "https://example.com/sse"
 
-    def _run_reader_two_streams(
-        self, httpx_mock, first_chunks, state, tracker=None
-    ):
+    def _run_reader_two_streams(self, httpx_mock, first_chunks, state, tracker=None):
         """Drive _sse_reader_loop through one stream drop + one reconnect.
 
         The existing _run_reader helper cannot be used: its generator sets
@@ -8364,8 +8323,14 @@ class TestRunSseInflightDrain:
     URL = "https://example.com/sse"
     POST_URL = "https://example.com/messages?sid=abc"
 
-    def _drive(self, httpx_mock, monkeypatch, stdin_lines, first_stream_tail=None,
-               pending_cap=None):
+    def _drive(
+        self,
+        httpx_mock,
+        monkeypatch,
+        stdin_lines,
+        first_stream_tail=None,
+        pending_cap=None,
+    ):
         """run_sse with a two-GET stream: GET-1 ends after ALL stdin lines have
         been POSTed (so every pending add strictly precedes the drain), GET-2
         releases stdin and holds until shutdown."""
