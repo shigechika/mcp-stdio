@@ -18,32 +18,42 @@ from mcp_stdio.relay import (
     MAX_RETRIES,
     PAGINATED_LIST_METHODS,
     _CancelTracker,
+    _ModernState,
     _SseState,
     _detect_paginated_list,
     _drain_pending,
     _emit,
+    _encode_mcp_name,
     _enforce_lf_stdio,
     _error_response,
     _escape_js_line_separators,
     _extract_cancel_id,
     _extract_id_and_presence,
+    _extract_log_level,
+    _extract_method_and_name,
     _extract_response_id,
     _extract_protocol_version,
+    _handle_modern_special_method,
     _handle_rate_limit,
+    _inject_modern_meta,
     _is_initialize_request,
     _iter_sse_events,
     _iter_sse_lines,
     _looks_like_initialize,
     _make_httpx_transport,
+    _mcp_request_headers,
+    _negotiate_modern_version,
     _normalize_null_arguments,
     _parse_retry_after,
     _parse_auth_params,
     _parse_www_authenticate_scope,
     _post_and_stream,
+    _probe_protocol_era,
     _cold_start_loop,
     _cold_start_response,
     _proactive_refresh_loop,
     _reinitialize,
+    _seed_modern_state_from_discover,
     _start_proactive_refresh,
     _stop_proactive_refresh,
     _same_origin,
@@ -8676,3 +8686,700 @@ class TestRunSseInflightDrain:
         # protection: only id 1 gets the synthesized error.
         assert [m["id"] for m in msgs] == [1]
         assert "in-flight tracker at cap" in capsys.readouterr().err
+
+
+# --- #270 Phase 1: modern (spec rev 2026-07-28) dual-mode dispatch ---
+
+
+class TestExtractMethodAndName:
+    def test_tools_call_extracts_name(self):
+        line = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo"}}'
+        assert _extract_method_and_name(line) == ("tools/call", "echo")
+
+    def test_resources_read_extracts_uri(self):
+        line = (
+            '{"jsonrpc":"2.0","id":1,"method":"resources/read",'
+            '"params":{"uri":"file:///a"}}'
+        )
+        assert _extract_method_and_name(line) == ("resources/read", "file:///a")
+
+    def test_prompts_get_extracts_name(self):
+        line = '{"jsonrpc":"2.0","id":1,"method":"prompts/get","params":{"name":"p"}}'
+        assert _extract_method_and_name(line) == ("prompts/get", "p")
+
+    def test_tools_list_has_no_name(self):
+        line = '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+        assert _extract_method_and_name(line) == ("tools/list", None)
+
+    def test_batch_array_returns_none_none(self):
+        line = '[{"jsonrpc":"2.0","id":1,"method":"tools/list"}]'
+        assert _extract_method_and_name(line) == (None, None)
+
+    def test_unparseable_returns_none_none(self):
+        assert _extract_method_and_name("not json") == (None, None)
+
+
+class TestEncodeMcpName:
+    def test_plain_ascii_rides_verbatim(self):
+        assert _encode_mcp_name("echo") == "echo"
+
+    def test_non_ascii_is_base64_sentinel_encoded(self):
+        # Spec's own worked example: "Hello, 世界" -> the exact sentinel form.
+        assert _encode_mcp_name("Hello, 世界") == "=?base64?SGVsbG8sIOS4lueVjA==?="
+
+    def test_leading_whitespace_is_encoded(self):
+        encoded = _encode_mcp_name(" echo")
+        assert encoded.startswith("=?base64?") and encoded.endswith("?=")
+
+    def test_value_resembling_sentinel_is_encoded_not_passed_through(self):
+        """A value that already LOOKS like the sentinel must still be encoded
+        (double-wrapped) — passing it through verbatim would be
+        indistinguishable on the wire from a real encoded value."""
+        tricky = "=?base64?not-really-encoded?="
+        encoded = _encode_mcp_name(tricky)
+        assert encoded != tricky
+        assert encoded.startswith("=?base64?") and encoded.endswith("?=")
+
+
+class TestMcpRequestHeaders:
+    def test_tools_call_gets_both_headers(self):
+        line = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo"}}'
+        assert _mcp_request_headers(line) == {
+            "Mcp-Method": "tools/call",
+            "Mcp-Name": "echo",
+        }
+
+    def test_tools_list_gets_method_only(self):
+        line = '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+        assert _mcp_request_headers(line) == {"Mcp-Method": "tools/list"}
+
+    def test_batch_gets_no_headers(self):
+        assert _mcp_request_headers("[]") == {}
+
+
+class TestExtractLogLevel:
+    def test_extracts_level(self):
+        line = '{"jsonrpc":"2.0","id":1,"method":"logging/setLevel","params":{"level":"debug"}}'
+        assert _extract_log_level(line) == "debug"
+
+    def test_non_matching_method_returns_none(self):
+        assert _extract_log_level('{"jsonrpc":"2.0","id":1,"method":"ping"}') is None
+
+    def test_missing_params_returns_none(self):
+        line = '{"jsonrpc":"2.0","id":1,"method":"logging/setLevel"}'
+        assert _extract_log_level(line) is None
+
+
+class TestNegotiateModernVersion:
+    def test_requested_version_honored_when_supported(self):
+        assert _negotiate_modern_version(
+            "2026-07-28", ["2025-06-18", "2026-07-28"]
+        ) == ("2026-07-28")
+
+    def test_falls_back_to_highest_supported(self):
+        assert _negotiate_modern_version(
+            "1999-01-01", ["2025-06-18", "2026-07-28"]
+        ) == ("2026-07-28")
+
+    def test_no_supported_versions_uses_requested(self):
+        assert _negotiate_modern_version("2026-07-28", []) == "2026-07-28"
+
+    def test_no_supported_and_no_requested_uses_floor(self):
+        assert _negotiate_modern_version(None, []) == "2026-07-28"
+
+
+class TestSeedModernStateFromDiscover:
+    def test_seeds_server_info_capabilities_versions(self):
+        state = _ModernState()
+        discover_result = {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "result": {
+                "resultType": "discover",
+                "supportedVersions": ["2026-07-28"],
+                "capabilities": {"tools": {}},
+                "_meta": {
+                    "io.modelcontextprotocol/serverInfo": {
+                        "name": "srv",
+                        "version": "1",
+                    }
+                },
+            },
+        }
+        _seed_modern_state_from_discover(state, discover_result)
+        assert state.server_info == {"name": "srv", "version": "1"}
+        assert state.capabilities == {"tools": {}}
+        assert state.supported_versions == ["2026-07-28"]
+
+    def test_none_result_leaves_defaults(self):
+        state = _ModernState()
+        _seed_modern_state_from_discover(state, None)
+        assert state.server_info is None
+        assert state.capabilities == {}
+        assert state.supported_versions == []
+
+    def test_error_result_leaves_defaults(self):
+        state = _ModernState()
+        _seed_modern_state_from_discover(
+            state,
+            {"jsonrpc": "2.0", "id": 0, "error": {"code": -32020, "message": "x"}},
+        )
+        assert state.server_info is None
+
+
+class TestProbeProtocolEra:
+    URL = "https://example.com/mcp"
+
+    def test_200_is_modern(self, httpx_mock):
+        httpx_mock.add_response(
+            text=json.dumps(
+                {"jsonrpc": "2.0", "id": 0, "result": {"resultType": "discover"}}
+            ),
+            headers={"content-type": "application/json"},
+        )
+        client = httpx.Client()
+        era, result = _probe_protocol_era(client, self.URL, {})
+        assert era == "modern"
+        assert result["result"]["resultType"] == "discover"
+        req = httpx_mock.get_requests()[0]
+        assert json.loads(req.content)["method"] == "server/discover"
+        assert req.headers["mcp-method"] == "server/discover"
+
+    def test_404_is_legacy(self, httpx_mock):
+        httpx_mock.add_response(status_code=404, text="")
+        client = httpx.Client()
+        era, result = _probe_protocol_era(client, self.URL, {})
+        assert era == "legacy"
+        assert result is None
+
+    def test_400_with_jsonrpc_error_body_is_modern(self, httpx_mock):
+        """: a 400 whose body IS a recognized JSON-RPC error proves the
+        server understood server/discover as a method — the spec says stay
+        modern, don't fall back to legacy."""
+        httpx_mock.add_response(
+            status_code=400,
+            text=json.dumps(
+                {"jsonrpc": "2.0", "id": 0, "error": {"code": -32020, "message": "bad"}}
+            ),
+            headers={"content-type": "application/json"},
+        )
+        client = httpx.Client()
+        era, _ = _probe_protocol_era(client, self.URL, {})
+        assert era == "modern"
+
+    def test_400_with_empty_body_is_legacy(self, httpx_mock):
+        httpx_mock.add_response(status_code=400, text="")
+        client = httpx.Client()
+        era, _ = _probe_protocol_era(client, self.URL, {})
+        assert era == "legacy"
+
+    def test_500_is_legacy(self, httpx_mock):
+        """Any status outside {200, 400-with-jsonrpc-error} is treated
+        conservatively as legacy — the default on anything ambiguous."""
+        httpx_mock.add_response(status_code=500, text="")
+        client = httpx.Client()
+        era, _ = _probe_protocol_era(client, self.URL, {})
+        assert era == "legacy"
+
+    def test_transport_error_degrades_to_legacy(self, httpx_mock):
+        httpx_mock.add_exception(httpx.ConnectError("refused"))
+        client = httpx.Client()
+        era, result = _probe_protocol_era(client, self.URL, {})
+        assert era == "legacy"
+        assert result is None
+
+
+class TestHandleModernSpecialMethod:
+    def test_initialize_is_synthesized_locally(self):
+        state = _ModernState()
+        state.server_info = {"name": "srv", "version": "9"}
+        state.capabilities = {"tools": {}}
+        line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": {"roots": {}},
+                    "clientInfo": {"name": "test-client", "version": "1.0"},
+                },
+            }
+        )
+        handled, reply = _handle_modern_special_method(line, 1, state)
+        assert handled is True
+        result = json.loads(reply)["result"]
+        assert result["serverInfo"] == {"name": "srv", "version": "9"}
+        assert result["capabilities"] == {"tools": {}}
+        assert result["protocolVersion"] == "2026-07-28"
+        # The client's own capabilities/clientInfo were captured for later
+        # _meta injection.
+        assert state.client_capabilities == {"roots": {}}
+        assert state.client_info == {"name": "test-client", "version": "1.0"}
+
+    def test_initialize_without_client_capabilities_becomes_empty_dict(self):
+        """: capabilities is REQUIRED in the modern _meta, so an absent
+        client capabilities object must become {} (present, empty) — never
+        left as None, which _inject_modern_meta would need to guard against."""
+        state = _ModernState()
+        line = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+        )
+        _handle_modern_special_method(line, 1, state)
+        assert state.client_capabilities == {}
+
+    def test_initialize_without_client_info_stays_none(self):
+        """: clientInfo is a SHOULD, never fabricated — absent from the
+        client's initialize means state.client_info stays None (so
+        _inject_modern_meta omits the key entirely, not sending a fake one)."""
+        state = _ModernState()
+        line = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+        )
+        _handle_modern_special_method(line, 1, state)
+        assert state.client_info is None
+
+    def test_notifications_initialized_is_swallowed(self):
+        state = _ModernState()
+        line = '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+        handled, reply = _handle_modern_special_method(line, None, state)
+        assert handled is True
+        assert reply is None
+
+    def test_notifications_cancelled_is_swallowed(self):
+        state = _ModernState()
+        line = (
+            '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+            '"params":{"requestId":1}}'
+        )
+        handled, reply = _handle_modern_special_method(line, None, state)
+        assert handled is True
+        assert reply is None
+
+    def test_ordinary_request_is_not_handled(self):
+        state = _ModernState()
+        line = '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+        handled, reply = _handle_modern_special_method(line, 1, state)
+        assert handled is False
+        assert reply is None
+
+
+class TestInjectModernMeta:
+    def test_injects_required_fields(self):
+        state = _ModernState()
+        state.negotiated_version = "2026-07-28"
+        state.client_capabilities = {"roots": {}}
+        line = '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+        injected = json.loads(_inject_modern_meta(line, state))
+        meta = injected["params"]["_meta"]
+        assert meta["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
+        assert meta["io.modelcontextprotocol/clientCapabilities"] == {"roots": {}}
+        assert "io.modelcontextprotocol/clientInfo" not in meta
+        assert "io.modelcontextprotocol/logLevel" not in meta
+
+    def test_injects_client_info_and_log_level_when_present(self):
+        state = _ModernState()
+        state.negotiated_version = "2026-07-28"
+        state.client_capabilities = {}
+        state.client_info = {"name": "c", "version": "1"}
+        state.log_level = "debug"
+        line = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x"}}'
+        injected = json.loads(_inject_modern_meta(line, state))
+        meta = injected["params"]["_meta"]
+        assert meta["io.modelcontextprotocol/clientInfo"] == {
+            "name": "c",
+            "version": "1",
+        }
+        assert meta["io.modelcontextprotocol/logLevel"] == "debug"
+
+    def test_preserves_existing_meta_keys(self):
+        state = _ModernState()
+        state.negotiated_version = "2026-07-28"
+        line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "x", "_meta": {"progressToken": "abc"}},
+            }
+        )
+        injected = json.loads(_inject_modern_meta(line, state))
+        meta = injected["params"]["_meta"]
+        assert meta["progressToken"] == "abc"
+        assert meta["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
+
+    def test_batch_is_returned_unchanged(self):
+        state = _ModernState()
+        line = "[]"
+        assert _inject_modern_meta(line, state) == line
+
+    def test_no_params_key_gets_one_created(self):
+        state = _ModernState()
+        state.negotiated_version = "2026-07-28"
+        line = '{"jsonrpc":"2.0","id":1,"method":"ping"}'
+        injected = json.loads(_inject_modern_meta(line, state))
+        assert (
+            injected["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"]
+            == "2026-07-28"
+        )
+
+
+class TestRunModernEra:
+    """Integration tests: run() dispatching on the modern (spec rev
+    2026-07-28) path via --protocol-era modern/auto."""
+
+    URL = "https://example.com/mcp"
+
+    def _run_with_stdin(self, httpx_mock, stdin_lines, **kwargs):
+        stdin_data = "\n".join(stdin_lines) + "\n"
+        stdout = StringIO()
+        with patch("sys.stdin", StringIO(stdin_data)), patch("sys.stdout", stdout):
+            run(self.URL, {"Content-Type": "application/json"}, **kwargs)
+        return stdout.getvalue()
+
+    def _discover_response(self, **extra_result):
+        result = {
+            "resultType": "discover",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {"tools": {}},
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": "modern-srv",
+                    "version": "1",
+                }
+            },
+        }
+        result.update(extra_result)
+        return json.dumps({"jsonrpc": "2.0", "id": 0, "result": result})
+
+    def test_forced_modern_initialize_is_synthesized_no_post(self, httpx_mock):
+        """: forcing --protocol-era modern still runs ONE discover probe
+        (to seed serverInfo), but the client's own `initialize` never reaches
+        the network — it is answered locally and echoes the discovered
+        serverInfo."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2026-07-28",
+                            "capabilities": {},
+                        },
+                    }
+                )
+            ],
+            protocol_era="modern",
+        )
+        reply = json.loads(output.strip())
+        assert reply["result"]["serverInfo"] == {"name": "modern-srv", "version": "1"}
+        # Exactly one HTTP request total: the discover probe. initialize
+        # never hit the wire.
+        assert len(httpx_mock.get_requests()) == 1
+        assert json.loads(httpx_mock.get_requests()[0].content)["method"] == (
+            "server/discover"
+        )
+
+    def test_notifications_initialized_produces_no_post_no_reply(self, httpx_mock):
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            ['{"jsonrpc":"2.0","method":"notifications/initialized"}'],
+            protocol_era="modern",
+        )
+        assert output.strip() == ""
+        assert len(httpx_mock.get_requests()) == 1  # only the discover probe
+
+    def test_tools_call_carries_mcp_method_name_and_meta_no_session(self, httpx_mock):
+        """: on the modern path every POST carries Mcp-Method/Mcp-Name and
+        MCP-Protocol-Version headers plus the _meta block, and NEVER
+        Mcp-Session-Id — sessions do not exist on this path."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":2,"result":{}}',
+            headers={
+                "content-type": "application/json",
+                # A non-compliant/legacy-ish echo — must NOT be adopted.
+                "mcp-session-id": "should-be-ignored",
+            },
+        )
+        self._run_with_stdin(
+            httpx_mock,
+            [
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {"name": "echo", "arguments": {}},
+                    }
+                )
+            ],
+            protocol_era="modern",
+        )
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 2  # discover probe + the tools/call
+        call_req = requests[1]
+        assert call_req.headers["mcp-method"] == "tools/call"
+        assert call_req.headers["mcp-name"] == "echo"
+        assert call_req.headers["mcp-protocol-version"] == "2026-07-28"
+        assert "mcp-session-id" not in call_req.headers
+        body = json.loads(call_req.content)
+        meta = body["params"]["_meta"]
+        assert meta["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
+        assert meta["io.modelcontextprotocol/clientCapabilities"] == {}
+
+    def test_second_request_still_omits_session_id_after_echoed_header(
+        self, httpx_mock
+    ):
+        """: even after a response ECHOES mcp-session-id, the NEXT modern
+        request must still omit it — session adoption is fully disabled on
+        this path, not just skipped once."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":2,"result":{}}',
+            headers={"content-type": "application/json", "mcp-session-id": "sneaky"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":3,"result":{}}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            httpx_mock,
+            [
+                json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+                json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+            ],
+            protocol_era="modern",
+        )
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 3  # discover + 2 tools/list
+        assert "mcp-session-id" not in requests[2].headers
+
+    def test_client_info_forwarded_when_client_provided_it(self, httpx_mock):
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":2,"result":{}}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            httpx_mock,
+            [
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2026-07-28",
+                            "capabilities": {},
+                            "clientInfo": {"name": "my-client", "version": "3"},
+                        },
+                    }
+                ),
+                json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            ],
+            protocol_era="modern",
+        )
+        # requests[0] is the discover probe; the client's own `initialize`
+        # is intercepted locally and never dispatched (see
+        # test_forced_modern_initialize_is_synthesized_no_post), so the
+        # tools/list is requests[1].
+        call_req = httpx_mock.get_requests()[1]
+        meta = json.loads(call_req.content)["params"]["_meta"]
+        assert meta["io.modelcontextprotocol/clientInfo"] == {
+            "name": "my-client",
+            "version": "3",
+        }
+
+    def test_client_info_omitted_when_client_never_sent_one(self, httpx_mock):
+        """: clientInfo is SHOULD, never fabricated. No initialize with a
+        clientInfo was ever sent -> the key must be entirely absent, not a
+        placeholder."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":2,"result":{}}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})],
+            protocol_era="modern",
+        )
+        call_req = httpx_mock.get_requests()[1]
+        meta = json.loads(call_req.content)["params"]["_meta"]
+        assert "io.modelcontextprotocol/clientInfo" not in meta
+
+    def test_cancelled_notification_not_forwarded_upstream(self, httpx_mock):
+        """: acceptance criterion #5 (part a — the "don't forward" half).
+        On the modern path notifications/cancelled must NOT be POSTed
+        upstream at all (the modern cancellation signal is closing the
+        response stream, not a forwarded JSON-RPC notification)."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/cancelled",
+                        "params": {"requestId": 5},
+                    }
+                )
+            ],
+            protocol_era="modern",
+        )
+        assert output.strip() == ""
+        # Only the discover probe — the cancel notification never hit the wire.
+        assert len(httpx_mock.get_requests()) == 1
+
+    def test_log_level_mirrored_into_meta_after_set_level(self, httpx_mock):
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":5,"result":{}}',
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":6,"result":{}}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            httpx_mock,
+            [
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 5,
+                        "method": "logging/setLevel",
+                        "params": {"level": "debug"},
+                    }
+                ),
+                json.dumps({"jsonrpc": "2.0", "id": 6, "method": "tools/list"}),
+            ],
+            protocol_era="modern",
+        )
+        requests = httpx_mock.get_requests()
+        # The setLevel request itself IS forwarded (it's an ordinary request
+        # on the modern path, not one of the three intercepted methods) and
+        # carries logLevel too (set before dispatch in the loop).
+        set_level_meta = json.loads(requests[1].content)["params"]["_meta"]
+        assert set_level_meta["io.modelcontextprotocol/logLevel"] == "debug"
+        list_meta = json.loads(requests[2].content)["params"]["_meta"]
+        assert list_meta["io.modelcontextprotocol/logLevel"] == "debug"
+
+    def test_cold_start_disabled_on_modern_era(self, httpx_mock, capsys):
+        """: --oauth-eager cold-start is disabled (with a warning) when the
+        era resolves to modern — _reinitialize's legacy handshake is
+        meaningless without sessions. A `ping` sent immediately must NOT get
+        the cold-start's locally-synthesized empty result (that synthesis is
+        legacy-only) — it is forwarded upstream like any other request."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":9,"result":{"upstream":true}}',
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 9, "method": "ping"})],
+            protocol_era="modern",
+            cold_start_login=lambda: {"Authorization": "Bearer x"},
+        )
+        assert "cold-start" in capsys.readouterr().err
+        reply = json.loads(output.strip())
+        # This is the UPSTREAM's reply (forwarded, not the cold-start local
+        # synthesis `{"result": {}}` with no "upstream" key).
+        assert reply["result"] == {"upstream": True}
+
+    def test_auto_detects_modern_and_dispatches_modern_path(self, httpx_mock):
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":2,"result":{}}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})],
+            protocol_era="auto",
+        )
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 2
+        assert requests[1].headers["mcp-method"] == "tools/list"
+
+    def test_auto_detects_legacy_and_dispatches_legacy_path(self, httpx_mock):
+        """: auto-detection against a legacy remote (discover 404s) must
+        fall through to the ordinary initialize/session-tracking dispatch —
+        no Mcp-Method header, session id adopted normally."""
+        httpx_mock.add_response(url=self.URL, status_code=404, text="")
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}',
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "legacy-sess",
+            },
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"})],
+            protocol_era="auto",
+        )
+        assert json.loads(output.strip())["id"] == 1
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 2  # discover probe (404) + real initialize
+        assert "mcp-method" not in requests[1].headers
+        assert (
+            "mcp-session-id" not in requests[1].headers
+        )  # not yet adopted (this IS the initialize)

@@ -575,6 +575,25 @@ def _main() -> None:
         help="Transport type: streamable-http (default) or sse (MCP 2024-11-05 legacy)",
     )
     parser.add_argument(
+        "--protocol-era",
+        choices=["legacy", "modern", "auto"],
+        default="legacy",
+        help=(
+            "MCP protocol era to speak to the remote over --transport "
+            "streamable-http (ignored on --transport sse, which is always "
+            "the pre-Streamable-HTTP legacy transport regardless of this "
+            "flag): 'legacy' (default) is today's initialize handshake + "
+            "Mcp-Session-Id (spec rev 2025-06-18 and earlier) — unchanged "
+            "wire behavior, so existing deployments are unaffected. "
+            "'modern' forces the spec rev 2026-07-28 path: no initialize "
+            "handshake or session id, per-request Mcp-Method/Mcp-Name "
+            "headers and _meta on every POST. 'auto' runs a one-shot "
+            "server/discover probe before serving (one extra request at "
+            "startup) and picks whichever era the probe indicates — not "
+            "the default because of that extra request. See #270."
+        ),
+    )
+    parser.add_argument(
         "--timeout-connect",
         type=_positive_float,
         # Float defaults: argparse applies ``type`` only to argv
@@ -972,6 +991,12 @@ def _main() -> None:
     cancel_filter = not args.no_cancel_filter
     normalize_arguments = not args.no_normalize_arguments
     proactive_refresh = not args.no_proactive_refresh
+    if args.transport == "sse" and args.protocol_era != "legacy":
+        print(
+            f"warning: --protocol-era {args.protocol_era} is ignored on "
+            "--transport sse (always the pre-Streamable-HTTP legacy transport)",
+            file=sys.stderr,
+        )
     if args.transport == "sse":
         run_sse(
             url=args.url,
@@ -1003,6 +1028,7 @@ def _main() -> None:
             proactive_refresh=proactive_refresh,
             refresh_leeway=args.oauth_refresh_leeway,
             cold_start_login=cold_start_login,
+            protocol_era=args.protocol_era,
         )
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import email.utils
 import json
 import math
@@ -334,6 +335,434 @@ def _extract_protocol_version(payload: str) -> str | None:
     if isinstance(pv, str) and pv and all(0x21 <= ord(c) <= 0x7E for c in pv):
         return pv
     return None
+
+
+# --- modern (spec rev 2026-07-28) dispatch path ---
+#
+# The 2026-07-28 revision removes the initialize handshake and
+# Mcp-Session-Id from the wire entirely: every request instead carries its
+# own per-request metadata (protocol version, capabilities, ...) as
+# ``params._meta``, plus two new REQUIRED-on-every-POST headers. Everything
+# in this section is used ONLY when the relay has resolved (or been forced
+# via --protocol-era) onto that modern path — see ``run()``'s ``era``
+# variable. The legacy path (spec rev 2025-06-18 and earlier) is completely
+# untouched by any of this: it neither calls nor imports from here, so it
+# stays byte-identical to pre-#270 behaviour (acceptance criterion #3).
+
+# Default protocol version to advertise on the modern path when nothing
+# better is known (no server/discover ever ran, or it returned no
+# supportedVersions, or the local client's initialize omitted
+# protocolVersion). This is this relay's own floor for "definitely modern",
+# mirroring how "2024-11-05" already serves as the floor on the legacy path
+# (_cold_start_response, _reinitialize).
+_MODERN_PROTOCOL_VERSION_DEFAULT = "2026-07-28"
+
+# _meta keys mirrored per request/result on the modern path (spec rev
+# 2026-07-28, clientInfo/serverInfo revision comment of 2026-07-27 — see the
+# table in the issue: protocolVersion and clientCapabilities are REQUIRED;
+# clientInfo is a SHOULD (never fabricated — see _handle_modern_special_method);
+# serverInfo appears on RESULTS, nested under this same namespace, not as a
+# top-level field (confirmed against server/discover's own worked example).
+_META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion"
+_META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities"
+_META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo"
+_META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
+# Amendment added 2026-07-27: mirror a client-set logging level into _meta on
+# the modern path (there is no other per-request channel for it now that
+# initialize/session state is gone). See _extract_log_level.
+_META_LOG_LEVEL = "io.modelcontextprotocol/logLevel"
+
+# MCP request metadata headers (spec rev 2026-07-28, "Request Metadata",
+# SEP-2243). Every Streamable HTTP POST on the modern path mirrors the
+# request's `method` into an `Mcp-Method` header; `tools/call` /
+# `resources/read` / `prompts/get` additionally mirror `params.name` (or
+# `params.uri` for resources/read) into `Mcp-Name`. Sent ONLY on the modern
+# path — see the module docstring above and _prepare_headers in run().
+# `x-mcp-header` / `Mcp-Param-{Name}` (custom per-tool headers mirrored from
+# `inputSchema` annotations) is a separate, materially larger feature — it
+# requires caching each tool's schema from `tools/list` responses to know
+# which call arguments to mirror — and is deliberately out of scope here.
+#
+# Batches: MCP removed JSON-RPC batching in spec rev 2025-06-18, and a batch
+# has no single top-level `method` to mirror, so `_extract_method_and_name`
+# only recognises a top-level JSON object; an array (or unparseable content)
+# yields `(None, None)` and the caller sends neither header.
+_NAME_BEARING_METHODS = {
+    "tools/call": "name",
+    "resources/read": "uri",
+    "prompts/get": "name",
+}
+
+
+def _extract_method_and_name(line: str) -> tuple[str | None, str | None]:
+    """Return ``(method, name_or_uri)`` for the ``Mcp-Method``/``Mcp-Name`` headers.
+
+    ``name_or_uri`` is populated only for the three methods
+    ``_NAME_BEARING_METHODS`` lists; every other method (``tools/list``, the
+    plain list methods, notifications, ...) returns ``(method, None)`` so the
+    caller sends ``Mcp-Method`` alone, matching the spec's "Required For"
+    column.
+    """
+    try:
+        msg = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return None, None
+    if not isinstance(msg, dict):
+        return None, None  # batch array, or a scalar — no single method
+    method = msg.get("method")
+    if not isinstance(method, str):
+        return None, None
+    name_key = _NAME_BEARING_METHODS.get(method)
+    if name_key is None:
+        return method, None
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return method, None
+    value = params.get(name_key)
+    return method, value if isinstance(value, str) else None
+
+
+_BASE64_SENTINEL_RE = re.compile(r"\A=\?base64\?.*\?=\Z", re.DOTALL)
+
+
+def _is_header_safe_ascii(value: str) -> bool:
+    """True if ``value`` can ride an HTTP header verbatim, unencoded.
+
+    Per RFC 9110 field-value syntax (spec rev 2026-07-28 "Value Encoding"),
+    the safe set is visible ASCII (0x21-0x7E) plus space (0x20) and
+    horizontal tab (0x09) — but the spec additionally forbids
+    leading/trailing whitespace even though the wire grammar would allow it,
+    so a value with either is NOT header-safe here and must be encoded.
+    """
+    if not value:
+        return True
+    if value[0] in (" ", "\t") or value[-1] in (" ", "\t"):
+        return False
+    return all(c in (" ", "\t") or 0x21 <= ord(c) <= 0x7E for c in value)
+
+
+def _encode_mcp_name(value: str) -> str:
+    """Encode a ``Mcp-Name`` header value per spec rev 2026-07-28 Value Encoding.
+
+    A plain ASCII value with no leading/trailing whitespace, that does not
+    itself look like the sentinel, rides verbatim. Everything else —
+    non-ASCII, control characters, leading/trailing whitespace, or a value
+    that would otherwise be mistaken for an already-encoded sentinel — is
+    Base64-encoded as ``=?base64?{...}?=``: the exact literal markers the
+    spec mandates (lowercase, no charset segment — unlike MIME
+    encoded-words). ``Mcp-Method`` never needs this: method names are
+    protocol-fixed identifiers (e.g. ``tools/call``), never arbitrary data,
+    so only ``Mcp-Name`` (mirroring a tool/prompt name or a resource URI,
+    both user- or server-supplied) can require it.
+    """
+    if _is_header_safe_ascii(value) and not _BASE64_SENTINEL_RE.match(value):
+        return value
+    encoded = base64.b64encode(value.encode("utf-8")).decode("ascii")
+    return f"=?base64?{encoded}?="
+
+
+def _mcp_request_headers(line: str) -> dict[str, str]:
+    """Build the ``Mcp-Method``/``Mcp-Name`` headers for one dispatched line.
+
+    Returns ``{}`` for a batch / unparseable / methodless line — there is no
+    single method to mirror. Used only on the modern path (see run()'s
+    ``_prepare_headers``).
+    """
+    method, name = _extract_method_and_name(line)
+    if method is None:
+        return {}
+    headers = {"Mcp-Method": method}
+    if name is not None:
+        headers["Mcp-Name"] = _encode_mcp_name(name)
+    return headers
+
+
+_SET_LEVEL_METHOD_RE = re.compile(r'"method"\s*:\s*"logging/setLevel"')
+
+
+def _extract_log_level(line: str) -> str | None:
+    """Return ``params.level`` from a ``logging/setLevel`` REQUEST, else None.
+
+    Tracked on BOTH eras — this is a cheap regex-gated READ, it never mutates
+    what is forwarded, so calling it unconditionally in run()'s loop cannot
+    change the legacy path's wire bytes. The captured level feeds the modern
+    path's ``io.modelcontextprotocol/logLevel`` _meta (amendment added
+    2026-07-27): a level set while the session was still on/resolving to
+    legacy is not lost if a later request needs it mirrored. The legacy
+    path's own forwarding of the raw ``logging/setLevel`` request is
+    completely unaffected — this function never rewrites the line.
+    """
+    if not _SET_LEVEL_METHOD_RE.search(line):
+        return None
+    try:
+        msg = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(msg, dict) or msg.get("method") != "logging/setLevel":
+        return None
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return None
+    level = params.get("level")
+    return level if isinstance(level, str) and level else None
+
+
+def _negotiate_modern_version(requested: str | None, supported: list[str]) -> str:
+    """Pick the ``MCP-Protocol-Version`` to advertise on the modern path.
+
+    Mirrors what a real negotiation would produce: the local client's
+    requested version wins when the remote's ``server/discover`` advertised
+    it in ``supportedVersions``; otherwise the HIGHEST advertised version is
+    used (ISO 8601 date-form version strings sort correctly with a plain
+    string ``max()``, exactly like every other MCP version string in this
+    codebase). With no advertised versions at all (a discover probe that
+    never ran, or returned none), fall back to the client's request or,
+    absent that too, this relay's own known-modern floor
+    (``_MODERN_PROTOCOL_VERSION_DEFAULT``).
+    """
+    if requested and requested in supported:
+        return requested
+    if supported:
+        return max(supported)
+    return requested or _MODERN_PROTOCOL_VERSION_DEFAULT
+
+
+class _ModernState:
+    """Per-session state for the modern (spec rev 2026-07-28) dispatch path.
+
+    ``server_info`` / ``capabilities`` / ``supported_versions`` are seeded
+    once from the era-detection ``server/discover`` probe (see
+    ``_probe_protocol_era``). ``client_capabilities`` / ``client_info`` /
+    ``negotiated_version`` are captured once from the local stdio client's
+    own ``initialize`` request (see ``_handle_modern_special_method`` — the
+    modern path never forwards that request upstream, so this is the only
+    place those values are ever seen). ``log_level`` is updated on every
+    ``logging/setLevel`` line regardless of era (see ``_extract_log_level``).
+
+    A single plain object (no lock): ``run()``'s stdin loop is
+    single-threaded except for the modern-path cancel-abort worker (see
+    ``_ModernDispatchWorker``), which never touches this state — only reads
+    ``negotiated_version``/``client_capabilities``/``client_info``/
+    ``log_level`` captured before it was spawned.
+    """
+
+    __slots__ = (
+        "server_info",
+        "capabilities",
+        "supported_versions",
+        "client_capabilities",
+        "client_info",
+        "negotiated_version",
+        "log_level",
+    )
+
+    def __init__(self) -> None:
+        self.server_info: dict[str, Any] | None = None
+        self.capabilities: dict[str, Any] = {}
+        self.supported_versions: list[str] = []
+        self.client_capabilities: dict[str, Any] | None = None
+        self.client_info: dict[str, Any] | None = None
+        self.negotiated_version: str | None = None
+        self.log_level: str | None = None
+
+
+def _seed_modern_state_from_discover(
+    modern_state: "_ModernState", discover_result: dict[str, Any] | None
+) -> None:
+    """Populate ``modern_state`` from a parsed ``server/discover`` response.
+
+    A no-op (state keeps its empty defaults) when ``discover_result`` is
+    ``None`` (probe failed / forced ``--protocol-era modern`` skipped or
+    could not parse the probe) or is a JSON-RPC error rather than a result —
+    the synthesized InitializeResult then falls back to
+    ``{"name": "mcp-stdio", ...}`` / empty capabilities / the client's own
+    requested version, which is honest given genuinely unknown remote info.
+    """
+    if not isinstance(discover_result, dict):
+        return
+    result = discover_result.get("result")
+    if not isinstance(result, dict):
+        return
+    caps = result.get("capabilities")
+    if isinstance(caps, dict):
+        modern_state.capabilities = caps
+    versions = result.get("supportedVersions")
+    if isinstance(versions, list) and all(isinstance(v, str) for v in versions):
+        modern_state.supported_versions = versions
+    meta = result.get("_meta")
+    if isinstance(meta, dict):
+        server_info = meta.get(_META_SERVER_INFO)
+        if isinstance(server_info, dict):
+            modern_state.server_info = server_info
+
+
+def _probe_protocol_era(
+    client: httpx.Client, url: str, headers: dict[str, str]
+) -> tuple[str, dict[str, Any] | None]:
+    """One-shot ``server/discover`` probe implementing the spec's era-detection
+    algorithm (Streamable HTTP, "Backward Compatibility") for
+    ``--protocol-era auto``.
+
+    Sends a MODERN-shaped request first (``server/discover`` — the modern
+    replacement for ``initialize``) and classifies the remote from the
+    response:
+
+    - HTTP 200 -> modern; the parsed body is returned for the caller to seed
+      ``_ModernState`` from (via ``_seed_modern_state_from_discover``).
+    - HTTP 400 whose body IS a recognized JSON-RPC error object -> STILL
+      modern (spec: a modern server also uses 400 for
+      ``UnsupportedProtocolVersionError`` / ``MissingRequiredClientCapabilityError``
+      / header-validation failures — an error body proves the server
+      UNDERSTOOD ``server/discover`` as a method, just rejected THIS
+      request, so the client should retry/correct rather than fall back).
+    - HTTP 400 with an empty/unrecognized body, HTTP 404 (method not
+      recognized at all — the transport spec's mandated response for an
+      unknown method), any OTHER status (401/403/5xx/...), or a transport
+      failure -> legacy, the conservative default on anything ambiguous.
+      This mirrors the issue's own 2026-07-27 revision note: "the transport
+      surface was still moving three weeks ago, so wait for publication
+      rather than chase the draft" — an inconclusive probe must not guess
+      modern.
+
+    A transport-level exception is swallowed (not propagated) so a
+    detection-probe failure degrades to legacy rather than crashing startup;
+    the first REAL request from the local client still surfaces a genuine
+    connectivity problem through the normal legacy retry path.
+    """
+    discover_msg = json.dumps(
+        {"jsonrpc": "2.0", "method": "server/discover", "id": 0, "params": {}}
+    )
+    probe_headers = {k: v for k, v in headers.items() if k.lower() != "mcp-method"}
+    probe_headers["Mcp-Method"] = "server/discover"
+    probe_headers = {
+        k: v for k, v in probe_headers.items() if k.lower() != "mcp-protocol-version"
+    }
+    probe_headers["MCP-Protocol-Version"] = _MODERN_PROTOCOL_VERSION_DEFAULT
+    try:
+        resp = client.post(url, content=discover_msg, headers=probe_headers)
+    except httpx.HTTPError as e:
+        log(f"protocol-era probe failed ({e}); assuming legacy")
+        return "legacy", None
+    if resp.status_code == 200:
+        return "modern", _parse_streamable_response(resp)
+    if resp.status_code == 400:
+        parsed = _parse_streamable_response(resp)
+        if isinstance(parsed, dict) and "error" in parsed:
+            log("protocol-era probe: 400 with a JSON-RPC error body; assuming modern")
+            return "modern", parsed
+        return "legacy", None
+    return "legacy", None
+
+
+def _handle_modern_special_method(
+    line: str,
+    req_id: Any,
+    modern_state: "_ModernState",
+) -> tuple[bool, str | None]:
+    """Intercept ``initialize`` / ``notifications/initialized`` /
+    ``notifications/cancelled`` on the modern path, where none of the three
+    exist on the wire to the remote: there is no initialize handshake
+    (``server/discover`` replaces it, already run before the stdin loop
+    starts) and no ``Mcp-Session-Id``, and cancellation is signalled by
+    closing the response stream, not a forwarded notification (spec rev
+    2026-07-28).
+
+    Returns ``(True, reply_or_None)`` when the line was fully handled
+    locally — the caller must NOT dispatch it upstream:
+
+    - ``initialize`` synthesizes a legacy-SHAPED ``InitializeResult`` (the
+      local stdio client still expects one) from ``modern_state``'s
+      discover-seeded ``server_info``/``capabilities``/``supported_versions``,
+      and captures the client's own ``capabilities``/``clientInfo`` into
+      ``modern_state`` for later ``_meta`` injection (``_inject_modern_meta``)
+      — this is the ONLY place those values are ever observed, since the
+      modern path never forwards the request that carries them.
+    - ``notifications/initialized`` and ``notifications/cancelled`` are
+      swallowed (``None`` reply — both are notifications, which never get a
+      response either way).
+
+    Returns ``(False, None)`` for every other line, which the caller
+    dispatches normally (through ``_inject_modern_meta`` first).
+    """
+    try:
+        msg = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return False, None
+    if not isinstance(msg, dict):
+        return False, None
+    method = msg.get("method")
+    if method == "initialize":
+        params = msg.get("params")
+        params = params if isinstance(params, dict) else {}
+        requested = params.get("protocolVersion")
+        requested = requested if isinstance(requested, str) and requested else None
+        # Presence-based, like every other MCP capabilities object (see
+        # _report_initialize's own note) — an absent/malformed capabilities
+        # object becomes {} (present, empty), never omitted downstream.
+        caps = params.get("capabilities")
+        modern_state.client_capabilities = caps if isinstance(caps, dict) else {}
+        client_info = params.get("clientInfo")
+        modern_state.client_info = (
+            client_info if isinstance(client_info, dict) else None
+        )
+        modern_state.negotiated_version = _negotiate_modern_version(
+            requested, modern_state.supported_versions
+        )
+        result = {
+            "protocolVersion": modern_state.negotiated_version,
+            "capabilities": modern_state.capabilities,
+            "serverInfo": modern_state.server_info
+            or {"name": "mcp-stdio", "version": __version__},
+        }
+        return True, json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result})
+    if method in ("notifications/initialized", "notifications/cancelled"):
+        return True, None
+    return False, None
+
+
+def _inject_modern_meta(line: str, modern_state: "_ModernState") -> str:
+    """Merge the modern per-request ``_meta`` block into ``params._meta``.
+
+    Placement follows the MCP base protocol's established ``_meta``
+    convention (``params._meta`` — unchanged since 2025-03-26, already used
+    for e.g. ``progressToken``), not a new location invented for spec rev
+    2026-07-28.
+
+    ``io.modelcontextprotocol/protocolVersion`` and
+    ``.../clientCapabilities`` are ALWAYS present (both REQUIRED per the
+    clientInfo/serverInfo revision comment — capabilities uses presence-based
+    semantics like every other MCP capabilities object, so an empty client
+    capabilities set is sent as ``{}`` rather than omitted).
+    ``.../clientInfo`` is sent only when the LOCAL client's own ``initialize``
+    actually provided one (SHOULD, never fabricated — see
+    ``_handle_modern_special_method``). ``.../logLevel`` is sent only once
+    the client has issued a ``logging/setLevel`` (see ``_extract_log_level``).
+
+    Returns ``line`` unchanged for a batch / unparseable / methodless line —
+    mirrors ``_extract_method_and_name``'s batch exemption (a batch has no
+    single top-level ``params`` to attach ``_meta`` to).
+    """
+    try:
+        msg = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return line
+    if not isinstance(msg, dict) or "method" not in msg:
+        return line
+    params = msg.get("params")
+    params = dict(params) if isinstance(params, dict) else {}
+    existing_meta = params.get("_meta")
+    meta = dict(existing_meta) if isinstance(existing_meta, dict) else {}
+    meta[_META_PROTOCOL_VERSION] = (
+        modern_state.negotiated_version or _MODERN_PROTOCOL_VERSION_DEFAULT
+    )
+    meta[_META_CLIENT_CAPABILITIES] = modern_state.client_capabilities or {}
+    if modern_state.client_info:
+        meta[_META_CLIENT_INFO] = modern_state.client_info
+    if modern_state.log_level:
+        meta[_META_LOG_LEVEL] = modern_state.log_level
+    params["_meta"] = meta
+    msg["params"] = params
+    return json.dumps(msg)
 
 
 # Cancel-aware response filter (MCP cancellation spec SHOULDs).
@@ -2226,6 +2655,7 @@ def run(
     proactive_refresh: bool = True,
     refresh_leeway: float = 60.0,
     cold_start_login: Any = None,
+    protocol_era: str = "legacy",
 ) -> None:
     """Run the stdio-to-HTTP relay loop.
 
@@ -2286,6 +2716,29 @@ def run(
             the gate and emits ``list_changed`` so the client fetches the
             now-available lists — so a long OAuth flow does not blow the
             client's initialize timeout (#296). Streamable HTTP only.
+            Ignored (a warning is logged and cold-start is disabled) when
+            ``protocol_era`` resolves to ``"modern"``: cold-start's
+            ``_reinitialize`` sends a legacy ``initialize`` handshake to
+            establish a session, which is meaningless on a path with no
+            sessions at all (#270 Phase 1).
+        protocol_era: One of ``"legacy"`` (default), ``"modern"``, or
+            ``"auto"``. ``"legacy"`` is today's behaviour — the initialize
+            handshake, ``Mcp-Session-Id`` tracking, and 401/403/404 recovery,
+            completely unchanged (spec rev 2025-06-18 and earlier; this is
+            the default specifically so an unmodified deployment's wire
+            traffic never changes — see #270). ``"modern"`` forces the spec
+            rev 2026-07-28 path unconditionally: no initialize handshake (the
+            local stdio client's own ``initialize``/``notifications/initialized``
+            are intercepted and answered/swallowed locally), no
+            ``Mcp-Session-Id``, per-request ``Mcp-Method``/``Mcp-Name``
+            headers and ``_meta`` (protocol version, client capabilities,
+            optionally clientInfo/logLevel) on every POST. ``"auto"`` runs a
+            one-shot ``server/discover`` probe before the stdin loop starts
+            (``_probe_protocol_era``) and picks whichever path the probe
+            indicates — this costs one extra HTTP request at startup
+            compared to a pinned era, which is why it is NOT the default (see
+            ``_probe_protocol_era``'s docstring for the exact classification
+            rules per HTTP status).
 
     Limitation — JSON-RPC batches: a top-level array (a batch) is
     treated like a notification for error synthesis. ``_extract_id_and_presence``
@@ -2333,20 +2786,83 @@ def run(
     headers_lock = threading.Lock()
     refresh_lock = threading.Lock()
 
-    def _prepare_headers() -> dict[str, str]:
-        """Build per-request headers with the current session + protocol version.
+    # Resolve the protocol era BEFORE the stdin loop starts (#270 Phase 1).
+    # "legacy" (the default) does NOTHING here — zero extra network traffic,
+    # zero new state — so an unmodified deployment's wire bytes are
+    # untouched (acceptance criterion #3). "modern" and "auto" both run the
+    # server/discover probe: "modern" to SEED modern_state (serverInfo /
+    # capabilities / supportedVersions for the synthesized InitializeResult)
+    # while forcing the era regardless of what the probe reports; "auto" to
+    # additionally CLASSIFY the era from the probe's outcome
+    # (_probe_protocol_era). This is why "auto" is opt-in rather than the
+    # default: it costs one extra POST at startup that a pinned era does not.
+    modern_state = _ModernState()
+    if protocol_era == "modern":
+        era = "modern"
+        with headers_lock:
+            probe_headers = dict(headers)
+        _, discover_result = _probe_protocol_era(client, url, probe_headers)
+        _seed_modern_state_from_discover(modern_state, discover_result)
+        log("protocol era: modern (forced via --protocol-era)")
+    elif protocol_era == "auto":
+        with headers_lock:
+            probe_headers = dict(headers)
+        era, discover_result = _probe_protocol_era(client, url, probe_headers)
+        _seed_modern_state_from_discover(modern_state, discover_result)
+        log(f"protocol era: {era} (auto-detected)")
+    else:
+        era = "legacy"
 
-        When the relay injects a value, it first drops any case-variant the
-        operator pinned via ``-H`` (e.g. ``-H 'mcp-protocol-version: x'``), so
-        httpx never serialises TWO ``MCP-Protocol-Version`` / ``Mcp-Session-Id``
-        header lines — a strict 2025-06-18 server treats these as singleton
-        fields and would reject or mis-select. Mirrors the initialize-path strip
-        in ``_dispatch`` / ``_reinitialize``. The strip is gated on the relay
-        actually having a value, so an operator pin still rides through on the
-        paths where the relay manages no value of its own.
+    if era == "modern" and cold_start_login is not None:
+        # _cold_start_loop's _reinitialize sends a legacy `initialize`
+        # handshake to establish a session — meaningless on a path with no
+        # sessions at all. Disable rather than silently sending a legacy
+        # handshake to a modern remote.
+        log(
+            "cold-start (--oauth-eager) is not supported on the modern "
+            "protocol era; disabling cold-start for this session"
+        )
+        cold_start_login = None
+
+    def _prepare_headers(line: str) -> dict[str, str]:
+        """Build per-request headers for ``line``.
+
+        LEGACY era (the ``else`` branch below): session + protocol version,
+        completely UNCHANGED from pre-#270 — this is the code that makes
+        acceptance criterion #3 ("byte-identical" wire bytes against a
+        legacy remote) hold structurally rather than by assertion. ``line``
+        is accepted but ignored on this branch.
+
+        MODERN era: per spec rev 2026-07-28 there is no ``Mcp-Session-Id`` at
+        all (the relay's own ``session_id`` never gets set on this path — see
+        run()'s three session-adoption sites, all additionally gated on
+        ``era == "legacy"``); instead every request carries
+        ``MCP-Protocol-Version`` (the negotiated modern version, from
+        ``modern_state.negotiated_version``) plus THIS request's
+        ``Mcp-Method``/``Mcp-Name`` (``_mcp_request_headers``, mirroring
+        ``_extract_method_and_name``).
+
+        Both branches drop any case-variant the operator pinned via ``-H``
+        before re-adding the relay's own value, so httpx never serialises two
+        header lines for the same field — a strict server treats these as
+        singleton fields and would reject or mis-select.
         """
         with headers_lock:
             h = dict(headers)
+        if era == "modern":
+            h = {k: v for k, v in h.items() if k.lower() != "mcp-session-id"}
+            h = {k: v for k, v in h.items() if k.lower() != "mcp-protocol-version"}
+            h["MCP-Protocol-Version"] = (
+                modern_state.negotiated_version or _MODERN_PROTOCOL_VERSION_DEFAULT
+            )
+            mcp_headers = _mcp_request_headers(line)
+            if "Mcp-Method" in mcp_headers:
+                h = {k: v for k, v in h.items() if k.lower() != "mcp-method"}
+                h["Mcp-Method"] = mcp_headers["Mcp-Method"]
+            if "Mcp-Name" in mcp_headers:
+                h = {k: v for k, v in h.items() if k.lower() != "mcp-name"}
+                h["Mcp-Name"] = mcp_headers["Mcp-Name"]
+            return h
         # session_id / protocol_version are mutated only by this (main) thread,
         # so they need no lock; only the shared ``headers`` object is contended.
         if session_id:
@@ -2439,7 +2955,36 @@ def run(
                             _emit(reply, tracker)
                         continue
 
-                req_headers = _prepare_headers()
+                # Track a client-set logging level on BOTH eras (a cheap,
+                # side-effect-free read — see _extract_log_level) so a level
+                # set before/while still resolving is available if the modern
+                # path later needs to mirror it into _meta.
+                level = _extract_log_level(line)
+                if level is not None:
+                    modern_state.log_level = level
+
+                if era == "modern":
+                    # initialize / notifications/initialized /
+                    # notifications/cancelled do not exist on the wire to a
+                    # modern remote — see _handle_modern_special_method.
+                    handled, modern_reply = _handle_modern_special_method(
+                        line, req_id, modern_state
+                    )
+                    if handled:
+                        if modern_reply is not None:
+                            _emit(modern_reply, tracker)
+                        continue
+                    # Every other request/notification carries the modern
+                    # per-request _meta block (protocol version, client
+                    # capabilities, optionally clientInfo/logLevel). Reassigning
+                    # `line` here means every dispatch call site below (initial
+                    # + the 401/403 retry branches, which all re-read the SAME
+                    # `line` variable) automatically sends the meta-injected
+                    # body — no separate threading of the injected content
+                    # through the recovery branches.
+                    line = _inject_modern_meta(line, modern_state)
+
+                req_headers = _prepare_headers(line)
 
                 def _dispatch(content: str, h: dict[str, str]) -> _StreamResult | None:
                     nonlocal protocol_version
@@ -2567,7 +3112,8 @@ def run(
                 # admits 202, so exclude a 202-to-request explicitly, matching the
                 # authoritative post-recovery gate's `not is_error`.
                 if (
-                    result.session_id
+                    era == "legacy"
+                    and result.session_id
                     and not (result.status_code == 202 and req_has_id)
                     and (result.status_code < 400 or feeds_recovery)
                 ):
@@ -2607,7 +3153,7 @@ def run(
                     if new_headers:
                         with headers_lock:
                             headers.update(new_headers)
-                        req_headers = _prepare_headers()
+                        req_headers = _prepare_headers(line)
                         result = _dispatch(line, req_headers)
                         if result is None:
                             # Transport exhaustion on the refreshed retry (None is
@@ -2629,7 +3175,8 @@ def run(
                         # excluded: its branch reinitializes from scratch, ignoring any
                         # rotated id, and a cold 404 must stay a terminal error.)
                         if (
-                            result.session_id
+                            era == "legacy"
+                            and result.session_id
                             and not (
                                 result.status_code == 202 and req_has_id
                             )  #: a 202-to-request is errored, not adopted
@@ -2668,7 +3215,7 @@ def run(
                         if new_headers:
                             with headers_lock:
                                 headers.update(new_headers)
-                            req_headers = _prepare_headers()
+                            req_headers = _prepare_headers(line)
                             result = _dispatch(line, req_headers)
                             if result is None:
                                 # Transport exhaustion on the stepped-up retry (None
@@ -2681,7 +3228,8 @@ def run(
                             # scratch (ignoring any rotated id), so a terminal status
                             # echoing a session id must not poison the next line.
                             if (
-                                result.session_id
+                                era == "legacy"
+                                and result.session_id
                                 and not (result.status_code == 202 and req_has_id)
                                 and result.status_code < 400
                             ):  #: a 202-to-request is errored, not adopted
@@ -2694,8 +3242,13 @@ def run(
                                 )
                             continue
 
-                # Session expired (404) — reset, re-initialize, then retry
-                if result.status_code == 404 and session_id:
+                # Session expired (404) — reset, re-initialize, then retry.
+                # LEGACY ONLY: this is dead code on the modern era regardless
+                # (session_id can never be set there — every adoption site
+                # above is gated on era == "legacy" — but the explicit
+                # conjunct documents that a 404 on the modern path is a
+                # genuine "not found", never a session recovery trigger).
+                if era == "legacy" and result.status_code == 404 and session_id:
                     log("session expired, re-initializing and retrying")
                     session_id = None
                     with headers_lock:
@@ -2714,7 +3267,7 @@ def run(
                     if renegotiated and renegotiated != protocol_version:
                         log(f"re-negotiated MCP protocol version: {renegotiated}")
                         protocol_version = renegotiated
-                    req_headers = _prepare_headers()
+                    req_headers = _prepare_headers(line)
                     result = _dispatch(line, req_headers)
                     if result is None:
                         continue
@@ -2740,7 +3293,7 @@ def run(
                 # known-bad state forward. The inline 401/403 re-adoptions above
                 # stay unconditional — they feed the very next chained recovery
                 # dispatch, not the next stdin line.
-                if result.session_id and not is_error:
+                if era == "legacy" and result.session_id and not is_error:
                     session_id = result.session_id
 
                 if is_error:
