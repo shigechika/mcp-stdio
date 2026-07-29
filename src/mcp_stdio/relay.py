@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import email.utils
 import json
 import math
@@ -291,6 +292,117 @@ def _extract_protocol_version(payload: str) -> str | None:
     if isinstance(pv, str) and pv and all(0x21 <= ord(c) <= 0x7E for c in pv):
         return pv
     return None
+
+
+# MCP request metadata headers (spec rev 2026-07-28, "Request Metadata",
+# SEP-2243). Every Streamable HTTP POST must mirror the request's `method`
+# into an `Mcp-Method` header; `tools/call` / `resources/read` / `prompts/get`
+# additionally mirror `params.name` (or `params.uri` for resources/read) into
+# `Mcp-Name`. A spec-strict 2026-07-28 server rejects a request missing these
+# with 400 + HeaderMismatch (-32020); a pre-2026-07-28 server has never heard
+# of them and, per RFC 9110, an unrecognized header is simply ignored — so
+# sending them unconditionally is safe against every era, not just modern
+# ones. `x-mcp-header` / `Mcp-Param-{Name}` (custom per-tool headers mirrored
+# from `inputSchema` annotations) is a separate, materially larger feature —
+# it requires caching each tool's schema from `tools/list` responses to know
+# which call arguments to mirror — and is deliberately out of scope here.
+#
+# Batches: MCP removed JSON-RPC batching in spec rev 2025-06-18, and a batch
+# has no single top-level `method` to mirror, so `_extract_method_and_name`
+# only recognises a top-level JSON object; an array (or unparseable content)
+# yields `(None, None)` and the caller sends neither header, mirroring how
+# `_extract_id_and_presence` already treats a non-object line as headerless.
+_NAME_BEARING_METHODS = {
+    "tools/call": "name",
+    "resources/read": "uri",
+    "prompts/get": "name",
+}
+
+
+def _extract_method_and_name(line: str) -> tuple[str | None, str | None]:
+    """Return ``(method, name_or_uri)`` for the ``Mcp-Method``/``Mcp-Name`` headers.
+
+    ``name_or_uri`` is populated only for the three methods
+    ``_NAME_BEARING_METHODS`` lists; every other method (``initialize``,
+    ``server/discover``, the plain list methods, notifications, ...) returns
+    ``(method, None)`` so the caller sends ``Mcp-Method`` alone, matching the
+    spec's "Required For" column. Unlike ``_is_initialize_request`` there is
+    no cheap-regex prefilter: this runs once per dispatched request (not on
+    every stdin line — pagination/id-extraction already gate the hot path),
+    so paying for one more ``json.loads`` here is not a new cost, just a new
+    read of a parse already being done.
+    """
+    try:
+        msg = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return None, None
+    if not isinstance(msg, dict):
+        return None, None  # batch array, or a scalar — no single method
+    method = msg.get("method")
+    if not isinstance(method, str):
+        return None, None
+    name_key = _NAME_BEARING_METHODS.get(method)
+    if name_key is None:
+        return method, None
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return method, None
+    value = params.get(name_key)
+    return method, value if isinstance(value, str) else None
+
+
+_BASE64_SENTINEL_RE = re.compile(r"\A=\?base64\?.*\?=\Z", re.DOTALL)
+
+
+def _is_header_safe_ascii(value: str) -> bool:
+    """True if ``value`` can ride an HTTP header verbatim, unencoded.
+
+    Per RFC 9110 field-value syntax (spec rev 2026-07-28 "Value Encoding"),
+    the safe set is visible ASCII (0x21-0x7E) plus space (0x20) and
+    horizontal tab (0x09) — but the spec additionally forbids
+    leading/trailing whitespace even though the wire grammar would allow it,
+    so a value with either is NOT header-safe here and must be encoded.
+    """
+    if not value:
+        return True
+    if value[0] in (" ", "\t") or value[-1] in (" ", "\t"):
+        return False
+    return all(c in (" ", "\t") or 0x21 <= ord(c) <= 0x7E for c in value)
+
+
+def _encode_mcp_name(value: str) -> str:
+    """Encode a ``Mcp-Name`` header value per spec rev 2026-07-28 Value Encoding.
+
+    A plain ASCII value with no leading/trailing whitespace, that does not
+    itself look like the sentinel, rides verbatim. Everything else —
+    non-ASCII, control characters, leading/trailing whitespace, or a value
+    that would otherwise be mistaken for an already-encoded sentinel — is
+    Base64-encoded as ``=?base64?{...}?=``: the exact literal markers the
+    spec mandates (lowercase, no charset segment — unlike MIME
+    encoded-words). ``Mcp-Method`` never needs this: method names are
+    protocol-fixed identifiers (e.g. ``tools/call``), never arbitrary data,
+    so only ``Mcp-Name`` (mirroring a tool/prompt name or a resource URI,
+    both user- or server-supplied) can require it.
+    """
+    if _is_header_safe_ascii(value) and not _BASE64_SENTINEL_RE.match(value):
+        return value
+    encoded = base64.b64encode(value.encode("utf-8")).decode("ascii")
+    return f"=?base64?{encoded}?="
+
+
+def _mcp_request_headers(line: str) -> dict[str, str]:
+    """Build the ``Mcp-Method``/``Mcp-Name`` headers for one dispatched line.
+
+    Returns ``{}`` for a batch / unparseable / methodless line — there is no
+    single method to report, so the caller simply adds nothing.
+    """
+    method, name = _extract_method_and_name(line)
+    if method is None:
+        return {}
+    result = {"Mcp-Method": method}
+    if name is not None:
+        result["Mcp-Name"] = _encode_mcp_name(name)
+    return result
 
 
 # Cancel-aware response filter (MCP cancellation spec SHOULDs).
@@ -1158,6 +1270,49 @@ def _detect_paginated_list(line: str) -> tuple[str, str] | None:
     return method, PAGINATED_LIST_METHODS[method]
 
 
+# CacheableResult fields (spec rev 2026-07-28, SEP-2549): ``tools/list`` /
+# ``prompts/list`` / ``resources/list`` / ``resources/read`` /
+# ``resources/templates/list`` results now carry ``ttlMs`` (a freshness
+# hint, in milliseconds) and ``cacheScope`` (``"public"`` lets shared
+# intermediaries cache the response; ``"private"`` restricts caching to the
+# requesting client). Rank higher = more restrictive, so
+# ``_merge_cacheable_field`` can compare across pages without special-casing
+# each field's own value semantics.
+_CACHE_SCOPE_RESTRICTIVENESS = {"public": 0, "private": 1}
+_CACHEABLE_MERGE_FIELDS = frozenset({"ttlMs", "cacheScope"})
+
+
+def _merge_cacheable_field(merged_result: dict[str, Any], key: str, value: Any) -> None:
+    """Merge one page's ``ttlMs``/``cacheScope`` into ``merged_result`` in place.
+
+    ``ttlMs``: keep the MINIMUM seen across pages — the merged list's true
+    freshness bound is set by its least-fresh member, not by whichever page
+    happened to be merged last. ``cacheScope``: keep the MOST RESTRICTIVE
+    value seen (``"private"`` wins over ``"public"``) — a merged list that
+    combines a private-scoped page with a public-scoped one must not be
+    reported as publicly cacheable, or a shared intermediary could legally
+    cache and leak the private page's items.
+
+    A value of the wrong type (a non-compliant server) is ignored rather
+    than raising or silently adopted — same "degrade, don't guess" posture
+    as ``_extract_protocol_version``.
+    """
+    if key == "ttlMs":
+        if not isinstance(value, (int, float)):
+            return
+        existing = merged_result.get("ttlMs")
+        if not isinstance(existing, (int, float)) or value < existing:
+            merged_result["ttlMs"] = value
+        return
+    if key == "cacheScope":
+        new_rank = _CACHE_SCOPE_RESTRICTIVENESS.get(value)
+        if new_rank is None:
+            return
+        existing_rank = _CACHE_SCOPE_RESTRICTIVENESS.get(merged_result.get("cacheScope"), -1)
+        if new_rank > existing_rank:
+            merged_result["cacheScope"] = value
+
+
 def _paginate_and_stream(
     client: httpx.Client,
     url: str,
@@ -1283,9 +1438,25 @@ def _paginate_and_stream(
             # Preserve top-level result fields (e.g. a late ``_meta``) that arrive
             # only on a later page — last-write-wins. The accumulated list and the
             # ``nextCursor`` are managed explicitly above, so skip them here.
+            #
+            # ``ttlMs``/``cacheScope`` (``CacheableResult``, spec rev 2026-07-28)
+            # are excluded from last-write-wins and merged via
+            # ``_merge_cacheable_field`` instead: last-write-wins can UNDERSTATE
+            # the true constraint on the combined list — e.g. page 1 says
+            # cacheScope="private" (must not be shared-cached) but page 2 says
+            # "public", and naive last-write-wins would report the merged list
+            # (whose page-1-derived items are still private-scoped data) as
+            # publicly cacheable, which a shared intermediary could then legally
+            # cache and leak. ``ttlMs`` has the same shape of bug: the merged
+            # list's true freshness bound is its LEAST fresh member, not
+            # whichever page happened to arrive last.
             for k, v in page_result.items():
-                if k not in (result_key, "nextCursor"):
-                    merged_result[k] = v
+                if k in (result_key, "nextCursor"):
+                    continue
+                if k in _CACHEABLE_MERGE_FIELDS:
+                    _merge_cacheable_field(merged_result, k, v)
+                    continue
+                merged_result[k] = v
 
         next_cursor = page_result.get("nextCursor")
         # An empty-string nextCursor is treated as terminal alongside null /
@@ -1539,8 +1710,14 @@ def _reinitialize(
     init_headers = {
         k: v
         for k, v in headers.items()
-        if k.lower() not in ("mcp-protocol-version", "mcp-session-id")
+        if k.lower() not in ("mcp-protocol-version", "mcp-session-id", "mcp-method")
     }
+    # Mcp-Method (spec rev 2026-07-28): required on every Streamable HTTP POST,
+    # including this internally-synthesized recovery handshake — a dual-era
+    # server that has started validating it even on the legacy initialize
+    # path must not see it missing. initialize has no params.name/uri, so
+    # Mcp-Name does not apply here (see _NAME_BEARING_METHODS).
+    init_headers["Mcp-Method"] = "initialize"
     try:
         resp = client.post(url, content=initialize_msg, headers=init_headers)
     except httpx.HTTPError as e:
@@ -1767,6 +1944,89 @@ def _check_connection_sse(
         client.close()
 
 
+def _parse_streamable_response(resp: httpx.Response) -> dict[str, Any] | None:
+    """Parse a Streamable HTTP POST response body (JSON or SSE) into a dict.
+
+    Shared by the ``initialize`` and ``server/discover`` probes in
+    ``check_connection``: both need the first JSON-RPC message on the
+    response that carries a ``result`` or ``error``, whether the body is a
+    plain JSON object or an SSE stream that may interleave notifications /
+    server-initiated requests first (see the keep-reading note this used to
+    carry inline, preserved here since both probes now share it).
+    """
+    content_type = resp.headers.get("content-type", "")
+    if "text/event-stream" in content_type:
+        for event_type, payload in _iter_sse_events(_split_sse_text(resp.text)):
+            if event_type != "message":
+                continue
+            try:
+                parsed = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict) and ("result" in parsed or "error" in parsed):
+                return parsed
+        return None
+    try:
+        return json.loads(resp.text)
+    except json.JSONDecodeError:
+        return None
+
+
+def _report_discover(result_data: dict[str, Any] | None) -> bool:
+    """Log a parsed ``server/discover`` response and return the probe verdict.
+
+    Mirrors ``_report_initialize``'s verdict rule: False only for a JSON-RPC
+    error; a missing/unparseable result still counts as "the server
+    responded" (spec rev 2026-07-28, ``server/discover``'s ``DiscoverResult``).
+    """
+    if result_data and "result" in result_data:
+        result = result_data["result"]
+        if not isinstance(result, dict):
+            log("✓ Server responded (discover result is not an object)")
+            return True
+        meta = result.get("_meta")
+        server_info = (
+            meta.get("io.modelcontextprotocol/serverInfo", {})
+            if isinstance(meta, dict)
+            else {}
+        )
+        name = server_info.get("name", "unknown") if isinstance(server_info, dict) else "unknown"
+        version = server_info.get("version", "?") if isinstance(server_info, dict) else "?"
+        versions = result.get("supportedVersions")
+        versions_str = versions if isinstance(versions, list) else "?"
+        log(
+            f"✓ MCP server/discover: server={name} v{version}, "
+            f"supportedVersions={versions_str}"
+        )
+        caps = result.get("capabilities")
+        caps = caps if isinstance(caps, dict) else {}
+        tools = "yes" if "tools" in caps else "no"
+        resources = "yes" if "resources" in caps else "no"
+        prompts = "yes" if "prompts" in caps else "no"
+        log(f"✓ Capabilities: tools={tools}, resources={resources}, prompts={prompts}")
+        return True
+    if result_data and "error" in result_data:
+        err = result_data["error"]
+        log(f"✗ MCP error: {err.get('message', err)}")
+        return False
+    log("✓ Server responded (could not parse discover result)")
+    return True
+
+
+# HTTP statuses on which the legacy `initialize` probe below falls back to a
+# `server/discover` retry (spec rev 2026-07-28, "Backward Compatibility" /
+# "Protocol Version Header"): 404 is what the transport spec mandates for an
+# unrecognized method, which `initialize` now IS on a server that has fully
+# removed the legacy handshake; 400 is what the same server returns when the
+# request is also missing required per-request `_meta`/headers a modern-only
+# server demands. Neither code is unique to "server doesn't speak legacy" —
+# a 400/404 can equally mean a genuinely broken/misconfigured endpoint — so
+# this is a best-effort diagnostic heuristic, not a protocol requirement:
+# worst case, a broken endpoint gets one extra POST before check_connection
+# reports it down.
+_DISCOVER_FALLBACK_STATUSES = (400, 404)
+
+
 def check_connection(
     url: str,
     headers: dict[str, str],
@@ -1781,6 +2041,12 @@ def check_connection(
     the probe: ``"streamable-http"`` (default) POSTs ``initialize`` directly,
     while ``"sse"`` runs the legacy GET/endpoint/POST handshake so the probe
     matches what ``run_sse`` would actually do.
+
+    On the Streamable HTTP path, a 400/404 response to the ``initialize``
+    probe retries once with ``server/discover`` (spec rev 2026-07-28) before
+    reporting the connection down — a server that has dropped the legacy
+    handshake entirely no longer recognizes ``initialize`` at all, and would
+    otherwise be misreported as unreachable rather than "alive, modern-only".
     """
     if transport == "sse":
         return _check_connection_sse(
@@ -1802,6 +2068,11 @@ def check_connection(
             },
         }
     )
+    # Mcp-Method (spec rev 2026-07-28): required on every Streamable HTTP
+    # POST, including this first-contact probe. initialize has no
+    # params.name/uri, so Mcp-Name does not apply (_NAME_BEARING_METHODS).
+    probe_headers = {k: v for k, v in headers.items() if k.lower() != "mcp-method"}
+    probe_headers["Mcp-Method"] = "initialize"
 
     client = httpx.Client(
         timeout=httpx.Timeout(connect=timeout_connect, read=timeout_read, write=30, pool=10)
@@ -1809,9 +2080,39 @@ def check_connection(
 
     try:
         log(f"testing connection to {url}")
-        resp = client.post(url, content=initialize_msg, headers=headers)
+        resp = client.post(url, content=initialize_msg, headers=probe_headers)
 
         if resp.status_code != 200:
+            if resp.status_code in _DISCOVER_FALLBACK_STATUSES:
+                log(
+                    f"initialize probe got HTTP {resp.status_code}; retrying "
+                    "with server/discover in case the server dropped the "
+                    "legacy handshake (spec rev 2026-07-28)"
+                )
+                discover_msg = json.dumps(
+                    {"jsonrpc": "2.0", "method": "server/discover", "id": 2, "params": {}}
+                )
+                discover_headers = {
+                    k: v for k, v in headers.items() if k.lower() != "mcp-method"
+                }
+                discover_headers["Mcp-Method"] = "server/discover"
+                try:
+                    discover_resp = client.post(
+                        url, content=discover_msg, headers=discover_headers
+                    )
+                except httpx.HTTPError as e:
+                    log(f"✗ server/discover retry failed: {e}")
+                    log(f"✗ HTTP {resp.status_code}")
+                    return False
+                if discover_resp.status_code != 200:
+                    log(f"✗ server/discover retry also failed: HTTP {discover_resp.status_code}")
+                    log(f"✗ HTTP {resp.status_code}")
+                    return False
+                log(f"✓ Connected via server/discover (HTTP {discover_resp.status_code})")
+                ok = _report_discover(_parse_streamable_response(discover_resp))
+                if "mcp-session-id" in discover_resp.headers:
+                    log(f"✓ Session ID: {discover_resp.headers['mcp-session-id']}")
+                return ok
             # Do not surface the response body — server error responses
             # commonly carry session IDs, stack traces, or echoed request
             # data. The status code alone is the right operational signal
@@ -1821,37 +2122,7 @@ def check_connection(
 
         log(f"✓ Connected (HTTP {resp.status_code})")
 
-        # Parse initialize response from JSON or SSE
-        content_type = resp.headers.get("content-type", "")
-        result_data: dict[str, Any] | None = None
-
-        if "text/event-stream" in content_type:
-            for event_type, payload in _iter_sse_events(_split_sse_text(resp.text)):
-                if event_type != "message":
-                    continue
-                try:
-                    parsed = json.loads(payload)
-                except json.JSONDecodeError:
-                    continue
-                # A compliant server MAY interleave notifications / server-
-                # initiated requests on the POST's SSE stream BEFORE the JSON-RPC
-                # response, so keep reading until a message carries result/error —
-                # matching the keep-reading gate in _post_parsed /
-                # _check_connection_sse. Breaking on the first message would
-                # mis-report a server that sends a notification frame first as
-                # "could not parse initialize result".
-                if isinstance(parsed, dict) and (
-                    "result" in parsed or "error" in parsed
-                ):
-                    result_data = parsed
-                    break
-        else:
-            try:
-                result_data = json.loads(resp.text)
-            except json.JSONDecodeError:
-                pass
-
-        ok = _report_initialize(result_data)
+        ok = _report_initialize(_parse_streamable_response(resp))
 
         if "mcp-session-id" in resp.headers:
             log(f"✓ Session ID: {resp.headers['mcp-session-id']}")
@@ -2119,8 +2390,9 @@ def run(
     headers_lock = threading.Lock()
     refresh_lock = threading.Lock()
 
-    def _prepare_headers() -> dict[str, str]:
-        """Build per-request headers with the current session + protocol version.
+    def _prepare_headers(line: str) -> dict[str, str]:
+        """Build per-request headers for ``line``: session + protocol version
+        + this request's ``Mcp-Method``/``Mcp-Name`` (spec rev 2026-07-28).
 
         When the relay injects a value, it first drops any case-variant the
         operator pinned via ``-H`` (e.g. ``-H 'mcp-protocol-version: x'``), so
@@ -2129,7 +2401,15 @@ def run(
         fields and would reject or mis-select. Mirrors the initialize-path strip
         in ``_dispatch`` / ``_reinitialize``. The strip is gated on the relay
         actually having a value, so an operator pin still rides through on the
-        paths where the relay manages no value of its own.
+        paths where the relay manages no value of its own — including
+        ``Mcp-Method``/``Mcp-Name`` for a batch/methodless line, where
+        ``_mcp_request_headers`` contributes neither key.
+
+        Every one of this function's call sites re-dispatches the SAME
+        ``line`` on retry (401 refresh, 403 step-up, 404 reinit — see ``run``),
+        so recomputing the method/name headers here on each retry is
+        automatically consistent with the request actually being sent, with
+        no separate threading of per-line state through the recovery branches.
         """
         with headers_lock:
             h = dict(headers)
@@ -2141,6 +2421,13 @@ def run(
         if protocol_version:
             h = {k: v for k, v in h.items() if k.lower() != "mcp-protocol-version"}
             h["MCP-Protocol-Version"] = protocol_version
+        mcp_headers = _mcp_request_headers(line)
+        if "Mcp-Method" in mcp_headers:
+            h = {k: v for k, v in h.items() if k.lower() != "mcp-method"}
+            h["Mcp-Method"] = mcp_headers["Mcp-Method"]
+        if "Mcp-Name" in mcp_headers:
+            h = {k: v for k, v in h.items() if k.lower() != "mcp-name"}
+            h["Mcp-Name"] = mcp_headers["Mcp-Name"]
         return h
 
     refresh_timer, refresh_stop = _start_proactive_refresh(
@@ -2225,7 +2512,7 @@ def run(
                             _emit(reply, tracker)
                         continue
 
-                req_headers = _prepare_headers()
+                req_headers = _prepare_headers(line)
 
                 def _dispatch(content: str, h: dict[str, str]) -> _StreamResult | None:
                     nonlocal protocol_version
@@ -2382,7 +2669,7 @@ def run(
                     if new_headers:
                         with headers_lock:
                             headers.update(new_headers)
-                        req_headers = _prepare_headers()
+                        req_headers = _prepare_headers(line)
                         result = _dispatch(line, req_headers)
                         if result is None:
                             # Transport exhaustion on the refreshed retry (None is
@@ -2441,7 +2728,7 @@ def run(
                         if new_headers:
                             with headers_lock:
                                 headers.update(new_headers)
-                            req_headers = _prepare_headers()
+                            req_headers = _prepare_headers(line)
                             result = _dispatch(line, req_headers)
                             if result is None:
                                 # Transport exhaustion on the stepped-up retry (None
@@ -2485,7 +2772,7 @@ def run(
                     if renegotiated and renegotiated != protocol_version:
                         log(f"re-negotiated MCP protocol version: {renegotiated}")
                         protocol_version = renegotiated
-                    req_headers = _prepare_headers()
+                    req_headers = _prepare_headers(line)
                     result = _dispatch(line, req_headers)
                     if result is None:
                         continue

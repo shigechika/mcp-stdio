@@ -42,6 +42,9 @@ from mcp_stdio.relay import (
     _post_and_stream,
     _cold_start_loop,
     _cold_start_response,
+    _encode_mcp_name,
+    _extract_method_and_name,
+    _merge_cacheable_field,
     _proactive_refresh_loop,
     _reinitialize,
     _start_proactive_refresh,
@@ -795,6 +798,97 @@ class TestIsInitializeRequest:
     def test_non_matching_line_short_circuits_to_false(self):
         # No substring → cheap regex returns False without a parse.
         assert _is_initialize_request('{"method":"tools/list","id":1}') is False
+
+
+class TestExtractMethodAndName:
+    """_extract_method_and_name feeds the Mcp-Method/Mcp-Name headers
+    (spec rev 2026-07-28, SEP-2243)."""
+
+    def test_tools_call_returns_params_name(self):
+        line = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "get_weather", "arguments": {}}}
+        )
+        assert _extract_method_and_name(line) == ("tools/call", "get_weather")
+
+    def test_resources_read_returns_params_uri(self):
+        line = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "resources/read",
+             "params": {"uri": "file:///projects/config.json"}}
+        )
+        assert _extract_method_and_name(line) == (
+            "resources/read", "file:///projects/config.json"
+        )
+
+    def test_prompts_get_returns_params_name(self):
+        line = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "prompts/get",
+             "params": {"name": "greeting"}}
+        )
+        assert _extract_method_and_name(line) == ("prompts/get", "greeting")
+
+    def test_non_name_bearing_method_returns_none_name(self):
+        """tools/list has no params.name/uri — Mcp-Name must not be sent."""
+        line = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        assert _extract_method_and_name(line) == ("tools/list", None)
+
+    def test_initialize_returns_none_name(self):
+        line = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+        )
+        assert _extract_method_and_name(line) == ("initialize", None)
+
+    def test_tools_call_missing_params_returns_none_name(self):
+        """A malformed tools/call with no params must not crash — degrade to
+        (method, None) so the caller just omits Mcp-Name."""
+        line = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call"})
+        assert _extract_method_and_name(line) == ("tools/call", None)
+
+    def test_name_not_a_string_returns_none_name(self):
+        line = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": 42}}
+        )
+        assert _extract_method_and_name(line) == ("tools/call", None)
+
+    def test_batch_array_returns_none_none(self):
+        """MCP removed batching in spec rev 2025-06-18; a batch has no single
+        top-level method, so both headers are omitted for it."""
+        line = json.dumps([{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}])
+        assert _extract_method_and_name(line) == (None, None)
+
+    def test_malformed_json_returns_none_none(self):
+        assert _extract_method_and_name("{not json") == (None, None)
+
+    def test_missing_method_returns_none_none(self):
+        assert _extract_method_and_name('{"jsonrpc":"2.0","id":1}') == (None, None)
+
+
+class TestEncodeMcpName:
+    """_encode_mcp_name implements the Value Encoding rules of spec rev
+    2026-07-28 exactly — the literal examples below are taken verbatim from
+    the spec's own encoding-examples table."""
+
+    def test_plain_ascii_rides_verbatim(self):
+        assert _encode_mcp_name("us-west1") == "us-west1"
+
+    def test_non_ascii_is_base64_sentinel_encoded(self):
+        assert _encode_mcp_name("Hello, 世界") == "=?base64?SGVsbG8sIOS4lueVjA==?="
+
+    def test_leading_trailing_whitespace_is_encoded(self):
+        assert _encode_mcp_name(" padded ") == "=?base64?IHBhZGRlZCA=?="
+
+    def test_embedded_newline_is_encoded(self):
+        assert _encode_mcp_name("line1\nline2") == "=?base64?bGluZTEKbGluZTI=?="
+
+    def test_value_matching_sentinel_pattern_is_reencoded(self):
+        """A plain-ASCII value that itself looks like the sentinel must still
+        be encoded, per spec — otherwise a server cannot distinguish a literal
+        value from an actually-encoded one."""
+        assert (
+            _encode_mcp_name("=?base64?literal?=")
+            == "=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?="
+        )
 
 
 class TestIterSseEvents:
@@ -2716,6 +2810,159 @@ class TestProtocolVersionHeader:
         assert reqs[4].headers["mcp-protocol-version"] == "2025-03-26"  # retry
 
 
+class TestMcpMethodNameHeader:
+    """Mcp-Method / Mcp-Name request headers (spec rev 2026-07-28, SEP-2243).
+
+    Required on every Streamable HTTP POST so a server that has moved to the
+    new per-request-metadata model can validate a request without a body
+    parse; a pre-2026-07-28 server has never heard of these headers and, per
+    RFC 9110, ignores an unrecognized one — so sending them unconditionally
+    is safe against every server era, not just modern ones.
+    """
+
+    def _run_with_stdin(self, stdin_lines):
+        stdin_data = "\n".join(stdin_lines) + "\n"
+        stdout = StringIO()
+        with patch("sys.stdin", StringIO(stdin_data)), patch("sys.stdout", stdout):
+            run("https://example.com/mcp", {"Content-Type": "application/json"})
+        return stdout.getvalue()
+
+    def test_tools_call_carries_method_and_name(self, httpx_mock):
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            ['{"jsonrpc":"2.0","method":"tools/call","id":1,'
+             '"params":{"name":"get_weather","arguments":{}}}']
+        )
+        req = httpx_mock.get_requests()[0]
+        assert req.headers["mcp-method"] == "tools/call"
+        assert req.headers["mcp-name"] == "get_weather"
+
+    def test_resources_read_carries_uri_as_name(self, httpx_mock):
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            ['{"jsonrpc":"2.0","method":"resources/read","id":1,'
+             '"params":{"uri":"file:///projects/config.json"}}']
+        )
+        req = httpx_mock.get_requests()[0]
+        assert req.headers["mcp-method"] == "resources/read"
+        assert req.headers["mcp-name"] == "file:///projects/config.json"
+
+    def test_tools_list_carries_method_but_no_name(self, httpx_mock):
+        """tools/list has no params.name/uri — Mcp-Name must be absent, not
+        sent empty."""
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"tools":[]},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            ['{"jsonrpc":"2.0","method":"tools/list","id":1,"params":{"cursor":"x"}}']
+        )
+        req = httpx_mock.get_requests()[0]
+        assert req.headers["mcp-method"] == "tools/list"
+        assert "mcp-name" not in req.headers
+
+    def test_non_ascii_tool_name_is_base64_sentinel_encoded(self, httpx_mock):
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            [json.dumps(
+                {"jsonrpc": "2.0", "method": "tools/call", "id": 1,
+                 "params": {"name": "Hello, 世界", "arguments": {}}}
+            )]
+        )
+        req = httpx_mock.get_requests()[0]
+        assert req.headers["mcp-name"] == "=?base64?SGVsbG8sIOS4lueVjA==?="
+
+    def test_batch_request_carries_neither_header(self, httpx_mock):
+        """MCP removed batching in spec rev 2025-06-18; a batch has no single
+        top-level method, so neither header is sent for it."""
+        httpx_mock.add_response(
+            text='[{"jsonrpc":"2.0","result":{},"id":1}]',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            [json.dumps([{"jsonrpc": "2.0", "method": "tools/list", "id": 1}])]
+        )
+        req = httpx_mock.get_requests()[0]
+        assert "mcp-method" not in req.headers
+        assert "mcp-name" not in req.headers
+
+    def test_401_retry_recomputes_headers_for_same_line(self, httpx_mock):
+        """The 401-refresh retry re-dispatches the SAME line — Mcp-Method/
+        Mcp-Name must appear on the retried request too, not just the first
+        attempt that got the 401."""
+        httpx_mock.add_response(status_code=401, headers={"www-authenticate": "Bearer"})
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+        stdin_data = (
+            '{"jsonrpc":"2.0","method":"tools/call","id":1,'
+            '"params":{"name":"get_weather","arguments":{}}}\n'
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", StringIO(stdin_data)), patch("sys.stdout", stdout):
+            run(
+                "https://example.com/mcp",
+                {"Content-Type": "application/json"},
+                token_refresher=lambda: {"Authorization": "Bearer new-token"},
+            )
+        reqs = httpx_mock.get_requests()
+        assert len(reqs) == 2
+        assert reqs[1].headers["mcp-method"] == "tools/call"
+        assert reqs[1].headers["mcp-name"] == "get_weather"
+
+    def test_initialize_carries_method_but_no_name(self, httpx_mock):
+        httpx_mock.add_response(
+            text='{"jsonrpc":"2.0","result":{"protocolVersion":"2025-06-18"},"id":1}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(['{"jsonrpc":"2.0","method":"initialize","id":1}'])
+        req = httpx_mock.get_requests()[0]
+        assert req.headers["mcp-method"] == "initialize"
+        assert "mcp-name" not in req.headers
+
+
+class TestMergeCacheableField:
+    """_merge_cacheable_field: ttlMs (min) / cacheScope (most restrictive)
+    merge across paginated pages (CacheableResult, spec rev 2026-07-28,
+    SEP-2549)."""
+
+    def test_ttl_ms_keeps_minimum(self):
+        merged = {"ttlMs": 300000}
+        _merge_cacheable_field(merged, "ttlMs", 5000)
+        assert merged["ttlMs"] == 5000
+        # A later, LARGER ttlMs must not override the smaller one already seen.
+        _merge_cacheable_field(merged, "ttlMs", 999999)
+        assert merged["ttlMs"] == 5000
+
+    def test_cache_scope_private_wins_over_public(self):
+        merged = {"cacheScope": "public"}
+        _merge_cacheable_field(merged, "cacheScope", "private")
+        assert merged["cacheScope"] == "private"
+        # A later "public" must not downgrade an already-established "private".
+        _merge_cacheable_field(merged, "cacheScope", "public")
+        assert merged["cacheScope"] == "private"
+
+    def test_non_numeric_ttl_ms_is_ignored(self):
+        merged = {"ttlMs": 100}
+        _merge_cacheable_field(merged, "ttlMs", "not-a-number")
+        assert merged["ttlMs"] == 100
+
+    def test_unknown_cache_scope_value_is_ignored(self):
+        merged = {"cacheScope": "public"}
+        _merge_cacheable_field(merged, "cacheScope", "unknown-value")
+        assert merged["cacheScope"] == "public"
+
+
 # --- step-up authorization (anthropics/claude-code#44652) ---
 
 
@@ -4006,6 +4253,54 @@ class TestPagination:
         assert merged["result"]["tools"] == [{"name": "a"}]
         assert len(httpx_mock.get_requests()) == 2  # original empty + fallback
 
+    def test_cacheable_fields_merge_to_minimum_ttl_and_most_restrictive_scope(
+        self, httpx_mock
+    ):
+        """CacheableResult fields (spec rev 2026-07-28, SEP-2549): merging 3
+        pages must NOT last-write-wins ttlMs/cacheScope — it must take the
+        MINIMUM ttlMs and the MOST RESTRICTIVE cacheScope seen across all
+        pages, or a merged list combining a private-scoped page with a
+        public-scoped one could be reported as publicly cacheable."""
+        page1 = {
+            "jsonrpc": "2.0", "id": 1,
+            "result": {
+                "tools": [{"name": "a"}], "nextCursor": "p2",
+                "ttlMs": 300000, "cacheScope": "public",
+            },
+        }
+        page2 = {
+            "jsonrpc": "2.0", "id": 1,
+            "result": {
+                "tools": [{"name": "b"}], "nextCursor": "p3",
+                "ttlMs": 5000, "cacheScope": "private",
+            },
+        }
+        page3 = {
+            "jsonrpc": "2.0", "id": 1,
+            "result": {
+                "tools": [{"name": "c"}],
+                "ttlMs": 999999, "cacheScope": "public",
+            },
+        }
+        for page in (page1, page2, page3):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=json.dumps(page),
+                headers={"content-type": "application/json"},
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())["result"]
+        assert [t["name"] for t in merged["tools"]] == ["a", "b", "c"]
+        # The least-fresh page (5000ms) bounds the whole merged list, even
+        # though page 3 (arriving last) said a much larger ttlMs.
+        assert merged["ttlMs"] == 5000
+        # page 2's "private" wins over pages 1 and 3's "public", even though
+        # page 3 (arriving last) said "public" again.
+        assert merged["cacheScope"] == "private"
+
 
 # --- check_connection ---
 
@@ -4226,6 +4521,78 @@ class TestCheckConnection:
         assert check_connection(self.URL, dict(self.HEADERS)) is True
         captured = capsys.readouterr()
         assert "sess-xyz" in captured.err
+
+    def test_404_falls_back_to_server_discover(self, httpx_mock):
+        """A server that dropped the legacy handshake entirely (spec rev
+        2026-07-28) returns 404/-32601 for the unrecognized `initialize`
+        method — check_connection must retry with server/discover instead of
+        reporting the (actually healthy, modern) server as down."""
+        httpx_mock.add_response(url=self.URL, status_code=404, text="")
+        discover_body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "resultType": "complete",
+                    "supportedVersions": ["2026-07-28"],
+                    "capabilities": {"tools": {}},
+                    "_meta": {
+                        "io.modelcontextprotocol/serverInfo": {
+                            "name": "modern-server", "version": "2.0.0",
+                        }
+                    },
+                },
+            }
+        )
+        httpx_mock.add_response(
+            url=self.URL, text=discover_body,
+            headers={"content-type": "application/json"},
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+        reqs = httpx_mock.get_requests()
+        assert len(reqs) == 2
+        assert json.loads(reqs[0].content)["method"] == "initialize"
+        assert reqs[0].headers["mcp-method"] == "initialize"
+        assert json.loads(reqs[1].content)["method"] == "server/discover"
+        assert reqs[1].headers["mcp-method"] == "server/discover"
+
+    def test_400_falls_back_to_server_discover(self, httpx_mock):
+        """A modern-only server also uses 400 for a legacy-shaped initialize
+        missing the required per-request _meta/headers — same fallback."""
+        httpx_mock.add_response(url=self.URL, status_code=400, text="")
+        discover_body = json.dumps(
+            {"jsonrpc": "2.0", "id": 2, "result": {"supportedVersions": ["2026-07-28"]}}
+        )
+        httpx_mock.add_response(
+            url=self.URL, text=discover_body,
+            headers={"content-type": "application/json"},
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+
+    def test_discover_fallback_also_failing_reports_down(self, httpx_mock):
+        """If server/discover ALSO fails, the connection is genuinely down —
+        report False, not a crash or a false positive."""
+        httpx_mock.add_response(url=self.URL, status_code=404, text="")
+        httpx_mock.add_response(url=self.URL, status_code=404, text="")
+        assert check_connection(self.URL, dict(self.HEADERS)) is False
+
+    def test_plain_server_error_does_not_trigger_discover_fallback(self, httpx_mock):
+        """A bare 500 is a generic server error, not the specific
+        method-not-recognized signal — must NOT trigger a second POST."""
+        httpx_mock.add_response(url=self.URL, status_code=500, text="oops")
+        assert check_connection(self.URL, dict(self.HEADERS)) is False
+        assert len(httpx_mock.get_requests()) == 1
+
+    def test_initialize_probe_carries_mcp_method_header(self, httpx_mock):
+        body = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2024-11-05"}}
+        )
+        httpx_mock.add_response(
+            text=body, headers={"content-type": "application/json"}
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+        req = httpx_mock.get_requests()[0]
+        assert req.headers["mcp-method"] == "initialize"
 
 
 class TestCheckConnectionSse:
