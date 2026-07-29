@@ -3195,6 +3195,101 @@ class TestPagination:
         # Page 1 contributed an empty list (coerced); page 2 appended its item.
         assert merged["result"]["tools"] == [{"name": "a"}]
 
+    def test_cache_scope_merge_is_most_restrictive_not_last_write(self, httpx_mock):
+        """: page 1 says cacheScope="private", page 2 says "public" — the
+        merged result must still report "private" (most restrictive), not
+        "public" (last-write-wins), or a shared intermediary could legally cache
+        and leak page 1's private-scoped items."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [{"name": "a"}],
+                "cacheScope": "private",
+                "nextCursor": "p2",
+            },
+        }
+        page2 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "b"}], "cacheScope": "public"},
+        }
+        for page in (page1, page2):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=json.dumps(page),
+                headers={"content-type": "application/json"},
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())["result"]
+        assert merged["cacheScope"] == "private"
+        assert merged["tools"] == [{"name": "a"}, {"name": "b"}]
+
+    def test_cache_scope_private_survives_page_omitting_the_field(self, httpx_mock):
+        """: page 1 says cacheScope="private"; page 2 OMITS cacheScope
+        entirely (a page that just doesn't repeat it, not a page asserting
+        "public"). The merge must not reset to unscoped/public — the private
+        constraint established by page 1 must survive a later page's silence."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [{"name": "a"}],
+                "cacheScope": "private",
+                "nextCursor": "p2",
+            },
+        }
+        page2 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "b"}]},  # no cacheScope key at all
+        }
+        for page in (page1, page2):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=json.dumps(page),
+                headers={"content-type": "application/json"},
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())["result"]
+        assert merged["cacheScope"] == "private"
+
+    def test_ttl_ms_merge_is_minimum_not_last_write(self, httpx_mock):
+        """: page 1 ttlMs=5000, page 2 ttlMs=60000 — the merged list's
+        true freshness bound is its LEAST fresh member, so the merge must keep
+        the MINIMUM (5000). Last-write-wins would instead report 60000 (page
+        2's larger, staler-tolerant value), overstating the combined list's
+        freshness. Page 1's value is deliberately the smaller one so the two
+        merge strategies disagree and this test actually discriminates them."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "a"}], "ttlMs": 5000, "nextCursor": "p2"},
+        }
+        page2 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "b"}], "ttlMs": 60000},
+        }
+        for page in (page1, page2):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=json.dumps(page),
+                headers={"content-type": "application/json"},
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())["result"]
+        assert merged["ttlMs"] == 5000
+
     def test_paginated_notification_no_id_produces_no_response(self, httpx_mock):
         """: a list method sent as a NOTIFICATION (no id key) must get
         NO response — the merged-response emit is gated on has_id, mirroring every
@@ -4104,6 +4199,90 @@ class TestCheckConnection:
     def test_non_200_returns_false(self, httpx_mock):
         httpx_mock.add_response(status_code=500, text="oops")
         assert check_connection(self.URL, dict(self.HEADERS)) is False
+
+    def test_400_falls_back_to_discover_and_succeeds(self, httpx_mock, capsys):
+        """: a spec rev 2026-07-28 server that dropped the legacy
+        initialize handshake answers it with 400. --check must retry with
+        server/discover before reporting the connection down, and the discover
+        DiscoverResult's serverInfo (nested at
+        _meta["io.modelcontextprotocol/serverInfo"]) must be logged."""
+        httpx_mock.add_response(status_code=400, text="")
+        discover_body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "resultType": "discover",
+                    "supportedVersions": ["2026-07-28"],
+                    "capabilities": {"tools": {}},
+                    "_meta": {
+                        "io.modelcontextprotocol/serverInfo": {
+                            "name": "modern-server",
+                            "version": "9.9",
+                        }
+                    },
+                },
+            }
+        )
+        httpx_mock.add_response(
+            text=discover_body, headers={"content-type": "application/json"}
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+        err = capsys.readouterr().err
+        assert "server=modern-server" in err
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 2
+        assert json.loads(requests[0].content)["method"] == "initialize"
+        assert json.loads(requests[1].content)["method"] == "server/discover"
+
+    def test_404_falls_back_to_discover(self, httpx_mock):
+        """: 404 (unrecognized method) is the OTHER fallback trigger
+        alongside 400 — a server that fully removed initialize returns 404 for
+        an unrecognized method per the transport spec."""
+        httpx_mock.add_response(status_code=404, text="")
+        httpx_mock.add_response(
+            text=json.dumps({"jsonrpc": "2.0", "id": 2, "result": {}}),
+            headers={"content-type": "application/json"},
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+        assert len(httpx_mock.get_requests()) == 2
+
+    def test_500_does_not_retry_with_discover(self, httpx_mock):
+        """: 500 is NOT in the discover-fallback set — retrying it with a
+        different method would not distinguish "legacy-dropped" from "broken"
+        and would cost every genuinely-broken endpoint an extra round-trip.
+        Exactly one request must be sent."""
+        httpx_mock.add_response(status_code=500, text="oops")
+        assert check_connection(self.URL, dict(self.HEADERS)) is False
+        assert len(httpx_mock.get_requests()) == 1
+
+    def test_400_discover_retry_also_fails(self, httpx_mock):
+        """: both the initialize probe AND the discover retry fail —
+        the connection is genuinely down, not just legacy-dropped."""
+        httpx_mock.add_response(status_code=400, text="")
+        httpx_mock.add_response(status_code=400, text="")
+        assert check_connection(self.URL, dict(self.HEADERS)) is False
+        assert len(httpx_mock.get_requests()) == 2
+
+    def test_400_discover_retry_gets_jsonrpc_error(self, httpx_mock):
+        """: the discover retry itself may come back HTTP 200 but with a
+        JSON-RPC error body (e.g. the endpoint exists but rejects empty
+        params) — that is still "the server responded", just unhealthily, and
+        the probe's verdict must be False (mirrors _report_initialize). The
+        request-count assertion is what discriminates this from the
+        no-fallback behavior: without the fix only ONE request is ever sent
+        and the (unconsumed) discover mock would leave httpx_mock's teardown
+        assertion failing, not this one — assert the count directly so the
+        fallback path is unambiguously exercised."""
+        httpx_mock.add_response(status_code=400, text="")
+        httpx_mock.add_response(
+            text=json.dumps(
+                {"jsonrpc": "2.0", "id": 2, "error": {"code": -32020, "message": "bad"}}
+            ),
+            headers={"content-type": "application/json"},
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is False
+        assert len(httpx_mock.get_requests()) == 2
 
     def test_non_200_does_not_leak_body_to_stderr(self, httpx_mock, capsys):
         """#16: response body must not appear in --check stderr output.

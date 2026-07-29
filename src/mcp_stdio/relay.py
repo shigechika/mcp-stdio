@@ -1182,6 +1182,54 @@ def _normalize_null_arguments(line: str) -> str:
     return line
 
 
+# CacheableResult fields (spec rev 2026-07-28, SEP-2549): ``tools/list`` /
+# ``prompts/list`` / ``resources/list`` / ``resources/read`` /
+# ``resources/templates/list`` results now carry ``ttlMs`` (a freshness
+# hint, in milliseconds) and ``cacheScope`` (``"public"`` lets shared
+# intermediaries cache the response; ``"private"`` restricts caching to the
+# requesting client). Rank higher = more restrictive, so
+# ``_merge_cacheable_field`` can compare across pages without special-casing
+# each field's own value semantics.
+_CACHE_SCOPE_RESTRICTIVENESS = {"public": 0, "private": 1}
+_CACHEABLE_MERGE_FIELDS = frozenset({"ttlMs", "cacheScope"})
+
+
+def _merge_cacheable_field(merged_result: dict[str, Any], key: str, value: Any) -> None:
+    """Merge one page's ``ttlMs``/``cacheScope`` into ``merged_result`` in place.
+
+    ``ttlMs``: keep the MINIMUM seen across pages — the merged list's true
+    freshness bound is set by its least-fresh member, not by whichever page
+    happened to be merged last. ``cacheScope``: keep the MOST RESTRICTIVE
+    value seen (``"private"`` wins over ``"public"``) — a merged list that
+    combines a private-scoped page with a public-scoped one must not be
+    reported as publicly cacheable, or a shared intermediary could legally
+    cache and leak the private page's items.
+
+    A value of the wrong type (a non-compliant server) is ignored rather
+    than raising or silently adopted — same "degrade, don't guess" posture
+    as ``_extract_protocol_version``. A page that OMITS the field entirely
+    never calls this (the caller only invokes it for keys actually present
+    in that page's result), so a prior page's stricter value survives an
+    absent field on a later page rather than being reset.
+    """
+    if key == "ttlMs":
+        if not isinstance(value, (int, float)):
+            return
+        existing = merged_result.get("ttlMs")
+        if not isinstance(existing, (int, float)) or value < existing:
+            merged_result["ttlMs"] = value
+        return
+    if key == "cacheScope":
+        new_rank = _CACHE_SCOPE_RESTRICTIVENESS.get(value)
+        if new_rank is None:
+            return
+        existing_rank = _CACHE_SCOPE_RESTRICTIVENESS.get(
+            merged_result.get("cacheScope"), -1
+        )
+        if new_rank > existing_rank:
+            merged_result["cacheScope"] = value
+
+
 def _detect_paginated_list(line: str) -> tuple[str, str] | None:
     """Return ``(method, result_key)`` if the request should auto-paginate.
 
@@ -1327,9 +1375,25 @@ def _paginate_and_stream(
             # Preserve top-level result fields (e.g. a late ``_meta``) that arrive
             # only on a later page — last-write-wins. The accumulated list and the
             # ``nextCursor`` are managed explicitly above, so skip them here.
+            #
+            # ``ttlMs``/``cacheScope`` (``CacheableResult``, spec rev 2026-07-28)
+            # are excluded from last-write-wins and merged via
+            # ``_merge_cacheable_field`` instead: last-write-wins can UNDERSTATE
+            # the true constraint on the combined list — e.g. page 1 says
+            # cacheScope="private" (must not be shared-cached) but page 2 says
+            # "public", and naive last-write-wins would report the merged list
+            # (whose page-1-derived items are still private-scoped data) as
+            # publicly cacheable, which a shared intermediary could then legally
+            # cache and leak. ``ttlMs`` has the same shape of bug: the merged
+            # list's true freshness bound is its LEAST fresh member, not
+            # whichever page happened to arrive last.
             for k, v in page_result.items():
-                if k not in (result_key, "nextCursor"):
-                    merged_result[k] = v
+                if k in (result_key, "nextCursor"):
+                    continue
+                if k in _CACHEABLE_MERGE_FIELDS:
+                    _merge_cacheable_field(merged_result, k, v)
+                    continue
+                merged_result[k] = v
 
         next_cursor = page_result.get("nextCursor")
         # An empty-string nextCursor is treated as terminal alongside null /
@@ -1679,6 +1743,103 @@ def _report_initialize(result_data: dict[str, Any] | None) -> bool:
     return True
 
 
+def _parse_streamable_response(resp: httpx.Response) -> dict[str, Any] | None:
+    """Parse a Streamable HTTP POST response body (JSON or SSE) into a dict.
+
+    Shared by the ``initialize`` and ``server/discover`` probes in
+    ``check_connection``: both need the first JSON-RPC message on the
+    response that carries a ``result`` or ``error``, whether the body is a
+    plain JSON object or an SSE stream that may interleave notifications /
+    server-initiated requests first — a compliant server MAY do so before the
+    actual response, matching the keep-reading gate in ``_post_parsed`` /
+    ``_check_connection_sse``.
+    """
+    content_type = resp.headers.get("content-type", "")
+    if "text/event-stream" in content_type:
+        for event_type, payload in _iter_sse_events(_split_sse_text(resp.text)):
+            if event_type != "message":
+                continue
+            try:
+                parsed = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict) and ("result" in parsed or "error" in parsed):
+                return parsed
+        return None
+    try:
+        return json.loads(resp.text)
+    except json.JSONDecodeError:
+        return None
+
+
+def _report_discover(result_data: dict[str, Any] | None) -> bool:
+    """Log a parsed ``server/discover`` response and return the probe verdict.
+
+    Mirrors ``_report_initialize``'s verdict rule: False only for a JSON-RPC
+    error; a missing/unparseable result still counts as "the server
+    responded" (spec rev 2026-07-28, ``server/discover``'s ``DiscoverResult``,
+    whose ``serverInfo`` lives at ``_meta["io.modelcontextprotocol/serverInfo"]``
+    rather than as a top-level field — see the verified research fetched
+    directly from the spec's own worked example).
+    """
+    if result_data and "result" in result_data:
+        result = result_data["result"]
+        if not isinstance(result, dict):
+            log("✓ Server responded (discover result is not an object)")
+            return True
+        meta = result.get("_meta")
+        server_info = (
+            meta.get("io.modelcontextprotocol/serverInfo", {})
+            if isinstance(meta, dict)
+            else {}
+        )
+        name = (
+            server_info.get("name", "unknown")
+            if isinstance(server_info, dict)
+            else "unknown"
+        )
+        version = (
+            server_info.get("version", "?") if isinstance(server_info, dict) else "?"
+        )
+        versions = result.get("supportedVersions")
+        versions_str = versions if isinstance(versions, list) else "?"
+        log(
+            f"✓ MCP server/discover: server={name} v{version}, "
+            f"supportedVersions={versions_str}"
+        )
+        caps = result.get("capabilities")
+        caps = caps if isinstance(caps, dict) else {}
+        tools = "yes" if "tools" in caps else "no"
+        resources = "yes" if "resources" in caps else "no"
+        prompts = "yes" if "prompts" in caps else "no"
+        log(f"✓ Capabilities: tools={tools}, resources={resources}, prompts={prompts}")
+        return True
+    if result_data and "error" in result_data:
+        err = result_data["error"]
+        log(f"✗ MCP error: {err.get('message', err)}")
+        return False
+    log("✓ Server responded (could not parse discover result)")
+    return True
+
+
+# HTTP statuses on which the legacy `initialize` probe in check_connection()
+# falls back to a `server/discover` retry (spec rev 2026-07-28, "Backward
+# Compatibility" / "Protocol Version Header"): 404 is what the transport spec
+# mandates for an unrecognized method, which `initialize` now IS on a server
+# that has fully removed the legacy handshake; 400 is what the same server
+# returns when the request is also missing required per-request
+# `_meta`/headers a modern-only server demands. Neither code is unique to
+# "server doesn't speak legacy" — a 400/404 can equally mean a genuinely
+# broken/misconfigured endpoint — so this is a best-effort diagnostic
+# heuristic, not a protocol requirement: worst case, a broken endpoint gets
+# one extra POST before check_connection reports it down. Every OTHER
+# status (500, 503, ...) is left alone deliberately: retrying those with a
+# different method would not distinguish "legacy-dropped" from "broken" any
+# better, and would cost every genuinely-broken endpoint a second round-trip
+# for no diagnostic gain.
+_DISCOVER_FALLBACK_STATUSES = (400, 404)
+
+
 def _check_connection_sse(
     url: str,
     headers: dict[str, str],
@@ -1824,6 +1985,13 @@ def check_connection(
     the probe: ``"streamable-http"`` (default) POSTs ``initialize`` directly,
     while ``"sse"`` runs the legacy GET/endpoint/POST handshake so the probe
     matches what ``run_sse`` would actually do.
+
+    On the Streamable HTTP path, a 400/404 response to the ``initialize``
+    probe retries once with ``server/discover`` (spec rev 2026-07-28,
+    ``_DISCOVER_FALLBACK_STATUSES``) before reporting the connection down —
+    a server that has dropped the legacy handshake entirely no longer
+    recognizes ``initialize`` at all, and would otherwise be misreported as
+    unreachable rather than "alive, modern-only".
     """
     if transport == "sse":
         return _check_connection_sse(
@@ -1857,6 +2025,41 @@ def check_connection(
         resp = client.post(url, content=initialize_msg, headers=headers)
 
         if resp.status_code != 200:
+            if resp.status_code in _DISCOVER_FALLBACK_STATUSES:
+                log(
+                    f"initialize probe got HTTP {resp.status_code}; retrying "
+                    "with server/discover in case the server dropped the "
+                    "legacy handshake (spec rev 2026-07-28)"
+                )
+                discover_msg = json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "server/discover",
+                        "id": 2,
+                        "params": {},
+                    }
+                )
+                try:
+                    discover_resp = client.post(
+                        url, content=discover_msg, headers=headers
+                    )
+                except httpx.HTTPError as e:
+                    log(f"✗ server/discover retry failed: {e}")
+                    log(f"✗ HTTP {resp.status_code}")
+                    return False
+                if discover_resp.status_code != 200:
+                    log(
+                        f"✗ server/discover retry also failed: HTTP {discover_resp.status_code}"
+                    )
+                    log(f"✗ HTTP {resp.status_code}")
+                    return False
+                log(
+                    f"✓ Connected via server/discover (HTTP {discover_resp.status_code})"
+                )
+                ok = _report_discover(_parse_streamable_response(discover_resp))
+                if "mcp-session-id" in discover_resp.headers:
+                    log(f"✓ Session ID: {discover_resp.headers['mcp-session-id']}")
+                return ok
             # Do not surface the response body — server error responses
             # commonly carry session IDs, stack traces, or echoed request
             # data. The status code alone is the right operational signal
@@ -1866,37 +2069,7 @@ def check_connection(
 
         log(f"✓ Connected (HTTP {resp.status_code})")
 
-        # Parse initialize response from JSON or SSE
-        content_type = resp.headers.get("content-type", "")
-        result_data: dict[str, Any] | None = None
-
-        if "text/event-stream" in content_type:
-            for event_type, payload in _iter_sse_events(_split_sse_text(resp.text)):
-                if event_type != "message":
-                    continue
-                try:
-                    parsed = json.loads(payload)
-                except json.JSONDecodeError:
-                    continue
-                # A compliant server MAY interleave notifications / server-
-                # initiated requests on the POST's SSE stream BEFORE the JSON-RPC
-                # response, so keep reading until a message carries result/error —
-                # matching the keep-reading gate in _post_parsed /
-                # _check_connection_sse. Breaking on the first message would
-                # mis-report a server that sends a notification frame first as
-                # "could not parse initialize result".
-                if isinstance(parsed, dict) and (
-                    "result" in parsed or "error" in parsed
-                ):
-                    result_data = parsed
-                    break
-        else:
-            try:
-                result_data = json.loads(resp.text)
-            except json.JSONDecodeError:
-                pass
-
-        ok = _report_initialize(result_data)
+        ok = _report_initialize(_parse_streamable_response(resp))
 
         if "mcp-session-id" in resp.headers:
             log(f"✓ Session ID: {resp.headers['mcp-session-id']}")
