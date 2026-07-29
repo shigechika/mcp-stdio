@@ -37,6 +37,7 @@ from mcp_stdio.relay import (
     _handle_rate_limit,
     _inject_modern_meta,
     _is_initialize_request,
+    _is_recognized_modern_error,
     _iter_sse_events,
     _iter_sse_lines,
     _looks_like_initialize,
@@ -8827,6 +8828,67 @@ class TestSeedModernStateFromDiscover:
         assert state.server_info is None
 
 
+class TestIsRecognizedModernError:
+    """Base Protocol "Error Codes" (spec rev 2026-07-28): -32020..-32099 is
+    "reserved for the MCP specification"; -32000..-32019 is the legacy/
+    grandfathered sub-range with no new allocations; standard pre-existing
+    JSON-RPC codes like -32601 sit outside -32000..-32099 entirely.
+    """
+
+    def test_reserved_range_code_is_recognized(self):
+        assert _is_recognized_modern_error(
+            {"jsonrpc": "2.0", "id": 0, "error": {"code": -32020, "message": "x"}}
+        )
+
+    def test_reserved_range_boundaries_are_recognized(self):
+        assert _is_recognized_modern_error(
+            {"jsonrpc": "2.0", "id": 0, "error": {"code": -32020, "message": "x"}}
+        )
+        assert _is_recognized_modern_error(
+            {"jsonrpc": "2.0", "id": 0, "error": {"code": -32099, "message": "x"}}
+        )
+
+    def test_generic_jsonrpc_code_is_not_recognized(self):
+        """-32601 Method not found predates this revision entirely and is
+        exactly what a legacy server sends for an unrecognized method."""
+        assert not _is_recognized_modern_error(
+            {"jsonrpc": "2.0", "id": 0, "error": {"code": -32601, "message": "x"}}
+        )
+
+    def test_legacy_subrange_code_is_not_recognized(self):
+        assert not _is_recognized_modern_error(
+            {"jsonrpc": "2.0", "id": 0, "error": {"code": -32000, "message": "x"}}
+        )
+
+    def test_just_outside_reserved_range_is_not_recognized(self):
+        """-32019 is the top of the legacy sub-range; -32100 is one below
+        the reserved range's floor. Neither is in -32020..-32099."""
+        assert not _is_recognized_modern_error(
+            {"jsonrpc": "2.0", "id": 0, "error": {"code": -32019, "message": "x"}}
+        )
+        assert not _is_recognized_modern_error(
+            {"jsonrpc": "2.0", "id": 0, "error": {"code": -32100, "message": "x"}}
+        )
+
+    def test_no_error_key_is_not_recognized(self):
+        assert not _is_recognized_modern_error(
+            {"jsonrpc": "2.0", "id": 0, "result": {}}
+        )
+
+    def test_none_is_not_recognized(self):
+        assert not _is_recognized_modern_error(None)
+
+    def test_non_dict_error_is_not_recognized(self):
+        assert not _is_recognized_modern_error(
+            {"jsonrpc": "2.0", "id": 0, "error": "oops"}
+        )
+
+    def test_non_int_code_is_not_recognized(self):
+        assert not _is_recognized_modern_error(
+            {"jsonrpc": "2.0", "id": 0, "error": {"code": "not-an-int"}}
+        )
+
+
 class TestProbeProtocolEra:
     URL = "https://example.com/mcp"
 
@@ -8866,6 +8928,72 @@ class TestProbeProtocolEra:
         client = httpx.Client()
         era, _ = _probe_protocol_era(client, self.URL, {})
         assert era == "modern"
+
+    def test_400_with_generic_jsonrpc_error_body_is_legacy(self, httpx_mock):
+        """Bug regression: a legacy server's ordinary "Method not found"
+        reply (-32601, a standard pre-existing JSON-RPC code — NOT in the
+        -32020..-32099 sub-range this spec revision reserves for itself) to
+        the unrecognized server/discover probe must fall back to legacy,
+        not be mistaken for a recognized-modern error just because an
+        "error" key is present."""
+        httpx_mock.add_response(
+            status_code=400,
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "error": {"code": -32601, "message": "Method not found"},
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        client = httpx.Client()
+        era, result = _probe_protocol_era(client, self.URL, {})
+        assert era == "legacy"
+        assert result is None
+
+    def test_200_with_generic_jsonrpc_error_body_is_legacy(self, httpx_mock):
+        """Bug regression: many legacy servers reply to an unrecognized
+        method with HTTP 200 and the JSON-RPC error in the body (a common
+        JSON-RPC-over-HTTP convention). A generic error code (-32601) there
+        must not be treated as proof of a modern server just because the
+        HTTP status was 200."""
+        httpx_mock.add_response(
+            status_code=200,
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "error": {"code": -32601, "message": "Method not found"},
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        client = httpx.Client()
+        era, result = _probe_protocol_era(client, self.URL, {})
+        assert era == "legacy"
+        assert result is None
+
+    def test_200_with_recognized_modern_error_body_is_modern(self, httpx_mock):
+        """A modern server that rejects this particular server/discover call
+        (e.g. a missing required client capability, -32021) but replies over
+        HTTP 200 rather than 400 is still proven modern by the error code
+        itself, matching the 400 path's own recognized-modern rule."""
+        httpx_mock.add_response(
+            status_code=200,
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "error": {"code": -32021, "message": "missing capability"},
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        client = httpx.Client()
+        era, result = _probe_protocol_era(client, self.URL, {})
+        assert era == "modern"
+        assert result["error"]["code"] == -32021
 
     def test_400_with_empty_body_is_legacy(self, httpx_mock):
         httpx_mock.add_response(status_code=400, text="")

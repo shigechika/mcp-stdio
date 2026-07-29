@@ -545,10 +545,10 @@ class _ModernState:
     notifications/cancelled upstream" half of cancellation, AC #5's easy
     half; actually ABORTING an in-flight POST when a cancel arrives would
     require a second thread reading stdin concurrently with a blocking
-    dispatch, which is deliberately deferred — see the PR description for
-    why: several single-threaded-mutation invariants elsewhere in ``run()``
-    — ``protocol_version``, the 401/403/404 recovery ladder — depend on
-    "at most one dispatch in flight" and would need re-auditing first).
+    dispatch, which is deliberately deferred: several
+    single-threaded-mutation invariants elsewhere in ``run()`` —
+    ``protocol_version``, the 401/403/404 recovery ladder — depend on "at
+    most one dispatch in flight" and would need re-auditing first).
     """
 
     __slots__ = (
@@ -601,6 +601,44 @@ def _seed_modern_state_from_discover(
             modern_state.server_info = server_info
 
 
+# Base Protocol "Error Codes" (spec rev 2026-07-28): JSON-RPC 2.0 reserves
+# -32000..-32099 for implementation-defined server errors. This revision
+# partitions that range further: -32000..-32019 is legacy/grandfathered
+# (no new allocations), while -32020..-32099 is "reserved for the MCP
+# specification... defined exclusively by the MCP specification" — currently
+# -32020 (HeaderMismatch), -32021 (MissingRequiredClientCapability), -32022
+# (UnsupportedProtocolVersion). Standard pre-existing JSON-RPC codes such as
+# -32601 (Method not found) are OUTSIDE this range entirely (they predate
+# the -32000..-32099 implementation-defined range's own sub-partitioning),
+# so they can never be mistaken for a spec-defined modern error by range
+# membership alone.
+_MCP_RESERVED_ERROR_CODES = range(-32099, -32019)
+
+
+def _is_recognized_modern_error(parsed: dict[str, Any] | None) -> bool:
+    """True iff ``parsed`` is a JSON-RPC error object whose ``error.code``
+    falls in ``_MCP_RESERVED_ERROR_CODES`` (see that constant's comment for
+    the exact spec citation) — i.e. a "recognized modern JSON-RPC error" in
+    the sense used by the Streamable HTTP "Backward Compatibility" section.
+
+    A generic/pre-existing JSON-RPC code such as ``-32601`` (``Method not
+    found``) sits outside that sub-range and is exactly what an unmodified
+    LEGACY server would send for an unrecognized ``server/discover`` method
+    — over HTTP 400 by some servers' conventions, or HTTP 200 by others
+    (JSON-RPC-over-HTTP commonly returns 200 with the error in the body).
+    Neither counts as proof the remote speaks a modern version of MCP.
+    Shared by ``_probe_protocol_era``'s HTTP 200 and HTTP 400 paths so both
+    are judged by the identical rule.
+    """
+    if not isinstance(parsed, dict):
+        return False
+    error = parsed.get("error")
+    if not isinstance(error, dict):
+        return False
+    code = error.get("code")
+    return isinstance(code, int) and code in _MCP_RESERVED_ERROR_CODES
+
+
 def _probe_protocol_era(
     client: httpx.Client, url: str, headers: dict[str, str]
 ) -> tuple[str, dict[str, Any] | None]:
@@ -612,22 +650,29 @@ def _probe_protocol_era(
     replacement for ``initialize``) and classifies the remote from the
     response:
 
-    - HTTP 200 -> modern; the parsed body is returned for the caller to seed
-      ``_ModernState`` from (via ``_seed_modern_state_from_discover``).
-    - HTTP 400 whose body IS a recognized JSON-RPC error object -> STILL
-      modern (spec: a modern server also uses 400 for
-      ``UnsupportedProtocolVersionError`` / ``MissingRequiredClientCapabilityError``
-      / header-validation failures — an error body proves the server
+    - HTTP 200 whose body has no ``error`` key (a JSON-RPC result, or an
+      unparseable/absent body) -> modern; the parsed body is returned for
+      the caller to seed ``_ModernState`` from (via
+      ``_seed_modern_state_from_discover``).
+    - HTTP 200 or HTTP 400 whose body IS a recognized-modern JSON-RPC error
+      per ``_is_recognized_modern_error`` -> STILL modern (spec: a modern
+      server also uses 400 for ``UnsupportedProtocolVersionError`` /
+      ``MissingRequiredClientCapabilityError`` / header-validation
+      failures — a recognized-modern error body proves the server
       UNDERSTOOD ``server/discover`` as a method, just rejected THIS
       request, so the client should retry/correct rather than fall back).
-    - HTTP 400 with an empty/unrecognized body, HTTP 404 (method not
-      recognized at all — the transport spec's mandated response for an
-      unknown method), any OTHER status (401/403/5xx/...), or a transport
-      failure -> legacy, the conservative default on anything ambiguous.
-      This mirrors the issue's own 2026-07-27 revision note: "the transport
-      surface was still moving three weeks ago, so wait for publication
-      rather than chase the draft" — an inconclusive probe must not guess
-      modern.
+      The same rule applies at HTTP 200 because a recognized-modern error
+      code is diagnostic regardless of which HTTP status carried it.
+    - HTTP 200 or HTTP 400 whose body is a GENERIC/unrecognized JSON-RPC
+      error (e.g. ``-32601`` Method not found — the ordinary reply an
+      unmodified LEGACY server sends for an unknown method), HTTP 404
+      (method not recognized at all — the transport spec's mandated
+      response for an unknown method), any OTHER status (401/403/5xx/...),
+      or a transport failure -> legacy, the conservative default on
+      anything ambiguous. Spec: "If the body is empty or is not a
+      recognized modern JSON-RPC error, fall back to `initialize` and
+      continue with the legacy version for subsequent requests" (Streamable
+      HTTP, "Backward Compatibility").
 
     A transport-level exception is swallowed (not propagated) so a
     detection-probe failure degrades to legacy rather than crashing startup;
@@ -649,12 +694,29 @@ def _probe_protocol_era(
         log(f"protocol-era probe failed ({e}); assuming legacy")
         return "legacy", None
     if resp.status_code == 200:
-        return "modern", _parse_streamable_response(resp)
-    if resp.status_code == 400:
         parsed = _parse_streamable_response(resp)
         if isinstance(parsed, dict) and "error" in parsed:
-            log("protocol-era probe: 400 with a JSON-RPC error body; assuming modern")
+            if _is_recognized_modern_error(parsed):
+                log(
+                    "protocol-era probe: 200 with a recognized-modern "
+                    "JSON-RPC error body; assuming modern"
+                )
+                return "modern", parsed
+            log(
+                "protocol-era probe: 200 with a generic JSON-RPC error "
+                "body; assuming legacy"
+            )
+            return "legacy", None
+        return "modern", parsed
+    if resp.status_code == 400:
+        parsed = _parse_streamable_response(resp)
+        if _is_recognized_modern_error(parsed):
+            log(
+                "protocol-era probe: 400 with a recognized-modern JSON-RPC "
+                "error body; assuming modern"
+            )
             return "modern", parsed
+        log("protocol-era probe: 400 with an empty/generic body; assuming legacy")
         return "legacy", None
     return "legacy", None
 
