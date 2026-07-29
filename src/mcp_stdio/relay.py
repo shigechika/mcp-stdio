@@ -539,11 +539,16 @@ class _ModernState:
     place those values are ever seen). ``log_level`` is updated on every
     ``logging/setLevel`` line regardless of era (see ``_extract_log_level``).
 
-    A single plain object (no lock): ``run()``'s stdin loop is
-    single-threaded except for the modern-path cancel-abort worker (see
-    ``_ModernDispatchWorker``), which never touches this state — only reads
-    ``negotiated_version``/``client_capabilities``/``client_info``/
-    ``log_level`` captured before it was spawned.
+    A single plain object (no lock): ``run()``'s stdin loop dispatches one
+    line at a time, fully synchronously, on both eras — including the
+    modern path (Phase 1 implements the "don't forward
+    notifications/cancelled upstream" half of cancellation, AC #5's easy
+    half; actually ABORTING an in-flight POST when a cancel arrives would
+    require a second thread reading stdin concurrently with a blocking
+    dispatch, which is deliberately deferred — see the PR description for
+    why: several single-threaded-mutation invariants elsewhere in ``run()``
+    — ``protocol_version``, the 401/403/404 recovery ladder — depend on
+    "at most one dispatch in flight" and would need re-auditing first).
     """
 
     __slots__ = (
