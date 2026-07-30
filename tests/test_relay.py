@@ -14279,6 +14279,119 @@ class TestRunModernMrtrBridge:
         assert len(answers) == 1
         assert "never declared" in answers[0]["error"]["message"]
 
+    def _register_status(self, httpx_mock, status_code):
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            status_code=status_code,
+            text="",
+            headers={"content-type": "application/json"},
+        )
+
+    def test_retry_401_refreshes_the_token_once_and_re_posts(self, httpx_mock):
+        """#356 review R1F2. A retry is USER-WORK-BEARING: the human has
+        already answered the elicitation dialogs it carries. Letting a 401
+        kill the transaction means "self-heals on the client's next request"
+        cashes out as "the client re-asks the same questions". One bounded
+        `token_refresher` refresh and one re-POST — the loop's own 401
+        discipline, on the loop's own thread — saves the answers.
+
+        The re-POST is the SAME round under the SAME retry id: the server
+        answered a challenge without processing the request, exactly as when
+        the loop re-dispatches the same `line`. The MUST that binds is only
+        "different between the initial request and the retry"."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(
+            httpx_mock, self._input_required(2, {"who": self._elicit()})
+        )
+        self._register_status(httpx_mock, 401)
+        self._register_json(
+            httpx_mock,
+            {
+                "jsonrpc": "2.0",
+                "id": "mcp-stdio/mrtr-retry/1/1",
+                "result": {"content": [{"type": "text", "text": "hi octocat"}]},
+            },
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"elicitation": {}}),
+                self._call(),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mcp-stdio/mrtr/1/who",
+                        "result": {"action": "accept", "content": {"name": "octocat"}},
+                    }
+                ),
+            ],
+            protocol_era="modern",
+            token_refresher=lambda: {"Authorization": "Bearer refreshed"},
+        )
+        calls = self._tool_calls(httpx_mock)
+        # original, the 401'd retry, the refreshed re-POST. No more: the
+        # refresh is single-attempt, not a ladder.
+        assert len(calls) == 3
+        # Same round, same id, same collected answers — not a re-derivation
+        # and not a new round.
+        assert calls[1] == calls[2]
+        assert calls[2]["id"] == "mcp-stdio/mrtr-retry/1/1"
+        assert calls[2]["params"]["inputResponses"] == {
+            "who": {"action": "accept", "content": {"name": "octocat"}}
+        }
+        posts = [
+            r
+            for r in httpx_mock.get_requests()
+            if r.headers.get("mcp-method") == "tools/call"
+        ]
+        # The refreshed credentials reached the re-POST, and the version
+        # header is still the one pinned from the stored body's _meta
+        # (re-preparing headers without re-pinning would be -32020
+        # HeaderMismatch on a compliant server).
+        assert "authorization" not in posts[1].headers
+        assert posts[2].headers["authorization"] == "Bearer refreshed"
+        assert posts[2].headers["mcp-protocol-version"] == "2026-07-28"
+        # The user's answers were not thrown away: one clean result under 2.
+        answers = [line for line in self._out(output) if line.get("id") == 2]
+        assert len(answers) == 1
+        assert answers[0]["result"]["content"][0]["text"] == "hi octocat"
+
+    def test_retry_401_with_a_failed_refresh_fails_loudly(self, httpx_mock):
+        """The recovery is ONE stage wide and stays honest at its edge: a
+        refresh that declines falls straight through to the single "upstream
+        error on retry -> error under N, drop txn" arm, so the client gets a
+        loud HTTP 401 under its own id instead of a hang or a silent second
+        attempt."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(
+            httpx_mock, self._input_required(2, {"who": self._elicit()})
+        )
+        self._register_status(httpx_mock, 401)
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"elicitation": {}}),
+                self._call(),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mcp-stdio/mrtr/1/who",
+                        "result": {"action": "accept", "content": {}},
+                    }
+                ),
+            ],
+            protocol_era="modern",
+            token_refresher=lambda: None,
+        )
+        # No re-POST was attempted on a refusal.
+        assert len(self._tool_calls(httpx_mock)) == 2
+        answers = [line for line in self._out(output) if line.get("id") == 2]
+        assert len(answers) == 1
+        assert answers[0]["error"]["message"] == "HTTP 401"
+
 
 # --- modern era: subscriptions/listen stream (#270 Phase 2 PR A) ---
 

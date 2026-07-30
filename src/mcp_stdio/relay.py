@@ -5436,6 +5436,59 @@ def run(
         msg["params"] = params
         return json.dumps(msg)
 
+    def _mrtr_post_retry(
+        client_id: Any, txn: dict[str, Any], retry_id: Any, retry_line: str
+    ) -> _StreamResult | None:
+        """POST one retry body: headers prepared, version re-pinned, hooked.
+
+        Factored out because the retry may be sent TWICE for one round —
+        once, and again after a 401 token refresh (#356 review R1F2) — and
+        every part of this preparation has to be redone for the second POST:
+
+        - ``_prepare_headers`` derives ``MCP-Protocol-Version`` from LIVE
+          state, so re-preparing without re-applying ``pinned_version``
+          would send a version disagreeing with the stored body's ``_meta``
+          — ``-32020`` HeaderMismatch on a compliant server, the exact
+          failure design change 7 exists to prevent (the same override PR A
+          (#352) applies to every listen reconnect).
+        - a FRESH interception hook and abort callback per POST, mirroring
+          ``_dispatch``'s own rule: no state may leak between the attempts
+          one logical dispatch makes.
+
+        ``retry_in_flight`` is raised and lowered here so it stays truthful
+        on every exit, including an exception unwinding to run()'s safety
+        net. ``round_opened`` is cleared per POST for the same reason: it
+        must describe THIS POST's outcome, never the previous attempt's.
+        """
+        retry_headers = _prepare_headers(retry_line)
+        if txn["pinned_version"]:
+            retry_headers = {
+                k: v
+                for k, v in retry_headers.items()
+                if k.lower() != "mcp-protocol-version"
+            }
+            retry_headers["MCP-Protocol-Version"] = txn["pinned_version"]
+        txn["round_opened"] = False
+        txn["retry_in_flight"] = True
+        try:
+            return _post_and_stream(
+                client,
+                url,
+                retry_line,
+                retry_headers,
+                # Every synthesized error inside belongs to the client's
+                # request, not to the relay's retry id.
+                client_id,
+                tracker,
+                has_id=True,
+                input_required_hook=_make_input_required_hook(
+                    client_id, retry_id, txn["stored_line"]
+                ),
+                input_required_abort=_make_input_required_abort(client_id),
+            )
+        finally:
+            txn["retry_in_flight"] = False
+
     def _mrtr_run_retry(client_id: Any) -> None:
         """Drive a transaction's retries until it needs the client again.
 
@@ -5451,16 +5504,35 @@ def run(
         ``client_id`` all the way down, so every synthesized error
         ``_post_and_stream`` may write lands under the right id.
 
-        LIMITATION: a retry gets NO auth recovery. The stdin loop's
-        401-refresh / 403-step-up / 404-reinit ladder wraps ``_dispatch``,
-        which a retry deliberately bypasses (see above), so a token that
-        expires mid-transaction surfaces the upstream status as an error
-        under the client's id and drops the transaction — discarding
-        dialogs the user already answered. It self-heals on the client's
-        next request (that one runs the ladder and refreshes the shared
-        headers), and the transaction is short-lived by construction, so
-        the design settled on "upstream error on retry → error under N,
-        drop txn" rather than a second recovery ladder here.
+        AUTH RECOVERY is deliberately ONE stage wide (#356 review R1F2):
+        a 401 gets a single bounded ``token_refresher`` refresh and one
+        re-POST, and nothing else does. The original design took the
+        no-recovery stance ("it self-heals on the client's next request"),
+        which is true of an ordinary dispatch and false here: a retry is
+        USER-WORK-BEARING. The human has already answered the elicitation
+        dialogs this POST carries, and "self-heals next request" means the
+        client re-asks them. A token expiring between the dialog going up
+        and the answer coming back is the ordinary case, not an exotic one.
+
+        Why it is safe to run here when the listen thread deliberately runs
+        NO recovery at all: that exemption is about THREADS —
+        ``_probe_auth_recovery``'s lock ordering "is not safe from a third
+        concurrent caller", and the listen thread would be that third
+        caller. A retry runs on the stdin loop thread, the FIRST caller,
+        the one the loop's own 401 branch already refreshes from; and
+        ``refresh_lock`` (serialising against the proactive-refresh daemon's
+        rotation) and ``headers_lock`` are taken sequentially, never nested,
+        exactly as they are there. So this adds no lock ordering.
+
+        And why ONLY 401 -> refresh: a 403 step-up and a 404 re-initialize
+        are session-era machinery. The 404 branch rebuilds a session this
+        era does not have (every session adoption site in run() is gated on
+        ``era == "legacy"``), and a step-up mid-transaction changes the
+        scope the server granted the round it is holding state for. Both are
+        wider than the user-work argument justifies. Everything else — a
+        refresh that fails, a second 401, any other status — falls through
+        to the single "upstream error on retry -> error under N, drop txn"
+        arm below, which is the original design's stance and stays loud.
         """
         while True:
             txn = mrtr_txns.get(client_id)
@@ -5482,45 +5554,52 @@ def run(
                 return
             retry_id = f"{_MRTR_RETRY_ID_PREFIX}{txn['seq']}/{txn['rounds']}"
             retry_line = _mrtr_build_retry(txn, retry_id)
-            retry_headers = _prepare_headers(retry_line)
-            if txn["pinned_version"]:
-                # Design change 7: _prepare_headers derives the version
-                # from LIVE state, which a re-initialize between rounds can
-                # move; the stored body's _meta cannot. A disagreement
-                # between the two is -32020 HeaderMismatch on a compliant
-                # server, which would kill a transaction the user has
-                # already answered dialogs for. Same override PR A (#352)
-                # applies to every listen reconnect.
-                retry_headers = {
-                    k: v
-                    for k, v in retry_headers.items()
-                    if k.lower() != "mcp-protocol-version"
-                }
-                retry_headers["MCP-Protocol-Version"] = txn["pinned_version"]
-            txn["round_opened"] = False
             txn["retry_id"] = retry_id
-            txn["retry_in_flight"] = True
             log(f"MRTR retry {txn['rounds']} for id {client_id!r} as {retry_id!r}")
-            result = _post_and_stream(
-                client,
-                url,
-                retry_line,
-                retry_headers,
-                # Every synthesized error inside belongs to the client's
-                # request, not to the relay's retry id.
-                client_id,
-                tracker,
-                has_id=True,
-                input_required_hook=_make_input_required_hook(
-                    client_id, retry_id, txn["stored_line"]
-                ),
-                input_required_abort=_make_input_required_abort(client_id),
-            )
-            txn["retry_in_flight"] = False
+            result = _mrtr_post_retry(client_id, txn, retry_id, retry_line)
             if mrtr_txns.get(client_id) is not txn:
                 # Aborted from inside the hook (an unbridgeable round);
                 # _mrtr_abort already answered the client.
                 return
+            if (
+                result is not None
+                and result.status_code == 401
+                and token_refresher is not None
+            ):
+                # ONE bounded refresh, then ONE re-POST (#356 review R1F2).
+                # Same shape and same locks as the stdin loop's own 401
+                # branch, on the same thread: `refresh_lock` serialises
+                # against the proactive-refresh daemon so the two never race
+                # the AS's refresh-token rotation (#242), `headers_lock`
+                # guards the shared header dict, and the two are taken
+                # sequentially, never nested.
+                #
+                # The round is NOT re-counted and the retry id is NOT
+                # reissued: this is the same JSON-RPC request being re-sent
+                # after a challenge the server answered without processing
+                # it — precisely what the loop does when it re-dispatches
+                # the same `line` under the same id. The MUST that binds
+                # here is only "different between the INITIAL request and
+                # the retry", which `retry_id` already satisfies. Charging a
+                # round for an auth failure would also let a 401-happy
+                # server burn the cap.
+                log("MRTR retry received 401, attempting token refresh")
+                with refresh_lock:
+                    new_headers = token_refresher()
+                if new_headers:
+                    with headers_lock:
+                        headers.update(new_headers)
+                    # Fresh headers, re-pinned version, fresh hook — see
+                    # _mrtr_post_retry.
+                    result = _mrtr_post_retry(client_id, txn, retry_id, retry_line)
+                    if mrtr_txns.get(client_id) is not txn:
+                        return
+                else:
+                    # Refresh declined/failed: fall through to the terminal
+                    # arm below with the 401 intact, so the client gets a
+                    # loud "HTTP 401" under its own id rather than a silent
+                    # hang. (b)'s honesty half, kept.
+                    log("MRTR retry token refresh failed")
             if result is None:
                 # Transport retries exhausted. _post_and_stream already
                 # wrote the error under client_id — purge silently rather
