@@ -9883,7 +9883,7 @@ class TestHandleModernSpecialMethod:
                 "method": "initialize",
                 "params": {
                     "protocolVersion": "2026-07-28",
-                    "capabilities": {"roots": {}},
+                    "capabilities": {"experimental": {"caching": {}}},
                     "clientInfo": {"name": "test-client", "version": "1.0"},
                 },
             }
@@ -9896,7 +9896,7 @@ class TestHandleModernSpecialMethod:
         assert result["protocolVersion"] == "2026-07-28"
         # The client's own capabilities/clientInfo were captured for later
         # _meta injection.
-        assert state.client_capabilities == {"roots": {}}
+        assert state.client_capabilities == {"experimental": {"caching": {}}}
         assert state.client_info == {"name": "test-client", "version": "1.0"}
 
     def test_initialize_without_client_capabilities_becomes_empty_dict(self):
@@ -9909,6 +9909,67 @@ class TestHandleModernSpecialMethod:
         )
         _handle_modern_special_method(line, 1, state)
         assert state.client_capabilities == {}
+
+    def test_mrtr_replaced_client_capabilities_stripped_at_capture(self):
+        """#350 review round 10, finding 10-1: sampling/elicitation/roots
+        map to the server-initiated flows spec rev 2026-07-28 (SEP-2322)
+        replaced with MRTR — which Phase 1 defers to Phase 2. Advertising
+        them upstream would invite a modern server to answer with the very
+        ``input_required`` result this relay can only forward verbatim to a
+        legacy client that cannot answer it. The keys are stripped at the
+        SINGLE capture site so every downstream use (per-request ``_meta``,
+        reseed re-probe) advertises only what the relay can bridge. Other
+        keys — ``experimental`` and anything unrecognized — must survive
+        untouched: they do not map to an MRTR-replaced flow, and
+        over-stripping would under-advertise a genuinely bridgeable
+        capability."""
+        state = _ModernState()
+        line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": {
+                        "sampling": {},
+                        "elicitation": {},
+                        "roots": {"listChanged": True},
+                        "experimental": {"caching": {}},
+                        "tools": {"quirky": True},
+                    },
+                },
+            }
+        )
+        _handle_modern_special_method(line, 1, state)
+        assert state.client_capabilities == {
+            "experimental": {"caching": {}},
+            "tools": {"quirky": True},
+        }
+
+    def test_server_capability_echo_unaffected_by_client_capability_filter(self):
+        """#350 review round 10, finding 10-1 (the non-goal pinned): the
+        filter applies to what the relay claims the CLIENT can do upstream,
+        never to the SERVER capability set echoed downstream in the
+        synthesized InitializeResult — a discover-seeded server set that
+        happens to share a key name with the stripped client keys must
+        reach the client intact."""
+        state = _ModernState()
+        state.capabilities = {"tools": {}, "elicitation": {}}
+        line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": {"roots": {}},
+                },
+            }
+        )
+        _, reply = _handle_modern_special_method(line, 1, state)
+        result = json.loads(reply)["result"]
+        assert result["capabilities"] == {"tools": {}, "elicitation": {}}
 
     def test_initialize_without_client_info_stays_none(self):
         """: clientInfo is a SHOULD, never fabricated — absent from the
@@ -9963,7 +10024,7 @@ class TestHandleModernSpecialMethod:
                 "method": "initialize",
                 "params": {
                     "protocolVersion": "2026-07-28",
-                    "capabilities": {"roots": {}, "sampling": {}},
+                    "capabilities": {"experimental": {"a": {}}, "tools": {}},
                     "clientInfo": {"name": "real-client", "version": "3.0"},
                 },
             }
@@ -9976,7 +10037,7 @@ class TestHandleModernSpecialMethod:
         # The real client data WAS captured (for _meta injection on later
         # requests) — it is simply never fed back into this synthesized
         # result, which is the documented limitation, not a missed capture.
-        assert state.client_capabilities == {"roots": {}, "sampling": {}}
+        assert state.client_capabilities == {"experimental": {"a": {}}, "tools": {}}
         assert state.client_info == {"name": "real-client", "version": "3.0"}
 
     def test_synthesized_protocol_version_echoes_client_request_not_upstream(self):
@@ -10052,6 +10113,10 @@ class TestDiscoverReseedRetry:
     cost on the common already-seeded path."""
 
     def _initialize_line(self, req_id=1, version="2025-06-18"):
+        # A BRIDGEABLE capability: the MRTR-replaced keys (sampling/
+        # elicitation/roots) are stripped at capture (#350 review round 10,
+        # finding 10-1) and stripped-to-empty capabilities suppress the
+        # reseed — see test_no_retry_when_client_caps_all_unbridgeable.
         return json.dumps(
             {
                 "jsonrpc": "2.0",
@@ -10059,7 +10124,7 @@ class TestDiscoverReseedRetry:
                 "method": "initialize",
                 "params": {
                     "protocolVersion": version,
-                    "capabilities": {"roots": {}},
+                    "capabilities": {"experimental": {"caching": {}}},
                     "clientInfo": {"name": "real-client", "version": "3.0"},
                 },
             }
@@ -10081,7 +10146,12 @@ class TestDiscoverReseedRetry:
         _, reply = _handle_modern_special_method(
             self._initialize_line(), 1, state, discover_retry=retry
         )
-        assert calls == [({"roots": {}}, {"name": "real-client", "version": "3.0"})]
+        assert calls == [
+            (
+                {"experimental": {"caching": {}}},
+                {"name": "real-client", "version": "3.0"},
+            )
+        ]
         result = json.loads(reply)["result"]
         # The reseeded discover data feeds the synthesized result...
         assert result["serverInfo"] == {"name": "reseeded-srv", "version": "2"}
@@ -10192,6 +10262,38 @@ class TestDiscoverReseedRetry:
         # capabilities may still use the one reseed attempt.
         assert state.discover_retry_attempted is False
 
+    def test_no_retry_when_client_caps_all_unbridgeable(self):
+        """#350 review round 10, finding 10-1 x round 9's reseed condition:
+        a client whose ONLY capabilities are the MRTR-replaced keys is left
+        with {} after the capture-time strip — so it has nothing this relay
+        may advertise, and the re-probe would carry exactly the placeholder
+        {} the startup probe already sent. No retry fires, and the one
+        latched attempt is preserved for a re-initialize that carries a
+        bridgeable capability."""
+        state = _ModernState()
+        line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": {
+                        "sampling": {},
+                        "elicitation": {},
+                        "roots": {"listChanged": True},
+                    },
+                },
+            }
+        )
+        calls = []
+        _handle_modern_special_method(
+            line, 1, state, discover_retry=lambda: calls.append(1)
+        )
+        assert calls == []
+        assert state.client_capabilities == {}
+        assert state.discover_retry_attempted is False
+
     def test_failed_retry_degrades_and_never_retries_again(self):
         """A retry that seeds nothing (the remote rejected discovery again)
         degrades to exactly the pre-retry behavior — honest-unknown
@@ -10233,8 +10335,11 @@ class TestReseedDiscoverProbe:
     URL = "https://example.com/mcp"
 
     def _state_with_client_data(self):
+        # Captured state never contains the MRTR-replaced keys (they are
+        # stripped at capture, #350 review round 10, finding 10-1), so
+        # model a bridgeable capability here.
         state = _ModernState()
-        state.client_capabilities = {"roots": {}}
+        state.client_capabilities = {"experimental": {"caching": {}}}
         state.client_info = {"name": "real-client", "version": "3.0"}
         return state
 
@@ -10267,7 +10372,9 @@ class TestReseedDiscoverProbe:
         # The re-probe advertises the client's REAL capabilities/info —
         # the whole reason it can succeed where the startup probe's {}
         # was rejected with -32021.
-        assert meta["io.modelcontextprotocol/clientCapabilities"] == {"roots": {}}
+        assert meta["io.modelcontextprotocol/clientCapabilities"] == {
+            "experimental": {"caching": {}}
+        }
         assert meta["io.modelcontextprotocol/clientInfo"] == {
             "name": "real-client",
             "version": "3.0",
@@ -10385,7 +10492,9 @@ class TestReseedDiscoverProbe:
         # capabilities/info — the whole point of the reseed — because the
         # shared loop rebuilds the request with the same modern_state.
         meta = json.loads(requests[1].content)["params"]["_meta"]
-        assert meta["io.modelcontextprotocol/clientCapabilities"] == {"roots": {}}
+        assert meta["io.modelcontextprotocol/clientCapabilities"] == {
+            "experimental": {"caching": {}}
+        }
         assert meta["io.modelcontextprotocol/clientInfo"] == {
             "name": "real-client",
             "version": "3.0",
@@ -10471,12 +10580,17 @@ class TestInjectModernMeta:
     def test_injects_required_fields(self):
         state = _ModernState()
         state.negotiated_version = "2026-07-28"
-        state.client_capabilities = {"roots": {}}
+        # Captured state never contains the MRTR-replaced keys (stripped at
+        # capture, #350 review round 10, finding 10-1) — model a bridgeable
+        # capability. _inject_modern_meta itself forwards state verbatim.
+        state.client_capabilities = {"experimental": {}}
         line = '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
         injected = json.loads(_inject_modern_meta(line, state))
         meta = injected["params"]["_meta"]
         assert meta["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
-        assert meta["io.modelcontextprotocol/clientCapabilities"] == {"roots": {}}
+        assert meta["io.modelcontextprotocol/clientCapabilities"] == {
+            "experimental": {}
+        }
         assert "io.modelcontextprotocol/clientInfo" not in meta
         assert "io.modelcontextprotocol/logLevel" not in meta
 
@@ -11114,7 +11228,7 @@ class TestRunModernEra:
                         "method": "initialize",
                         "params": {
                             "protocolVersion": "2026-07-28",
-                            "capabilities": {"roots": {}},
+                            "capabilities": {"experimental": {"caching": {}}},
                             "clientInfo": {"name": "real-client", "version": "3.0"},
                         },
                     }
@@ -11131,7 +11245,9 @@ class TestRunModernEra:
         reseed_body = json.loads(requests[1].content)
         assert reseed_body["method"] == "server/discover"
         meta = reseed_body["params"]["_meta"]
-        assert meta["io.modelcontextprotocol/clientCapabilities"] == {"roots": {}}
+        assert meta["io.modelcontextprotocol/clientCapabilities"] == {
+            "experimental": {"caching": {}}
+        }
         assert meta["io.modelcontextprotocol/clientInfo"] == {
             "name": "real-client",
             "version": "3.0",
@@ -11171,7 +11287,7 @@ class TestRunModernEra:
                 "method": "initialize",
                 "params": {
                     "protocolVersion": "2026-07-28",
-                    "capabilities": {"roots": {}},
+                    "capabilities": {"experimental": {"caching": {}}},
                 },
             }
         )
@@ -11182,7 +11298,7 @@ class TestRunModernEra:
                 "method": "initialize",
                 "params": {
                     "protocolVersion": "2026-07-28",
-                    "capabilities": {"roots": {}},
+                    "capabilities": {"experimental": {"caching": {}}},
                 },
             }
         )
@@ -11197,6 +11313,151 @@ class TestRunModernEra:
         # startup probe + ONE reseed attempt — the second initialize did
         # not trigger a third.
         assert len(httpx_mock.get_requests()) == 2
+
+    def test_unbridgeable_client_capabilities_stripped_from_upstream_meta(
+        self, httpx_mock
+    ):
+        """#350 review round 10, finding 10-1, end-to-end: the client
+        advertises sampling/elicitation/roots alongside bridgeable
+        capabilities. Spec rev 2026-07-28 (SEP-2322) replaced the
+        server-initiated flows those three keys negotiate with MRTR, whose
+        passthrough Phase 1 defers — so forwarding them upstream would
+        invite a modern server to answer with an ``input_required`` result
+        this relay can only hand a legacy client verbatim. Every upstream
+        advertisement — the reseed re-probe's ``_meta`` AND each ordinary
+        request's ``_meta`` — must carry only the bridgeable remainder,
+        while the SERVER capability set echoed downstream stays intact."""
+        httpx_mock.add_response(
+            url=self.URL,
+            status_code=400,
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "error": {"code": -32021, "message": "missing capability"},
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":2,"result":{}}',
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2026-07-28",
+                            "capabilities": {
+                                "sampling": {},
+                                "elicitation": {},
+                                "roots": {"listChanged": True},
+                                "experimental": {"caching": {}},
+                                "tools": {"quirky": True},
+                            },
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {"name": "echo", "arguments": {}},
+                    }
+                ),
+            ],
+            protocol_era="auto",
+        )
+        expected_caps = {
+            "experimental": {"caching": {}},
+            "tools": {"quirky": True},
+        }
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 3  # startup probe + reseed + tools/call
+        reseed_meta = json.loads(requests[1].content)["params"]["_meta"]
+        assert (
+            reseed_meta["io.modelcontextprotocol/clientCapabilities"] == expected_caps
+        )
+        call_meta = json.loads(requests[2].content)["params"]["_meta"]
+        assert call_meta["io.modelcontextprotocol/clientCapabilities"] == expected_caps
+        # The synthesized InitializeResult echoes the SERVER's discover-
+        # seeded capabilities untouched — the filter never applies there.
+        reply = json.loads(output.strip().split("\n")[0])
+        assert reply["result"]["capabilities"] == {"tools": {}}
+
+    def test_client_with_only_unbridgeable_caps_treated_as_empty_no_reseed(
+        self, httpx_mock
+    ):
+        """#350 review round 10, finding 10-1 x the round-9 reseed
+        condition: a client advertising ONLY the MRTR-replaced keys has
+        nothing this relay may forward upstream — the capture-time strip
+        leaves {}, so the reseed re-probe (which exists to advertise the
+        client's REAL capabilities) must not fire: it would carry exactly
+        the placeholder {} the -32021-gated startup probe already sent.
+        Subsequent requests advertise clientCapabilities: {} — never the
+        un-bridgeable keys."""
+        httpx_mock.add_response(
+            url=self.URL,
+            status_code=400,
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "error": {"code": -32021, "message": "missing capability"},
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":2,"result":{}}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            httpx_mock,
+            [
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2026-07-28",
+                            "capabilities": {
+                                "sampling": {},
+                                "elicitation": {},
+                                "roots": {},
+                            },
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/list",
+                    }
+                ),
+            ],
+            protocol_era="auto",
+        )
+        requests = httpx_mock.get_requests()
+        # Startup probe + tools/list — NO reseed re-probe in between.
+        assert len(requests) == 2
+        call_meta = json.loads(requests[1].content)["params"]["_meta"]
+        assert call_meta["io.modelcontextprotocol/clientCapabilities"] == {}
 
     def test_additive_2026_result_shape_forwarded_verbatim_to_2025_client(
         self, httpx_mock
@@ -11273,9 +11534,14 @@ class TestRunModernEra:
         (resultType: "input_required" REPLACING the real payload,
         SEP-2322), is forwarded verbatim by Phase 1 — translating it into
         legacy server-initiated sampling/elicitation/roots requests is
-        #270's explicitly-phased Phase 2 work. This pins the documented
-        gap so Phase 2 has a test to flip, and so the gap can never become
-        an accidental rewrite instead of a deliberate translation."""
+        #270's explicitly-phased Phase 2 work. Since round 10 (finding
+        10-1) the relay strips the client capability keys that would
+        invite this flow, so a COMPLIANT server no longer has reason to
+        send it — this pins the residual: a NON-compliant upstream that
+        sends input_required unprovoked (as here, where the client never
+        advertised those capabilities at all) is still forwarded verbatim,
+        so Phase 2 has a test to flip and the gap can never become an
+        accidental rewrite instead of a deliberate translation."""
         mrtr_result = json.dumps(
             {
                 "jsonrpc": "2.0",

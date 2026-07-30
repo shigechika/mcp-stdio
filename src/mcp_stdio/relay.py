@@ -407,6 +407,30 @@ _META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
 # initialize/session state is gone). See _extract_log_level.
 _META_LOG_LEVEL = "io.modelcontextprotocol/logLevel"
 
+# Client capability keys whose MODERN semantics this Phase 1 relay cannot
+# bridge (#350 review round 10, finding 10-1). Spec rev 2026-07-28
+# (SEP-2322) REPLACED the server-initiated ``sampling``/``elicitation``/
+# ``roots`` round-trips these keys advertise with MRTR: a server needing
+# client input answers the request itself with an ``InputRequiredResult``
+# (``resultType: "input_required"``) that the client must satisfy by
+# re-issuing the request with ``inputResponses``. Translating that exchange
+# back into the legacy server-initiated requests a 2025-era stdio client
+# understands is #270's explicitly-phased Phase 2 work — so forwarding these
+# keys upstream in ``_meta``'s ``clientCapabilities`` would ADVERTISE flows
+# this relay cannot deliver: a modern server, told the client supports them,
+# may legitimately answer e.g. a ``tools/call`` with an MRTR result that
+# Phase 1 forwards verbatim to a client that cannot answer it (misread as an
+# oddly-shaped success, or a hang). Stripping the keys at CAPTURE time
+# (``_handle_modern_special_method``'s ``initialize`` interception) removes
+# the invitation at every downstream use in one place — per-request
+# ``_meta`` injection AND the reseed re-probe's advertised capabilities —
+# and makes the reseed's "client has real capabilities" condition naturally
+# correct for a client whose ONLY capabilities are un-bridgeable ones.
+# Every other key (notably ``experimental``, and any future additions) does
+# not map to an MRTR-replaced flow and passes through untouched. Remove
+# entries here only when Phase 2 actually bridges the corresponding flow.
+_MRTR_REPLACED_CLIENT_CAPABILITIES = frozenset({"sampling", "elicitation", "roots"})
+
 # MCP request metadata headers (spec rev 2026-07-28, "Request Metadata",
 # SEP-2243). Every Streamable HTTP POST on the modern path mirrors the
 # request's `method` into an `Mcp-Method` header; `tools/call` /
@@ -613,7 +637,11 @@ class _ModernState:
     ``negotiated_version`` are captured once from the local stdio client's
     own ``initialize`` request (see ``_handle_modern_special_method`` — the
     modern path never forwards that request upstream, so this is the only
-    place those values are ever seen). ``log_level`` is updated on every
+    place those values are ever seen). ``client_capabilities`` holds the
+    client's set MINUS the MRTR-replaced keys this Phase 1 relay cannot
+    bridge (``_MRTR_REPLACED_CLIENT_CAPABILITIES``, #350 review round 10,
+    finding 10-1) — every upstream advertisement reads this field, so the
+    filter applies once, here. ``log_level`` is updated on every
     ``logging/setLevel`` line regardless of era (see ``_extract_log_level``).
 
     A single plain object (no lock): ``run()``'s stdin loop dispatches one
@@ -1251,13 +1279,18 @@ def _handle_modern_special_method(
       (2) The ONE genuinely incompatible result shape is MRTR's
       ``InputRequiredResult`` (``resultType: "input_required"`` REPLACES
       the real result payload, SEP-2322) — it substitutes for
-      server-INITIATED sampling/elicitation/roots round-trips, so it only
-      arises when the local client advertised those capabilities, and
-      relaying it is explicitly Phase 2 (#270 "Phase 2 — MRTR
-      passthrough"). Until then a Phase 1 relay forwards such a result
-      verbatim — a KNOWN GAP documented in run()'s "Limitation — MRTR"
-      section, not a consequence of which version this field echoes: it
-      would be forwarded verbatim no matter what the echo said.
+      server-INITIATED sampling/elicitation/roots round-trips, so a
+      COMPLIANT server only initiates it when the client's advertised
+      capabilities include those flows. Since round 10 (finding 10-1)
+      this relay never advertises them upstream — the capture above
+      strips ``_MRTR_REPLACED_CLIENT_CAPABILITIES`` — so a compliant
+      modern server has no standing invitation to send MRTR at all;
+      relaying/bridging it is explicitly Phase 2 (#270 "Phase 2 — MRTR
+      passthrough"). A NON-compliant server that sends
+      ``input_required`` unprovoked is still forwarded verbatim — a
+      KNOWN residual documented in run()'s "Limitation — MRTR" section,
+      not a consequence of which version this field echoes: it would be
+      forwarded verbatim no matter what the echo said.
 
       (3) Why not report ``negotiated_version`` (the reviewer-proposed
       alternative): lifecycle spec, Version Negotiation — "If the client
@@ -1299,8 +1332,24 @@ def _handle_modern_special_method(
         # Presence-based, like every other MCP capabilities object (see
         # _report_initialize's own note) — an absent/malformed capabilities
         # object becomes {} (present, empty), never omitted downstream.
+        # Un-bridgeable keys are stripped HERE, at the single capture site
+        # (#350 review round 10, finding 10-1): sampling/elicitation/roots
+        # map to the MRTR flows Phase 1 defers to Phase 2 (see
+        # _MRTR_REPLACED_CLIENT_CAPABILITIES), so advertising them upstream
+        # would invite exactly the input_required results this relay can
+        # only forward verbatim. Filtering at capture covers every
+        # downstream use at once — _inject_modern_meta's per-request _meta
+        # and the reseed re-probe — and the reseed condition below then
+        # correctly treats a client whose ONLY capabilities are
+        # un-bridgeable as having none to advertise. The SERVER capability
+        # set echoed in the synthesized result is untouched: this filter
+        # applies to what the relay claims the CLIENT can do, never to what
+        # the remote reported.
         caps = params.get("capabilities")
-        modern_state.client_capabilities = caps if isinstance(caps, dict) else {}
+        caps = caps if isinstance(caps, dict) else {}
+        modern_state.client_capabilities = {
+            k: v for k, v in caps.items() if k not in _MRTR_REPLACED_CLIENT_CAPABILITIES
+        }
         client_info = params.get("clientInfo")
         modern_state.client_info = (
             client_info if isinstance(client_info, dict) else None
@@ -1317,7 +1366,11 @@ def _handle_modern_special_method(
         # capabilities is the ONE field that placeholder can plausibly
         # distort. A client that itself has no capabilities gets no
         # retry: the re-probe would carry the same ``{}`` the startup
-        # probe already sent and cannot change the outcome. Latch the
+        # probe already sent and cannot change the outcome. That includes
+        # (round 10, finding 10-1) a client whose only capabilities were
+        # the MRTR-replaced keys stripped at capture above — after
+        # filtering it HAS nothing this relay may advertise, so the
+        # re-probe would again carry ``{}``. Latch the
         # attempt BEFORE probing so neither a failed retry nor a
         # re-initialize can ever probe a second time (zero extra
         # round-trips on the common path: a non-empty capabilities seed
@@ -1363,6 +1416,10 @@ def _inject_modern_meta(line: str, modern_state: "_ModernState") -> str:
     clientInfo/serverInfo revision comment — capabilities uses presence-based
     semantics like every other MCP capabilities object, so an empty client
     capabilities set is sent as ``{}`` rather than omitted).
+    ``client_capabilities`` arrives here already stripped of the
+    MRTR-replaced keys Phase 1 cannot bridge — the filter lives at the
+    single capture site (``_handle_modern_special_method``, #350 review
+    round 10, finding 10-1), never re-applied per request.
     ``.../clientInfo`` is sent only when the LOCAL client's own ``initialize``
     actually provided one (SHOULD, never fabricated — see
     ``_handle_modern_special_method``). ``.../logLevel`` is sent only once
@@ -3536,11 +3593,18 @@ def run(
     sampling/elicitation/roots requests a 2025-era stdio client would
     understand — the ``input_required`` result reaches the client
     unchanged, and a client that does not know the discriminator will
-    misread it as an oddly-shaped success. Exposure requires the client to
-    have advertised ``sampling``/``elicitation``/``roots`` capabilities (a
-    modern server has no other reason to initiate MRTR) AND the upstream to
-    actually use them; the ordinary tools/resources/prompts flows are
-    unaffected (their 2026 result shapes are additive-only — see
+    misread it as an oddly-shaped success. Since round 10 (finding 10-1)
+    the relay no longer INVITES that flow: the client capability keys MRTR
+    replaced (``sampling``/``elicitation``/``roots``) are stripped before
+    anything is advertised upstream (``_MRTR_REPLACED_CLIENT_CAPABILITIES``,
+    applied at capture in ``_handle_modern_special_method``), and a server
+    may only use "capabilities that were successfully negotiated"
+    (lifecycle spec) — so a COMPLIANT modern server now has no legitimate
+    reason to send ``input_required`` through this relay. The
+    verbatim-forward caveat therefore covers only a NON-compliant upstream
+    that initiates MRTR despite the client never advertising the flows; the
+    ordinary tools/resources/prompts flows are unaffected (their 2026
+    result shapes are additive-only — see
     ``_handle_modern_special_method``). MRTR passthrough is #270's
     explicitly-phased Phase 2 work, not an oversight in Phase 1.
     """
