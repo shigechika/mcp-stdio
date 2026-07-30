@@ -10195,18 +10195,21 @@ class TestBuildDiscoverProbeRequestStripsAllCaseVariants:
 
 def _with_list_changed(caps):
     """Expected synthesized-InitializeResult capabilities under the C8 union
-    (#270 Phase 2 PR A): the relay itself opens the subscriptions/listen
-    stream and forwards the three list_changed notification kinds, so the
-    synthesized modern InitializeResult must advertise ``listChanged: true``
-    on tools/resources/prompts regardless of what discover seeded —
-    forwarding a notification for an unadvertised capability violates the
-    lifecycle spec's "Only use capabilities that were successfully
-    negotiated", and a gating client would drop it. Every other seeded key
-    (and every other field of the three unioned keys) must survive
-    untouched."""
+    (#270 Phase 2 PR A), NARROWED by #352 round-3 finding 2: ``listChanged:
+    true`` is set only on the tools/resources/prompts families ALREADY
+    PRESENT in the discover seed — an absent family is never created, since
+    a capabilities object's mere presence advertises the whole feature
+    family and would send a capability-gated client after e.g.
+    ``resources/list`` on an upstream that never claimed resources. With an
+    empty seed the union adds nothing (and the relay-side gate then
+    swallows every listen notification — the documented degraded mode).
+    Every other seeded key (and every other field of a unioned family) must
+    survive untouched."""
     expected = copy.deepcopy(caps)
     for key in ("tools", "resources", "prompts"):
-        entry = expected.get(key)
+        if key not in expected:
+            continue
+        entry = expected[key]
         if not isinstance(entry, dict):
             entry = {}
         entry["listChanged"] = True
@@ -10237,6 +10240,11 @@ class TestHandleModernSpecialMethod:
         assert result["serverInfo"] == {"name": "srv", "version": "9"}
         # C8 (#270 Phase 2 PR A): listChanged unioned onto the seeded set.
         assert result["capabilities"] == _with_list_changed({"tools": {}})
+        # #352 round-3 finding 2: families absent from the discover seed
+        # are NOT fabricated — their presence would advertise upstream
+        # feature support discover never reported.
+        assert "resources" not in result["capabilities"]
+        assert "prompts" not in result["capabilities"]
         assert result["protocolVersion"] == "2026-07-28"
         # The client's own capabilities/clientInfo were captured for later
         # _meta injection.
@@ -10315,9 +10323,13 @@ class TestHandleModernSpecialMethod:
         result = json.loads(reply)["result"]
         # C8 (#270 Phase 2 PR A): the listChanged union applies on top of
         # the (unfiltered) server capability echo — elicitation survives.
+        # #352 round-3 finding 2: only the PRESENT tools family is
+        # unioned; resources/prompts are not fabricated.
         assert result["capabilities"] == _with_list_changed(
             {"tools": {}, "elicitation": {}}
         )
+        assert "resources" not in result["capabilities"]
+        assert "prompts" not in result["capabilities"]
 
     def test_initialize_without_client_info_stays_none(self):
         """: clientInfo is a SHOULD, never fabricated — absent from the
@@ -10379,9 +10391,9 @@ class TestHandleModernSpecialMethod:
         )
         _, reply = _handle_modern_special_method(line, 1, state)
         result = json.loads(reply)["result"]
-        # Under-reports: empty capabilities (modulo the C8 listChanged
-        # union, which is the relay's OWN advertisement, not client data),
-        # honest-unknown identity.
+        # Under-reports: exactly empty capabilities (#352 round-3 finding
+        # 2 narrowed the C8 union to families already present, so an empty
+        # seed unions nothing), honest-unknown identity.
         assert result["capabilities"] == _with_list_changed({})
         assert "unknown" in result["serverInfo"]["name"].lower()
         # The real client data WAS captured (for _meta injection on later
@@ -12311,6 +12323,51 @@ class TestRunModernEra:
         assert "mcp-name" not in req.headers
         assert "mcp-session-id" not in req.headers
 
+    def test_run_seeds_advertised_families_into_listen_state(self, httpx_mock):
+        """#352 round-3 finding 2: run()'s _seed_listen_snapshot freezes
+        the advertised-family set — derived from the discover-seeded
+        capabilities by the SAME helper the InitializeResult synthesis
+        uses — into the state carrier handed to the listen thread, so the
+        forwarding gate matches the advertisement. Discover seeds
+        {"tools": {}} → exactly {"tools"} reaches the thread; without the
+        seeding, the gate would fall back to permissive forwarding and
+        the narrowing would hold only in unit tests."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        seen = {}
+        exited = threading.Event()
+
+        def stub_loop(**kwargs):
+            seen["state"] = kwargs["state"]
+            exited.set()
+
+        with patch("mcp_stdio.relay._listen_stream_loop", stub_loop):
+            self._run_with_stdin(
+                httpx_mock,
+                [
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "initialize",
+                            "params": {
+                                "protocolVersion": "2026-07-28",
+                                "capabilities": {},
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {"jsonrpc": "2.0", "method": "notifications/initialized"}
+                    ),
+                ],
+                protocol_era="modern",
+            )
+        assert exited.wait(timeout=5)
+        assert seen["state"]["advertised"] == frozenset({"tools"})
+
     def test_legacy_era_never_opens_listen_stream(self, httpx_mock):
         """AC 3 (#270): the legacy era has NO listen call site — a full
         initialize + notifications/initialized handshake (the stdin covers
@@ -12877,6 +12934,79 @@ class TestHandleListenMessage:
         assert result is None
         assert stdout.getvalue() == ""
 
+    def test_unadvertised_family_swallowed_advertised_forwarded(self):
+        """#352 round-3 finding 2 (the C8 narrowing's forwarding side):
+        ``state["advertised"]`` carries the family set the synthesized
+        InitializeResult actually advertised listChanged on, frozen at
+        listen-seed time. A notifications/resources/list_changed whose
+        family was never advertised is swallowed — forwarding it would be
+        exactly the un-negotiated-capability notification C8 exists to
+        prevent — while an advertised family's notification still flows."""
+        state = {"advertised": frozenset({"tools"})}
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            assert (
+                self._handle(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/resources/list_changed",
+                    },
+                    state=state,
+                )
+                is None
+            )
+        assert stdout.getvalue() == ""
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            assert (
+                self._handle(
+                    {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"},
+                    state=state,
+                )
+                is None
+            )
+        assert (
+            json.loads(stdout.getvalue())["method"]
+            == "notifications/tools/list_changed"
+        )
+
+    def test_empty_advertised_set_swallows_all_three(self):
+        """#352 round-3 finding 2: an empty discover seed ({} — the #350
+        chicken-and-egg case) advertises no family at all, so ALL three
+        list_changed kinds are swallowed — the documented degraded mode."""
+        state = {"advertised": frozenset()}
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            for family in ("tools", "resources", "prompts"):
+                assert (
+                    self._handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": f"notifications/{family}/list_changed",
+                        },
+                        state=state,
+                    )
+                    is None
+                )
+        assert stdout.getvalue() == ""
+
+    def test_unseeded_carrier_keeps_permissive_forwarding(self):
+        """#352 round-3 finding 2, the deliberate fallback: a carrier that
+        never saw a seed (state is None, or no "advertised" key — direct
+        callers in tests) keeps the pre-narrowing permissive behavior.
+        run() always seeds the set before the thread starts, so this arm
+        is unreachable in the real pipeline."""
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            self._handle(
+                {"jsonrpc": "2.0", "method": "notifications/prompts/list_changed"},
+                state=None,
+            )
+        assert (
+            json.loads(stdout.getvalue())["method"]
+            == "notifications/prompts/list_changed"
+        )
+
     def test_cancelled_with_foreign_request_id_is_swallowed(self):
         assert (
             self._handle(
@@ -13085,6 +13215,36 @@ class TestListenStreamLoop:
             "resourcesListChanged": True,
         }
         assert len(httpx_mock.get_requests()) == 1  # graceful: no reconnect
+
+    def test_loop_swallows_unadvertised_family_forwards_advertised(self, httpx_mock):
+        """#352 round-3 finding 2 through the real loop: the state carrier
+        run() seeds gates forwarding — with only the tools family
+        advertised, a resources list_changed on the stream is swallowed
+        while the tools one reaches stdout."""
+        resources_changed = {
+            "jsonrpc": "2.0",
+            "method": "notifications/resources/list_changed",
+        }
+        tools_changed = {
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed",
+        }
+        httpx_mock.add_response(
+            stream=self._sse(
+                self._ack(),
+                resources_changed,
+                tools_changed,
+                self._graceful(),
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+        stdout = StringIO()
+        state = {"advertised": frozenset({"tools"})}
+        with patch("sys.stdout", stdout):
+            self._run_loop(state=state)
+        lines = [json.loads(line) for line in stdout.getvalue().strip().split("\n")]
+        assert lines == [tools_changed]
+        assert len(httpx_mock.get_requests()) == 1
 
     def test_graceful_result_stops_without_reconnect(self, httpx_mock):
         httpx_mock.add_response(

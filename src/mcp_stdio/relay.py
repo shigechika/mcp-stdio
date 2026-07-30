@@ -1365,13 +1365,24 @@ def _handle_modern_special_method(
     nothing), so a client-driven re-``initialize`` or a repeated
     ``initialized`` can never spawn a second thread. The
     synthesized ``InitializeResult`` unions ``listChanged: true`` into
-    ``tools``/``resources``/``prompts`` on this path (C8): the relay
-    itself forwards those three ``list_changed`` notification kinds
-    downstream, and forwarding one for an unadvertised capability would
-    violate the lifecycle spec's "Only use capabilities that were
-    successfully negotiated" — a gating client would drop it (precedent:
-    ``_COLD_START_LIST_CHANGED``, which advertises the same union while
-    the cold-start gate is closed).
+    the capability families ALREADY PRESENT in the discover-seeded
+    ``modern_state.capabilities`` — never creating an absent
+    ``tools``/``resources``/``prompts`` family (C8, narrowed by #352
+    round-3 finding 2): a capabilities object's mere presence advertises
+    the whole feature family, so fabricating e.g. ``resources`` over a
+    discover seed of ``{"tools": {}}`` would invite a capability-gated
+    client to issue ``resources/list`` against an upstream that never
+    claimed to support it. The relay forwards a ``list_changed`` kind
+    downstream only for families advertised here
+    (``_listen_advertised_families``, frozen into the listen state at
+    seed time and enforced by ``_handle_listen_message``), keeping the
+    lifecycle spec's "Only use capabilities that were successfully
+    negotiated" coherent in BOTH directions; with an empty discover seed
+    (the #350 chicken-and-egg case) nothing is advertised and every
+    listen notification is swallowed — the documented degraded mode
+    (precedent for advertising exactly what is forwarded:
+    ``_COLD_START_LIST_CHANGED``, which advertises the union it later
+    emits while the cold-start gate is closed).
 
     Returns ``(False, None)`` for every other line, which the caller
     dispatches normally (through ``_inject_modern_meta`` first).
@@ -1457,24 +1468,38 @@ def _handle_modern_special_method(
         # the handshake reply.
         if listen_seed is not None:
             listen_seed()
-        # C8 (#270 Phase 2 PR A): union `listChanged: true` into tools/
-        # resources/prompts. The relay forwards exactly those three
-        # list_changed notification kinds from the listen stream, so the
-        # synthesized result MUST advertise them: the lifecycle spec says
-        # both parties "Only use capabilities that were successfully
-        # negotiated", and a client that gates on the advertisement would
-        # drop an un-advertised notification. Deep-copied so the union
-        # never leaks into the discover-seeded `modern_state.capabilities`
-        # (which every later re-initialize re-reads). Precedent:
-        # _COLD_START_LIST_CHANGED. Unconditional on the modern path —
-        # the stream is default-on, and advertising listChanged when the
+        # C8 (#270 Phase 2 PR A), NARROWED by #352 round-3 finding 2:
+        # union `listChanged: true` into the capability families the
+        # discover seed actually advertised — never CREATING an absent
+        # family. A capabilities object's mere presence advertises the
+        # whole feature family (tools/resources/prompts), not just its
+        # change notifications, so fabricating e.g. `resources` over a
+        # seed of `{"tools": {}}` would send a capability-gated client
+        # after `resources/list` on an upstream that never claimed
+        # resources at all. Three distinct layers now cooperate: the
+        # listen FILTER still over-REQUESTS all three kinds
+        # (_LISTEN_REQUESTED_NOTIFICATIONS — spec-safe, see its comment),
+        # the server's ack narrows what ARRIVES, and the advertised set
+        # frozen at listen-seed time (_listen_advertised_families — the
+        # same helper used here) gates what the relay FORWARDS
+        # (_handle_listen_message). So a forwarded list_changed always has
+        # its family advertised ("Only use capabilities that were
+        # successfully negotiated" holds in BOTH directions), and an empty
+        # discover seed ({} — the #350 chicken-and-egg case) advertises
+        # nothing and forwards nothing: the documented degraded mode.
+        # Deep-copied so the union never leaks into the discover-seeded
+        # `modern_state.capabilities` (which every later re-initialize
+        # re-reads). Precedent for advertising exactly what is forwarded:
+        # _COLD_START_LIST_CHANGED. Advertising listChanged when the
         # stream later turns out unsupported (the C6 terminal arm) merely
         # promises notifications that never arrive, which listChanged
         # never guarantees anyway.
         capabilities = copy.deepcopy(modern_state.capabilities)
-        for key in ("tools", "resources", "prompts"):
+        for key in _listen_advertised_families(capabilities):
             entry = capabilities.get(key)
             if not isinstance(entry, dict):
+                # Present but malformed (non-object): the family IS
+                # advertised, so coerce to an object we can flag.
                 entry = {}
             entry["listChanged"] = True
             capabilities[key] = entry
@@ -2936,7 +2961,10 @@ def _cold_start_loop(
 # snapshot is seeded earlier, at ``initialize`` interception —
 # ``_handle_modern_special_method`` -> run()'s ``_start_listen_stream``)
 # and forwards ONLY the three ``list_changed`` notification kinds
-# downstream. Resource subscriptions (``resourceSubscriptions`` +
+# downstream — and only for capability families the synthesized
+# InitializeResult actually advertised (the C8 narrowing, #352 round-3
+# finding 2; see ``_listen_advertised_families``). Resource
+# subscriptions (``resourceSubscriptions`` +
 # ``resources/subscribe`` interception) are PR B; the MRTR bridge is PR C
 # (#270 Phase 2 phasing).
 _LISTEN_METHOD = "subscriptions/listen"
@@ -2952,6 +2980,12 @@ _LISTEN_ID_PREFIX = "mcp-stdio/listen/"
 # The notification kinds requested on every listen POST: all three
 # list_changed booleans, no ``resourceSubscriptions`` until PR B. Also the
 # reference set the ack's honored subset is compared against.
+# DELIBERATELY broader than what may be forwarded (#352 round-3 finding
+# 2): over-requesting is spec-safe (the server merely sends kinds the
+# relay may then drop), and three distinct layers do three distinct jobs
+# — this REQUEST filter over-asks, the server's ack narrows what ARRIVES,
+# and the advertised-family set frozen at seed time
+# (``_listen_advertised_families``) gates what the relay FORWARDS.
 _LISTEN_REQUESTED_NOTIFICATIONS = {
     "toolsListChanged": True,
     "promptsListChanged": True,
@@ -2962,6 +2996,28 @@ _LISTEN_REQUESTED_NOTIFICATIONS = {
 # ``notifications/cancelled``, is relay-internal and swallowed). Same
 # three methods the cold-start gate emits, shared so they can never drift.
 _LISTEN_FORWARDED_NOTIFICATIONS = frozenset(_COLD_START_LIST_CHANGED)
+# The three capability families whose list_changed kinds the listen
+# stream can carry — the family is the middle segment of each
+# _LISTEN_FORWARDED_NOTIFICATIONS method name.
+_LISTEN_FAMILIES = ("tools", "resources", "prompts")
+
+
+def _listen_advertised_families(capabilities: dict[str, Any]) -> frozenset[str]:
+    """Families among tools/resources/prompts PRESENT in ``capabilities``.
+
+    The single source of truth for the C8 narrowing (#352 round-3 finding
+    2): ``_handle_modern_special_method`` sets ``listChanged: true`` on
+    exactly these families in the synthesized ``InitializeResult``, and
+    run()'s ``_seed_listen_snapshot`` records the same set (frozen
+    alongside the C1 body snapshot) for ``_handle_listen_message`` to gate
+    forwarding on — one helper, so the advertisement and the gate can
+    never drift. Presence-based like every MCP capabilities object: a
+    present-but-malformed family value still advertises the family (the
+    synthesis coerces it to an object it can flag).
+    """
+    return frozenset(k for k in _LISTEN_FAMILIES if k in capabilities)
+
+
 # Error codes that prove the remote will NEVER accept subscriptions/listen
 # (C6): -32601 Method not found, plus the modern reserved codes -32020
 # HeaderMismatch / -32021 MissingRequiredClientCapability / -32022
@@ -3054,7 +3110,12 @@ def _handle_listen_message(
     reconnect), or ``None`` (message consumed; keep reading).
 
     Whitelist semantics: only the three ``list_changed`` notification
-    kinds are forwarded (subscriptionId stripped first), and only as TRUE
+    kinds are forwarded (subscriptionId stripped first) — and only those
+    whose capability family the synthesized ``InitializeResult`` actually
+    advertised (#352 round-3 finding 2: the advertised-family set rides
+    ``state["advertised"]``, frozen at listen-seed time; an unadvertised
+    family's notification is swallowed, ALL of them when the discover
+    seed was empty) — and only as TRUE
     notifications — a whitelisted method carrying an ``id`` is a JSON-RPC
     request, not a notification, and is swallowed (#352 round-2 finding
     3: a hostile upstream must not solicit a response from the legacy
@@ -3099,7 +3160,23 @@ def _handle_listen_message(
         # relay-internal interaction into the ordinary request path. Only a
         # true notification (id absent) is forwarded; anything else is
         # swallowed like every other non-whitelisted message.
-        if "id" not in msg:
+        #
+        # #352 round-3 finding 2 (the C8 narrowing's forwarding side):
+        # forward only when the notification's family was actually
+        # advertised (listChanged) in the synthesized InitializeResult —
+        # the advertised set is frozen into ``state`` at listen-seed time
+        # (run()'s ``_seed_listen_snapshot``). A family the discover seed
+        # never contained was never advertised downstream, so forwarding
+        # its list_changed would be exactly the un-negotiated-capability
+        # notification C8 exists to prevent; swallowed instead. With an
+        # empty discover seed ALL three are swallowed — the documented
+        # degraded mode. An unseeded carrier (``state`` is None or never
+        # saw a seed — direct callers in tests) keeps the permissive
+        # pre-narrowing behavior; run() always seeds before the thread
+        # starts.
+        advertised = state.get("advertised") if state is not None else None
+        family = method.split("/")[1]
+        if "id" not in msg and (advertised is None or family in advertised):
             _emit(json.dumps(_strip_listen_subscription_id(msg)), tracker)
         return None
     if method == "notifications/cancelled":
@@ -4500,7 +4577,10 @@ def run(
     # time; None means no initialize was ever intercepted, so an orphan
     # `initialized` starts nothing. "honored" records the
     # server-acknowledged notification subset from the ack (logged on
-    # divergence; consumed for real by PR B). "client" is the thread's
+    # divergence; consumed for real by PR B). "advertised" is the frozen
+    # set of capability families the synthesized InitializeResult
+    # advertised listChanged on (#352 round-3 finding 2) — the forwarding
+    # gate _handle_listen_message applies. "client" is the thread's
     # DEDICATED httpx client (#352 round-2 finding 2), created alongside
     # the thread and closed by the finally below — from the main thread —
     # to actively unblock a parked read at shutdown.
@@ -4508,6 +4588,7 @@ def run(
         "thread": None,
         "params": None,
         "honored": None,
+        "advertised": None,
         "client": None,
     }
 
@@ -4516,11 +4597,23 @@ def run(
 
         Re-seeded by a re-``initialize`` only until the thread starts —
         the latest negotiation wins at start time; after that the running
-        thread's snapshot stays frozen (C1).
+        thread's snapshot stays frozen (C1). The advertised-family set
+        (#352 round-3 finding 2) freezes on the same schedule, computed by
+        the SAME helper the InitializeResult synthesis uses
+        (``_listen_advertised_families``), so the gate and the
+        advertisement cannot drift. A re-``initialize`` AFTER the thread
+        started re-derives the synthesized result but never widens what
+        the running thread forwards — the conservative direction: an
+        over-advertised family merely gets no notifications (which
+        ``listChanged`` never guarantees), never a forwarded notification
+        for an unadvertised one.
         """
         if listen_state["thread"] is not None:
             return
         listen_state["params"] = _build_listen_params(modern_state)
+        listen_state["advertised"] = _listen_advertised_families(
+            modern_state.capabilities
+        )
 
     def _start_listen_stream() -> None:
         """Open the background subscriptions/listen stream, at most once.
