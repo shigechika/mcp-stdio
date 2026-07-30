@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.32.0](https://github.com/shigechika/mcp-stdio/compare/v0.31.0...v0.32.0) (2026-07-30)
+
+
+### Features
+
+* subscriptions/listen stream on the modern era ([#270](https://github.com/shigechika/mcp-stdio/issues/270) Phase 2 PR A) ([#352](https://github.com/shigechika/mcp-stdio/issues/352)) ([b28fe63](https://github.com/shigechika/mcp-stdio/commit/b28fe6369633fe45fd88f4cd2f12669ae0ade0d6))
+
+
+### Bug Fixes
+
+* **ci:** verifier diff parity and case-insensitive DROP id matching ([#355](https://github.com/shigechika/mcp-stdio/issues/355)) ([9eb7cb4](https://github.com/shigechika/mcp-stdio/commit/9eb7cb41f661b4c9405fae7ad660a1034fab8032))
+
 ## [0.31.0](https://github.com/shigechika/mcp-stdio/compare/v0.30.1...v0.31.0) (2026-07-30)
 
 
