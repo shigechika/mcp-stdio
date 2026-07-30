@@ -3125,7 +3125,10 @@ def _handle_listen_message(
     Returns ``"graceful"`` (server ended the stream on purpose — stop, no
     reconnect, nothing on stdout), ``"terminal"`` (the remote will never
     accept ``subscriptions/listen`` — C6: logged loudly once, stop, no
-    reconnect), or ``None`` (message consumed; keep reading).
+    reconnect), ``"ack"`` (the acknowledgement — consumed like ``None``,
+    keep reading, but it is the protocol-valid establishment evidence
+    ``_listen_stream_loop`` records; #352 round-5 finding 2), or ``None``
+    (message consumed; keep reading).
 
     Whitelist semantics: only the three ``list_changed`` notification
     kinds are forwarded (subscriptionId stripped first) — and only those
@@ -3168,7 +3171,7 @@ def _handle_listen_message(
                 "listen stream: server honored a subset of the requested "
                 f"notifications: {honored}"
             )
-        return None
+        return "ack"
     if method in _LISTEN_FORWARDED_NOTIFICATIONS:
         # #352 round-2 finding 3: JSON-RPC 2.0 defines any message that
         # CARRIES an "id" member as a request — the sender expects a
@@ -3289,7 +3292,17 @@ def _listen_stream_loop(
       BEFORE any success, fail fast instead (C7's ``established`` split —
       the first attempt runs moments after a successful probe/initialize,
       so a first-attempt failure is far more likely non-support than a
-      blip). 401/403 are EXEMPT from that fail-fast (#352 round-2
+      blip). "Established" means the acknowledgement — the spec-mandated
+      FIRST stream message — was observed, NOT that some attempt got an
+      HTTP 200 (#352 round-5 finding 2: a misrouted endpoint answering a
+      generic empty/HTML 200, or a 200 SSE closing before any ack, must
+      hit this same fail-fast, not reconnect forever). It is deliberately
+      once-per-THREAD, not per-attempt: a server that once proved it
+      speaks the protocol has earned C7's infinite patience, so a
+      reconnect answered with ack-less junk is treated as the
+      transient blip (LB flap, mid-deploy proxy page) it almost certainly
+      is and retried — sudden genuine non-support still terminates via
+      the C6 terminal arms. 401/403 are EXEMPT from the fail-fast (#352 round-2
       finding 1): an auth challenge is always a retryable drop (C3),
       established or not — NO auth recovery runs on this thread
       (``_probe_auth_recovery``'s lock ordering is not safe from a
@@ -3407,7 +3420,21 @@ def _listen_stream_loop(
                     else:
                         log(f"listen stream: HTTP {resp.status_code}; reconnecting")
                 else:
-                    established = True
+                    # #352 round-5 finding 2: an HTTP 200 alone is NOT
+                    # establishment. Establishment is recorded only on the
+                    # acknowledgement — the spec-mandated FIRST stream
+                    # message, the protocol-valid evidence the endpoint
+                    # actually speaks subscriptions/listen. Recording it
+                    # on any 200 let an unsupported/misrouted endpoint
+                    # answering a generic empty/HTML 200 (or a 200 SSE
+                    # that closes before any ack) flip the loop into the
+                    # post-establishment reconnect-forever arm — POSTing
+                    # at 1 Hz forever against an endpoint that never spoke
+                    # the protocol, exactly what C7's fail-fast exists to
+                    # prevent. Graceful/terminal classifications still win
+                    # over the no-ack fail-fast below: they return from
+                    # inside the message handling, before stream end is
+                    # ever reached.
                     if _is_sse_response(resp):
                         for event_type, data in _iter_sse_events(
                             _iter_sse_lines(resp.iter_text())
@@ -3416,21 +3443,42 @@ def _listen_stream_loop(
                                 return
                             if event_type != "message":
                                 continue
-                            if (
-                                _handle_listen_message(data, listen_id, tracker, state)
-                                is not None
-                            ):
+                            outcome = _handle_listen_message(
+                                data, listen_id, tracker, state
+                            )
+                            if outcome == "ack":
+                                established = True
+                            elif outcome is not None:
                                 return
                         # Stream ended with neither graceful signal.
+                        if not established:
+                            log(
+                                "listen stream: 200 stream ended without the "
+                                "acknowledgement before the stream was ever "
+                                "established; list_changed forwarding "
+                                "disabled for this session"
+                            )
+                            return
                         log("listen stream ended without a signal; reconnecting")
                     else:
                         resp.read()
                         text = resp.text.strip()
-                        if (
-                            text
-                            and _handle_listen_message(text, listen_id, tracker, state)
-                            is not None
-                        ):
+                        outcome = (
+                            _handle_listen_message(text, listen_id, tracker, state)
+                            if text
+                            else None
+                        )
+                        if outcome == "ack":
+                            established = True
+                        elif outcome is not None:
+                            return
+                        if not established:
+                            log(
+                                "listen stream: 200 response carried no "
+                                "acknowledgement before the stream was ever "
+                                "established; list_changed forwarding "
+                                "disabled for this session"
+                            )
                             return
                         log(
                             "listen stream: JSON 200 carried no terminal "

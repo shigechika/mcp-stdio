@@ -13173,6 +13173,9 @@ class TestHandleListenMessage:
     def test_ack_records_honored_subset_and_logs_divergence(self, capsys):
         state = {}
         honored = {"toolsListChanged": True}
+        # "ack" (not None): the ack is consumed like any swallowed message
+        # but reported distinctly — it is the protocol-valid establishment
+        # evidence the loop records (#352 round-5 finding 2).
         assert (
             self._handle(
                 {
@@ -13182,7 +13185,7 @@ class TestHandleListenMessage:
                 },
                 state=state,
             )
-            is None
+            == "ack"
         )
         assert state["honored"] == honored
         assert "honored a subset" in capsys.readouterr().err
@@ -13194,13 +13197,16 @@ class TestHandleListenMessage:
             "promptsListChanged": True,
             "resourcesListChanged": True,
         }
-        self._handle(
-            {
-                "jsonrpc": "2.0",
-                "method": "notifications/subscriptions/acknowledged",
-                "params": {"notifications": honored},
-            },
-            state=state,
+        assert (
+            self._handle(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/subscriptions/acknowledged",
+                    "params": {"notifications": honored},
+                },
+                state=state,
+            )
+            == "ack"
         )
         assert state["honored"] == honored
         assert "honored a subset" not in capsys.readouterr().err
@@ -13461,6 +13467,117 @@ class TestListenStreamLoop:
             self._run_loop()
         assert len(httpx_mock.get_requests()) == 1
         assert "before the stream was ever established" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "body,content_type",
+        [
+            ("", "text/plain"),
+            ("<html><body>It works!</body></html>", "text/html"),
+            ("OK", "application/json"),
+        ],
+    )
+    def _add_regression_escape_hatch(self, httpx_mock):
+        """Bound the fail-fast tests against their own regression.
+
+        On the fixed loop this optional graceful response is never
+        consumed (the ack-less 200 fail-fasts after one POST). On a
+        regressed loop — 200 counting as establishment again — attempt 2
+        would otherwise find NO registered response, get pytest-httpx's
+        synthesized timeout, classify it as a post-establishment drop and
+        spin forever: the suite would HANG instead of failing. The hatch
+        ends a regressed loop at attempt 2, so the request-count assert
+        fails loudly instead."""
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=self._sse(self._graceful(attempt=2)),
+            headers={"content-type": "text/event-stream"},
+            is_optional=True,
+        )
+
+    @pytest.mark.parametrize(
+        "body,content_type",
+        [
+            ("", "text/plain"),
+            ("<html><body>It works!</body></html>", "text/html"),
+            ("OK", "application/json"),
+        ],
+    )
+    def test_200_without_ack_fails_fast(self, httpx_mock, capsys, body, content_type):
+        """#352 round-5 finding 2: an unsupported/misrouted endpoint
+        answering the listen POST with a generic 200 (empty body, a
+        default HTML page, junk) used to count as "established" and flip
+        the loop into the reconnect-forever arm — POSTing at 1 Hz forever
+        against an endpoint that never spoke the protocol. Establishment
+        is now the acknowledgement, so this is a pre-establishment
+        failure: exactly one POST, one loud stderr line, no retry."""
+        httpx_mock.add_response(
+            url=self.URL, text=body, headers={"content-type": content_type}
+        )
+        self._add_regression_escape_hatch(httpx_mock)
+        with (
+            patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            patch("sys.stdout", StringIO()),
+        ):
+            self._run_loop()
+        assert len(httpx_mock.get_requests()) == 1
+        err = capsys.readouterr().err
+        assert err.count("before the stream was ever established") == 1
+        assert "disabled for this session" in err
+
+    def test_200_sse_closing_without_ack_fails_fast(self, httpx_mock, capsys):
+        """#352 round-5 finding 2, SSE shape: a 200 text/event-stream that
+        closes without ever sending the acknowledgement — even one that
+        carried unrelated messages first (a non-ack message is NOT
+        establishment evidence) — is equally pre-establishment: exactly
+        one POST, loud stderr once, no reconnect loop."""
+        unrelated = {"jsonrpc": "2.0", "method": "notifications/message", "params": {}}
+        httpx_mock.add_response(
+            stream=self._sse(unrelated),
+            headers={"content-type": "text/event-stream"},
+        )
+        self._add_regression_escape_hatch(httpx_mock)
+        with (
+            patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            patch("sys.stdout", StringIO()),
+        ):
+            self._run_loop()
+        assert len(httpx_mock.get_requests()) == 1
+        err = capsys.readouterr().err
+        assert err.count("before the stream was ever established") == 1
+        assert "disabled for this session" in err
+
+    def test_established_then_ackless_junk_reconnect_keeps_retrying(
+        self, httpx_mock, capsys
+    ):
+        """#352 round-5 finding 2, the once-per-THREAD pin: after a real
+        establishment (ack observed), a reconnect answered with an
+        ack-less junk 200 is a transient blip (LB flap, mid-deploy proxy
+        page) from a server that already proved it speaks the protocol —
+        C7's infinite patience applies, so the loop keeps retrying instead
+        of fail-fasting per-attempt (a genuine loss of support still
+        terminates via the C6 terminal arms)."""
+        httpx_mock.add_response(
+            stream=self._sse(self._ack()),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text="<html><body>503 backend flapping, says the LB</body></html>",
+            headers={"content-type": "text/html"},
+        )
+        httpx_mock.add_response(
+            stream=self._sse(self._graceful(attempt=3)),
+            headers={"content-type": "text/event-stream"},
+        )
+        with (
+            patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            patch("sys.stdout", StringIO()),
+        ):
+            self._run_loop()
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 3
+        assert json.loads(requests[2].content)["id"] == "mcp-stdio/listen/3"
+        assert "disabled" not in capsys.readouterr().err
 
     def test_auth_failures_before_establishment_retry_with_fresh_headers(
         self, httpx_mock, capsys
