@@ -10387,85 +10387,7 @@ class TestHandleModernSpecialMethod:
         _handle_modern_special_method(line, 1, state)
         assert state.client_capabilities == {}
 
-    def test_mrtr_replaced_client_capabilities_stripped_at_capture(self):
-        """#350 review round 10, finding 10-1: sampling/elicitation/roots
-        map to the server-initiated flows spec rev 2026-07-28 (SEP-2322)
-        replaced with MRTR — which Phase 1 defers to Phase 2. Advertising
-        them upstream would invite a modern server to answer with the very
-        ``input_required`` result this relay can only forward verbatim to a
-        legacy client that cannot answer it. The keys are stripped at the
-        SINGLE capture site so every downstream use (per-request ``_meta``,
-        reseed re-probe) advertises only what the relay can bridge. Other
-        keys — ``experimental`` and anything unrecognized — must survive
-        untouched: they do not map to an MRTR-replaced flow, and
-        over-stripping would under-advertise a genuinely bridgeable
-        capability."""
-        state = _ModernState()
-        line = json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2026-07-28",
-                    "capabilities": {
-                        "sampling": {},
-                        "elicitation": {},
-                        "roots": {"listChanged": True},
-                        "experimental": {"caching": {}},
-                        "tools": {"quirky": True},
-                    },
-                },
-            }
-        )
-        _handle_modern_special_method(line, 1, state)
-        assert state.client_capabilities == {
-            "experimental": {"caching": {}},
-            "tools": {"quirky": True},
-        }
-
-    def test_declared_client_capabilities_retained_before_the_strip(self):
-        """#270 PR C design change 2: the UNFILTERED declaration is kept
-        alongside the advertised (stripped) one. This is the only place
-        the relay ever sees what the local client can actually do — the
-        modern path never forwards the initialize — and the MRTR bridge
-        needs it to decide whether a server-requested elicitation /
-        sampling / roots round-trip may legitimately be minted onto
-        stdout. Phase 1 discarded it, which is why the bridge could not
-        exist before this slot did."""
-        state = _ModernState()
-        line = json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2026-07-28",
-                    "capabilities": {
-                        "elicitation": {"form": {}},
-                        "roots": {"listChanged": True},
-                        "experimental": {"caching": {}},
-                    },
-                },
-            }
-        )
-        _handle_modern_special_method(line, 1, state)
-        # Advertised upstream: still stripped (the un-strip is a later,
-        # separately revertible commit).
-        assert state.client_capabilities == {"experimental": {"caching": {}}}
-        # Declared by the client: retained in full, including the keys the
-        # advertisement drops.
-        assert state.client_capabilities_declared == {
-            "elicitation": {"form": {}},
-            "roots": {"listChanged": True},
-            "experimental": {"caching": {}},
-        }
-
-    def test_declared_client_capabilities_is_a_copy_not_the_params_object(self):
-        """The retained declaration must not alias the parsed params: the
-        advertised set is built by comprehension (a fresh dict), so an
-        aliased declaration could be mutated from the other side and the
-        two would silently drift apart."""
+    def _capture(self, capabilities):
         state = _ModernState()
         _handle_modern_special_method(
             json.dumps(
@@ -10473,12 +10395,117 @@ class TestHandleModernSpecialMethod:
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "initialize",
-                    "params": {"capabilities": {"sampling": {}}},
+                    "params": {
+                        "protocolVersion": "2026-07-28",
+                        "capabilities": capabilities,
+                    },
                 }
             ),
             1,
             state,
         )
+        return state
+
+    def test_mrtr_replaced_client_capabilities_are_advertised_after_the_bridge(self):
+        """#270 Phase 2 PR C, the un-strip. #350 review round 10 (finding
+        10-1) filtered sampling/elicitation/roots out of the upstream
+        advertisement, because advertising a flow Phase 1 could not deliver
+        invited exactly the ``input_required`` results it could only
+        forward verbatim. PR C delivers the flow, so withholding the
+        declaration now costs the user the feature for nothing: a
+        compliant server may "only use capabilities that were successfully
+        negotiated", and one told the client cannot elicit will refuse
+        rather than ask.
+
+        Only keys the client itself declared reach the wire — the captured
+        set is a copy of its own object, never a fabrication."""
+        state = self._capture(
+            {
+                "sampling": {},
+                "elicitation": {},
+                "roots": {"listChanged": True},
+                "experimental": {"caching": {}},
+                "tools": {"quirky": True},
+            }
+        )
+        assert state.client_capabilities == {
+            "sampling": {},
+            "elicitation": {},
+            "roots": {"listChanged": True},
+            "experimental": {"caching": {}},
+            "tools": {"quirky": True},
+        }
+        assert state.client_capabilities_declared == state.client_capabilities
+
+    def test_mrtr_strip_env_restores_the_pre_bridge_advertisement(self, monkeypatch):
+        """The kill-switch (#270 PR C, final commit): one environment
+        variable puts round 10's filter back, so a COMPLIANT server is
+        again told the client cannot do these flows and has no standing
+        invitation to send MRTR. Other keys — ``experimental`` and anything
+        unrecognized — must survive either way: they never mapped to an
+        MRTR-replaced flow.
+
+        The DECLARED set is unaffected, which is what keeps the bridge
+        working for a non-compliant server that sends `input_required`
+        anyway: the client really can answer it."""
+        monkeypatch.setenv("MCP_STDIO_MRTR_STRIP", "1")
+        state = self._capture(
+            {
+                "sampling": {},
+                "elicitation": {},
+                "roots": {"listChanged": True},
+                "experimental": {"caching": {}},
+                "tools": {"quirky": True},
+            }
+        )
+        assert state.client_capabilities == {
+            "experimental": {"caching": {}},
+            "tools": {"quirky": True},
+        }
+        assert "elicitation" in state.client_capabilities_declared
+
+    def test_mrtr_strip_env_ignores_falsey_and_empty_values(self, monkeypatch):
+        """An unset, empty or explicitly-off value must leave the bridge's
+        advertisement alone — an operator who exported the name without a
+        value has not asked for the old behavior back."""
+        for value in ("", "0", "false", "no", "off", "  "):
+            monkeypatch.setenv("MCP_STDIO_MRTR_STRIP", value)
+            assert (
+                "elicitation" in self._capture({"elicitation": {}}).client_capabilities
+            )
+        monkeypatch.setenv("MCP_STDIO_MRTR_STRIP", "TRUE")
+        assert self._capture({"elicitation": {}}).client_capabilities == {}
+
+    def test_declared_client_capabilities_retained_unfiltered(self):
+        """#270 PR C design change 2: the declaration is captured
+        unfiltered, whatever the advertisement does with it. This is the
+        only place the relay ever sees what the local client can actually
+        do — the modern path never forwards the initialize — and the MRTR
+        bridge needs it to decide whether a server-requested elicitation /
+        sampling / roots round-trip may legitimately be minted onto
+        stdout. Phase 1 discarded it, which is why the bridge could not
+        exist before this slot did."""
+        state = self._capture(
+            {
+                "elicitation": {"form": {}},
+                "roots": {"listChanged": True},
+                "experimental": {"caching": {}},
+            }
+        )
+        assert state.client_capabilities_declared == {
+            "elicitation": {"form": {}},
+            "roots": {"listChanged": True},
+            "experimental": {"caching": {}},
+        }
+
+    def test_declared_client_capabilities_is_a_copy_not_the_params_object(
+        self, monkeypatch
+    ):
+        """The retained declaration must not alias the advertised set (nor
+        the parsed params): under the kill-switch the two legitimately
+        differ, and an alias would let one be mutated through the other."""
+        monkeypatch.setenv("MCP_STDIO_MRTR_STRIP", "1")
+        state = self._capture({"sampling": {}})
         assert state.client_capabilities_declared == {"sampling": {}}
         state.client_capabilities_declared["sampling"] = {"mutated": True}
         assert state.client_capabilities == {}
@@ -10862,15 +10889,18 @@ class TestDiscoverReseedRetry:
         # capabilities may still use the one reseed attempt.
         assert state.discover_retry_attempted is False
 
-    def test_no_retry_when_client_caps_all_unbridgeable(self):
-        """#350 review round 10, finding 10-1 x round 9's reseed condition:
-        a client whose ONLY capabilities are the MRTR-replaced keys is left
-        with {} after the capture-time strip — so it has nothing this relay
-        may advertise, and the re-probe would carry exactly the placeholder
-        {} the startup probe already sent. No retry fires, and the one
-        latched attempt is preserved for a re-initialize that carries a
-        bridgeable capability."""
-        state = _ModernState()
+    def test_reseed_follows_the_advertised_set_not_the_declared_one(self, monkeypatch):
+        """Round 9's reseed condition reads the ADVERTISED set, because
+        that is what a re-probe would actually carry — so it stays correct
+        as that set's contents change.
+
+        A client whose ONLY capabilities are the MRTR-replaced keys is the
+        case that moved. While #350 round 10 stripped them it had nothing
+        to advertise and the re-probe would have carried the same
+        placeholder {} the startup probe already sent, so no retry fired.
+        #270 PR C's un-strip gives it something real to advertise, so the
+        retry now DOES fire — and setting the kill-switch restores the old
+        reading verbatim, condition unchanged."""
         line = json.dumps(
             {
                 "jsonrpc": "2.0",
@@ -10886,13 +10916,25 @@ class TestDiscoverReseedRetry:
                 },
             }
         )
+        state = _ModernState()
         calls = []
         _handle_modern_special_method(
             line, 1, state, discover_retry=lambda: calls.append(1)
         )
-        assert calls == []
-        assert state.client_capabilities == {}
-        assert state.discover_retry_attempted is False
+        assert calls == [1]
+        assert state.discover_retry_attempted is True
+
+        monkeypatch.setenv("MCP_STDIO_MRTR_STRIP", "1")
+        stripped_state = _ModernState()
+        stripped_calls = []
+        _handle_modern_special_method(
+            line, 1, stripped_state, discover_retry=lambda: stripped_calls.append(1)
+        )
+        assert stripped_calls == []
+        assert stripped_state.client_capabilities == {}
+        # The one latched attempt is preserved for a re-initialize that
+        # carries a bridgeable capability.
+        assert stripped_state.discover_retry_attempted is False
 
     def test_failed_retry_degrades_and_never_retries_again(self):
         """A retry that seeds nothing (the remote rejected discovery again)
@@ -12041,19 +12083,18 @@ class TestRunModernEra:
         # filtered out here).
         assert len(self._non_listen_requests(httpx_mock)) == 2
 
-    def test_unbridgeable_client_capabilities_stripped_from_upstream_meta(
-        self, httpx_mock
-    ):
-        """#350 review round 10, finding 10-1, end-to-end: the client
-        advertises sampling/elicitation/roots alongside bridgeable
-        capabilities. Spec rev 2026-07-28 (SEP-2322) replaced the
-        server-initiated flows those three keys negotiate with MRTR, whose
-        passthrough Phase 1 defers — so forwarding them upstream would
-        invite a modern server to answer with an ``input_required`` result
-        this relay can only hand a legacy client verbatim. Every upstream
-        advertisement — the reseed re-probe's ``_meta`` AND each ordinary
-        request's ``_meta`` — must carry only the bridgeable remainder,
-        while the SERVER capability set echoed downstream stays intact."""
+    def test_client_capabilities_reach_upstream_meta_unfiltered(self, httpx_mock):
+        """#270 Phase 2 PR C's un-strip, end-to-end: the client declares
+        sampling/elicitation/roots alongside other capabilities, and every
+        upstream advertisement — the reseed re-probe's ``_meta`` AND each
+        ordinary request's ``_meta`` — carries them, because the relay now
+        bridges the MRTR results they invite. #350 review round 10 filtered
+        them out while Phase 1 could only forward such a result verbatim;
+        with a compliant server allowed to "only use capabilities that were
+        successfully negotiated", withholding them now would simply lose
+        the feature. The SERVER capability set echoed downstream stays
+        intact either way — the advertisement decision is about what the
+        relay claims the CLIENT can do."""
         self._register_listen_stream(httpx_mock)
         httpx_mock.add_response(
             url=self.URL,
@@ -12109,6 +12150,9 @@ class TestRunModernEra:
             protocol_era="auto",
         )
         expected_caps = {
+            "sampling": {},
+            "elicitation": {},
+            "roots": {"listChanged": True},
             "experimental": {"caching": {}},
             "tools": {"quirky": True},
         }
@@ -12126,17 +12170,19 @@ class TestRunModernEra:
         reply = json.loads(output.strip().split("\n")[0])
         assert reply["result"]["capabilities"] == _with_list_changed({"tools": {}})
 
-    def test_client_with_only_unbridgeable_caps_treated_as_empty_no_reseed(
-        self, httpx_mock
+    def test_mrtr_strip_env_restores_the_stripped_advertisement_end_to_end(
+        self, httpx_mock, monkeypatch
     ):
-        """#350 review round 10, finding 10-1 x the round-9 reseed
-        condition: a client advertising ONLY the MRTR-replaced keys has
-        nothing this relay may forward upstream — the capture-time strip
-        leaves {}, so the reseed re-probe (which exists to advertise the
-        client's REAL capabilities) must not fire: it would carry exactly
-        the placeholder {} the -32021-gated startup probe already sent.
-        Subsequent requests advertise clientCapabilities: {} — never the
-        un-bridgeable keys."""
+        """The kill-switch end to end (#270 PR C, final commit). With
+        ``MCP_STDIO_MRTR_STRIP`` set, a client declaring ONLY the
+        MRTR-replaced keys has nothing this relay may advertise: the
+        reseed re-probe (which exists to advertise the client's REAL
+        capabilities) must not fire — it would carry exactly the
+        placeholder {} the -32021-gated startup probe already sent — and
+        subsequent requests advertise clientCapabilities: {}. This is
+        verbatim #350 round 10's behavior, restored by one environment
+        variable."""
+        monkeypatch.setenv("MCP_STDIO_MRTR_STRIP", "1")
         self._register_listen_stream(httpx_mock)
         httpx_mock.add_response(
             url=self.URL,
@@ -14007,6 +14053,58 @@ class TestRunModernMrtrBridge:
             protocol_era="modern",
         )
         assert self._out(output)[-1] == json.loads(body)
+
+    def test_kill_switch_withdraws_the_invitation_but_keeps_the_bridge(
+        self, httpx_mock, monkeypatch
+    ):
+        """`MCP_STDIO_MRTR_STRIP` restores the pre-bridge advertisement, so
+        a COMPLIANT server is told the client cannot elicit and has no
+        standing invitation to send MRTR ("Only use capabilities that were
+        successfully negotiated"). It does NOT disable the bridge: the
+        minting gate reads what the client DECLARED, so a non-compliant
+        server that sends `input_required` anyway is still bridged rather
+        than rejected — the client really can answer it, and failing the
+        call instead would serve the user worse. This is exactly the state
+        PR C's own commits 2-5 were built and tested in."""
+        monkeypatch.setenv("MCP_STDIO_MRTR_STRIP", "1")
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(
+            httpx_mock, self._input_required(2, {"who": self._elicit()})
+        )
+        self._register_json(
+            httpx_mock,
+            {
+                "jsonrpc": "2.0",
+                "id": "mcp-stdio/mrtr-retry/1/1",
+                "result": {"content": []},
+            },
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"elicitation": {}}),
+                self._call(),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mcp-stdio/mrtr/1/who",
+                        "result": {"action": "accept", "content": {}},
+                    }
+                ),
+            ],
+            protocol_era="modern",
+        )
+        calls = self._tool_calls(httpx_mock)
+        # The invitation is withdrawn...
+        meta = calls[0]["params"]["_meta"]
+        assert meta["io.modelcontextprotocol/clientCapabilities"] == {}
+        # ...but the round trip still completes for a server that ignored
+        # it.
+        lines = self._out(output)
+        assert lines[1]["method"] == "elicitation/create"
+        assert lines[-1]["id"] == 2
+        assert "inputResponses" in calls[1]["params"]
 
     def test_swallowed_round_does_not_synthesize_an_empty_response(self, httpx_mock):
         """`_post_and_stream` synthesizes "empty response from server" for

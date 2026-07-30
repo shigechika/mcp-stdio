@@ -7,6 +7,7 @@ import copy
 import email.utils
 import json
 import math
+import os
 import re
 import signal
 import socket
@@ -417,28 +418,24 @@ _META_LOG_LEVEL = "io.modelcontextprotocol/logLevel"
 # reaches the legacy stdio client (see _strip_listen_subscription_id).
 _META_SUBSCRIPTION_ID = "io.modelcontextprotocol/subscriptionId"
 
-# Client capability keys whose MODERN semantics this Phase 1 relay cannot
-# bridge (#350 review round 10, finding 10-1). Spec rev 2026-07-28
-# (SEP-2322) REPLACED the server-initiated ``sampling``/``elicitation``/
-# ``roots`` round-trips these keys advertise with MRTR: a server needing
-# client input answers the request itself with an ``InputRequiredResult``
-# (``resultType: "input_required"``) that the client must satisfy by
-# re-issuing the request with ``inputResponses``. Translating that exchange
-# back into the legacy server-initiated requests a 2025-era stdio client
-# understands is #270's explicitly-phased Phase 2 work — so forwarding these
-# keys upstream in ``_meta``'s ``clientCapabilities`` would ADVERTISE flows
-# this relay cannot deliver: a modern server, told the client supports them,
-# may legitimately answer e.g. a ``tools/call`` with an MRTR result that
-# Phase 1 forwards verbatim to a client that cannot answer it (misread as an
-# oddly-shaped success, or a hang). Stripping the keys at CAPTURE time
-# (``_handle_modern_special_method``'s ``initialize`` interception) removes
-# the invitation at every downstream use in one place — per-request
-# ``_meta`` injection AND the reseed re-probe's advertised capabilities —
-# and makes the reseed's "client has real capabilities" condition naturally
-# correct for a client whose ONLY capabilities are un-bridgeable ones.
-# Every other key (notably ``experimental``, and any future additions) does
-# not map to an MRTR-replaced flow and passes through untouched. Remove
-# entries here only when Phase 2 actually bridges the corresponding flow.
+# Client capability keys spec rev 2026-07-28 (SEP-2322) REPLACED with MRTR:
+# a server needing ``sampling``/``elicitation``/``roots`` input no longer
+# initiates a request of its own, it answers the client's request with an
+# ``InputRequiredResult``. Phase 1 could not translate that exchange back
+# into the server-initiated requests a 2025-era stdio client understands, so
+# #350 review round 10 (finding 10-1) STRIPPED these keys before anything
+# was advertised upstream: advertising a flow the relay could not deliver
+# invited exactly the ``input_required`` results it could only forward
+# verbatim.
+#
+# #270 Phase 2 PR C bridges that exchange, so the strip is gone by default —
+# the relay now advertises what the client really declared and answers the
+# MRTR results that invitation legitimately produces. The set survives as
+# the KILL-SWITCH's filter (``MCP_STDIO_MRTR_STRIP``, see
+# ``_mrtr_strip_enabled``), which restores the round-10 behavior in one
+# environment variable if a real deployment needs the invitation withdrawn.
+# Every other key (notably ``experimental``, and any future additions) never
+# mapped to an MRTR-replaced flow and was always passed through untouched.
 _MRTR_REPLACED_CLIENT_CAPABILITIES = frozenset({"sampling", "elicitation", "roots"})
 
 # --- MRTR bridge (#270 Phase 2 PR C) ---------------------------------
@@ -515,6 +512,33 @@ _MRTR_MAX_ROUNDS = 32
 # documents. At the cap the NEW transaction fails with an error under its own
 # id (never-hang beats hang); the older, already-prompted ones survive.
 _MRTR_MAX_TXNS = 256
+# Kill-switch environment variable. Setting it restores the pre-PR-C
+# advertisement filter (``_MRTR_REPLACED_CLIENT_CAPABILITIES``), so a
+# COMPLIANT modern server is told the client cannot do sampling /
+# elicitation / roots and therefore has no standing invitation to send MRTR
+# at all ("Only use capabilities that were successfully negotiated" —
+# lifecycle spec). One variable, no arg-surface change.
+#
+# It does NOT disable the bridge: the minting legitimacy gate reads the
+# client's DECLARED capabilities, not the advertised ones, so a
+# NON-compliant server that sends ``input_required`` anyway is still
+# bridged rather than rejected. The local client genuinely declared those
+# flows, so answering serves the user better than failing — and this is
+# exactly the state PR C's own commits 2-5 ran and were tested in, while
+# the strip was still in place. A full off-switch would be a separate flag.
+_MRTR_STRIP_ENV = "MCP_STDIO_MRTR_STRIP"
+_MRTR_STRIP_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _mrtr_strip_enabled() -> bool:
+    """Whether the operator asked for the pre-PR-C capability strip back.
+
+    Read per ``initialize`` rather than cached at import: the cost is one
+    dict lookup on a once-per-session path, and it keeps the switch
+    observable in tests without module reloading.
+    """
+    return os.environ.get(_MRTR_STRIP_ENV, "").strip().lower() in _MRTR_STRIP_TRUTHY
+
 
 # MCP request metadata headers (spec rev 2026-07-28, "Request Metadata",
 # SEP-2243). Every Streamable HTTP POST on the modern path mirrors the
@@ -722,19 +746,18 @@ class _ModernState:
     ``negotiated_version`` are captured once from the local stdio client's
     own ``initialize`` request (see ``_handle_modern_special_method`` — the
     modern path never forwards that request upstream, so this is the only
-    place those values are ever seen). ``client_capabilities`` holds the
-    client's set MINUS the MRTR-replaced keys this Phase 1 relay cannot
-    bridge (``_MRTR_REPLACED_CLIENT_CAPABILITIES``, #350 review round 10,
-    finding 10-1) — every upstream advertisement reads this field, so the
-    filter applies once, here. ``client_capabilities_declared`` holds the
-    UNFILTERED set the client actually declared (#270 PR C design change
+    place those values are ever seen). ``client_capabilities`` is what the
+    relay ADVERTISES upstream — the client's own set, or that set minus
+    ``_MRTR_REPLACED_CLIENT_CAPABILITIES`` when the
+    ``MCP_STDIO_MRTR_STRIP`` kill-switch restores #350 round 10's filter —
+    and every upstream advertisement reads this one field, so the decision
+    is made once, at capture. ``client_capabilities_declared`` is what the
+    client actually DECLARED, always unfiltered (#270 PR C design change
     2): the MRTR bridge may only mint a server-requested
-    elicitation/sampling/roots request when the LOCAL client declared it
-    can answer that kind, and the advertised set above is exactly the one
-    that may have had those keys removed. Keeping both is what lets the
-    bridge be built and tested while the strip is still in place, and what
-    the un-strip commit reads to prove only client-declared keys ever
-    reach the wire. ``log_level`` is updated on every
+    elicitation/sampling/roots request when the local client said it can
+    answer that kind, and that question is about the client's real
+    abilities, not about what the relay chose to advertise. ``log_level``
+    is updated on every
     ``logging/setLevel`` line regardless of era (see ``_extract_log_level``).
 
     A single plain object (no lock): ``run()``'s stdin loop dispatches one
@@ -1400,16 +1423,17 @@ def _handle_modern_special_method(
       the real result payload, SEP-2322) — it substitutes for
       server-INITIATED sampling/elicitation/roots round-trips, so a
       COMPLIANT server only initiates it when the client's advertised
-      capabilities include those flows. Since round 10 (finding 10-1)
-      this relay never advertises them upstream — the capture above
-      strips ``_MRTR_REPLACED_CLIENT_CAPABILITIES`` — so a compliant
-      modern server has no standing invitation to send MRTR at all;
-      relaying/bridging it is explicitly Phase 2 (#270 "Phase 2 — MRTR
-      passthrough"). A NON-compliant server that sends
-      ``input_required`` unprovoked is still forwarded verbatim — a
-      KNOWN residual documented in run()'s "Limitation — MRTR" section,
-      not a consequence of which version this field echoes: it would be
-      forwarded verbatim no matter what the echo said.
+      capabilities include those flows. #350 review round 10 (finding
+      10-1) removed that invitation by stripping the keys here; #270
+      Phase 2 PR C instead BRIDGES the exchange — the capture below
+      advertises what the client really declared, and an
+      ``input_required`` result is translated back into the
+      server-initiated requests a 2025-era client understands (see
+      run()'s MRTR section). What survives is the strip as an operator
+      kill-switch (``MCP_STDIO_MRTR_STRIP``) and the clean-reject
+      fallback for shapes the bridge cannot carry — never a verbatim
+      forward of a result the client would misread, whatever this field
+      echoes.
 
       (3) Why not report ``negotiated_version`` (the reviewer-proposed
       alternative): lifecycle spec, Version Negotiation — "If the client
@@ -1487,36 +1511,52 @@ def _handle_modern_special_method(
         # Presence-based, like every other MCP capabilities object (see
         # _report_initialize's own note) — an absent/malformed capabilities
         # object becomes {} (present, empty), never omitted downstream.
-        # Un-bridgeable keys are stripped HERE, at the single capture site
-        # (#350 review round 10, finding 10-1): sampling/elicitation/roots
-        # map to the MRTR flows Phase 1 defers to Phase 2 (see
-        # _MRTR_REPLACED_CLIENT_CAPABILITIES), so advertising them upstream
-        # would invite exactly the input_required results this relay can
-        # only forward verbatim. Filtering at capture covers every
-        # downstream use at once — _inject_modern_meta's per-request _meta
-        # and the reseed re-probe — and the reseed condition below then
-        # correctly treats a client whose ONLY capabilities are
-        # un-bridgeable as having none to advertise. The SERVER capability
-        # set echoed in the synthesized result is untouched: this filter
-        # applies to what the relay claims the CLIENT can do, never to what
-        # the remote reported.
+        #
+        # THE UN-STRIP (#270 Phase 2 PR C, final commit). #350 review round
+        # 10 (finding 10-1) filtered sampling/elicitation/roots out here,
+        # because advertising a flow Phase 1 could not deliver invited
+        # exactly the ``input_required`` results it could only forward
+        # verbatim. PR C delivers the flow — the bridge mints those
+        # requests onto stdout and re-POSTs the original with
+        # ``inputResponses`` — so withholding the declaration now costs the
+        # user the feature for nothing: a COMPLIANT server may "only use
+        # capabilities that were successfully negotiated" (lifecycle spec),
+        # and one told the client cannot elicit will refuse rather than
+        # ask. Only keys the client ITSELF declared reach the wire, by
+        # construction — this is a copy of its own object, never a
+        # fabrication.
+        #
+        # ``MCP_STDIO_MRTR_STRIP`` puts the filter back for an operator who
+        # needs the invitation withdrawn (see ``_mrtr_strip_enabled``); the
+        # bridge itself keeps working for a non-compliant server, because
+        # the minting gate reads the DECLARED set below.
+        #
+        # The SERVER capability set echoed in the synthesized result is
+        # untouched either way: this is about what the relay claims the
+        # CLIENT can do, never about what the remote reported.
         caps = params.get("capabilities")
         caps = caps if isinstance(caps, dict) else {}
-        # Retain the UNFILTERED declaration before the strip (#270 PR C
-        # design change 2). This is the ONLY observation point for what
-        # the local client can actually do — the modern path never
-        # forwards the initialize that carries it — and the MRTR bridge
-        # needs it to decide whether a server-requested elicitation /
-        # sampling / roots round-trip may legitimately be minted onto
-        # stdout: "Servers MUST NOT send an inputRequests that the client
-        # has not declared support for in its capabilities" (MRTR server
-        # requirement 7) is a rule the relay enforces from this side too.
-        # Discarding it (as Phase 1 did) would leave the bridge unable to
-        # tell a legitimate request from one the client cannot answer.
+        # The UNFILTERED declaration (#270 PR C design change 2). This is
+        # the ONLY observation point for what the local client can actually
+        # do — the modern path never forwards the initialize that carries
+        # it — and the MRTR bridge needs it to decide whether a
+        # server-requested elicitation / sampling / roots round-trip may
+        # legitimately be minted onto stdout: "Servers MUST NOT send an
+        # inputRequests that the client has not declared support for in its
+        # capabilities" (MRTR server requirement 7) is a rule the relay
+        # enforces from this side too. It stays distinct from the
+        # advertised set below because the kill-switch can still narrow
+        # that one.
         modern_state.client_capabilities_declared = dict(caps)
-        modern_state.client_capabilities = {
-            k: v for k, v in caps.items() if k not in _MRTR_REPLACED_CLIENT_CAPABILITIES
-        }
+        modern_state.client_capabilities = (
+            {
+                k: v
+                for k, v in caps.items()
+                if k not in _MRTR_REPLACED_CLIENT_CAPABILITIES
+            }
+            if _mrtr_strip_enabled()
+            else dict(caps)
+        )
         client_info = params.get("clientInfo")
         modern_state.client_info = (
             client_info if isinstance(client_info, dict) else None
@@ -1533,11 +1573,15 @@ def _handle_modern_special_method(
         # capabilities is the ONE field that placeholder can plausibly
         # distort. A client that itself has no capabilities gets no
         # retry: the re-probe would carry the same ``{}`` the startup
-        # probe already sent and cannot change the outcome. That includes
-        # (round 10, finding 10-1) a client whose only capabilities were
-        # the MRTR-replaced keys stripped at capture above — after
-        # filtering it HAS nothing this relay may advertise, so the
-        # re-probe would again carry ``{}``. Latch the
+        # probe already sent and cannot change the outcome. The condition
+        # reads the ADVERTISED set (``client_capabilities``), which is
+        # what the re-probe would actually send — so it stays correct as
+        # that set's contents change: round 10's carve-out for "a client
+        # whose only capabilities are the MRTR-replaced keys" applied
+        # while they were stripped, and #270 PR C's un-strip retires it
+        # by making such a client have something real to advertise again.
+        # Under ``MCP_STDIO_MRTR_STRIP`` the round-10 reading returns,
+        # unchanged and for the same reason. Latch the
         # attempt BEFORE probing so neither a failed retry nor a
         # re-initialize can ever probe a second time (zero extra
         # round-trips on the common path: a non-empty capabilities seed
@@ -1643,10 +1687,13 @@ def _inject_modern_meta(line: str, modern_state: "_ModernState") -> str:
     clientInfo/serverInfo revision comment — capabilities uses presence-based
     semantics like every other MCP capabilities object, so an empty client
     capabilities set is sent as ``{}`` rather than omitted).
-    ``client_capabilities`` arrives here already stripped of the
-    MRTR-replaced keys Phase 1 cannot bridge — the filter lives at the
-    single capture site (``_handle_modern_special_method``, #350 review
-    round 10, finding 10-1), never re-applied per request.
+    ``client_capabilities`` arrives here exactly as it will go on the wire
+    — the client's own declaration since #270 Phase 2 PR C bridged the MRTR
+    flows, or that declaration minus the MRTR-replaced keys when the
+    ``MCP_STDIO_MRTR_STRIP`` kill-switch is set. Either way the decision
+    was made once, at the single capture site
+    (``_handle_modern_special_method``), and is never re-applied per
+    request.
     ``.../clientInfo`` is sent only when the LOCAL client's own ``initialize``
     actually provided one (SHOULD, never fabricated — see
     ``_handle_modern_special_method``). ``.../logLevel`` is sent only once
@@ -4745,23 +4792,49 @@ def run(
     headers/session/byte-identity) is unaffected: the legacy path never
     runs any of this.
 
-    MRTR (``resultType: "input_required"``, SEP-2322): a modern upstream
-    that needs client input mid-request replaces the real result with an
-    ``InputRequiredResult`` the client must answer by re-issuing the
-    request with ``inputResponses``. A 2025-era stdio client knows only
-    the server-INITIATED sampling/elicitation/roots requests MRTR
-    replaced, so Phase 1 forwarded such a result verbatim and the client
-    misread it as an oddly-shaped success. #270 Phase 2 PR C closes that:
-    an ``input_required`` result on one of the three methods the spec
-    allows it on (``tools/call`` / ``resources/read`` / ``prompts/get``)
-    is intercepted and answered with a clean JSON-RPC error under the
-    client's own id — never forwarded verbatim, never a hang. On any
-    OTHER method the spec forbids the result outright ("Servers MUST NOT
-    send InputRequiredResult responses on any other client requests"), so
-    it keeps the verbatim-forward behavior rather than being swallowed by
-    a path that cannot legitimately see it. The ordinary
-    tools/resources/prompts flows are unaffected (their 2026 result shapes
-    are additive-only — see ``_handle_modern_special_method``).
+    MRTR (``resultType: "input_required"``, SEP-2322) — #270 Phase 2 PR C:
+    a modern upstream that needs client input mid-request replaces the
+    real result with an ``InputRequiredResult`` the client must answer by
+    re-issuing the request with ``inputResponses``. A 2025-era stdio
+    client knows only the server-INITIATED sampling/elicitation/roots
+    requests MRTR replaced, so Phase 1 forwarded such a result verbatim
+    and the client misread it as an oddly-shaped success. The relay now
+    BRIDGES the two patterns, on the three methods the spec allows the
+    result on (``tools/call`` / ``resources/read`` / ``prompts/get``):
+    the result is swallowed, its ``inputRequests`` entries are minted as
+    ordinary server-initiated requests on stdout under
+    ``mcp-stdio/mrtr/<seq>/<key>`` ids, the client's answers are
+    collected, and the ORIGINAL request is re-POSTed with
+    ``inputResponses`` plus a byte-exact ``requestState`` echo under a
+    fresh id (the spec requires the retry id to differ). The final result
+    is re-keyed to the client's own id on the way out. Multi-round works;
+    a ``requestState``-only result re-POSTs immediately.
+
+    Bounds and fallbacks, all of which answer the client rather than
+    hanging it: 32 rounds per transaction (a ``requestState``-only loop
+    needs no user involvement at all, so it is the hostile-server case),
+    256 pending transactions (a hard count, never a TTL — a TTL races the
+    human at the dialog), a clean JSON-RPC error for anything unbridgeable
+    (an undeclared capability, ``mode: "url"``, tool-augmented sampling, an
+    unknown request kind, a client error on a minted id), and rejection of
+    a client id that still owns a pending transaction. A cancel for the
+    client's id drops the transaction and cancels the outstanding minted
+    requests downstream. On any method OTHER than the three above the spec
+    forbids the result outright ("Servers MUST NOT send InputRequiredResult
+    responses on any other client requests"), so it keeps the
+    verbatim-forward behavior rather than being swallowed by a path that
+    cannot legitimately see it. The ordinary tools/resources/prompts flows
+    are unaffected (their 2026 result shapes are additive-only — see
+    ``_handle_modern_special_method``).
+
+    Not yet bridged (#270 Phase 2 PR D): cancelling an in-flight retry
+    POST upstream. On this transport the cancellation signal is closing
+    the response stream, which needs a second thread reading stdin
+    concurrently with a blocking dispatch — see ``_ModernState``'s note.
+
+    ``MCP_STDIO_MRTR_STRIP=1`` restores the pre-bridge advertisement
+    filter, withdrawing the relay's invitation for MRTR from a compliant
+    server. It does not disable the bridge (see ``_MRTR_STRIP_ENV``).
     """
 
     # Graceful shutdown on SIGTERM/SIGINT
