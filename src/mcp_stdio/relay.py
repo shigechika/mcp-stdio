@@ -3674,12 +3674,16 @@ def run(
         in the session by the one-shot discover reseed (#350 review round
         8, finding 8-2 — ``_discover_reseed`` below, called from the stdin
         loop's ``initialize`` handling), at which point the daemon MAY be
-        live: taking ``refresh_lock`` is then load-bearing, not stylistic —
-        it serialises this refresh against the timer's, so the two can
-        never race the AS's refresh-token rotation, exactly like the
-        reactive 401 path. The refreshed headers are merged into the SHARED
-        ``headers`` dict (under ``headers_lock``) so the whole session (not
-        just the probe retry) proceeds with the recovered credentials.
+        live: taking ``refresh_lock`` is then load-bearing, not stylistic.
+        BOTH recovery stages serialise against the daemon's rotation under
+        that one lock (#350 review round 10, finding 10-2 — round 8 locked
+        only the 401 refresh; the 403 ``scope_upgrader`` ran bare, so a
+        step-up racing the timer's refresh could fail the refresh
+        mid-rotation, or let an old-scope refreshed token overwrite the
+        just-upgraded credentials in the shared ``headers``). The recovered
+        headers are merged into the SHARED ``headers`` dict (under
+        ``headers_lock``) so the whole session (not just the probe retry)
+        proceeds with the recovered credentials.
         """
         if resp.status_code == 401 and token_refresher is not None:
             log("protocol-era probe: 401, attempting token refresh")
@@ -3700,7 +3704,13 @@ def run(
                     f"protocol-era probe: 403 insufficient_scope "
                     f"(required: {required_scope}), attempting step-up"
                 )
-                new_headers = scope_upgrader(required_scope)
+                # Same lock as the 401 branch (#350 review round 10,
+                # finding 10-2): the discover reseed can invoke this while
+                # the proactive-refresh daemon is live, and an unserialised
+                # step-up races the timer's token rotation — see the
+                # docstring's thread-safety note.
+                with refresh_lock:
+                    new_headers = scope_upgrader(required_scope)
                 if new_headers:
                     with headers_lock:
                         headers.update(new_headers)

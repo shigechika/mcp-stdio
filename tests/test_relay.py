@@ -11189,6 +11189,80 @@ class TestRunModernEra:
         assert json.loads(requests[1].content)["method"] == "initialize"
         assert "mcp-method" not in requests[1].headers
 
+    def test_probe_403_step_up_serialized_with_refresh_lock(self, httpx_mock):
+        """#350 review round 10, finding 10-2: _probe_auth_recovery's 401
+        branch takes run()'s internal refresh_lock around token_refresher,
+        but the 403 branch invoked scope_upgrader bare. The same callback
+        serves the post-initialize discover reseed, when the
+        proactive-refresh daemon may already be live — an unserialised
+        step-up can race the timer's rotation (refresh fails mid-rotation,
+        or an old-scope refreshed token overwrites the just-upgraded
+        credentials in the shared headers). Both stages must hold the SAME
+        lock. The lock is internal to run(), so this test instruments lock
+        creation (precedent: patching mcp_stdio.relay.sys/time elsewhere in
+        this file): a chained 401 -> 403 probe records which instrumented
+        locks are held inside each fake — the refresher's held set is
+        refresh_lock by construction (round 8), and the upgrader must
+        observe exactly the same held lock. Removing the fix makes the
+        upgrader observe none."""
+        created_locks = []
+        real_lock = threading.Lock
+
+        def recording_lock():
+            lock = real_lock()
+            created_locks.append(lock)
+            return lock
+
+        held = {}
+
+        def refresher():
+            held["refresh"] = [id(x) for x in created_locks if x.locked()]
+            return {"Authorization": "Bearer refreshed"}
+
+        def upgrader(scope):
+            assert scope == "mcp:admin"
+            held["step_up"] = [id(x) for x in created_locks if x.locked()]
+            return {"Authorization": "Bearer stepped-up"}
+
+        httpx_mock.add_response(url=self.URL, status_code=401, text="")
+        httpx_mock.add_response(
+            url=self.URL,
+            status_code=403,
+            text="",
+            headers={
+                "www-authenticate": (
+                    'Bearer error="insufficient_scope", scope="mcp:admin"'
+                )
+            },
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        with patch("mcp_stdio.relay.threading.Lock", recording_lock):
+            self._run_with_stdin(
+                httpx_mock,
+                [],
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer stale",
+                },
+                protocol_era="auto",
+                token_refresher=refresher,
+                scope_upgrader=upgrader,
+            )
+        # Each stage ran under exactly one held instrumented lock — and the
+        # SAME one: the 403 step-up serialises against the proactive
+        # refresh through the identical refresh_lock the 401 branch uses.
+        assert len(held["refresh"]) == 1
+        assert held["step_up"] == held["refresh"]
+        # The chained recovery actually completed: three probes, the last
+        # with the stepped-up credentials, classified modern.
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 3
+        assert requests[2].headers["authorization"] == "Bearer stepped-up"
+
     def test_capability_gated_discover_reseeded_once_with_real_capabilities(
         self, httpx_mock
     ):
