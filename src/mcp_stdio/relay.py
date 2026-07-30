@@ -5159,6 +5159,11 @@ def run(
                 "minted": {},
                 "rounds": 0,
                 "retry_now": False,
+                # Set by this function, cleared by the retry driver before
+                # each POST: it is how the driver tells "the server opened
+                # another round, wait for the client" apart from "the
+                # server finally answered, the transaction is done".
+                "round_opened": False,
                 "retry_id": None,
                 "retry_in_flight": False,
             }
@@ -5216,19 +5221,164 @@ def run(
             # client, so the retry is fired by the caller as soon as this
             # POST unwinds.
             txn["retry_now"] = True
+        txn["round_opened"] = True
         log(
             f"MRTR round opened for id {client_id!r}: "
             f"{len(minted)} request(s) minted, "
             f"requestState {'present' if has_state else 'absent'}"
         )
 
-    def _mrtr_record_client_response(msg: dict[str, Any]) -> None:
+    def _mrtr_build_retry(txn: dict[str, Any], retry_id: Any) -> str:
+        """Build the retry body from the STORED original request.
+
+        Design change 7: the retry is the stored POST-form line with a
+        fresh id and two params added — never a re-derivation. Re-running
+        ``_inject_modern_meta`` would refresh ``_meta`` from LIVE state (a
+        client-driven re-``initialize``, a ``logging/setLevel`` between
+        rounds), so the retry would carry a different protocol version or
+        capability set than the round the server is holding state for.
+
+        ``inputResponses`` carries the client's results verbatim under the
+        server's own keys. ``requestState`` is echoed byte-exactly and ONLY
+        when the latest result carried one: "If an InputRequiredResult
+        contains the requestState field, the client MUST echo back the
+        exact value of that field when retrying the original request.
+        Clients MUST NOT inspect, parse, modify, or make any assumptions
+        about the requestState contents. If the InputRequiredResult does
+        not contain a requestState field, the client MUST NOT include one
+        in the retry." — hence the explicit presence flag rather than a
+        truthiness test, and hence no type policing of the value.
+
+        ``stored_line`` is parseable by construction: a line only becomes
+        MRTR-eligible after ``_extract_method_and_name`` parsed a method
+        out of it.
+        """
+        msg = json.loads(txn["stored_line"])
+        # "The JSON-RPC id MUST be different between the initial request
+        # and the retry, as they are independent requests."
+        msg["id"] = retry_id
+        params = msg.get("params")
+        params = dict(params) if isinstance(params, dict) else {}
+        if txn["responses"]:
+            params["inputResponses"] = txn["responses"]
+        if txn["has_request_state"]:
+            params["requestState"] = txn["request_state"]
+        msg["params"] = params
+        return json.dumps(msg)
+
+    def _mrtr_run_retry(client_id: Any) -> None:
+        """Drive a transaction's retries until it needs the client again.
+
+        Loops rather than recurses because a ``requestState``-only result
+        means "retry immediately" with no client involvement at all, and a
+        server may legitimately chain several of those.
+
+        Defined at this scope, NOT inside the stdin loop (design change 7):
+        a retry is fired from the stdin line carrying the client's LAST
+        minted response, and the loop's ``_dispatch`` closure would capture
+        that line's id — the minted one — instead of the id the client is
+        waiting on. ``req_id`` is therefore passed explicitly as
+        ``client_id`` all the way down, so every synthesized error
+        ``_post_and_stream`` may write lands under the right id.
+        """
+        while True:
+            txn = mrtr_txns.get(client_id)
+            if txn is None or not txn["retry_now"]:
+                return
+            txn["retry_now"] = False
+            txn["rounds"] += 1
+            if txn["rounds"] > _MRTR_MAX_ROUNDS:
+                # Design change 4. A ``requestState``-only result costs the
+                # client nothing and the relay one POST, so a hostile or
+                # merely looping server can spin this thread forever with
+                # no user involvement. -32000: the relay's own resource
+                # limit, not a malformed message.
+                _mrtr_abort(
+                    client_id,
+                    f"upstream asked for more input more than {_MRTR_MAX_ROUNDS} times",
+                    code=-32000,
+                )
+                return
+            retry_id = f"{_MRTR_RETRY_ID_PREFIX}{txn['seq']}/{txn['rounds']}"
+            retry_line = _mrtr_build_retry(txn, retry_id)
+            retry_headers = _prepare_headers(retry_line)
+            if txn["pinned_version"]:
+                # Design change 7: _prepare_headers derives the version
+                # from LIVE state, which a re-initialize between rounds can
+                # move; the stored body's _meta cannot. A disagreement
+                # between the two is -32020 HeaderMismatch on a compliant
+                # server, which would kill a transaction the user has
+                # already answered dialogs for. Same override PR A (#352)
+                # applies to every listen reconnect.
+                retry_headers = {
+                    k: v
+                    for k, v in retry_headers.items()
+                    if k.lower() != "mcp-protocol-version"
+                }
+                retry_headers["MCP-Protocol-Version"] = txn["pinned_version"]
+            txn["round_opened"] = False
+            txn["retry_id"] = retry_id
+            txn["retry_in_flight"] = True
+            log(f"MRTR retry {txn['rounds']} for id {client_id!r} as {retry_id!r}")
+            result = _post_and_stream(
+                client,
+                url,
+                retry_line,
+                retry_headers,
+                # Every synthesized error inside belongs to the client's
+                # request, not to the relay's retry id.
+                client_id,
+                tracker,
+                has_id=True,
+                input_required_hook=_make_input_required_hook(
+                    client_id, retry_id, txn["stored_line"]
+                ),
+            )
+            txn["retry_in_flight"] = False
+            if mrtr_txns.get(client_id) is not txn:
+                # Aborted from inside the hook (an unbridgeable round);
+                # _mrtr_abort already answered the client.
+                return
+            if result is None:
+                # Transport retries exhausted. _post_and_stream already
+                # wrote the error under client_id — purge silently rather
+                # than answering twice.
+                _mrtr_purge(client_id)
+                return
+            if result.status_code != 200:
+                _mrtr_purge(client_id)
+                log(f"MRTR retry for id {client_id!r} got HTTP {result.status_code}")
+                _write_line(_error_response(f"HTTP {result.status_code}", client_id))
+                return
+            if txn["retry_now"]:
+                # requestState-only round: loop straight back into another
+                # POST, which is what "the client MAY retry the original
+                # request immediately" means — and why the round cap above
+                # counts these too.
+                continue
+            if txn["round_opened"]:
+                # A new round with real questions: the minted requests are
+                # on stdout and the transaction now waits for the client.
+                return
+            # Nothing left to ask: the final result was emitted under the
+            # client's id (re-keyed by the hook) or _post_and_stream
+            # synthesized an empty-response error for it. Either way this
+            # transaction is finished.
+            _mrtr_purge(client_id)
+            return
+
+    def _mrtr_record_client_response(msg: dict[str, Any]) -> Any:
         """Consume a client response to a relay-minted MRTR request.
 
         Every response-shaped line is either one of these or a spec
         violation on this era (rev 2026-07-28 removed server-initiated
         requests outright), so an unrecognised one is logged and DROPPED
         rather than POSTed upstream, which is what the pre-PR-C loop did.
+
+        Returns the client id whose transaction is now ready to retry, or
+        ``None``. The caller — not this function — fires the retry, so the
+        POST happens on the stdin loop's own frame rather than nested
+        inside the bookkeeping.
         """
         rid = msg["id"]
         entry = mrtr_minted.get(rid) if _is_scalar_id(rid) else None
@@ -5238,7 +5388,7 @@ def run(
                 f"modern era has no server-initiated requests to answer "
                 f"(spec rev 2026-07-28 replaced them with MRTR)"
             )
-            return
+            return None
         client_id, key = entry
         txn = mrtr_txns.get(client_id)
         if txn is None:
@@ -5246,10 +5396,10 @@ def run(
             # cannot happen — log rather than KeyError if it ever does.
             mrtr_minted.pop(rid, None)
             log(f"dropping client response for orphaned MRTR id {rid!r}")
-            return
+            return None
         if "error" in msg:
             log(f"client answered minted id {rid!r} with a JSON-RPC error")
-            return
+            return None
         # The result object goes into inputResponses VERBATIM, with no
         # wrapper, under the server's OWN key: "InputResponses object is a
         # map of client responses to the server requests. Keys correspond
@@ -5264,6 +5414,8 @@ def run(
         txn["minted"].pop(rid, None)
         if txn["expected_keys"] <= set(txn["responses"]):
             txn["retry_now"] = True
+            return client_id
+        return None
 
     def _make_input_required_hook(
         client_id: Any, upstream_id: Any, stored_line: str
@@ -5547,7 +5699,15 @@ def run(
                     # test_legacy_response_shaped_stdin_line_is_posted_verbatim).
                     client_response = _parse_client_response(line)
                     if client_response is not None:
-                        _mrtr_record_client_response(client_response)
+                        ready = _mrtr_record_client_response(client_response)
+                        if ready is not None:
+                            # The last answer this round was waiting on:
+                            # re-POST the original request carrying every
+                            # collected inputResponse. Driven from HERE,
+                            # on the loop's own frame, with the client's
+                            # id — never through `_dispatch`, whose
+                            # closure would use THIS line's minted id.
+                            _mrtr_run_retry(ready)
                         continue
                     # Reject a method that cannot ride the REQUIRED Mcp-Method
                     # header (#350 review round 5, finding 5-2). JSON-RPC 2.0
@@ -5954,6 +6114,16 @@ def run(
                             else f"HTTP {result.status_code}"
                         )
                         _write_line(_error_response(msg, req_id, data=err_data))
+
+                # A ``requestState``-only round opened on THIS dispatch has
+                # nothing to ask the client ("If the InputRequiredResult
+                # does not contain the inputRequests field, the client MAY
+                # retry the original request immediately"), so it must be
+                # re-POSTed now rather than waiting for a stdin line that
+                # will never come. A no-op for every other line: the driver
+                # returns immediately unless a transaction is flagged.
+                if mrtr_eligible:
+                    _mrtr_run_retry(req_id)
             except Exception as e:  # noqa: BLE001 — never crash the gateway
                 # The #11 contract is structural here, not just per-helper: an
                 # unexpected non-httpx exception escaping _dispatch / the recovery
