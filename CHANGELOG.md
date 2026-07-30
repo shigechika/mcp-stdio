@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.31.0](https://github.com/shigechika/mcp-stdio/compare/v0.30.1...v0.31.0) (2026-07-30)
+
+
+### Features
+
+* dual-mode Streamable HTTP era detection for MCP 2026-07-28 (Phase 1, [#270](https://github.com/shigechika/mcp-stdio/issues/270)) ([#350](https://github.com/shigechika/mcp-stdio/issues/350)) ([5580f98](https://github.com/shigechika/mcp-stdio/commit/5580f98ef6bcf6a40c2d93d4dc315ca37adea759))
+
 ## [0.30.1](https://github.com/shigechika/mcp-stdio/compare/v0.30.0...v0.30.1) (2026-07-28)
 
 
