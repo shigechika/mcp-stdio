@@ -3014,6 +3014,24 @@ def _listen_advertised_families(capabilities: dict[str, Any]) -> frozenset[str]:
     never drift. Presence-based like every MCP capabilities object: a
     present-but-malformed family value still advertises the family (the
     synthesis coerces it to an object it can flag).
+
+    Deliberate consequence (#352 round-4 finding, WONTFIX): with an empty
+    discover seed this set is empty, nothing is advertised, and every
+    ``list_changed`` from a nonetheless-working stream is swallowed. That
+    is the conservative side of a real trade-off, chosen on the spec's
+    authority: a compliant modern server MUST advertise its supported
+    families in ``server/discover`` capabilities, so "supports
+    subscriptions yet advertised no families (and the one-shot reseed
+    also got nothing)" describes a NON-compliant server — and forwarding
+    for families the synthesized ``InitializeResult`` never advertised
+    would violate the 2025-06-18 lifecycle MUST ("only use capabilities
+    that were successfully negotiated") for every COMPLIANT client, which
+    #350/#352 established twice as the binding rule. Possible future
+    widening if real-world servers need it: union the listen ACK's
+    honored subset into the forwarding gate (the ack is a legitimate
+    relay-to-upstream negotiation artifact) — but the client-side
+    advertisement can never be widened retroactively, so a strict client
+    would still be within its rights to drop those notifications.
     """
     return frozenset(k for k in _LISTEN_FAMILIES if k in capabilities)
 
