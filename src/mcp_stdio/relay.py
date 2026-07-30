@@ -737,7 +737,10 @@ def _build_discover_probe_request(
 
 
 def _probe_protocol_era(
-    client: httpx.Client, url: str, headers: dict[str, str]
+    client: httpx.Client,
+    url: str,
+    headers: dict[str, str],
+    auth_recovery: Callable[[httpx.Response], dict[str, str] | None] | None = None,
 ) -> tuple[str, dict[str, Any] | None]:
     """One-shot ``server/discover`` probe implementing the spec's era-detection
     algorithm (Streamable HTTP, "Backward Compatibility") for
@@ -760,16 +763,30 @@ def _probe_protocol_era(
       request, so the client should retry/correct rather than fall back).
       The same rule applies at HTTP 200 because a recognized-modern error
       code is diagnostic regardless of which HTTP status carried it.
+    - HTTP 401/403 with ``auth_recovery`` provided: the challenge is
+      AUTHENTICATION evidence, not protocol evidence (#350 review round 4)
+      — a modern-only server with an expired cached OAuth token 401s
+      before ever inspecting ``server/discover``, and classifying that as
+      legacy would permanently misconfigure the session (the relay would
+      later send ``initialize``, which the modern remote rejects, while
+      the first real dispatch's own 401 recovery silently fixes only the
+      credentials, not the era). ``auth_recovery`` is handed the raw
+      response (it needs the status and any ``WWW-Authenticate``
+      challenge) and returns the FULL refreshed header set on successful
+      recovery — the probe is then rebuilt from those headers and retried
+      exactly ONCE. A recovery that declines/fails (``None``), or a retry
+      that fails again, falls through to the conservative rules below —
+      identical to not having ``auth_recovery`` at all.
     - HTTP 200 or HTTP 400 whose body is a GENERIC/unrecognized JSON-RPC
       error (e.g. ``-32601`` Method not found — the ordinary reply an
       unmodified LEGACY server sends for an unknown method), HTTP 404
       (method not recognized at all — the transport spec's mandated
-      response for an unknown method), any OTHER status (401/403/5xx/...),
-      or a transport failure -> legacy, the conservative default on
-      anything ambiguous. Spec: "If the body is empty or is not a
-      recognized modern JSON-RPC error, fall back to `initialize` and
-      continue with the legacy version for subsequent requests" (Streamable
-      HTTP, "Backward Compatibility").
+      response for an unknown method), any OTHER status (unrecovered
+      401/403, 5xx, ...), or a transport failure -> legacy, the
+      conservative default on anything ambiguous. Spec: "If the body is
+      empty or is not a recognized modern JSON-RPC error, fall back to
+      `initialize` and continue with the legacy version for subsequent
+      requests" (Streamable HTTP, "Backward Compatibility").
 
     A transport-level exception is swallowed (not propagated) so a
     detection-probe failure degrades to legacy rather than crashing startup;
@@ -782,11 +799,28 @@ def _probe_protocol_era(
     two headers).
     """
     discover_msg, probe_headers = _build_discover_probe_request(headers)
-    try:
-        resp = client.post(url, content=discover_msg, headers=probe_headers)
-    except httpx.HTTPError as e:
-        log(f"protocol-era probe failed ({e}); assuming legacy")
-        return "legacy", None
+    resp: httpx.Response | None = None
+    for attempt in (0, 1):
+        try:
+            resp = client.post(url, content=discover_msg, headers=probe_headers)
+        except httpx.HTTPError as e:
+            log(f"protocol-era probe failed ({e}); assuming legacy")
+            return "legacy", None
+        if (
+            attempt == 0
+            and resp.status_code in (401, 403)
+            and auth_recovery is not None
+        ):
+            refreshed = auth_recovery(resp)
+            if refreshed is not None:
+                log(
+                    f"protocol-era probe: HTTP {resp.status_code} recovered; "
+                    "re-probing once with refreshed credentials"
+                )
+                discover_msg, probe_headers = _build_discover_probe_request(refreshed)
+                continue
+        break
+    assert resp is not None  # the loop always posts at least once
     if resp.status_code == 200:
         parsed = _parse_streamable_response(resp)
         if isinstance(parsed, dict) and "error" in parsed:
@@ -812,6 +846,12 @@ def _probe_protocol_era(
             return "modern", parsed
         log("protocol-era probe: 400 with an empty/generic body; assuming legacy")
         return "legacy", None
+    # Any other status — 404 (unknown method), an unrecovered 401/403 (no
+    # auth_recovery configured, or recovery/retry failed), 5xx, ... — is the
+    # conservative legacy fallback. Logged explicitly so an operator whose
+    # modern-only server is being misclassified can see WHY (and knows the
+    # workaround: fix credentials, or pin --protocol-era modern).
+    log(f"protocol-era probe: HTTP {resp.status_code}; assuming legacy")
     return "legacy", None
 
 
@@ -3111,17 +3151,71 @@ def run(
     # (_probe_protocol_era). This is why "auto" is opt-in rather than the
     # default: it costs one extra POST at startup that a pinned era does not.
     modern_state = _ModernState()
+
+    def _probe_auth_recovery(resp: httpx.Response) -> dict[str, str] | None:
+        """Recover credentials for a 401/403 at PROBE time (#350 round 4).
+
+        Mirrors the stdin loop's own recovery ladder — 401 -> token refresh,
+        403 + parseable ``insufficient_scope`` challenge -> RFC 9470 step-up
+        — so an auth challenge to the era-detection probe is repaired with
+        the SAME machinery a real dispatch would use, instead of being
+        misread as protocol evidence for "legacy". Returns the full updated
+        header set on success (``_probe_protocol_era`` rebuilds the probe
+        from it and retries once) or ``None`` to decline (probe falls back
+        to the conservative legacy classification, unchanged behavior).
+
+        Thread-safety: this runs BEFORE the proactive-refresh daemon and the
+        cold-start thread are started (both are created further down), so
+        nothing else can hold ``refresh_lock`` yet — it is taken anyway to
+        keep every ``token_refresher()`` call site uniformly serialised
+        against the AS's refresh-token rotation, exactly like the reactive
+        401 path. The refreshed headers are merged into the SHARED
+        ``headers`` dict so the whole session (not just the probe retry)
+        proceeds with the recovered credentials.
+        """
+        if resp.status_code == 401 and token_refresher is not None:
+            log("protocol-era probe: 401, attempting token refresh")
+            with refresh_lock:
+                new_headers = token_refresher()
+            if new_headers:
+                with headers_lock:
+                    headers.update(new_headers)
+                    return dict(headers)
+            log("protocol-era probe: token refresh failed")
+            return None
+        if resp.status_code == 403 and scope_upgrader is not None:
+            required_scope = _parse_www_authenticate_scope(
+                resp.headers.get("www-authenticate")
+            )
+            if required_scope is not None:
+                log(
+                    f"protocol-era probe: 403 insufficient_scope "
+                    f"(required: {required_scope}), attempting step-up"
+                )
+                new_headers = scope_upgrader(required_scope)
+                if new_headers:
+                    with headers_lock:
+                        headers.update(new_headers)
+                        return dict(headers)
+                log("protocol-era probe: step-up authorization failed")
+            return None
+        return None
+
     if protocol_era == "modern":
         era = "modern"
         with headers_lock:
             probe_headers = dict(headers)
-        _, discover_result = _probe_protocol_era(client, url, probe_headers)
+        _, discover_result = _probe_protocol_era(
+            client, url, probe_headers, auth_recovery=_probe_auth_recovery
+        )
         _seed_modern_state_from_discover(modern_state, discover_result)
         log("protocol era: modern (forced via --protocol-era)")
     elif protocol_era == "auto":
         with headers_lock:
             probe_headers = dict(headers)
-        era, discover_result = _probe_protocol_era(client, url, probe_headers)
+        era, discover_result = _probe_protocol_era(
+            client, url, probe_headers, auth_recovery=_probe_auth_recovery
+        )
         _seed_modern_state_from_discover(modern_state, discover_result)
         log(f"protocol era: {era} (auto-detected)")
     else:

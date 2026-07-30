@@ -9313,6 +9313,131 @@ class TestProbeProtocolEra:
         assert era == "legacy"
         assert result is None
 
+    def test_401_without_auth_recovery_is_legacy_and_logged(self, httpx_mock, capsys):
+        """#350 review round 4 finding 3, the no-recovery half: with no
+        ``auth_recovery`` configured (no OAuth), a 401 probe keeps today's
+        conservative legacy fallback — one probe, no retry — but the WHY
+        must be visible in the log so an operator whose modern-only server
+        got misclassified can diagnose it (workaround: fix credentials or
+        pin ``--protocol-era modern``)."""
+        httpx_mock.add_response(status_code=401, text="")
+        client = httpx.Client()
+        era, result = _probe_protocol_era(client, self.URL, {})
+        assert era == "legacy"
+        assert result is None
+        assert len(httpx_mock.get_requests()) == 1
+        assert "HTTP 401; assuming legacy" in capsys.readouterr().err
+
+    def test_401_with_auth_recovery_reprobes_and_detects_modern(self, httpx_mock):
+        """#350 review round 4 finding 3: a 401 to the probe is an
+        AUTHENTICATION challenge, not protocol evidence — with an expired
+        cached OAuth token a modern-only server 401s before ever seeing
+        ``server/discover``. The probe must invoke the same token-refresh
+        recovery the dispatch path uses and re-probe once with the
+        refreshed credentials, classifying the server by what it says once
+        it can actually be reached."""
+        httpx_mock.add_response(status_code=401, text="")
+        httpx_mock.add_response(
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "result": {"supportedVersions": ["2026-07-28"]},
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        recovered = []
+
+        def recovery(resp):
+            recovered.append(resp.status_code)
+            return {"Authorization": "Bearer fresh"}
+
+        client = httpx.Client()
+        era, result = _probe_protocol_era(
+            client,
+            self.URL,
+            {"Authorization": "Bearer stale"},
+            auth_recovery=recovery,
+        )
+        assert era == "modern"
+        assert result["result"]["supportedVersions"] == ["2026-07-28"]
+        assert recovered == [401]
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 2
+        assert requests[0].headers["authorization"] == "Bearer stale"
+        assert requests[1].headers["authorization"] == "Bearer fresh"
+        # The retry is a full, spec-compliant probe — same builder as the
+        # first attempt (body incl. params._meta, Mcp-Method header).
+        assert json.loads(requests[1].content)["method"] == "server/discover"
+        assert requests[1].headers["mcp-method"] == "server/discover"
+
+    def test_401_recovery_declining_falls_back_to_legacy_single_probe(self, httpx_mock):
+        """A recovery that returns None (refresh failed / no refresh_token)
+        must degrade exactly like having no auth_recovery at all: one
+        probe, conservative legacy."""
+        httpx_mock.add_response(status_code=401, text="")
+        client = httpx.Client()
+        era, result = _probe_protocol_era(
+            client, self.URL, {}, auth_recovery=lambda resp: None
+        )
+        assert era == "legacy"
+        assert result is None
+        assert len(httpx_mock.get_requests()) == 1
+
+    def test_second_401_after_recovery_stays_legacy_no_loop(self, httpx_mock):
+        """The recovery retry is once-only: a re-probe that 401s AGAIN must
+        not invoke recovery a second time (no refresh loop at startup) —
+        exactly two probes, recovery called exactly once, legacy fallback."""
+        httpx_mock.add_response(status_code=401, text="")
+        httpx_mock.add_response(status_code=401, text="")
+        recovered = []
+
+        def recovery(resp):
+            recovered.append(resp.status_code)
+            return {"Authorization": "Bearer fresh"}
+
+        client = httpx.Client()
+        era, result = _probe_protocol_era(client, self.URL, {}, auth_recovery=recovery)
+        assert era == "legacy"
+        assert result is None
+        assert recovered == [401]
+        assert len(httpx_mock.get_requests()) == 2
+
+    def test_403_with_auth_recovery_reprobes_and_detects_modern(self, httpx_mock):
+        """403 analogue of the 401 case: the recovery callback receives the
+        raw response (it needs the WWW-Authenticate challenge to decide
+        whether an RFC 9470 step-up applies) and its refreshed headers
+        drive one re-probe."""
+        httpx_mock.add_response(
+            status_code=403,
+            text="",
+            headers={
+                "www-authenticate": (
+                    'Bearer error="insufficient_scope", scope="mcp:tools"'
+                )
+            },
+        )
+        httpx_mock.add_response(
+            text=json.dumps({"jsonrpc": "2.0", "id": 0, "result": {}}),
+            headers={"content-type": "application/json"},
+        )
+        challenge_scopes = []
+
+        def recovery(resp):
+            challenge_scopes.append(
+                _parse_www_authenticate_scope(resp.headers.get("www-authenticate"))
+            )
+            return {"Authorization": "Bearer stepped-up"}
+
+        client = httpx.Client()
+        era, _ = _probe_protocol_era(client, self.URL, {}, auth_recovery=recovery)
+        assert era == "modern"
+        assert challenge_scopes == ["mcp:tools"]
+        assert (
+            httpx_mock.get_requests()[1].headers["authorization"] == "Bearer stepped-up"
+        )
+
 
 class TestBuildDiscoverProbeRequestStripsAllCaseVariants:
     """#350 review rounds 2 AND 3 (flagged independently by both):
@@ -10063,3 +10188,71 @@ class TestRunModernEra:
         assert (
             "mcp-session-id" not in requests[1].headers
         )  # not yet adopted (this IS the initialize)
+
+    def test_auto_401_probe_refreshes_token_and_detects_modern(self, httpx_mock):
+        """#350 review round 4 finding 3: an expired cached OAuth token
+        makes a modern-only server 401 the era probe before it ever
+        inspects server/discover. auto mode must run the SAME token
+        refresh the dispatch path would, re-probe once, and classify the
+        server by its actual answer — not permanently latch legacy off an
+        authentication challenge (which would make every later request a
+        legacy `initialize` the modern remote rejects)."""
+        httpx_mock.add_response(url=self.URL, status_code=401, text="")
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":2,"result":{}}',
+            headers={"content-type": "application/json"},
+        )
+        refresh_calls = []
+
+        def refresher():
+            refresh_calls.append(True)
+            return {"Authorization": "Bearer fresh"}
+
+        self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})],
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer stale",
+            },
+            protocol_era="auto",
+            token_refresher=refresher,
+        )
+        assert refresh_calls == [True]
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 3  # 401 probe + refreshed probe + tools/list
+        assert requests[1].headers["authorization"] == "Bearer fresh"
+        # Era resolved MODERN: the real request rides the modern path...
+        assert requests[2].headers["mcp-method"] == "tools/list"
+        # ...and the refreshed credentials persist for the whole session
+        # (merged into the shared headers, not just the probe retry).
+        assert requests[2].headers["authorization"] == "Bearer fresh"
+
+    def test_auto_401_probe_without_refresher_stays_legacy(self, httpx_mock):
+        """No token_refresher configured (no OAuth): a 401 probe keeps
+        today's conservative legacy fallback — the workaround for a
+        modern-only server behind auth is --protocol-era modern (see
+        _probe_protocol_era's log line)."""
+        httpx_mock.add_response(url=self.URL, status_code=401, text="")
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"})],
+            protocol_era="auto",
+        )
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 2  # one probe only, then the legacy dispatch
+        # Legacy path: the client's initialize is forwarded raw, no modern
+        # headers.
+        assert json.loads(requests[1].content)["method"] == "initialize"
+        assert "mcp-method" not in requests[1].headers
