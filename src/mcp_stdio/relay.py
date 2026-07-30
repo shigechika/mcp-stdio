@@ -357,6 +357,27 @@ def _extract_protocol_version(payload: str) -> str | None:
 # (_cold_start_response, _reinitialize).
 _MODERN_PROTOCOL_VERSION_DEFAULT = "2026-07-28"
 
+# Fallback ``serverInfo`` used by ``_handle_modern_special_method`` ONLY when
+# the era-detection ``server/discover`` probe never yielded a real one (probe
+# failed transport-level, or returned a recognized-modern JSON-RPC error with
+# no result, or a compliant server simply chose not to send the SHOULD-only
+# ``_meta.serverInfo`` field). The design goal (#270 revision comment) is to
+# source ``serverInfo`` from real discover data "instead of inventing a
+# placeholder" — this name is deliberately NOT a bare ``"mcp-stdio"`` (which
+# would misrepresent this relay's own identity AS the remote server's
+# self-reported identity, the exact thing #270 says not to do) but says
+# plainly that the real upstream identity is unknown, while still naming the
+# relay for troubleshooting. ``serverInfo`` is spec-documented as
+# "self-reported... intended for display, logging, and debugging" (server/
+# discover, "DiscoverResult") — never used for behavior/security decisions —
+# so an honestly-labelled placeholder here is display-only degraded-mode
+# behavior, not a protocol violation, as long as it does not claim to BE the
+# remote's own report.
+_UNKNOWN_UPSTREAM_SERVER_INFO = {
+    "name": "mcp-stdio (upstream identity unknown)",
+    "version": __version__,
+}
+
 # _meta keys mirrored per request/result on the modern path (spec rev
 # 2026-07-28, clientInfo/serverInfo revision comment of 2026-07-27 — see the
 # table in the issue: protocolVersion and clientCapabilities are REQUIRED;
@@ -580,8 +601,13 @@ def _seed_modern_state_from_discover(
     ``None`` (probe failed / forced ``--protocol-era modern`` skipped or
     could not parse the probe) or is a JSON-RPC error rather than a result —
     the synthesized InitializeResult then falls back to
-    ``{"name": "mcp-stdio", ...}`` / empty capabilities / the client's own
-    requested version, which is honest given genuinely unknown remote info.
+    ``_UNKNOWN_UPSTREAM_SERVER_INFO`` / empty capabilities / the client's own
+    requested version. That fallback name says plainly that the real
+    upstream identity is unknown (see ``_UNKNOWN_UPSTREAM_SERVER_INFO``'s own
+    comment) — never a bare ``"mcp-stdio"`` that would misrepresent this
+    relay's identity AS the remote's self-reported one, which is exactly
+    what the #270 design says not to do ("source it from real discover data
+    instead of inventing a placeholder").
     """
     if not isinstance(discover_result, dict):
         return
@@ -787,11 +813,14 @@ def _handle_modern_special_method(
 
     - ``initialize`` synthesizes a legacy-SHAPED ``InitializeResult`` (the
       local stdio client still expects one) from ``modern_state``'s
-      discover-seeded ``server_info``/``capabilities``/``supported_versions``,
-      and captures the client's own ``capabilities``/``clientInfo`` into
-      ``modern_state`` for later ``_meta`` injection (``_inject_modern_meta``)
-      — this is the ONLY place those values are ever observed, since the
-      modern path never forwards the request that carries them.
+      discover-seeded ``server_info``/``capabilities``/``supported_versions``
+      — ``serverInfo`` falls back to ``_UNKNOWN_UPSTREAM_SERVER_INFO`` (never
+      a bare ``"mcp-stdio"`` claiming to BE the remote — see that constant's
+      comment) only when the probe never yielded a real one — and captures
+      the client's own ``capabilities``/``clientInfo`` into ``modern_state``
+      for later ``_meta`` injection (``_inject_modern_meta``) — this is the
+      ONLY place those values are ever observed, since the modern path never
+      forwards the request that carries them.
     - ``notifications/initialized`` and ``notifications/cancelled`` are
       swallowed (``None`` reply — both are notifications, which never get a
       response either way).
@@ -826,8 +855,7 @@ def _handle_modern_special_method(
         result = {
             "protocolVersion": modern_state.negotiated_version,
             "capabilities": modern_state.capabilities,
-            "serverInfo": modern_state.server_info
-            or {"name": "mcp-stdio", "version": __version__},
+            "serverInfo": modern_state.server_info or _UNKNOWN_UPSTREAM_SERVER_INFO,
         }
         return True, json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result})
     if method in ("notifications/initialized", "notifications/cancelled"):

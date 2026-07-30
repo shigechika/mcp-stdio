@@ -9119,6 +9119,26 @@ class TestHandleModernSpecialMethod:
         _handle_modern_special_method(line, 1, state)
         assert state.client_info is None
 
+    def test_serverinfo_fallback_when_discover_never_seeded_it_is_honest(self):
+        """#350 review finding 2: a forced-modern startup probe that
+        transiently fails (or returns a recognized-modern error with no
+        result) leaves ``state.server_info`` at its default ``None`` —
+        exactly the scenario the reviewer described. The synthesized
+        InitializeResult must not silently claim the remote server's
+        identity IS "mcp-stdio" (the #270 design says source serverInfo
+        from real discover data "instead of inventing a placeholder"); the
+        fallback name must say plainly that the real upstream identity is
+        unknown."""
+        state = _ModernState()
+        assert state.server_info is None
+        line = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+        )
+        _, reply = _handle_modern_special_method(line, 1, state)
+        server_info = json.loads(reply)["result"]["serverInfo"]
+        assert server_info["name"] != "mcp-stdio"
+        assert "unknown" in server_info["name"].lower()
+
     def test_notifications_initialized_is_swallowed(self):
         state = _ModernState()
         line = '{"jsonrpc":"2.0","method":"notifications/initialized"}'
