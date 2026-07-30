@@ -5070,11 +5070,12 @@ def run(
         log(f"MRTR transaction for id {client_id!r} aborted: {reason}")
         _write_line(_error_response(f"MRTR bridge: {reason}", client_id, code=code))
 
-    def _mrtr_translate(key: str, entry: Any) -> tuple[str, dict[str, Any]] | None:
+    def _mrtr_translate(entry: Any) -> tuple[str | None, Any]:
         """Translate one ``inputRequests`` entry into a legacy request.
 
-        Returns ``(capability_key, envelope_without_id)`` or ``None`` when
-        the entry cannot be bridged (the caller aborts the transaction).
+        Returns ``(capability_key, envelope_without_id)`` on success, or
+        ``(None, reason)`` when the entry cannot be bridged — the caller
+        aborts the transaction with that reason.
 
         An ``inputRequests`` value is a bare ``{method, params}`` object,
         NOT a JSON-RPC message — "values are request objects that MUST be
@@ -5085,25 +5086,77 @@ def run(
         ``roots/list``); what MRTR changed is who sends them and how the
         answer travels back, which is precisely what this bridge restores.
 
-        Params are passed VERBATIM. Spec rev 2026-07-28 adds fields to
-        these request shapes (URL-mode elicitation, richer schemas) that a
+        Params are otherwise passed VERBATIM. Spec rev 2026-07-28 adds
+        fields to these request shapes (richer elicitation schemas) that a
         2025 client will not recognise, but every MCP request object is
         open/extensible and inventing a lossy down-translation would be
         worse than passing what the server actually said. ``roots/list``
         takes no params at all, so none are minted for it.
         """
         if not isinstance(entry, dict):
-            return None
+            return None, "server sent a malformed input request"
         method = entry.get("method")
         capability = _MRTR_REQUEST_CAPABILITY.get(method) if method else None
         if capability is None:
-            return None
+            return None, "server requested an input kind the relay cannot bridge"
         envelope: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
-        if method != "roots/list":
-            params = entry.get("params")
-            if not isinstance(params, dict):
-                return None
-            envelope["params"] = params
+        if method == "roots/list":
+            # ListRootsRequest carries no params at all.
+            return capability, envelope
+        params = entry.get("params")
+        if not isinstance(params, dict):
+            return None, "server sent an input request with no params object"
+        if method == "elicitation/create":
+            mode = params.get("mode")
+            if mode == "url":
+                # Design change 10. URL-mode elicitation (introduced in rev
+                # 2025-11-25) loads a pile of MUSTs onto the CLIENT that
+                # this relay can neither perform nor verify: "MUST NOT
+                # automatically pre-fetch the URL", "MUST NOT open the URL
+                # without explicit consent from the user", "MUST show the
+                # full URL to the user for examination before consent",
+                # "MUST open the URL provided by the server in a secure
+                # manner that does not enable the client or LLM to inspect
+                # the content or user inputs" — and the spec devotes a
+                # whole section to the phishing attack that follows when
+                # they are not honored. A 2025-era stdio client predates
+                # URL mode entirely and would render the request as a form,
+                # so the bridge refuses rather than silently downgrading
+                # what is usually a credential or payment flow. The
+                # capability gate in the caller should normally have caught
+                # this first: an ``elicitation: {}`` declaration "is
+                # equivalent to declaring support for form mode only", and
+                # "Servers MUST NOT send elicitation requests with modes
+                # that are not supported by the client" — this arm is the
+                # defensive backstop for a server that ignores that MUST.
+                return None, (
+                    "server requested URL-mode elicitation, which cannot "
+                    "be bridged to a legacy client"
+                )
+            if "mode" in params:
+                # Strip ``mode: "form"``: "For backwards compatibility,
+                # servers MAY omit the mode field for form mode elicitation
+                # requests. Clients MUST treat requests without a mode
+                # field as form mode." Omitting it hands the 2025-era
+                # client exactly the shape it has always known instead of
+                # an unrecognised discriminator it might reject. Any other
+                # value than "form"/"url" is unknown to this relay too, and
+                # dropping it degrades to form mode — the same reading the
+                # spec gives a client that sees no mode at all.
+                params = {k: v for k, v in params.items() if k != "mode"}
+        elif method == "sampling/createMessage" and "tools" in params:
+            # Tool-augmented sampling is a 2026 addition whose answer a
+            # 2025 client cannot produce: it would return a plain
+            # CreateMessageResult with no tool calls and the server would
+            # act on an answer that silently dropped half the request.
+            # (The sampling leg as a whole is best-effort — SEP-2577
+            # deprecates it — so this stays a hard abort rather than
+            # growing a translation.)
+            return None, (
+                "server requested tool-augmented sampling, which cannot be "
+                "bridged to a legacy client"
+            )
+        envelope["params"] = params
         return capability, envelope
 
     def _mrtr_open_round(
@@ -5142,6 +5195,18 @@ def run(
             return
         declared = modern_state.client_capabilities_declared or {}
         txn = mrtr_txns.get(client_id)
+        if txn is None and len(mrtr_txns) >= _MRTR_MAX_TXNS:
+            # Design change 5: a hard count cap, never a TTL. Fail the NEW
+            # transaction rather than evicting an old one — the old ones
+            # already have dialogs in front of a user, and never-hang beats
+            # hang. -32000: the relay's own resource limit, not a malformed
+            # message.
+            _mrtr_abort(
+                client_id,
+                f"too many pending input-required transactions (cap {_MRTR_MAX_TXNS})",
+                code=-32000,
+            )
+            return
         if txn is None:
             mrtr_seq += 1
             txn = {
@@ -5171,15 +5236,10 @@ def run(
         # Translate and gate the WHOLE round before emitting any of it.
         minted: list[tuple[Any, str, dict[str, Any]]] = []
         for key, entry in requests.items():
-            translated = _mrtr_translate(key, entry)
-            if translated is None:
-                _mrtr_abort(
-                    client_id,
-                    f"server requested an input kind the relay cannot "
-                    f"bridge (key {key!r})",
-                )
+            capability, envelope = _mrtr_translate(entry)
+            if capability is None:
+                _mrtr_abort(client_id, f"{envelope} (key {key!r})")
                 return
-            capability, envelope = translated
             if capability not in declared:
                 # MRTR server requirement 7: "Servers MUST NOT send an
                 # inputRequests that the client has not declared support
@@ -5398,7 +5458,25 @@ def run(
             log(f"dropping client response for orphaned MRTR id {rid!r}")
             return None
         if "error" in msg:
-            log(f"client answered minted id {rid!r} with a JSON-RPC error")
+            # Design change 3: abort the whole transaction rather than
+            # retrying with the remaining keys. A partial ``inputResponses``
+            # IS spec-legal — "If the client fails to send all the
+            # information requested in a previous InputRequests, and the
+            # missing information is necessary for the server to process
+            # the request, the server SHOULD respond with a new
+            # InputRequiredResult requesting the missing information again,
+            # rather than returning an error" — but a client that answers
+            # an elicitation with a JSON-RPC error is telling us it cannot
+            # answer it at all, so the partial retry would only burn a
+            # round and come back asking for the same key. Abandoning the
+            # transaction is equally legal: "Servers MUST NOT assume that
+            # clients will fulfill the inputRequests or retry the original
+            # request."
+            _mrtr_abort(
+                client_id,
+                f"client returned a JSON-RPC error for input request {key!r}",
+                code=-32000,
+            )
             return None
         # The result object goes into inputResponses VERBATIM, with no
         # wrapper, under the server's OWN key: "InputResponses object is a
@@ -5416,6 +5494,52 @@ def run(
             txn["retry_now"] = True
             return client_id
         return None
+
+    def _mrtr_handle_cancel(cancel_id: Any) -> None:
+        """Drop a transaction the client just cancelled (design change 11).
+
+        The client cancelled the id it is waiting on, so per the
+        cancellation spec's receiver SHOULD ("Not send a response for the
+        cancelled request") nothing is answered for it. What DOES go out is
+        one ``notifications/cancelled`` per still-outstanding minted
+        request: the relay issued those, they are still in progress, and
+        both conditions the spec puts on a canceller ("Cancellation
+        notifications MUST only reference requests that: were previously
+        issued by the client; are believed to still be in-progress") hold.
+        Without them the client keeps an elicitation dialog open for an
+        answer nobody will ever collect.
+
+        Nothing is forwarded UPSTREAM, and there is nothing in flight there
+        to cancel: a retry POST is synchronous on this same thread, so by
+        the time a stdin line can be read it has already returned. Even if
+        it had not, ``notifications/cancelled`` is not the mechanism on
+        this transport — "Streamable HTTP: Closing the SSE response stream
+        is the cancellation signal. The server MUST treat a client
+        disconnect as cancellation of that request. No
+        notifications/cancelled message is required or expected." Closing a
+        POST mid-stream needs a second thread reading stdin, which
+        ``_ModernState``'s own note defers ("actually ABORTING an in-flight
+        POST when a cancel arrives would require a second thread reading
+        stdin concurrently with a blocking dispatch") — #270 Phase 2 PR D.
+        """
+        txn = _mrtr_purge(cancel_id)
+        if txn is None:
+            return
+        log(f"MRTR transaction for id {cancel_id!r} cancelled by the client")
+        for minted_id in txn["minted"]:
+            _emit(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/cancelled",
+                        "params": {
+                            "requestId": minted_id,
+                            "reason": "originating request cancelled",
+                        },
+                    }
+                ),
+                tracker,
+            )
 
     def _make_input_required_hook(
         client_id: Any, upstream_id: Any, stored_line: str
@@ -5614,10 +5738,20 @@ def run(
                 if normalize_arguments:
                     line = _normalize_null_arguments(line)
 
-                if tracker is not None:
+                # The cancel id is extracted for TWO consumers now (#270 PR
+                # C, design change 11): the cancel filter's tracker (only
+                # when the filter is on) and the MRTR bridge (only on the
+                # modern era, and regardless of `--no-cancel-filter` — a
+                # transaction must be droppable either way). The outer
+                # guard keeps the legacy era's work identical to pre-#270
+                # when the filter is off: no extraction, no branch.
+                if tracker is not None or era == "modern":
                     cid = _extract_cancel_id(line)
                     if cid is not None:
-                        tracker.add(cid)
+                        if tracker is not None:
+                            tracker.add(cid)
+                        if era == "modern":
+                            _mrtr_handle_cancel(cid)
 
                 # Derive both the id value and its presence from one parse (the
                 # hot path). A notification (no id) must never receive a response —
@@ -5708,6 +5842,34 @@ def run(
                             # id — never through `_dispatch`, whose
                             # closure would use THIS line's minted id.
                             _mrtr_run_retry(ready)
+                        continue
+                    # Client id reuse while a transaction is pending
+                    # (design change 6). JSON-RPC lets a client reuse an id
+                    # once the prior call is DONE, and the cancel tracker's
+                    # `discard` above encodes exactly that — but PR C makes
+                    # the collision stateful: this id currently owns minted
+                    # requests, a stored body and a round counter, and
+                    # accepting a second request under it would either
+                    # clobber that state or put two responses on the wire
+                    # for one id. Reject the newcomer and leave the
+                    # transaction alone; the client can cancel it (which
+                    # frees the id) or answer it. `_is_scalar_id` guards
+                    # the dict lookup against an unhashable id, and the
+                    # comparison is type-aware by construction — `1` and
+                    # `"1"` are different keys.
+                    if req_has_id and _is_scalar_id(req_id) and req_id in mrtr_txns:
+                        log(
+                            f"rejecting request: id {req_id!r} still owns a "
+                            f"pending MRTR transaction"
+                        )
+                        _write_line(
+                            _error_response(
+                                "request id is still awaiting input for an "
+                                "earlier request (MRTR transaction pending)",
+                                req_id,
+                                code=-32600,
+                            )
+                        )
                         continue
                     # Reject a method that cannot ride the REQUIRED Mcp-Method
                     # header (#350 review round 5, finding 5-2). JSON-RPC 2.0
