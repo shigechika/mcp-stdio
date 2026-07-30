@@ -840,7 +840,13 @@ def _handle_modern_special_method(
       the client's own ``capabilities``/``clientInfo`` into ``modern_state``
       for later ``_meta`` injection (``_inject_modern_meta``) — this is the
       ONLY place those values are ever observed, since the modern path never
-      forwards the request that carries them. The returned ``protocolVersion``
+      forwards the request that carries them. NOTE: ``capabilities``/
+      ``server_info`` here are whatever the era-detection probe seeded
+      BEFORE this client-supplied data existed — they are never re-derived
+      from it, which can under-report real server capabilities in one
+      narrow case (documented in ``run()``'s own "Limitation" section,
+      #350 review round 3: never over-claims, ordinary requests are
+      unaffected). The returned ``protocolVersion``
       is the client's OWN ``requested`` string, not ``negotiated_version``
       (#350 review round 3): this relay never re-shapes request/response
       BODIES based on protocol version (no code path here touches the new
@@ -3022,6 +3028,42 @@ def run(
     ``id:null`` error for a batch would itself violate JSON-RPC, and MCP removed
     batching in spec rev 2025-06-18, so the exposure is minimal. A single
     (non-batch) request always gets a synthesized error on the same failures.
+
+    Limitation — modern discover-derived state is never re-seeded once the
+    local client's REAL capabilities are known (#350 review round 3): the
+    ``server/discover`` probe that seeds ``modern_state.server_info`` /
+    ``capabilities`` / ``supported_versions`` runs BEFORE the stdin loop
+    starts (see above), which is necessarily before the local client has
+    sent its own ``initialize`` — so the probe always advertises
+    ``clientCapabilities: {}`` (see ``_build_discover_probe_request``,
+    which seeds a throwaway, never-populated ``_ModernState()``). If the
+    remote requires a capability the local client would actually have
+    supplied to answer ``server/discover`` (returning the recognized-modern
+    error ``-32021`` ``MissingRequiredClientCapabilityError``), the probe
+    still correctly classifies the era as ``modern`` (see
+    ``_probe_protocol_era``), but seeds NOTHING: ``modern_state.server_info``
+    stays ``None`` and ``capabilities`` stays ``{}``. The synthesized
+    ``InitializeResult`` returned to the local client (in
+    ``_handle_modern_special_method``) then reports the honest-unknown
+    placeholder identity and empty capabilities — this UNDER-reports what
+    the remote actually supports, it never over-claims, and every ORDINARY
+    request is still dispatched upstream regardless (the local client can
+    still successfully call a tool its own initialize never got to hear
+    the server explicitly advertise). A retry-the-probe-once-real-
+    capabilities-are-known fix was considered and rejected for Phase 1: it
+    would add a second discover round-trip to EVERY session using
+    ``--protocol-era modern``/``auto`` against a server implementing this
+    specific (and unusual, since ``server/discover`` is explicitly
+    documented as the low-requirement backward-compatibility probe) gate,
+    for a purely cosmetic under-report that resolves itself the moment
+    ordinary traffic flows. If this under-reporting actually blocks a
+    client that gates its own tool usage on advertised capabilities,
+    operators have two escapes: fix the upstream server's discover-gating
+    (it is not spec-mandated), or pin ``--protocol-era legacy`` if the
+    remote also still speaks the old handshake. Acceptance criterion #3
+    (#270: headers/session/byte-identity) is unaffected — nothing here
+    changes what goes out on the wire, only what this one synthesized
+    field claims.
     """
 
     # Graceful shutdown on SIGTERM/SIGINT

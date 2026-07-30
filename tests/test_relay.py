@@ -9424,6 +9424,46 @@ class TestHandleModernSpecialMethod:
         assert server_info["name"] != "mcp-stdio"
         assert "unknown" in server_info["name"].lower()
 
+    def test_unseeded_discover_state_is_not_backfilled_from_client_initialize(self):
+        """#350 review round 3, DOCUMENTED LIMITATION (see run()'s own
+        "Limitation" docstring section): the era-detection ``server/
+        discover`` probe runs BEFORE the stdin loop starts — necessarily
+        before the local client's own ``initialize`` — so it always
+        advertises ``clientCapabilities: {}``. A remote gating discover
+        itself on a real client capability (returning the recognized-modern
+        ``-32021`` with no ``result``) leaves ``modern_state.server_info``/
+        ``capabilities`` unseeded. This pins that the synthesized
+        InitializeResult reports that honest under-report REGARDLESS of
+        what real capabilities/clientInfo the local client's initialize
+        supplies — they are captured into ``modern_state`` for later
+        ``_meta`` injection (proven below), but never used to retroactively
+        backfill ``server_info``/``capabilities``, confirming this is a
+        deliberate, documented tradeoff rather than an accident a future
+        refactor could silently reintroduce or silently "fix" halfway."""
+        state = _ModernState()
+        line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": {"roots": {}, "sampling": {}},
+                    "clientInfo": {"name": "real-client", "version": "3.0"},
+                },
+            }
+        )
+        _, reply = _handle_modern_special_method(line, 1, state)
+        result = json.loads(reply)["result"]
+        # Under-reports: empty capabilities, honest-unknown identity.
+        assert result["capabilities"] == {}
+        assert "unknown" in result["serverInfo"]["name"].lower()
+        # The real client data WAS captured (for _meta injection on later
+        # requests) — it is simply never fed back into this synthesized
+        # result, which is the documented limitation, not a missed capture.
+        assert state.client_capabilities == {"roots": {}, "sampling": {}}
+        assert state.client_info == {"name": "real-client", "version": "3.0"}
+
     def test_synthesized_protocol_version_echoes_client_request_not_upstream(self):
         """#350 review round 3: a local client that only speaks legacy
         2025-06-18 must not be told the negotiated session is 2026-07-28
