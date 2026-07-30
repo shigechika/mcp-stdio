@@ -12612,6 +12612,113 @@ class TestRunModernEra:
         # line during an ordinary shutdown.
         assert "listen stream dropped" not in err
 
+    def test_shutdown_race_before_first_stream_call_exits_clean(
+        self, httpx_mock, capsys
+    ):
+        """#352 round-5 finding 1: shutdown immediately after
+        notifications/initialized can interleave with the listen thread's
+        FIRST attempt — the thread passes the loop-top stop check, run()'s
+        finally then sets stop and closes the dedicated client, and the
+        attempt's client.stream() lands on the closed client. httpx raises
+        a plain RuntimeError there ("Cannot send a request, as the client
+        has been closed." — 0.28.1's ClientState.CLOSED guard in
+        Client.send), which neither the HTTPError nor the OSError arm
+        covers, so an otherwise clean shutdown smeared an unhandled
+        daemon-thread traceback. Forced deterministically, no sleeps: the
+        attempt's prepare_headers snapshot — taken BETWEEN the loop-top
+        stop check and client.stream() — parks until the dedicated
+        client's close (run()'s finally, which set listen_stop just
+        before) releases it, guaranteeing the closed-client call."""
+        entered = threading.Event()
+        released = threading.Event()
+        done = threading.Event()
+        failures = []
+        created = []
+
+        class RecordingClient(httpx.Client):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                created.append(self)
+
+            def close(self):
+                # created[1] is the dedicated listen client; its close IS
+                # run()'s finally, entered after listen_stop.set().
+                if len(created) > 1 and self is created[1]:
+                    released.set()
+                super().close()
+
+        real_loop = _listen_stream_loop
+
+        def wrapped_loop(**kwargs):
+            real_prepare = kwargs["prepare_headers"]
+
+            def gated_prepare(body):
+                # The loop-top stop check has already passed. Hold the
+                # attempt here until run()'s teardown (stop set + client
+                # close) completed, then let it hit the closed client.
+                entered.set()
+                assert released.wait(timeout=5)
+                return real_prepare(body)
+
+            kwargs["prepare_headers"] = gated_prepare
+            try:
+                real_loop(**kwargs)
+            except BaseException as e:  # revert detector, see assert below
+                failures.append(e)
+                raise
+            finally:
+                done.set()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        init = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2026-07-28", "capabilities": {}},
+            }
+        )
+        initialized = json.dumps(
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        )
+
+        def stdin_lines():
+            yield init + "\n"
+            yield initialized + "\n"
+            # Hold stdin open until the first attempt is provably past
+            # the loop-top stop check (parked in its header snapshot), so
+            # the EOF-triggered finally races a LIVE first attempt.
+            assert entered.wait(timeout=5)
+
+        with (
+            patch("mcp_stdio.relay._listen_stream_loop", wrapped_loop),
+            patch("mcp_stdio.relay.httpx.Client", RecordingClient),
+            patch("sys.stdin", stdin_lines()),
+            patch("sys.stdout", StringIO()),
+        ):
+            run(self.URL, {"Content-Type": "application/json"}, protocol_era="modern")
+
+        assert done.is_set()  # the bounded join reaped the thread
+        # The closed-client RuntimeError was absorbed by the stop-set arm,
+        # never propagated out of the loop (pytest's threadexception hook
+        # would swallow the traceback into a warning, so THIS is the
+        # deterministic revert detector, not the stderr scrape below).
+        assert failures == []
+        assert len(created) == 2
+        assert all(c.is_closed for c in created)
+        err = capsys.readouterr().err
+        assert "Traceback" not in err
+        assert "RuntimeError" not in err
+        # The raced attempt died before the transport: no listen POST.
+        assert all(
+            r.headers.get("mcp-method") != "subscriptions/listen"
+            for r in httpx_mock.get_requests()
+        )
+
     def test_second_initialize_never_spawns_second_listen_thread(self, httpx_mock):
         """Spec item 2: the start hook fires on EVERY
         notifications/initialized (#352 review finding 1 moved the start
@@ -13748,4 +13855,26 @@ class TestListenStreamLoop:
         stop = threading.Event()
         stop.set()
         self._run_loop(stop=stop)
+        assert len(httpx_mock.get_requests()) == 0
+
+    def test_closed_client_runtimeerror_without_stop_reraises(self, httpx_mock):
+        """#352 round-5 finding 1, the deliberate complement: with stop
+        NOT set, a closed-client RuntimeError has no legitimate producer —
+        run()'s finally is the ONLY closer of the dedicated client, and it
+        sets stop before closing — so the loop re-raises it loudly instead
+        of mapping it to a drop/return arm: swallowing would mask a real
+        logic bug as a silent thread death."""
+        client = httpx.Client()
+        client.close()
+        with pytest.raises(RuntimeError, match="has been closed"):
+            _listen_stream_loop(
+                client=client,
+                url=self.URL,
+                params=self._default_params(),
+                prepare_headers=lambda body: {"Content-Type": "application/json"},
+                tracker=None,
+                stop=threading.Event(),
+                timeout=httpx.Timeout(connect=10, read=300, write=30, pool=10),
+                state=None,
+            )
         assert len(httpx_mock.get_requests()) == 0

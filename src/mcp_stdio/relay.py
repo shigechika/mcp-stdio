@@ -3298,6 +3298,11 @@ def _listen_stream_loop(
       snapshot picks up whatever the main loop / daemon refreshed.
     - dead stdout (C12): ``OSError``/``BrokenPipeError`` from ``_emit`` is
       terminal — reconnecting into a closed stdout would spin forever.
+    - shutdown race (#352 round-5 finding 1): a ``RuntimeError`` from an
+      attempt that raced run()'s teardown (stop set, dedicated client
+      closed, but this thread had already passed the loop-top stop check)
+      exits silently iff stop is set; with stop UNSET it re-raises — see
+      the handler's comment.
     """
     # C1 x C2 interaction guard (#352 review finding 2): the body is
     # FROZEN (C1) but prepare_headers (the modern _prepare_headers) reads
@@ -3454,6 +3459,28 @@ def _listen_stream_loop(
             # upstream stream would spin against a dead stdout.
             log(f"listen stream: stdout write failed ({e}); stopping")
             return
+        except RuntimeError:
+            # Shutdown race (#352 round-5 finding 1): run()'s finally sets
+            # the stop event and THEN closes this thread's dedicated
+            # client, but an attempt that passed the loop-top stop check
+            # just before can still reach client.stream() afterwards —
+            # httpx (0.28.1: Client.send's ClientState.CLOSED guard)
+            # raises a plain RuntimeError("Cannot send a request, as the
+            # client has been closed."), not an HTTPError/OSError, so
+            # without this arm an ordinary shutdown smeared an unhandled
+            # daemon-thread traceback across stderr. httpx's StreamError
+            # family (e.g. StreamClosed, when the close lands mid-read)
+            # subclasses RuntimeError too and is covered by the same
+            # reasoning. stop set → this is the teardown's own doing (the
+            # set() happens-before the close() this thread just observed):
+            # exit silently, exactly like the stop-set arms above. stop
+            # NOT set → nothing legitimate produces this (run()'s finally
+            # is the ONLY closer of the dedicated client, and it sets stop
+            # first), so re-raise loudly: swallowing would mask a real
+            # logic bug as a quiet thread death.
+            if stop.is_set():
+                return
+            raise
         if stop.wait(RETRY_DELAY):
             return
 
