@@ -2409,6 +2409,7 @@ def _post_and_stream(
     capture_init: bool = False,
     has_id: bool = True,
     input_required_hook: Callable[[str], str | None] | None = None,
+    input_required_abort: Callable[[str], None] | None = None,
 ) -> _StreamResult | None:
     """Send a POST and stream the response to stdout with retry.
 
@@ -2447,7 +2448,28 @@ def _post_and_stream(
     A swallow also disables the mid-stream retry for the same reason
     ``emitted`` does: minted requests are already on the client's stdin and
     the tool call may already have run server-side, so replaying the POST
-    is not safe.
+    is not safe. A swallow is therefore TERMINAL for this POST: every exit
+    below it returns a 200 ``_StreamResult``, so neither this function's own
+    attempt loop nor run()'s 401/403/404 recovery ladder can re-POST the
+    original body while a transaction it opened is still alive.
+
+    ``input_required_abort`` (#356 review R1F1) is the failure counterpart,
+    passed by exactly the same two call sites and never alone. When the
+    stream breaks AFTER a swallow, writing the ordinary
+    "upstream stream interrupted" error under ``req_id`` would answer the
+    client while the transaction stays alive and its minted requests stay on
+    the client's stdin — the client then answers them, the retry fires, and
+    the final result lands under the SAME id: two responses for one id, the
+    hazard ``_SSE_PENDING_MAX`` documents. So on that one path the abort
+    callback is invoked INSTEAD of the generic write; it funnels through
+    ``_mrtr_abort``, which purges the transaction, cancels the outstanding
+    minted requests downstream and writes exactly one error under the
+    client's id. (Only the SWALLOWED case is special. A retry whose re-keyed
+    final result was already emitted and is then interrupted still gets a
+    result plus an interrupted error under one id — that is the generic
+    partial-delivery behavior of this function on both eras, unchanged by
+    and pre-dating the bridge; ``_mrtr_run_retry`` merely purges afterwards
+    so no THIRD response follows.)
     """
     last_error: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -2575,7 +2597,20 @@ def _post_and_stream(
                 # requests on the client's stdin and the server-side work may
                 # already have run, so a replay would duplicate both.
                 log("upstream stream interrupted after partial delivery; not retrying")
-                if has_id:
+                if swallowed and input_required_abort is not None:
+                    # #356 review R1F1: the swallowed payload opened (or
+                    # extended) an MRTR transaction that is STILL alive, with
+                    # minted requests already on the client's stdin. A plain
+                    # error under req_id would answer the client now and the
+                    # completed retry would answer it again later. Route
+                    # through the transaction's own abort funnel instead —
+                    # exactly one error under this id, plus the downstream
+                    # cancels that retire the dialogs nobody will collect.
+                    # The callback is a no-op when the hook ALREADY aborted
+                    # (an unbridgeable round answers and purges from inside
+                    # the swallow), so this path can never write twice.
+                    input_required_abort(f"upstream stream interrupted: {e}")
+                elif has_id:
                     _write_line(
                         _error_response(f"upstream stream interrupted: {e}", req_id)
                     )
@@ -5479,6 +5514,7 @@ def run(
                 input_required_hook=_make_input_required_hook(
                     client_id, retry_id, txn["stored_line"]
                 ),
+                input_required_abort=_make_input_required_abort(client_id),
             )
             txn["retry_in_flight"] = False
             if mrtr_txns.get(client_id) is not txn:
@@ -5702,6 +5738,46 @@ def run(
             return None
 
         return hook
+
+    def _make_input_required_abort(client_id: Any) -> Callable[[str], None]:
+        """Build the failure counterpart of the interception hook (R1F1).
+
+        Handed to ``_post_and_stream`` alongside every hook and invoked on
+        the ONE path that would otherwise answer the client twice: a stream
+        that breaks after a payload was SWALLOWED. The swallow means a round
+        was opened — minted requests are on the client's stdin and the
+        transaction is waiting for them — so the generic
+        "upstream stream interrupted" error would land under the client's id
+        now, and the retry those answers eventually fire would land a result
+        under the same id later. Funnelling through ``_mrtr_abort`` instead
+        purges the transaction, cancels the outstanding minted requests
+        downstream, and writes exactly one error under N.
+
+        The membership check is what makes "exactly once" true rather than
+        merely intended: a swallow does NOT imply a live transaction — an
+        unbridgeable round (undeclared capability, ``mode: "url"``, a cap
+        breach) is swallowed by the hook and aborted from inside
+        ``_mrtr_open_round``, which has already answered and purged. Aborting
+        again on the way out would put a second error on the wire for one id,
+        which is the very failure this callback exists to prevent.
+
+        ``-32000`` rather than the funnel's ``-32600`` default: the fault is
+        an upstream transport failure, not a malformed MRTR message from the
+        server, and the same code already covers the other "the exchange
+        could not be completed" outcomes (cap breaches, a client error on a
+        minted id).
+        """
+
+        def abort(reason: str) -> None:
+            if client_id not in mrtr_txns:
+                log(
+                    f"MRTR POST for id {client_id!r} failed after the "
+                    f"transaction was already answered: {reason}"
+                )
+                return
+            _mrtr_abort(client_id, reason, code=-32000)
+
+        return abort
 
     # --- modern era: subscriptions/listen stream (#270 Phase 2 PR A) ---
     # ARRANGED here (era-resolution scope); the body snapshot is SEEDED by
@@ -6146,6 +6222,16 @@ def run(
                         # legacy era.
                         input_required_hook=(
                             _make_input_required_hook(req_id, req_id, content)
+                            if mrtr_eligible
+                            else None
+                        ),
+                        # Always paired with the hook (#356 review R1F1): a
+                        # stream that breaks after a swallow must answer
+                        # through the transaction's abort funnel, not with a
+                        # bare error that leaves the transaction alive to
+                        # answer a second time.
+                        input_required_abort=(
+                            _make_input_required_abort(req_id)
                             if mrtr_eligible
                             else None
                         ),

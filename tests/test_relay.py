@@ -14177,6 +14177,108 @@ class TestRunModernMrtrBridge:
         assert lines[1]["method"] == "elicitation/create"
         assert not [line for line in lines if "error" in line]
 
+    def test_interrupt_after_a_swallowed_round_aborts_once(self, httpx_mock):
+        """#356 review R1F1. The stream carrying the `input_required` breaks
+        AFTER the hook swallowed it, so the transaction is alive and its
+        minted request is already on the client's stdin. The generic
+        "upstream stream interrupted" error would answer id 2 now — and the
+        retry the client's answer then fires would answer id 2 AGAIN, the
+        two-responses-one-id hazard `_SSE_PENDING_MAX` documents. A swallow
+        routes the failure through `_mrtr_abort` instead: exactly one error
+        under 2, one downstream cancel retiring the dialog nobody will
+        collect, transaction purged — so the client's late answer is dropped
+        rather than re-POSTed."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+
+        def gen():
+            payload = json.dumps(self._input_required(2, {"who": self._elicit()}))
+            yield f"event: message\ndata: {payload}\n\n".encode()
+            raise httpx.ReadError("connection dropped after the input_required")
+
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            stream=IteratorStream(gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+        # Registered but not expected: with the abort funnel wired the retry
+        # never fires. It exists so that REMOVING the funnel produces the
+        # two-response output this test asserts against, instead of dying on
+        # an unmatched request.
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "mcp-stdio/mrtr-retry/1/1",
+                    "result": {"content": [{"type": "text", "text": "too late"}]},
+                }
+            ),
+            headers={"content-type": "application/json"},
+            is_optional=True,
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"elicitation": {}}),
+                self._call(),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mcp-stdio/mrtr/1/who",
+                        "result": {"action": "accept", "content": {}},
+                    }
+                ),
+            ],
+            protocol_era="modern",
+        )
+        # The interrupted POST and nothing else: the original was never
+        # replayed and the retry was never fired.
+        assert len(self._tool_calls(httpx_mock)) == 1
+        lines = self._out(output)
+        answers = [line for line in lines if line.get("id") == 2]
+        assert len(answers) == 1
+        assert answers[0]["error"]["code"] == -32000
+        assert answers[0]["error"]["message"].startswith("MRTR bridge: upstream stream")
+        cancels = [
+            line for line in lines if line.get("method") == "notifications/cancelled"
+        ]
+        assert [c["params"]["requestId"] for c in cancels] == ["mcp-stdio/mrtr/1/who"]
+
+    def test_interrupt_after_an_aborted_round_does_not_answer_twice(self, httpx_mock):
+        """The same interrupt when the swallowed round was UNBRIDGEABLE. The
+        hook swallowed it and `_mrtr_open_round` already answered and purged
+        (an undeclared capability), so re-entering the abort funnel on the
+        way out would put a SECOND error on the wire for one id — the exact
+        failure the funnel exists to prevent. The membership check in
+        `_make_input_required_abort` is what keeps "exactly once" true."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+
+        def gen():
+            payload = json.dumps(self._input_required(2, {"who": self._elicit()}))
+            yield f"event: message\ndata: {payload}\n\n".encode()
+            raise httpx.ReadError("connection dropped after the input_required")
+
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            stream=IteratorStream(gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            # No elicitation declared: the round is rejected from inside the
+            # swallow before the stream ever breaks.
+            [self._initialize({"roots": {}}), self._call()],
+            protocol_era="modern",
+        )
+        answers = [line for line in self._out(output) if line.get("id") == 2]
+        assert len(answers) == 1
+        assert "never declared" in answers[0]["error"]["message"]
+
 
 # --- modern era: subscriptions/listen stream (#270 Phase 2 PR A) ---
 
