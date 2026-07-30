@@ -13265,7 +13265,9 @@ class TestListenStreamLoop:
 
     def test_404_with_method_not_found_terminal_one_post(self, httpx_mock, capsys):
         """Design test 4 / C6: 404 + a -32601 body is the remote saying the
-        method does not exist — exactly one POST, loud stderr, no retry."""
+        method does not exist — exactly one POST, loud stderr, no retry.
+        (#352 round-3 finding 1 unified the non-200 terminal wording with
+        the on-stream classifier's "rejected subscriptions/listen".)"""
         httpx_mock.add_response(
             url=self.URL,
             status_code=404,
@@ -13281,7 +13283,7 @@ class TestListenStreamLoop:
         with patch("sys.stdout", StringIO()):
             self._run_loop()
         assert len(httpx_mock.get_requests()) == 1
-        assert "does not support" in capsys.readouterr().err
+        assert "rejected subscriptions/listen" in capsys.readouterr().err
 
     def test_404_method_not_found_terminal_even_after_establishment(
         self, httpx_mock, capsys
@@ -13306,7 +13308,83 @@ class TestListenStreamLoop:
         ):
             self._run_loop()
         assert len(httpx_mock.get_requests()) == 2
-        assert "does not support" in capsys.readouterr().err
+        assert "rejected subscriptions/listen" in capsys.readouterr().err
+
+    def test_post_establishment_terminal_body_stops_for_good(self, httpx_mock, capsys):
+        """#352 round-3 finding 1: after a successful establishment, a
+        reconnect answered HTTP 400 with a -32020 JSON-RPC body is the
+        server deterministically rejecting THIS request (C6), not an
+        abrupt drop — round 2's split read only 404 bodies, so this exact
+        response was reconnect-looped at 1 Hz forever against a server
+        that will never say yes. Exactly two POSTs (establish + rejected
+        reconnect), one loud stderr line, no further attempts."""
+        httpx_mock.add_response(
+            stream=self._sse(self._ack()),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            status_code=400,
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32020, "message": "header mismatch"},
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        with (
+            patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            patch("sys.stdout", StringIO()),
+        ):
+            self._run_loop()
+        assert len(httpx_mock.get_requests()) == 2
+        assert capsys.readouterr().err.count("rejected subscriptions/listen") == 1
+
+    def test_post_establishment_unparseable_non_200_still_retries(self, httpx_mock):
+        """#352 round-3 finding 1, the pinned complement: a non-200 whose
+        body does NOT parse to a terminal JSON-RPC error keeps the round-2
+        behavior exactly — post-establishment it is an abrupt drop,
+        reconnected with a re-minted id."""
+        httpx_mock.add_response(
+            stream=self._sse(self._ack()),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(url=self.URL, status_code=400, text="Bad Request")
+        httpx_mock.add_response(
+            stream=self._sse(self._graceful(attempt=3)),
+            headers={"content-type": "text/event-stream"},
+        )
+        with (
+            patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            patch("sys.stdout", StringIO()),
+        ):
+            self._run_loop()
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 3
+        assert json.loads(requests[2].content)["id"] == "mcp-stdio/listen/3"
+
+    def test_pre_establishment_terminal_body_logs_rejection_not_fail_fast(
+        self, httpx_mock, capsys
+    ):
+        """#352 round-3 finding 1: the terminal-body classification runs
+        BEFORE the pre-establishment fail-fast, so a first-attempt 400
+        with a -32021 body is reported as the server's deterministic
+        rejection (C6), not the generic fail-fast — same one-POST outcome,
+        but the stderr line carries the real verdict."""
+        httpx_mock.add_response(
+            url=self.URL,
+            status_code=400,
+            text=json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32021}}),
+            headers={"content-type": "application/json"},
+        )
+        with patch("sys.stdout", StringIO()):
+            self._run_loop()
+        assert len(httpx_mock.get_requests()) == 1
+        err = capsys.readouterr().err
+        assert "rejected subscriptions/listen" in err
+        assert "before the stream was ever established" not in err
 
     def test_error_result_terminal_one_post(self, httpx_mock, capsys):
         """Design test 4, error-result variant: a -32601 error result on a

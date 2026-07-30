@@ -3180,10 +3180,15 @@ def _listen_stream_loop(
 
     - graceful (either signal — see ``_handle_listen_message``): stop, no
       reconnect, nothing on stdout.
-    - non-support (C6): HTTP 404 with a ``-32601`` body, or a terminal
-      error result — one loud stderr line, stop, NEVER retry (retrying
-      would POST forever at 1 Hz against a server that will never accept).
-    - abrupt drop: stream end without a signal, a non-200, or any
+    - non-support (C6): ANY non-200 whose body is a JSON-RPC error with a
+      terminal code (#352 round-3 finding 1 — a ``-32601``-bodied 404 is
+      the canonical case, but a reconnect answered 400 + ``-32020`` must
+      not be retried forever either; see ``_listen_error_code``), or a
+      terminal error result on-stream — one loud stderr line, stop, NEVER
+      retry (retrying would POST forever at 1 Hz against a server that
+      will never accept).
+    - abrupt drop: stream end without a signal, a non-200 without a
+      terminal-code body, or any
       ``httpx.HTTPError`` — after a first successful establishment,
       reconnect forever on a fixed ``stop.wait(RETRY_DELAY)`` backoff;
       BEFORE any success, fail fast instead (C7's ``established`` split —
@@ -3245,19 +3250,34 @@ def _listen_stream_loop(
             ) as resp:
                 if resp.status_code != 200:
                     resp.read()
-                    if resp.status_code == 404 and _listen_404_is_method_not_found(
-                        resp
-                    ):
-                        # C6: a -32601-bodied 404 is the spec's "this method
-                        # does not exist here" — deterministic, never retried.
+                    # #352 round-3 finding 1: classify the BODY before the
+                    # status split. Round 2 read only a 404 body, so a
+                    # reconnect answered e.g. HTTP 400 with a -32020
+                    # JSON-RPC body was treated as an abrupt drop and
+                    # retried at 1 Hz forever — against a server rejecting
+                    # THIS exact request deterministically, exactly what
+                    # the C6 terminal arm exists to prevent. ANY non-200
+                    # whose body parses to a terminal JSON-RPC error code
+                    # (the same _LISTEN_TERMINAL_ERROR_CODES set
+                    # _handle_listen_message classifies on-stream) now
+                    # stops for good, established or not — and BEFORE the
+                    # 401/403 exemption: a body carrying one of the
+                    # reserved deterministic-rejection codes is the
+                    # remote's own verdict on this request, more specific
+                    # than the transport status around it. An absent or
+                    # unparseable body keeps the round-2 split below
+                    # exactly as it was.
+                    code = _listen_error_code(resp)
+                    if code in _LISTEN_TERMINAL_ERROR_CODES:
                         log(
-                            "listen stream: server does not support "
-                            "subscriptions/listen (HTTP 404, -32601); "
-                            "list_changed forwarding disabled for this session"
+                            "listen stream: server rejected "
+                            f"subscriptions/listen (HTTP {resp.status_code}, "
+                            f"JSON-RPC {code}); list_changed forwarding "
+                            "disabled for this session"
                         )
                         return
                     # Three-way split (#352 round-2 finding 1): terminal
-                    # codes (C6 — the -32601-bodied 404 above, and the
+                    # codes (C6 — classified from the body above, and the
                     # terminal error results _handle_listen_message
                     # classifies) stop for good; auth challenges 401/403
                     # are ALWAYS retryable drops (C3), even before the
@@ -3343,21 +3363,27 @@ def _listen_stream_loop(
             return
 
 
-def _listen_404_is_method_not_found(resp: httpx.Response) -> bool:
-    """True iff a (fully-read) 404 body is a JSON-RPC ``-32601`` error.
+def _listen_error_code(resp: httpx.Response) -> int | None:
+    """JSON-RPC error code carried by a (fully-read) response body, or None.
 
-    The C6 non-support signature: HTTP 404 alone is ambiguous (a legacy
-    proxy, a wrong path), but 404 + ``Method not found`` in the body is the
-    remote itself saying ``subscriptions/listen`` does not exist — terminal.
+    Generalized from a 404-only ``-32601`` probe by #352 round-3 finding
+    1: ANY non-200 the listen POST gets back may carry the remote's real
+    JSON-RPC verdict (e.g. HTTP 400 with a ``-32020`` body), and only the
+    code decides whether the rejection is one of the deterministic
+    ``_LISTEN_TERMINAL_ERROR_CODES``. HTTP status alone stays ambiguous
+    (a legacy proxy, a wrong path, a transient 5xx) — an unparseable,
+    absent, or code-less body returns ``None`` and the caller falls back
+    to the status-based drop/fail-fast split.
     """
     try:
         parsed = json.loads(resp.text)
     except (json.JSONDecodeError, ValueError):
-        return False
+        return None
     if not isinstance(parsed, dict):
-        return False
+        return None
     error = parsed.get("error")
-    return isinstance(error, dict) and error.get("code") == -32601
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, int) else None
 
 
 def _reinitialize(
