@@ -13211,6 +13211,61 @@ class TestHandleListenMessage:
         assert state["honored"] == honored
         assert "honored a subset" not in capsys.readouterr().err
 
+    def test_id_bearing_ack_is_not_establishment_evidence(self):
+        """#352 round-6 finding: an "ack" carrying an id is a JSON-RPC
+        REQUEST wearing the ack's method name (the round-2 rule the
+        forwarding branch enforces) — a broken/unsupported endpoint
+        emitting it must not flip `established` and bypass the round-5
+        pre-establishment fail-fast into reconnect-forever."""
+        state = {}
+        assert (
+            self._handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "notifications/subscriptions/acknowledged",
+                    "params": {"notifications": {"toolsListChanged": True}},
+                },
+                state=state,
+            )
+            is None
+        )
+        assert "honored" not in state
+
+    def test_payload_less_ack_is_not_establishment_evidence(self):
+        """#352 round-6 finding, the missing-payload half: a bare
+        `{"method": ...acknowledged}` (no `params.notifications` object)
+        carries no honored subset — not protocol-valid evidence."""
+        state = {}
+        for params in (None, {}, {"notifications": "yes"}, {"notifications": None}):
+            msg = {
+                "jsonrpc": "2.0",
+                "method": "notifications/subscriptions/acknowledged",
+            }
+            if params is not None:
+                msg["params"] = params
+            assert self._handle(msg, state=state) is None
+        assert "honored" not in state
+
+    def test_empty_honored_subset_still_establishes(self, capsys):
+        """Boundary pin for the round-6 validation: `notifications: {}` is
+        a VALID "nothing honored" ack — the server spoke the protocol, so
+        it establishes (and logs the subset divergence)."""
+        state = {}
+        assert (
+            self._handle(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/subscriptions/acknowledged",
+                    "params": {"notifications": {}},
+                },
+                state=state,
+            )
+            == "ack"
+        )
+        assert state["honored"] == {}
+        assert "honored a subset" in capsys.readouterr().err
+
 
 class TestListenStreamLoop:
     """Unit tests for the listen reader loop, driven synchronously (no

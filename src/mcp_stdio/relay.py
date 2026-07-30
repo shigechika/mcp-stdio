@@ -3162,8 +3162,22 @@ def _handle_listen_message(
         return None
     method = msg.get("method")
     if method == _LISTEN_ACK_METHOD:
+        # #352 round-6 finding: establishment evidence must be a REAL ack.
+        # Since round 5, returning "ack" is what flips `established` and
+        # thereby earns C7's infinite reconnect patience — so a malformed
+        # look-alike from a broken/unsupported endpoint must not qualify.
+        # Two checks, same rules the rest of this function already applies:
+        # a true notification (id ABSENT — an id makes it a JSON-RPC
+        # request, the round-2 rule the forwarding branch below enforces)
+        # that actually CARRIES the honored subset (`params.notifications`,
+        # an object, per the ack's spec shape — an honored subset of {} is
+        # a valid "nothing honored" ack and still establishes). Anything
+        # else is swallowed, leaving the round-5 pre-establishment
+        # fail-fast in charge.
         params = msg.get("params")
         honored = params.get("notifications") if isinstance(params, dict) else None
+        if "id" in msg or not isinstance(honored, dict):
+            return None
         if state is not None:
             state["honored"] = honored
         if honored != _LISTEN_REQUESTED_NOTIFICATIONS:
