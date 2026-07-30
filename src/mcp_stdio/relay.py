@@ -5458,6 +5458,14 @@ def run(
             log(f"dropping client response for orphaned MRTR id {rid!r}")
             return None
         if "error" in msg:
+            # This key IS answered, badly — retire its minted id before
+            # aborting. The abort cancels what is still OUTSTANDING, and a
+            # cancellation for a request the client just replied to is
+            # exactly what the spec calls invalid ("Cancellation
+            # notifications MUST only reference requests that ... are
+            # believed to still be in-progress").
+            mrtr_minted.pop(rid, None)
+            txn["minted"].pop(rid, None)
             # Design change 3: abort the whole transaction rather than
             # retrying with the remaining keys. A partial ``inputResponses``
             # IS spec-legal — "If the client fails to send all the

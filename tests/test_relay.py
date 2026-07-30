@@ -13073,6 +13073,963 @@ class TestRunModernEra:
         assert captured["timeout"].connect == 7.0
 
 
+# --- modern era: MRTR bridge (#270 Phase 2 PR C) ---
+
+
+class TestRunModernMrtrBridge:
+    """The multi round-trip requests bridge, end to end through run().
+
+    Spec rev 2026-07-28 made a server ANSWER the client's request with an
+    InputRequiredResult instead of initiating a request of its own; these
+    exercise the relay turning that back into the server-initiated
+    requests a 2025-era stdio client understands, and every way the
+    exchange can fail.
+
+    None of these send ``notifications/initialized``, so the PR A listen
+    thread never starts and there is no racy background POST to filter —
+    request ordering in each test is exactly what the bridge did. The
+    optional listen absorber is still registered so a future change to
+    the thread's start point cannot turn these into flakes.
+    """
+
+    URL = "https://example.com/mcp"
+
+    def _run_with_stdin(self, httpx_mock, stdin_lines, **kwargs):
+        stdin_data = "\n".join(stdin_lines) + "\n"
+        stdout = StringIO()
+        with patch("sys.stdin", StringIO(stdin_data)), patch("sys.stdout", stdout):
+            run(self.URL, {"Content-Type": "application/json"}, **kwargs)
+        return stdout.getvalue()
+
+    def _register_listen_stream(self, httpx_mock):
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "subscriptions/listen"},
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "mcp-stdio/listen/1",
+                    "result": {"resultType": "complete"},
+                }
+            ),
+            headers={"content-type": "application/json"},
+            is_optional=True,
+            is_reusable=True,
+        )
+
+    def _register_discover(self, httpx_mock):
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "result": {
+                        "resultType": "discover",
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"tools": {}},
+                    },
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+
+    def _register_json(self, httpx_mock, body):
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            text=json.dumps(body),
+            headers={"content-type": "application/json"},
+        )
+
+    def _initialize(self, capabilities):
+        return json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": capabilities,
+                },
+            }
+        )
+
+    def _call(self, req_id=2, name="greet"):
+        return json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": {}},
+            }
+        )
+
+    def _input_required(self, req_id, requests=None, state="OPAQUE"):
+        result = {"resultType": "input_required"}
+        if requests is not None:
+            result["inputRequests"] = requests
+        if state is not None:
+            result["requestState"] = state
+        return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+    def _elicit(self, message="name?", **extra):
+        params = {"mode": "form", "message": message, "requestedSchema": {}}
+        params.update(extra)
+        return {"method": "elicitation/create", "params": params}
+
+    def _out(self, output):
+        return [json.loads(line) for line in output.strip().split("\n") if line]
+
+    def _tool_calls(self, httpx_mock):
+        return [
+            json.loads(r.content)
+            for r in httpx_mock.get_requests()
+            if r.headers.get("mcp-method") == "tools/call"
+        ]
+
+    # --- happy paths, one per request kind ---
+
+    def test_elicitation_round_trip(self, httpx_mock):
+        """The whole bridge in one test: the server answers tools/call with
+        an InputRequiredResult, the relay mints a legacy elicitation/create
+        onto stdout, the client answers it, and the relay re-POSTs the
+        ORIGINAL request with `inputResponses` + the byte-exact
+        `requestState` echo under a DIFFERENT id ("The JSON-RPC id MUST be
+        different between the initial request and the retry"), then hands
+        the final result back under the id the client is waiting on."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(
+            httpx_mock, self._input_required(2, {"who": self._elicit()})
+        )
+        self._register_json(
+            httpx_mock,
+            {
+                "jsonrpc": "2.0",
+                "id": "mcp-stdio/mrtr-retry/1/1",
+                "result": {"content": [{"type": "text", "text": "hi octocat"}]},
+            },
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"elicitation": {}}),
+                self._call(),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mcp-stdio/mrtr/1/who",
+                        "result": {"action": "accept", "content": {"name": "octocat"}},
+                    }
+                ),
+            ],
+            protocol_era="modern",
+        )
+        lines = self._out(output)
+        # [0] synthesized InitializeResult, [1] minted request, [2] result.
+        assert len(lines) == 3
+        minted = lines[1]
+        assert minted["method"] == "elicitation/create"
+        assert minted["id"] == "mcp-stdio/mrtr/1/who"
+        # mode:"form" is stripped — a 2025 client has never seen the field,
+        # and "Clients MUST treat requests without a mode field as form
+        # mode".
+        assert "mode" not in minted["params"]
+        assert minted["params"]["message"] == "name?"
+        # The final result is re-keyed from the relay's retry id to 2.
+        assert lines[2]["id"] == 2
+        assert lines[2]["result"]["content"][0]["text"] == "hi octocat"
+        calls = self._tool_calls(httpx_mock)
+        assert len(calls) == 2
+        retry = calls[1]
+        assert retry["id"] == "mcp-stdio/mrtr-retry/1/1"
+        assert retry["id"] != calls[0]["id"]
+        assert retry["params"]["inputResponses"] == {
+            "who": {"action": "accept", "content": {"name": "octocat"}}
+        }
+        assert retry["params"]["requestState"] == "OPAQUE"
+        # Same tool, same arguments: the retry is the STORED request line,
+        # not a re-derivation.
+        assert retry["params"]["name"] == calls[0]["params"]["name"]
+
+    def test_sampling_and_roots_round_trip(self, httpx_mock):
+        """The other two kinds, and a multi-key round: sampling params ride
+        verbatim, roots/list is minted with NO params at all
+        (ListRootsRequest has none), and the retry waits for BOTH answers
+        before it fires — "Always send ALL keys"."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        sampling = {
+            "method": "sampling/createMessage",
+            "params": {"messages": [], "maxTokens": 100},
+        }
+        self._register_json(
+            httpx_mock,
+            self._input_required(
+                2, {"ask": sampling, "roots": {"method": "roots/list"}}, state=None
+            ),
+        )
+        self._register_json(
+            httpx_mock,
+            {
+                "jsonrpc": "2.0",
+                "id": "mcp-stdio/mrtr-retry/1/1",
+                "result": {"content": []},
+            },
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"sampling": {}, "roots": {}}),
+                self._call(),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mcp-stdio/mrtr/1/ask",
+                        "result": {"role": "assistant", "content": {"type": "text"}},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mcp-stdio/mrtr/1/roots",
+                        "result": {"roots": [{"uri": "file:///w"}]},
+                    }
+                ),
+            ],
+            protocol_era="modern",
+        )
+        lines = self._out(output)
+        minted = {line["id"]: line for line in lines[1:3]}
+        assert minted["mcp-stdio/mrtr/1/ask"]["params"] == sampling["params"]
+        assert "params" not in minted["mcp-stdio/mrtr/1/roots"]
+        assert minted["mcp-stdio/mrtr/1/roots"]["method"] == "roots/list"
+        calls = self._tool_calls(httpx_mock)
+        # ONE retry, fired only after the second answer arrived.
+        assert len(calls) == 2
+        assert set(calls[1]["params"]["inputResponses"]) == {"ask", "roots"}
+        # requestState absent from the result -> absent from the retry:
+        # "If the InputRequiredResult does not contain a requestState
+        # field, the client MUST NOT include one in the retry."
+        assert "requestState" not in calls[1]["params"]
+
+    def test_elicitation_decline_is_forwarded_as_a_result(self, httpx_mock):
+        """An elicitation decline (and cancel) is a RESULT in the
+        three-action model — {"action": "decline"} — not a JSON-RPC error,
+        so it rides `inputResponses` like any other answer and the SERVER
+        decides what it means. Treating it as a failure here would take
+        that decision away from the only party that can make it."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(
+            httpx_mock, self._input_required(2, {"who": self._elicit()})
+        )
+        self._register_json(
+            httpx_mock,
+            {
+                "jsonrpc": "2.0",
+                "id": "mcp-stdio/mrtr-retry/1/1",
+                "result": {"content": [{"type": "text", "text": "ok, skipping"}]},
+            },
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"elicitation": {}}),
+                self._call(),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mcp-stdio/mrtr/1/who",
+                        "result": {"action": "decline"},
+                    }
+                ),
+            ],
+            protocol_era="modern",
+        )
+        calls = self._tool_calls(httpx_mock)
+        assert calls[1]["params"]["inputResponses"] == {"who": {"action": "decline"}}
+        assert self._out(output)[-1]["id"] == 2
+
+    def test_multi_round_replaces_request_state_and_keys(self, httpx_mock):
+        """Round 2's requestState REPLACES round 1's and its keys are its
+        own: "Both the inputRequests and requestState fields affect only
+        the client's retry of the original request." A stale echo would
+        replay state the server has already consumed."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(
+            httpx_mock,
+            self._input_required(2, {"first": self._elicit()}, state="STATE-1"),
+        )
+        self._register_json(
+            httpx_mock,
+            self._input_required(
+                "mcp-stdio/mrtr-retry/1/1",
+                {"second": self._elicit()},
+                state="STATE-2",
+            ),
+        )
+        self._register_json(
+            httpx_mock,
+            {
+                "jsonrpc": "2.0",
+                "id": "mcp-stdio/mrtr-retry/1/2",
+                "result": {"content": []},
+            },
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"elicitation": {}}),
+                self._call(),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mcp-stdio/mrtr/1/first",
+                        "result": {"action": "accept", "content": {}},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mcp-stdio/mrtr/1/second",
+                        "result": {"action": "accept", "content": {}},
+                    }
+                ),
+            ],
+            protocol_era="modern",
+        )
+        calls = self._tool_calls(httpx_mock)
+        assert len(calls) == 3
+        assert calls[1]["params"]["requestState"] == "STATE-1"
+        assert set(calls[1]["params"]["inputResponses"]) == {"first"}
+        assert calls[2]["params"]["requestState"] == "STATE-2"
+        # Round 2 sends ONLY round 2's key — the first answer belonged to
+        # the round the server has already processed.
+        assert set(calls[2]["params"]["inputResponses"]) == {"second"}
+        assert self._out(output)[-1]["id"] == 2
+
+    def test_retry_pins_the_version_of_the_stored_request(self, httpx_mock):
+        """Design change 7, both halves at once: the retry is built from
+        the STORED body (so `_meta` still carries round 1's negotiated
+        version — `_inject_modern_meta` is NOT re-run) and its
+        MCP-Protocol-Version header is pinned to that same value, even
+        though `_prepare_headers` derives the header from LIVE state that a
+        re-`initialize` has since moved. A header/`_meta` disagreement is
+        -32020 HeaderMismatch on a compliant server, which would kill a
+        transaction the user has already answered a dialog for — the same
+        pinning PR A (#352) applies to listen reconnects.
+
+        Two implemented versions are patched in, and the discover seed
+        advertises none, so the negotiated version follows whatever the
+        client last asked for — the only way to move it mid-session while
+        the relay implements exactly one version."""
+        self._register_listen_stream(httpx_mock)
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "result": {"resultType": "discover", "capabilities": {"tools": {}}},
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        self._register_json(
+            httpx_mock, self._input_required(2, {"who": self._elicit()})
+        )
+        self._register_json(
+            httpx_mock,
+            {
+                "jsonrpc": "2.0",
+                "id": "mcp-stdio/mrtr-retry/1/1",
+                "result": {"content": []},
+            },
+        )
+        reinit = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2027-01-01",
+                    "capabilities": {"elicitation": {}},
+                },
+            }
+        )
+        with patch(
+            "mcp_stdio.relay._RELAY_IMPLEMENTED_MODERN_VERSIONS",
+            frozenset({"2026-07-28", "2027-01-01"}),
+        ):
+            self._run_with_stdin(
+                httpx_mock,
+                [
+                    self._initialize({"elicitation": {}}),
+                    self._call(),
+                    # The client renegotiates mid-transaction.
+                    reinit,
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": "mcp-stdio/mrtr/1/who",
+                            "result": {"action": "accept", "content": {}},
+                        }
+                    ),
+                ],
+                protocol_era="modern",
+            )
+        posts = [
+            r
+            for r in httpx_mock.get_requests()
+            if r.headers.get("mcp-method") == "tools/call"
+        ]
+        body = json.loads(posts[1].content)
+        stored_version = body["params"]["_meta"][
+            "io.modelcontextprotocol/protocolVersion"
+        ]
+        assert stored_version == "2026-07-28"
+        assert posts[1].headers["mcp-protocol-version"] == stored_version
+        # And the retry still derives its own Mcp-Name from a body the
+        # added params did not disturb.
+        assert posts[1].headers["mcp-name"] == "greet"
+
+    # --- the ways it ends early ---
+
+    def test_undeclared_capability_aborts_to_the_client_id(self, httpx_mock):
+        """MRTR server requirement 7: "Servers MUST NOT send an
+        inputRequests that the client has not declared support for in its
+        capabilities." Minting it anyway would put a question on stdout
+        that the client has no handler for — an unanswerable request and a
+        hang. Nothing is minted, and the client gets one error."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(
+            httpx_mock, self._input_required(2, {"who": self._elicit()})
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [self._initialize({"roots": {}}), self._call()],
+            protocol_era="modern",
+        )
+        lines = self._out(output)
+        assert len(lines) == 2
+        assert lines[1]["id"] == 2
+        assert lines[1]["error"]["code"] == -32600
+        assert "elicitation" in lines[1]["error"]["message"]
+        # One POST only: no retry was attempted.
+        assert len(self._tool_calls(httpx_mock)) == 1
+
+    def test_url_mode_elicitation_aborts(self, httpx_mock):
+        """Design change 10: URL-mode elicitation loads client-side MUSTs
+        (never pre-fetch, explicit consent, show the full URL, open where
+        the client cannot inspect it) that a 2025-era stdio client predates
+        entirely — and the spec devotes a whole section to the phishing
+        attack that follows when they are not honored. Refuse rather than
+        silently downgrade a credential flow to a form."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(
+            httpx_mock,
+            self._input_required(
+                2,
+                {
+                    "auth": {
+                        "method": "elicitation/create",
+                        "params": {
+                            "mode": "url",
+                            "url": "https://evil.example/steal",
+                            "message": "sign in",
+                        },
+                    }
+                },
+            ),
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [self._initialize({"elicitation": {"url": {}}}), self._call()],
+            protocol_era="modern",
+        )
+        lines = self._out(output)
+        assert len(lines) == 2
+        assert lines[1]["error"]["code"] == -32600
+        assert "URL-mode" in lines[1]["error"]["message"]
+        # The URL never reached the client.
+        assert "evil.example" not in output
+
+    def test_tool_augmented_sampling_aborts(self, httpx_mock):
+        """A 2025 client cannot produce the answer shape, so the server
+        would act on a reply that silently dropped half the request."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(
+            httpx_mock,
+            self._input_required(
+                2,
+                {
+                    "ask": {
+                        "method": "sampling/createMessage",
+                        "params": {"messages": [], "tools": [{"name": "t"}]},
+                    }
+                },
+            ),
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [self._initialize({"sampling": {}}), self._call()],
+            protocol_era="modern",
+        )
+        assert "tool-augmented sampling" in self._out(output)[1]["error"]["message"]
+
+    def test_unknown_request_kind_aborts(self, httpx_mock):
+        """ "values are request objects that MUST be one of ElicitRequest,
+        CreateMessageRequest, or ListRootsRequest" — anything else has no
+        legacy counterpart to mint."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(
+            httpx_mock,
+            self._input_required(2, {"x": {"method": "logging/setLevel"}}),
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [self._initialize({"elicitation": {}}), self._call()],
+            protocol_era="modern",
+        )
+        assert "cannot bridge" in self._out(output)[1]["error"]["message"]
+
+    def test_neither_input_requests_nor_request_state_aborts(self, httpx_mock):
+        """Server requirement 6: "Servers MUST include at least one of
+        inputRequests or requestState in every InputRequiredResult
+        response." With neither, the retry would be byte-identical to the
+        request that just failed — an infinite loop."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(httpx_mock, self._input_required(2, state=None))
+        output = self._run_with_stdin(
+            httpx_mock,
+            [self._initialize({"elicitation": {}}), self._call()],
+            protocol_era="modern",
+        )
+        lines = self._out(output)
+        assert lines[1]["error"]["code"] == -32600
+        assert len(self._tool_calls(httpx_mock)) == 1
+
+    def test_client_error_on_a_minted_id_aborts_the_transaction(self, httpx_mock):
+        """Design change 3. A partial `inputResponses` retry IS legal —
+        the server "SHOULD respond with a new InputRequiredResult
+        requesting the missing information again, rather than returning an
+        error" — but a client that answers an elicitation with a JSON-RPC
+        error cannot answer it at all, so the partial retry would only burn
+        a round asking for the same key. Abandoning is equally legal:
+        "Servers MUST NOT assume that clients will fulfill the
+        inputRequests or retry the original request."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(
+            httpx_mock,
+            self._input_required(2, {"a": self._elicit(), "b": self._elicit()}),
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"elicitation": {}}),
+                self._call(),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mcp-stdio/mrtr/1/a",
+                        "error": {"code": -32601, "message": "no elicitation here"},
+                    }
+                ),
+            ],
+            protocol_era="modern",
+        )
+        lines = self._out(output)
+        # init, 2 minted requests, a cancel for the still-outstanding one,
+        # then the error.
+        cancels = [
+            line for line in lines if line.get("method") == "notifications/cancelled"
+        ]
+        assert [c["params"]["requestId"] for c in cancels] == ["mcp-stdio/mrtr/1/b"]
+        assert lines[-1]["id"] == 2
+        assert lines[-1]["error"]["code"] == -32000
+        assert len(self._tool_calls(httpx_mock)) == 1
+
+    def test_request_state_only_rounds_hit_the_round_cap(self, httpx_mock):
+        """Design change 4, the strongest hostile-server gap: an
+        InputRequiredResult with only `requestState` needs nothing from the
+        client ("the client MAY retry the original request immediately"),
+        so a looping server drives the relay through unbounded POSTs with
+        zero user involvement. The cap ends it with one error under the
+        client's id."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        # Every tools/call gets another requestState-only result, each
+        # echoing the id of the request it answers (the relay re-mints one
+        # per round, and a compliant server echoes it). One MORE response
+        # than the cap allows, so the cap — not the mock running dry — is
+        # what stops the loop.
+        for echoed in [2] + [f"mcp-stdio/mrtr-retry/1/{n}" for n in range(1, 34)]:
+            httpx_mock.add_response(
+                url=self.URL,
+                match_headers={"Mcp-Method": "tools/call"},
+                text=json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": echoed,
+                        "result": {"resultType": "input_required", "requestState": "s"},
+                    }
+                ),
+                headers={"content-type": "application/json"},
+                is_optional=True,
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [self._initialize({"elicitation": {}}), self._call()],
+            protocol_era="modern",
+        )
+        lines = self._out(output)
+        assert lines[-1]["id"] == 2
+        assert lines[-1]["error"]["code"] == -32000
+        assert "32 times" in lines[-1]["error"]["message"]
+        # The original POST plus exactly _MRTR_MAX_ROUNDS retries. The
+        # retries all carry the id the FIRST result echoed, so every one of
+        # them re-triggers the hook.
+        assert len(self._tool_calls(httpx_mock)) == 1 + 32
+
+    def test_transaction_cap_fails_the_newest_request(self, httpx_mock):
+        """Design change 5: a hard count cap, no TTL (a TTL races the human
+        at the dialog and would put two responses on the wire for one id).
+        At the cap the NEW transaction fails — the older ones already have
+        dialogs in front of a user."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        stdin = [self._initialize({"elicitation": {}})]
+        # 256 transactions open, then one more.
+        for i in range(257):
+            httpx_mock.add_response(
+                url=self.URL,
+                match_headers={"Mcp-Method": "tools/call"},
+                text=json.dumps(self._input_required(100 + i, {"q": self._elicit()})),
+                headers={"content-type": "application/json"},
+            )
+            stdin.append(self._call(req_id=100 + i))
+        output = self._run_with_stdin(httpx_mock, stdin, protocol_era="modern")
+        lines = self._out(output)
+        errors = [line for line in lines if "error" in line]
+        assert len(errors) == 1
+        assert errors[0]["id"] == 100 + 256
+        assert errors[0]["error"]["code"] == -32000
+        assert "cap 256" in errors[0]["error"]["message"]
+
+    def test_client_id_reuse_while_pending_is_rejected(self, httpx_mock):
+        """Design change 6: JSON-RPC permits id reuse once the prior call
+        is DONE, but a pending transaction owns minted ids, a stored body
+        and a round counter under that id — a second request would clobber
+        them or put two responses on the wire for one id."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(
+            httpx_mock, self._input_required(2, {"who": self._elicit()})
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [self._initialize({"elicitation": {}}), self._call(), self._call()],
+            protocol_era="modern",
+        )
+        lines = self._out(output)
+        assert lines[-1]["id"] == 2
+        assert lines[-1]["error"]["code"] == -32600
+        assert "pending" in lines[-1]["error"]["message"]
+        # The second tools/call never reached the wire.
+        assert len(self._tool_calls(httpx_mock)) == 1
+
+    def test_cancel_drops_the_transaction_and_cancels_minted_requests(self, httpx_mock):
+        """Design change 11. The client cancelled the id it is waiting on,
+        so nothing is answered for it ("Not send a response for the
+        cancelled request"), and every still-outstanding minted request is
+        cancelled downstream — the relay issued them, they are still in
+        progress, which is exactly what the spec requires of a canceller.
+        Nothing is forwarded upstream: on this transport "Closing the SSE
+        response stream is the cancellation signal ... No
+        notifications/cancelled message is required or expected", and a
+        synchronous retry POST cannot be in flight while this same thread
+        reads stdin (PR D's deferred stdin handoff)."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(
+            httpx_mock,
+            self._input_required(2, {"a": self._elicit(), "b": self._elicit()}),
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"elicitation": {}}),
+                self._call(),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/cancelled",
+                        "params": {"requestId": 2, "reason": "user"},
+                    }
+                ),
+            ],
+            protocol_era="modern",
+        )
+        lines = self._out(output)
+        cancels = [
+            line for line in lines if line.get("method") == "notifications/cancelled"
+        ]
+        assert {c["params"]["requestId"] for c in cancels} == {
+            "mcp-stdio/mrtr/1/a",
+            "mcp-stdio/mrtr/1/b",
+        }
+        # No response for the cancelled id, and no retry POST.
+        assert not [line for line in lines if line.get("id") == 2]
+        assert len(self._tool_calls(httpx_mock)) == 1
+
+    def test_cancel_works_with_the_cancel_filter_disabled(self, httpx_mock):
+        """The bridge extracts the cancel id itself rather than piggybacking
+        on the cancel tracker (design change 11): `--no-cancel-filter`
+        turns the tracker off, but a transaction must still be droppable —
+        otherwise the id stays locked for the whole session."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(httpx_mock, self._input_required(2, {"a": self._elicit()}))
+        # After the cancel the id is free again, so a second tools/call
+        # under it must reach the wire.
+        self._register_json(
+            httpx_mock, {"jsonrpc": "2.0", "id": 2, "result": {"content": []}}
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"elicitation": {}}),
+                self._call(),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/cancelled",
+                        "params": {"requestId": 2},
+                    }
+                ),
+                self._call(),
+            ],
+            protocol_era="modern",
+            cancel_filter=False,
+        )
+        assert len(self._tool_calls(httpx_mock)) == 2
+        assert self._out(output)[-1] == {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"content": []},
+        }
+
+    def test_upstream_error_on_the_retry_surfaces_under_the_client_id(self, httpx_mock):
+        """A retry that fails upstream must answer the id the CLIENT is
+        waiting on, never the relay's internal retry id — the client would
+        hang forever on a correlation it never issued."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(
+            httpx_mock, self._input_required(2, {"who": self._elicit()})
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            status_code=500,
+            text="",
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"elicitation": {}}),
+                self._call(),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mcp-stdio/mrtr/1/who",
+                        "result": {"action": "accept", "content": {}},
+                    }
+                ),
+            ],
+            protocol_era="modern",
+        )
+        lines = self._out(output)
+        assert lines[-1]["id"] == 2
+        assert lines[-1]["error"]["message"] == "HTTP 500"
+
+    # --- stdin lines that are not requests ---
+
+    def test_unknown_response_shaped_stdin_line_is_dropped_not_posted(self, httpx_mock):
+        """Interception point (b): on the modern era a response-shaped line
+        can only be answering a relay-minted request, because rev
+        2026-07-28 "no longer supported" server-initiated requests at all.
+        An unrecognised one is dropped with a log line instead of being
+        POSTed as the pre-PR-C loop did — a body with no `method`, hence no
+        Mcp-Method header, which "Required For: All requests" already made
+        non-compliant."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"elicitation": {}}),
+                json.dumps(
+                    {"jsonrpc": "2.0", "id": 99, "result": {"action": "accept"}}
+                ),
+                json.dumps(
+                    {"jsonrpc": "2.0", "id": 98, "error": {"code": -1, "message": "x"}}
+                ),
+            ],
+            protocol_era="modern",
+        )
+        # Only the discover probe ever hit the wire.
+        assert len(httpx_mock.get_requests()) == 1
+        # And nothing but the InitializeResult reached stdout.
+        assert len(self._out(output)) == 1
+
+    def test_stale_duplicate_response_to_a_consumed_minted_id_is_dropped(
+        self, httpx_mock
+    ):
+        """A minted id is consumed on first answer, so a duplicate falls
+        into the same drop path — it must not re-fire a retry or POST
+        anything."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(
+            httpx_mock, self._input_required(2, {"who": self._elicit()})
+        )
+        self._register_json(
+            httpx_mock,
+            {
+                "jsonrpc": "2.0",
+                "id": "mcp-stdio/mrtr-retry/1/1",
+                "result": {"content": []},
+            },
+        )
+        answer = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": "mcp-stdio/mrtr/1/who",
+                "result": {"action": "accept", "content": {}},
+            }
+        )
+        self._run_with_stdin(
+            httpx_mock,
+            [self._initialize({"elicitation": {}}), self._call(), answer, answer],
+            protocol_era="modern",
+        )
+        assert len(self._tool_calls(httpx_mock)) == 2
+
+    def test_answered_minted_ids_are_not_cancelled_later(self, httpx_mock):
+        """A minted id is retired from the transaction the moment it is
+        answered, so a later abort or cancel only cancels what is still
+        OUTSTANDING — "Cancellation notifications MUST only reference
+        requests that ... are believed to still be in-progress". Cancelling
+        a question the client already answered would be noise the spec
+        calls invalid."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(
+            httpx_mock,
+            self._input_required(2, {"a": self._elicit(), "b": self._elicit()}),
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"elicitation": {}}),
+                self._call(),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mcp-stdio/mrtr/1/a",
+                        "result": {"action": "accept", "content": {}},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/cancelled",
+                        "params": {"requestId": 2},
+                    }
+                ),
+            ],
+            protocol_era="modern",
+        )
+        cancels = [
+            line
+            for line in self._out(output)
+            if line.get("method") == "notifications/cancelled"
+        ]
+        assert [c["params"]["requestId"] for c in cancels] == ["mcp-stdio/mrtr/1/b"]
+
+    def test_input_required_on_an_ineligible_method_is_forwarded_verbatim(
+        self, httpx_mock
+    ):
+        """ "Servers MUST NOT send InputRequiredResult responses on any
+        other client requests", so the bridge hooks only tools/call,
+        resources/read and prompts/get. On anything else the Phase 1
+        verbatim forward stands — swallowing it on a path the spec says
+        cannot produce it would hide a server bug instead of surfacing
+        it."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"resultType": "input_required", "requestState": "s"},
+            }
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "completion/complete"},
+            text=body,
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"elicitation": {}}),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "completion/complete",
+                        "params": {},
+                    }
+                ),
+            ],
+            protocol_era="modern",
+        )
+        assert self._out(output)[-1] == json.loads(body)
+
+    def test_swallowed_round_does_not_synthesize_an_empty_response(self, httpx_mock):
+        """`_post_and_stream` synthesizes "empty response from server" for
+        a 200 that delivered no payload, so a swallowed input_required
+        would otherwise put a SECOND answer on the wire for one id — the
+        exact framing error this relay exists to absorb."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(
+            httpx_mock, self._input_required(2, {"who": self._elicit()})
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [self._initialize({"elicitation": {}}), self._call()],
+            protocol_era="modern",
+        )
+        lines = self._out(output)
+        # InitializeResult + the minted request. Nothing else.
+        assert len(lines) == 2
+        assert lines[1]["method"] == "elicitation/create"
+        assert not [line for line in lines if "error" in line]
+
+
 # --- modern era: subscriptions/listen stream (#270 Phase 2 PR A) ---
 
 
