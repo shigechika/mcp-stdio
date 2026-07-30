@@ -201,8 +201,22 @@ jobs:
                 printf '%s' "$compare" \
                   | jq -r '.files[]? | "--- " + .filename + " (" + .status + ")\n"
                            + (.patch // "(no textual patch)") + "\n"' 2>/dev/null \
-                  | head -c 100000 > delta.txt || true
-                if [ -s delta.txt ]; then DELTA_MODE=1; fi
+                  > delta_raw.txt || true
+                # Third completeness guard (R2F1, same class as R1F1/R1F2):
+                # a delta that exceeds the prompt cap would be silently
+                # truncated while reporting stays scoped to it, making the
+                # truncated-away code unreviewable. Over-cap deltas degrade
+                # to a full-diff round instead — full-diff's own cap
+                # truncation is the pre-existing, documented limitation and
+                # carries no scoped-reporting contract.
+                delta_bytes=$(wc -c < delta_raw.txt | tr -d ' ')
+                case "$delta_bytes" in ''|*[!0-9]*) delta_bytes=0 ;; esac
+                if [ "$delta_bytes" -gt 100000 ]; then
+                  echo "::notice::delta since $LAST_SHA exceeds the prompt cap (${delta_bytes} bytes) — degrading to a full-diff review"
+                elif [ -s delta_raw.txt ]; then
+                  mv delta_raw.txt delta.txt
+                  DELTA_MODE=1
+                fi
               fi
             fi
             # compare failed (force-push made LAST_SHA unreachable, or a
