@@ -10433,6 +10433,51 @@ class TestHandleModernSpecialMethod:
         assert handled is True
         assert reply is None
 
+    def test_listen_hooks_seed_on_initialize_start_on_initialized(self):
+        """#352 review finding 1: the SEED hook (frozen C1 body snapshot)
+        fires at initialize time — after negotiation, so the snapshot sees
+        the negotiated version — but the START hook must NOT: the
+        synthesized InitializeResult has not even been returned to run()'s
+        loop yet, and the lifecycle spec (2025-06-18) says the server
+        "SHOULD NOT send requests other than pings and logging before
+        receiving the initialized notification". The START hook fires only
+        on notifications/initialized — and never on the other swallowed
+        notification, notifications/cancelled."""
+        state = _ModernState()
+        state.supported_versions = ["2026-07-28"]
+        calls = []
+        hooks = {
+            "listen_seed": lambda: calls.append(("seed", state.negotiated_version)),
+            "listen_start": lambda: calls.append(("start", None)),
+        }
+        init = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2026-07-28", "capabilities": {}},
+            }
+        )
+        handled, reply = _handle_modern_special_method(init, 1, state, **hooks)
+        assert handled is True
+        assert reply is not None
+        # Seeded (after negotiation), NOT started.
+        assert calls == [("seed", "2026-07-28")]
+        cancelled = (
+            '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+            '"params":{"requestId":1}}'
+        )
+        handled, reply = _handle_modern_special_method(cancelled, None, state, **hooks)
+        assert handled is True
+        assert calls == [("seed", "2026-07-28")]  # still not started
+        initialized = '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+        handled, reply = _handle_modern_special_method(
+            initialized, None, state, **hooks
+        )
+        assert handled is True
+        assert reply is None
+        assert calls == [("seed", "2026-07-28"), ("start", None)]
+
     def test_notifications_cancelled_is_swallowed(self):
         state = _ModernState()
         line = (
@@ -11029,9 +11074,12 @@ class TestRunModernEra:
     def _register_listen_stream(self, httpx_mock):
         """Absorb the background subscriptions/listen POST (#270 Phase 2 PR A).
 
-        The listen thread starts on the first intercepted ``initialize`` and
-        races run()'s shutdown, so its POST may or may not fire before the
-        stop event is observed — the response must be ``is_optional``. It is
+        The listen thread starts on the client's
+        ``notifications/initialized`` (#352 review finding 1) and races
+        run()'s shutdown, so its POST may or may not fire before the stop
+        event is observed — the response must be ``is_optional`` (a
+        session whose stdin never sends ``initialized`` produces no listen
+        POST at all, which the optional response also absorbs). It is
         registered FIRST, guarded by an Mcp-Method matcher, so the racy
         background POST can never steal a matcher-less response registered
         for the main dispatch flow (pytest-httpx matches in registration
@@ -12149,7 +12197,10 @@ class TestRunModernEra:
 
     def test_listen_post_body_and_headers_deterministic(self, httpx_mock):
         """#270 Phase 2 PR A, end-to-end wire shape: the relay ORIGINATES
-        subscriptions/listen after the first intercepted initialize. Made
+        subscriptions/listen once the client's notifications/initialized
+        lands (#352 review finding 1 — the stdin below therefore sends
+        initialized after initialize, exactly like a lifecycle-compliant
+        client; the body snapshot was frozen at initialize time). Made
         deterministic without sleeps: a response callback flags the listen
         POST and a generator-backed stdin holds run() open until it fired.
         Pins the C1 snapshot rules (no logLevel although one was set
@@ -12205,9 +12256,17 @@ class TestRunModernEra:
             }
         )
 
+        initialized = json.dumps(
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        )
+
         def stdin_lines():
             yield set_level + "\n"
             yield init + "\n"
+            # The thread starts only on notifications/initialized (#352
+            # review finding 1) — a lifecycle-compliant client sends it
+            # right after consuming the InitializeResult.
+            yield initialized + "\n"
             # Hold stdin open until the background listen POST has fired,
             # so run()'s shutdown cannot win the race (event-driven wait).
             assert listen_posted.wait(timeout=5)
@@ -12253,16 +12312,21 @@ class TestRunModernEra:
         assert "mcp-session-id" not in req.headers
 
     def test_legacy_era_never_opens_listen_stream(self, httpx_mock):
-        """AC 3 (#270): the legacy era has NO listen call site — an
-        initialize-bearing session produces zero subscriptions/listen
-        POSTs and the forwarded wire stays the legacy shape (no Mcp-Method
-        header at all). Deterministic without filtering: the thread is
-        never created, so no racy background POST can exist."""
+        """AC 3 (#270): the legacy era has NO listen call site — a full
+        initialize + notifications/initialized handshake (the stdin covers
+        BOTH hook sites now that #352 review finding 1 moved the thread
+        start to initialized) produces zero subscriptions/listen POSTs and
+        the forwarded wire stays the legacy shape (no Mcp-Method header at
+        all; initialized is FORWARDED upstream, never swallowed).
+        Deterministic without filtering: the thread is never created, so
+        no racy background POST can exist."""
         httpx_mock.add_response(
             url=self.URL,
             text='{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}',
             headers={"content-type": "application/json"},
         )
+        # The forwarded notifications/initialized -> 202, no body.
+        httpx_mock.add_response(url=self.URL, status_code=202, text="")
         self._run_with_stdin(
             httpx_mock,
             [
@@ -12276,14 +12340,18 @@ class TestRunModernEra:
                             "capabilities": {},
                         },
                     }
-                )
+                ),
+                json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),
             ],
             protocol_era="legacy",
         )
         requests = httpx_mock.get_requests()
-        assert len(requests) == 1  # the forwarded initialize, nothing else
+        # The forwarded initialize + forwarded initialized, nothing else.
+        assert len(requests) == 2
         assert json.loads(requests[0].content)["method"] == "initialize"
+        assert json.loads(requests[1].content)["method"] == "notifications/initialized"
         assert "mcp-method" not in requests[0].headers
+        assert "mcp-method" not in requests[1].headers
 
     def test_shutdown_joins_listen_thread_before_client_close(self, httpx_mock):
         """C11: run()'s finally must stop + join the listen thread BEFORE
@@ -12325,7 +12393,12 @@ class TestRunModernEra:
                                 "capabilities": {},
                             },
                         }
-                    )
+                    ),
+                    # The thread starts on notifications/initialized
+                    # (#352 review finding 1).
+                    json.dumps(
+                        {"jsonrpc": "2.0", "method": "notifications/initialized"}
+                    ),
                 ],
                 protocol_era="modern",
             )
@@ -12334,10 +12407,13 @@ class TestRunModernEra:
         assert order.index("listen-exited") < order.index("client-close")
 
     def test_second_initialize_never_spawns_second_listen_thread(self, httpx_mock):
-        """Spec item 2: the listen hook is invoked on EVERY initialize but
-        latched one-shot — a client-driven re-initialize must never spawn
-        a second thread (a second concurrent listen stream would duplicate
-        every forwarded notification)."""
+        """Spec item 2: the start hook fires on EVERY
+        notifications/initialized (#352 review finding 1 moved the start
+        point there, so the stdin sends initialized after each initialize)
+        but is latched one-shot — neither a client-driven re-initialize
+        nor a repeated initialized may spawn a second thread (a second
+        concurrent listen stream would duplicate every forwarded
+        notification)."""
         httpx_mock.add_response(
             url=self.URL,
             text=self._discover_response(),
@@ -12356,13 +12432,86 @@ class TestRunModernEra:
             "params": {"protocolVersion": "2026-07-28", "capabilities": {}},
         }
         reinit = {**init, "id": 2}
+        initialized = {"jsonrpc": "2.0", "method": "notifications/initialized"}
         with patch("mcp_stdio.relay._listen_stream_loop", stub_loop):
             self._run_with_stdin(
                 httpx_mock,
-                [json.dumps(init), json.dumps(reinit)],
+                [
+                    json.dumps(init),
+                    json.dumps(initialized),
+                    json.dumps(reinit),
+                    json.dumps(initialized),
+                ],
                 protocol_era="modern",
             )
         assert len(starts) == 1
+
+    def test_no_listen_thread_before_initialized_notification(self, httpx_mock):
+        """#352 review finding 1: a session that ends after initialize —
+        without ever sending notifications/initialized — must never create
+        the listen thread. Started at initialize time (the reverted
+        behavior), a fast server could deliver a list_changed to stdout
+        BEFORE run()'s loop emitted the synthesized InitializeResult and
+        before the legacy client signalled readiness — traffic the
+        lifecycle spec tells servers not to send and a gating client may
+        drop. Deterministic revert detector: run()'s finally stops and
+        joins any started thread before returning, so the stub's record
+        is complete — no sleeps, no races."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        starts = []
+
+        def stub_loop(**kwargs):
+            starts.append(kwargs["params"])
+            assert kwargs["stop"].wait(timeout=5)
+
+        with patch("mcp_stdio.relay._listen_stream_loop", stub_loop):
+            self._run_with_stdin(
+                httpx_mock,
+                [
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "initialize",
+                            "params": {
+                                "protocolVersion": "2026-07-28",
+                                "capabilities": {},
+                            },
+                        }
+                    )
+                ],
+                protocol_era="modern",
+            )
+        assert starts == []
+
+    def test_initialized_without_prior_initialize_starts_no_thread(self, httpx_mock):
+        """#352 review finding 1, ordering guard: an orphan
+        notifications/initialized — no prior initialize on this session —
+        starts nothing. No snapshot was seeded (listen_state["params"] is
+        None), and a thread launched with an unseeded body would carry an
+        un-negotiated version and no captured client identity."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        starts = []
+
+        def stub_loop(**kwargs):
+            starts.append(kwargs["params"])
+            assert kwargs["stop"].wait(timeout=5)
+
+        with patch("mcp_stdio.relay._listen_stream_loop", stub_loop):
+            self._run_with_stdin(
+                httpx_mock,
+                ['{"jsonrpc":"2.0","method":"notifications/initialized"}'],
+                protocol_era="modern",
+            )
+        assert starts == []
 
     def test_listen_read_timeout_reaches_the_stream_timeout(self, httpx_mock):
         """C9: run()'s listen_read_timeout becomes the per-request READ
@@ -12393,7 +12542,12 @@ class TestRunModernEra:
                                 "capabilities": {},
                             },
                         }
-                    )
+                    ),
+                    # The thread starts on notifications/initialized
+                    # (#352 review finding 1).
+                    json.dumps(
+                        {"jsonrpc": "2.0", "method": "notifications/initialized"}
+                    ),
                 ],
                 protocol_era="modern",
                 timeout_connect=7.0,
@@ -13013,6 +13167,61 @@ class TestListenStreamLoop:
             "experimental": {}
         }
         assert requests[0].headers["authorization"] == "Bearer t1"
+        assert requests[1].headers["authorization"] == "Bearer t2"
+
+    def test_reconnect_header_version_pinned_to_frozen_body(self, httpx_mock):
+        """#352 review finding 2 (the C1 x C2 interaction): the real
+        modern _prepare_headers stamps MCP-Protocol-Version from the
+        MUTABLE modern_state.negotiated_version, so after a client-driven
+        re-initialize renegotiates mid-session, a reconnect's fresh header
+        snapshot (C2) would carry the NEW version while the frozen body
+        (C1) still carries the old one. A compliant server rejects the
+        divergence as HeaderMismatch -32020 — one of the C6 terminal
+        codes, so listening would be PERMANENTLY disabled by a mere
+        renegotiation. Every attempt's MCP-Protocol-Version must equal the
+        version frozen inside the body snapshot (any case-variant from
+        the snapshot replaced — one header line only), while credentials
+        from the same fresh snapshot keep flowing (C2's actual point)."""
+        state = _ModernState()
+        state.negotiated_version = "2026-07-28"
+        state.client_capabilities = {}
+        params = _build_listen_params(state)
+        calls = []
+
+        def prepare_headers(body):
+            # Mimic the real modern _prepare_headers: the version comes
+            # from the mutable state — renegotiated between attempts as a
+            # second initialize would — under a case-variant key to also
+            # pin the strip-then-set discipline.
+            calls.append(body)
+            state.negotiated_version = f"2099-01-0{len(calls)}"
+            return {
+                "Authorization": f"Bearer t{len(calls)}",
+                "mcp-protocol-version": state.negotiated_version,
+            }
+
+        httpx_mock.add_response(
+            stream=self._sse(self._ack()),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            stream=self._sse(self._graceful(attempt=2)),
+            headers={"content-type": "text/event-stream"},
+        )
+        with (
+            patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            patch("sys.stdout", StringIO()),
+        ):
+            self._run_loop(params=params, prepare_headers=prepare_headers)
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 2
+        for req in requests:
+            # Pinned to the frozen body version — never the mutated state
+            # the snapshot callable returned — and never two header lines.
+            assert req.headers.get_list("mcp-protocol-version") == ["2026-07-28"]
+            meta = json.loads(req.content)["params"]["_meta"]
+            assert meta["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
+        # C2 intact: the reconnect still picked up the fresh credentials.
         assert requests[1].headers["authorization"] == "Bearer t2"
 
     def test_attempt_headers_accept_override_mcp_method_no_name(self, httpx_mock):

@@ -1250,6 +1250,7 @@ def _handle_modern_special_method(
     req_id: Any,
     modern_state: "_ModernState",
     discover_retry: Callable[[], None] | None = None,
+    listen_seed: Callable[[], None] | None = None,
     listen_start: Callable[[], None] | None = None,
 ) -> tuple[bool, str | None]:
     """Intercept ``initialize`` / ``notifications/initialized`` /
@@ -1347,12 +1348,22 @@ def _handle_modern_special_method(
       swallowed (``None`` reply — both are notifications, which never get a
       response either way).
 
-    ``listen_start`` (#270 Phase 2 PR A): invoked on every ``initialize``
-    so run() can open the relay-originated ``subscriptions/listen`` stream
-    — the hook itself is latched one-shot by the caller
-    (``_start_listen_stream``), so a client-driven re-``initialize`` can
-    never spawn a second thread. It runs AFTER ``negotiated_version`` is
-    computed, so the listen body snapshot sees the negotiated state. The
+    ``listen_seed`` / ``listen_start`` (#270 Phase 2 PR A): ``listen_seed``
+    is invoked on every ``initialize`` — AFTER ``negotiated_version`` is
+    computed, so the frozen listen body snapshot (C1) sees the negotiated
+    state — while ``listen_start`` (the thread start) is invoked only on
+    ``notifications/initialized`` (#352 review finding 1): the lifecycle
+    spec (2025-06-18) has the client send ``initialized`` only after it
+    received the InitializeResult, and the server "SHOULD NOT send
+    requests other than pings and logging" before receiving it — starting
+    the thread on ``initialize`` let a fast server deliver a
+    ``list_changed`` notification to stdout BEFORE run()'s loop had even
+    emitted the synthesized InitializeResult, which a lifecycle-enforcing
+    client may reject or drop. Both hooks are guarded by the caller
+    (``_start_listen_stream`` is latched one-shot; an ``initialized``
+    with no prior ``initialize`` finds no seeded snapshot and starts
+    nothing), so a client-driven re-``initialize`` or a repeated
+    ``initialized`` can never spawn a second thread. The
     synthesized ``InitializeResult`` unions ``listChanged: true`` into
     ``tools``/``resources``/``prompts`` on this path (C8): the relay
     itself forwards those three ``list_changed`` notification kinds
@@ -1436,13 +1447,16 @@ def _handle_modern_special_method(
         modern_state.negotiated_version = _negotiate_modern_version(
             requested, modern_state.supported_versions
         )
-        # Open the relay-originated subscriptions/listen stream (#270
-        # Phase 2 PR A) — AFTER negotiation so the frozen listen body
-        # snapshot (_build_listen_params) carries the negotiated version.
-        # The hook is latched one-shot by run()'s _start_listen_stream; a
-        # re-initialize invokes it again but never spawns a second thread.
-        if listen_start is not None:
-            listen_start()
+        # Seed the frozen listen body snapshot (#270 Phase 2 PR A, C1) —
+        # AFTER negotiation so it carries the negotiated version. Only the
+        # SNAPSHOT is built here; the thread itself starts on
+        # notifications/initialized (#352 review finding 1, see the
+        # docstring): the InitializeResult synthesized below has not even
+        # been returned to run()'s loop yet, let alone emitted, so a
+        # thread started here could put a list_changed on stdout ahead of
+        # the handshake reply.
+        if listen_seed is not None:
+            listen_seed()
         # C8 (#270 Phase 2 PR A): union `listChanged: true` into tools/
         # resources/prompts. The relay forwards exactly those three
         # list_changed notification kinds from the listen stream, so the
@@ -1474,7 +1488,22 @@ def _handle_modern_special_method(
             "serverInfo": modern_state.server_info or _UNKNOWN_UPSTREAM_SERVER_INFO,
         }
         return True, json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result})
-    if method in ("notifications/initialized", "notifications/cancelled"):
+    if method == "notifications/initialized":
+        # THE lifecycle-correct start point for the listen thread (#352
+        # review finding 1): the client only sends initialized after it
+        # has consumed the InitializeResult (lifecycle spec 2025-06-18:
+        # "After successful initialization, the client MUST send an
+        # initialized notification"), and the same spec forbids the
+        # server unsolicited pre-initialized traffic ("The server SHOULD
+        # NOT send requests other than pings and logging before receiving
+        # the initialized notification") — so nothing the thread forwards
+        # can now precede the handshake reply on stdout. One-shot latch
+        # and the no-prior-initialize guard live in the caller
+        # (_start_listen_stream).
+        if listen_start is not None:
+            listen_start()
+        return True, None
+    if method == "notifications/cancelled":
         return True, None
     return False, None
 
@@ -2902,8 +2931,10 @@ def _cold_start_loop(
 # unless the relay opens a ``subscriptions/listen`` POST stream itself
 # (subscriptions pattern). A legacy stdio client never sends
 # ``subscriptions/listen`` — it does not know the method — so the relay
-# ORIGINATES the request after the first intercepted ``initialize``
-# (``_handle_modern_special_method`` -> run()'s ``_start_listen_stream``)
+# ORIGINATES the request once the client's ``notifications/initialized``
+# confirms the handshake is complete (#352 review finding 1; the body
+# snapshot is seeded earlier, at ``initialize`` interception —
+# ``_handle_modern_special_method`` -> run()'s ``_start_listen_stream``)
 # and forwards ONLY the three ``list_changed`` notification kinds
 # downstream. Resource subscriptions (``resourceSubscriptions`` +
 # ``resources/subscribe`` interception) are PR B; the MRTR bridge is PR C
@@ -2943,7 +2974,9 @@ _LISTEN_TERMINAL_ERROR_CODES = frozenset({-32601, -32020, -32021, -32022})
 def _build_listen_params(modern_state: "_ModernState") -> dict[str, Any]:
     """Build the FROZEN ``subscriptions/listen`` request params (C1).
 
-    Snapshotted exactly once, immediately before the listen thread starts,
+    Snapshotted at ``initialize`` interception time (re-seeded by a
+    re-``initialize`` only until the thread starts on
+    ``notifications/initialized`` — see ``_handle_modern_special_method``)
     and reused verbatim on every reconnect — only the JSON-RPC id is
     re-minted per attempt. ``modern_state.log_level`` is rewritten on every
     ``logging/setLevel`` stdin line and a repeat ``initialize`` rewrites
@@ -2956,7 +2989,10 @@ def _build_listen_params(modern_state: "_ModernState") -> dict[str, Any]:
     (``params._meta``) that ``_inject_modern_meta`` follows for every other
     modern request. ``protocolVersion`` uses the exact expression
     ``_prepare_headers``' modern branch uses for ``MCP-Protocol-Version``,
-    so the two byte-match at snapshot time. ``clientCapabilities`` may be
+    so the two byte-match at snapshot time — and ``_listen_stream_loop``
+    pins every attempt's header to THIS frozen value (#352 review finding
+    2), so they keep byte-matching even after a re-``initialize``
+    renegotiates the mutable state. ``clientCapabilities`` may be
     ``{}`` (presence-based, like every modern request); ``clientInfo`` only
     when the client supplied one (SHOULD, never fabricated). Nested values
     are deep-copied so later mutations of ``modern_state`` can never reach
@@ -3094,15 +3130,18 @@ def _listen_stream_loop(
 ) -> None:
     """Reader thread: maintain the modern ``subscriptions/listen`` stream.
 
-    Opened once per session by run()'s ``_start_listen_stream`` after the
-    first intercepted ``initialize``. Per attempt: re-mint the id
-    (``mcp-stdio/listen/1``, ``/2``, ...) into the FROZEN ``params``
-    snapshot (C1), take a FRESH ``prepare_headers`` snapshot (C2 — it
-    locks internally, so token refreshes from the main loop / proactive
-    daemon are picked up on reconnect) plus this request's own
-    ``Mcp-Method`` and a dual ``Accept``, and stream the POST with the
-    dedicated read timeout (``--listen-read-timeout``; per-request
-    override, like ``run_sse``'s ``post_timeout``).
+    Opened once per session by run()'s ``_start_listen_stream`` on the
+    client's ``notifications/initialized`` (#352 review finding 1 — never
+    before the synthesized InitializeResult reached stdout). Per attempt:
+    re-mint the id (``mcp-stdio/listen/1``, ``/2``, ...) into the FROZEN
+    ``params`` snapshot (C1), take a FRESH ``prepare_headers`` snapshot
+    (C2 — it locks internally, so token refreshes from the main loop /
+    proactive daemon are picked up on reconnect) with its
+    ``MCP-Protocol-Version`` re-pinned to the snapshot's frozen version
+    (#352 review finding 2 — see the comment at the pin), plus this
+    request's own ``Mcp-Method`` and a dual ``Accept``, and stream the
+    POST with the dedicated read timeout (``--listen-read-timeout``;
+    per-request override, like ``run_sse``'s ``post_timeout``).
 
     Raw ``client.stream`` + the shared SSE decoders — deliberately NOT
     ``_post_and_stream`` (its retry ladder and stdout plumbing must not
@@ -3131,6 +3170,18 @@ def _listen_stream_loop(
     - dead stdout (C12): ``OSError``/``BrokenPipeError`` from ``_emit`` is
       terminal — reconnecting into a closed stdout would spin forever.
     """
+    # C1 x C2 interaction guard (#352 review finding 2): the body is
+    # FROZEN (C1) but prepare_headers (the modern _prepare_headers) reads
+    # the MUTABLE modern_state.negotiated_version — a client-driven
+    # re-initialize can renegotiate it mid-session, and a reconnect would
+    # then send an MCP-Protocol-Version header disagreeing with the frozen
+    # params._meta protocolVersion. A compliant server rejects that as
+    # HeaderMismatch (-32020), which sits in _LISTEN_TERMINAL_ERROR_CODES:
+    # the C6 terminal arm would permanently disable listening over a mere
+    # renegotiation. Pin every attempt's header to the version frozen
+    # inside the snapshot; everything ELSE in the fresh snapshot — the
+    # credentials above all — stays fresh, which is C2's actual point.
+    frozen_version = params["_meta"][_META_PROTOCOL_VERSION]
     attempt = 0
     established = False
     while not stop.is_set():
@@ -3152,6 +3203,13 @@ def _listen_stream_loop(
         req_headers = {k: v for k, v in req_headers.items() if k.lower() != "accept"}
         req_headers["Accept"] = "application/json, text/event-stream"
         req_headers["Mcp-Method"] = _LISTEN_METHOD
+        # Frozen-version pin (#352 review finding 2, comment above the
+        # loop): strip any case-variant first — the file's strip-then-set
+        # discipline — so httpx never serialises two header lines.
+        req_headers = {
+            k: v for k, v in req_headers.items() if k.lower() != "mcp-protocol-version"
+        }
+        req_headers["MCP-Protocol-Version"] = frozen_version
         try:
             with client.stream(
                 "POST", url, content=body, headers=req_headers, timeout=timeout
@@ -4340,32 +4398,55 @@ def run(
         )
 
     # --- modern era: subscriptions/listen stream (#270 Phase 2 PR A) ---
-    # ARRANGED here (era-resolution scope) but STARTED lazily by the first
-    # intercepted `initialize` (_handle_modern_special_method's
-    # `listen_start` hook): the listen body snapshot needs the client's
-    # captured capabilities and the negotiated version, which do not exist
-    # before then. The legacy era gets NO new call site (acceptance
-    # criterion #3): the only caller is the era == "modern" branch in the
-    # stdin loop below, so legacy wire bytes are untouched structurally.
+    # ARRANGED here (era-resolution scope); the body snapshot is SEEDED by
+    # each intercepted `initialize` (_handle_modern_special_method's
+    # `listen_seed` hook — the snapshot needs the client's captured
+    # capabilities and the negotiated version, which do not exist before
+    # then) and the thread is STARTED by `notifications/initialized`
+    # (`listen_start` hook, #352 review finding 1 — never before the
+    # synthesized InitializeResult reached stdout). The legacy era gets NO
+    # new call site (acceptance criterion #3): the only caller of either
+    # hook is the era == "modern" branch in the stdin loop below, so
+    # legacy wire bytes are untouched structurally.
     listen_stop = threading.Event()
     # Mutable holder shared with the thread. "thread" doubles as the
-    # one-shot latch — a client-driven re-`initialize` invokes the hook
-    # again but must never spawn a second thread. "honored" records the
+    # one-shot latch — a client-driven re-`initialize`/repeat
+    # `initialized` invokes the hooks again but must never spawn a second
+    # thread. "params" is the frozen C1 snapshot, seeded at initialize
+    # time; None means no initialize was ever intercepted, so an orphan
+    # `initialized` starts nothing. "honored" records the
     # server-acknowledged notification subset from the ack (logged on
     # divergence; consumed for real by PR B).
-    listen_state: dict[str, Any] = {"thread": None, "honored": None}
+    listen_state: dict[str, Any] = {"thread": None, "params": None, "honored": None}
+
+    def _seed_listen_snapshot() -> None:
+        """Freeze the listen body snapshot (C1) at initialize time.
+
+        Re-seeded by a re-``initialize`` only until the thread starts —
+        the latest negotiation wins at start time; after that the running
+        thread's snapshot stays frozen (C1).
+        """
+        if listen_state["thread"] is not None:
+            return
+        listen_state["params"] = _build_listen_params(modern_state)
 
     def _start_listen_stream() -> None:
-        """Open the background subscriptions/listen stream, at most once."""
-        if listen_state["thread"] is not None:
+        """Open the background subscriptions/listen stream, at most once.
+
+        Invoked on ``notifications/initialized`` (#352 review finding 1).
+        No seeded snapshot — an ``initialized`` with no prior
+        ``initialize`` — starts nothing: the snapshot would carry an
+        un-negotiated version and no captured client identity.
+        """
+        if listen_state["thread"] is not None or listen_state["params"] is None:
             return
         listen_thread = threading.Thread(
             target=_listen_stream_loop,
             kwargs={
                 "client": client,
                 "url": url,
-                # Frozen body snapshot (C1) — built exactly once, here.
-                "params": _build_listen_params(modern_state),
+                # Frozen body snapshot (C1) — seeded at initialize time.
+                "params": listen_state["params"],
                 # Fresh header snapshot per attempt (C2) — _prepare_headers
                 # locks internally, so refreshed tokens reach reconnects.
                 "prepare_headers": _prepare_headers,
@@ -4489,6 +4570,7 @@ def run(
                         req_id,
                         modern_state,
                         discover_retry=_discover_reseed,
+                        listen_seed=_seed_listen_snapshot,
                         listen_start=_start_listen_stream,
                     )
                     if handled:
