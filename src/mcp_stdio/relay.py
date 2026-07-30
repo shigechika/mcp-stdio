@@ -2350,7 +2350,13 @@ def _is_valid_cacheable_value(key: str, value: Any) -> bool:
             and math.isfinite(value)
         )
     if key == "cacheScope":
-        return value in _CACHE_SCOPE_RESTRICTIVENESS
+        # The isinstance gate is not a type nicety: dict membership with an
+        # UNHASHABLE value (a JSON array/object — ``"cacheScope": []`` is
+        # valid JSON a malformed page can carry) raises TypeError instead
+        # of returning False, turning the page into a failed request rather
+        # than the conservative degrade this function exists to deliver
+        # (#350 review round 12).
+        return isinstance(value, str) and value in _CACHE_SCOPE_RESTRICTIVENESS
     return False
 
 
@@ -2384,11 +2390,22 @@ def _merge_cacheable_field(merged_result: dict[str, Any], key: str, value: Any) 
             merged_result["ttlMs"] = value
         return
     if key == "cacheScope":
+        # Both isinstance gates guard hashability, not just type (#350
+        # review round 12): ``.get()`` on an UNHASHABLE value raises
+        # TypeError. ``value`` can be a JSON array/object from a malformed
+        # page; ``existing`` can be the same garbage when page 1's
+        # dict-copy put it into merged_result unvetted (the finalization
+        # degrades it afterwards, but THIS call happens first).
+        if not isinstance(value, str):
+            return
         new_rank = _CACHE_SCOPE_RESTRICTIVENESS.get(value)
         if new_rank is None:
             return
-        existing_rank = _CACHE_SCOPE_RESTRICTIVENESS.get(
-            merged_result.get("cacheScope"), -1
+        existing = merged_result.get("cacheScope")
+        existing_rank = (
+            _CACHE_SCOPE_RESTRICTIVENESS.get(existing, -1)
+            if isinstance(existing, str)
+            else -1
         )
         if new_rank > existing_rank:
             merged_result["cacheScope"] = value

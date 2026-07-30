@@ -3581,6 +3581,80 @@ class TestPagination:
         merged = json.loads(output.strip())["result"]
         assert merged["ttlMs"] == 0
 
+    def test_unhashable_cache_scope_degrades_instead_of_crashing(self, httpx_mock):
+        """#350 review round 12: ``"cacheScope": []`` is valid JSON a
+        malformed page can carry, but a JSON array is UNHASHABLE — dict
+        membership/.get() on it raises TypeError, which turned the request
+        into a failure instead of the conservative degrade the round-11
+        bookkeeping promises. Page 2 carrying the garbage exercises both
+        _is_valid_cacheable_value's membership test and
+        _merge_cacheable_field's rank lookup on the incoming value."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [{"name": "a"}],
+                "cacheScope": "public",
+                "nextCursor": "p2",
+            },
+        }
+        page2 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "b"}], "cacheScope": []},
+        }
+        for page in (page1, page2):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=json.dumps(page),
+                headers={"content-type": "application/json"},
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())["result"]
+        assert merged["tools"] == [{"name": "a"}, {"name": "b"}]
+        assert merged["cacheScope"] == "private"
+
+    def test_unhashable_cache_scope_on_page1_then_valid_page2_no_crash(
+        self, httpx_mock
+    ):
+        """#350 review round 12, the existing-rank half: page 1's
+        ``"cacheScope": {}`` enters merged_result via the unvetted
+        dict-copy, so page 2's valid "public" hits
+        _merge_cacheable_field's EXISTING-value rank lookup with the
+        garbage — `.get(unhashable)` raised TypeError before the
+        isinstance gate on `existing` was added. Must degrade to
+        "private" (page 1's value was invalid), never crash."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [{"name": "a"}],
+                "cacheScope": {},
+                "nextCursor": "p2",
+            },
+        }
+        page2 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "b"}], "cacheScope": "public"},
+        }
+        for page in (page1, page2):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=json.dumps(page),
+                headers={"content-type": "application/json"},
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())["result"]
+        assert merged["tools"] == [{"name": "a"}, {"name": "b"}]
+        assert merged["cacheScope"] == "private"
+
     def test_paginated_notification_no_id_produces_no_response(self, httpx_mock):
         """: a list method sent as a NOTIFICATION (no id key) must get
         NO response — the merged-response emit is gated on has_id, mirroring every
