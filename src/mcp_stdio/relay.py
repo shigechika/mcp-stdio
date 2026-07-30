@@ -3000,7 +3000,12 @@ def run(
         leak a stale pinned value the request body no longer corroborates
         (Streamable HTTP "Server Validation": "Parameter not in arguments ->
         Client MUST omit the header"). A batch/methodless line similarly
-        must not carry a stale pinned ``Mcp-Method``.
+        must not carry a stale pinned ``Mcp-Method`` — it ends up with NO
+        ``Mcp-Method`` header at all, which is itself non-compliant with
+        "Required For: All requests" (MCP removed batching in spec rev
+        2025-06-18, so this is legacy-batch dead code territory; inventing
+        a synthetic method value for a line with none would be worse than
+        omitting the header).
         """
         with headers_lock:
             h = dict(headers)
