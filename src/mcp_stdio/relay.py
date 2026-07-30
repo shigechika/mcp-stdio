@@ -1804,6 +1804,23 @@ def _normalize_null_arguments(line: str) -> str:
 _CACHE_SCOPE_RESTRICTIVENESS = {"public": 0, "private": 1}
 _CACHEABLE_MERGE_FIELDS = frozenset({"ttlMs", "cacheScope"})
 
+# Conservative fallback fed into ``_merge_cacheable_field`` by
+# ``_paginate_and_stream`` for a page that OMITS the field entirely, per the
+# spec's own stated behavior for absence (#350 review round 3): "Caching"
+# says "If ttlMs is absent, clients SHOULD assume a default of 0 (immediately
+# stale)", and separately "Servers MUST apply the same cacheScope to all
+# response pages for a given list request" — an omission is therefore itself
+# non-compliant and must not let another page's laxer/present value leak
+# into the merged result. Both values already sit at the most-restrictive
+# extreme of their own domain (0 is the global minimum ttlMs the spec allows;
+# "private" is the highest ``_CACHE_SCOPE_RESTRICTIVENESS`` rank), so feeding
+# them into the existing min/most-restrictive merge rule "just works"
+# regardless of which page (first or later) is the one that omits the field.
+_CACHEABLE_FIELD_CONSERVATIVE_DEFAULT: dict[str, Any] = {
+    "ttlMs": 0,
+    "cacheScope": "private",
+}
+
 
 def _merge_cacheable_field(merged_result: dict[str, Any], key: str, value: Any) -> None:
     """Merge one page's ``ttlMs``/``cacheScope`` into ``merged_result`` in place.
@@ -1818,10 +1835,14 @@ def _merge_cacheable_field(merged_result: dict[str, Any], key: str, value: Any) 
 
     A value of the wrong type (a non-compliant server) is ignored rather
     than raising or silently adopted — same "degrade, don't guess" posture
-    as ``_extract_protocol_version``. A page that OMITS the field entirely
-    never calls this (the caller only invokes it for keys actually present
-    in that page's result), so a prior page's stricter value survives an
-    absent field on a later page rather than being reset.
+    as ``_extract_protocol_version``. This function itself has no notion of
+    "the field was absent" — it only ever sees a VALUE, never a missing key.
+    The caller (``_paginate_and_stream``) decides what value to pass for a
+    page that omits the field: the conservative default
+    (``_CACHEABLE_FIELD_CONSERVATIVE_DEFAULT``, #350 review round 3) when at
+    least one OTHER page in the same merge did supply a value, or nothing at
+    all (no call, field left absent) when the field is missing on every page
+    seen — see that function for the bookkeeping.
     """
     if key == "ttlMs":
         if not isinstance(value, (int, float)):
@@ -1903,6 +1924,14 @@ def _paginate_and_stream(
     # failure or the page-cap). Re-exposed as ``nextCursor`` on the merged
     # result so a truncated list is resumable instead of silently complete.
     pending_cursor: str | None = None
+    # Per-CacheableResult-field bookkeeping (#350 review round 3): True once
+    # ANY page seen so far omitted the field entirely. Checked after the
+    # loop (below) against whether the field ended up present in
+    # merged_result at all — present-and-missing-somewhere degrades to the
+    # conservative default (_CACHEABLE_FIELD_CONSERVATIVE_DEFAULT); missing
+    # everywhere leaves the field absent, matching a fully cache-unaware
+    # (e.g. legacy) server's existing behavior unchanged.
+    cacheable_missing: dict[str, bool] = dict.fromkeys(_CACHEABLE_MERGE_FIELDS, False)
 
     for page in range(1, MAX_LIST_PAGES + 1):
         page_request = dict(request)
@@ -1979,6 +2008,9 @@ def _paginate_and_stream(
             merged_result = {k: v for k, v in page_result.items() if k != "nextCursor"}
             if not isinstance(merged_result.get(result_key), list):
                 merged_result[result_key] = []
+            for field in _CACHEABLE_MERGE_FIELDS:
+                if field not in page_result:
+                    cacheable_missing[field] = True
         else:
             items = page_result.get(result_key)
             if isinstance(items, list):
@@ -1998,6 +2030,18 @@ def _paginate_and_stream(
             # cache and leak. ``ttlMs`` has the same shape of bug: the merged
             # list's true freshness bound is its LEAST fresh member, not
             # whichever page happened to arrive last.
+            #
+            # Handled UNCONDITIONALLY (not gated on the key being present in
+            # THIS page's result, #350 review round 3): a page that OMITS
+            # ttlMs/cacheScope entirely is not silence to skip over — it is
+            # itself the non-compliant condition _CACHEABLE_FIELD_CONSERVATIVE_
+            # DEFAULT exists to fail closed on (see cacheable_missing's
+            # finalization after this loop). Recorded here regardless of
+            # whether the field is present, then applied as a last-write-wins
+            # merge below only when it IS present.
+            for field in _CACHEABLE_MERGE_FIELDS:
+                if field not in page_result:
+                    cacheable_missing[field] = True
             for k, v in page_result.items():
                 if k in (result_key, "nextCursor"):
                     continue
@@ -2026,6 +2070,16 @@ def _paginate_and_stream(
     # cannot be constructed).
     if merged_result is None:
         merged_result = {result_key: []}
+
+    # Finalize ttlMs/cacheScope (#350 review round 3): a field missing on AT
+    # LEAST ONE processed page but present (from some OTHER page) cannot be
+    # trusted at whatever value the present page(s) supplied — degrade the
+    # WHOLE merged result to the conservative default. A field missing on
+    # EVERY processed page is left untouched (never fabricated from nothing
+    # — see test_cacheable_fields_absent_on_every_page_are_not_fabricated).
+    for field, conservative in _CACHEABLE_FIELD_CONSERVATIVE_DEFAULT.items():
+        if cacheable_missing[field] and field in merged_result:
+            merged_result[field] = conservative
 
     # A truncated list (a later page failed, or the page cap was hit) must NOT be
     # reported as complete: re-expose the cursor for the unfetched page so the

@@ -3305,6 +3305,144 @@ class TestPagination:
         merged = json.loads(output.strip())["result"]
         assert merged["ttlMs"] == 5000
 
+    def test_cache_scope_public_does_not_survive_a_page_omitting_it(self, httpx_mock):
+        """#350 review round 3: page 1 says cacheScope="public"; page 2
+        OMITS the field entirely (not "private" — just silent). The merged
+        result must NOT report "public": an omitted cacheScope on ANY page
+        is not permission to treat the WHOLE merged list as safe for shared
+        caching (spec rev 2026-07-28, "Caching": ttlMs/cacheScope are
+        REQUIRED on every resultType:"complete" page, and "Servers MUST
+        apply the same cacheScope to all response pages" — an omission is
+        itself non-compliant and must degrade to the conservative value,
+        not silently inherit page 1's laxer claim). This is the opposite
+        pairing from test_cache_scope_private_survives_page_omitting_the_field
+        above (where page 1 was ALREADY the most restrictive value, so that
+        test could not have caught this bug)."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [{"name": "a"}],
+                "cacheScope": "public",
+                "nextCursor": "p2",
+            },
+        }
+        page2 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "b"}]},  # no cacheScope key at all
+        }
+        for page in (page1, page2):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=json.dumps(page),
+                headers={"content-type": "application/json"},
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())["result"]
+        assert merged["cacheScope"] == "private"
+
+    def test_cache_scope_public_on_a_later_page_does_not_backfill_page1s_omission(
+        self, httpx_mock
+    ):
+        """#350 review round 3, reverse ordering: page 1 OMITS cacheScope
+        entirely; page 2 supplies "public". Page 1's silence must not be
+        treated as an implicit blank check that a later page's "public" can
+        fill in — the merge must still degrade to "private", exactly as
+        when the omission is on the LATER page. This exercises the page-1
+        bookkeeping specifically: a fix that only tracks omissions
+        starting from page 2 onward would pass the other ordering but miss
+        this one."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "a"}], "nextCursor": "p2"},
+        }
+        page2 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "b"}], "cacheScope": "public"},
+        }
+        for page in (page1, page2):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=json.dumps(page),
+                headers={"content-type": "application/json"},
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())["result"]
+        assert merged["cacheScope"] == "private"
+
+    def test_ttl_ms_does_not_survive_a_page_omitting_it(self, httpx_mock):
+        """#350 review round 3: the analogous ``ttlMs`` case — page 1
+        supplies ttlMs=5000, page 2 omits it entirely. Per spec ("Caching"):
+        "If ttlMs is absent, clients SHOULD assume a default of 0
+        (immediately stale)". The merged freshness bound must reflect that
+        absence (0), not silently inherit page 1's 5000 just because page 2
+        never contradicted it with a larger/smaller number."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "a"}], "ttlMs": 5000, "nextCursor": "p2"},
+        }
+        page2 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "b"}]},  # no ttlMs key at all
+        }
+        for page in (page1, page2):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=json.dumps(page),
+                headers={"content-type": "application/json"},
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())["result"]
+        assert merged["ttlMs"] == 0
+
+    def test_cacheable_fields_absent_on_every_page_are_not_fabricated(self, httpx_mock):
+        """#350 review round 3, guard against a naive fix: a server that
+        never sends ttlMs/cacheScope at all (legacy, pre-2026-07-28 shaped
+        responses relayed on ANY --protocol-era) must not suddenly gain
+        invented cache metadata on its merged, paginated result. The
+        conservative-default behavior above applies only when a field is
+        present on AT LEAST ONE page but missing on another — never when it
+        is absent everywhere, which must continue to leave the merged
+        result with neither key at all (today's pre-existing behavior for
+        cache-unaware servers)."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "a"}], "nextCursor": "p2"},
+        }
+        page2 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "b"}]},
+        }
+        for page in (page1, page2):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=json.dumps(page),
+                headers={"content-type": "application/json"},
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())["result"]
+        assert "cacheScope" not in merged
+        assert "ttlMs" not in merged
+
     def test_paginated_notification_no_id_produces_no_response(self, httpx_mock):
         """: a list method sent as a NOTIFICATION (no id key) must get
         NO response — the merged-response emit is gated on has_id, mirroring every
