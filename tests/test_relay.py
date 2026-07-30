@@ -9767,6 +9767,22 @@ class TestProbeProtocolEra:
         assert era == "legacy"
         assert result is None
 
+    def test_200_with_null_result_is_legacy(self, httpx_mock):
+        """#350 review round 14: a permissive legacy JSON-RPC endpoint can
+        answer an unknown method with ``"result": null`` instead of an
+        error. A null (or scalar) result is not a DiscoverResult shape and
+        must not be taken as proof of a modern server — only an OBJECT
+        result qualifies."""
+        httpx_mock.add_response(
+            status_code=200,
+            text=json.dumps({"jsonrpc": "2.0", "id": 0, "result": None}),
+            headers={"content-type": "application/json"},
+        )
+        client = httpx.Client()
+        era, result = _probe_protocol_era(client, self.URL, {})
+        assert era == "legacy"
+        assert result is None
+
     def test_400_with_empty_body_is_legacy(self, httpx_mock):
         httpx_mock.add_response(status_code=400, text="")
         client = httpx.Client()

@@ -1113,14 +1113,22 @@ def _probe_protocol_era(
                 "body; assuming legacy"
             )
             return "legacy", None
-        if isinstance(parsed, dict) and "result" in parsed:
+        if isinstance(parsed, dict) and isinstance(parsed.get("result"), dict):
             return "modern", parsed
         # 200 with an empty/unparseable/result-less body proves nothing: a
         # sloppy legacy endpoint (or an intermediary) can 200 an unknown
         # method with an empty body or bare {}. Only a genuine
         # DiscoverResult or a recognized-modern error is proof of modern —
         # the same "empty or unrecognized -> fall back" rule the 400 branch
-        # applies (#350 review round 13).
+        # applies (#350 review round 13). The result must itself be an
+        # OBJECT (#350 review round 14): a permissive legacy endpoint can
+        # answer an unknown method with ``"result": null`` (or a scalar),
+        # which is not a DiscoverResult shape either. Its FIELDS are
+        # deliberately not schema-validated beyond that — demanding
+        # resultType/supportedVersions would misclassify a slightly
+        # non-compliant but genuinely modern server, while a legacy server
+        # has no plausible reason to answer server/discover with an object
+        # result at all.
         log("protocol-era probe: 200 with an empty/unrecognized body; assuming legacy")
         return "legacy", None
     if resp.status_code == 400:
