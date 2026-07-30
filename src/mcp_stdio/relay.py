@@ -5603,7 +5603,11 @@ def run(
                     with headers_lock:
                         headers.update(new_headers)
                     # Fresh headers, re-pinned version, fresh hook — see
-                    # _mrtr_post_retry.
+                    # _mrtr_post_retry. Re-clearing `round_opened` there
+                    # discards nothing: the hook runs only on a 200, and
+                    # this arm is reached only on a 401, so the challenged
+                    # POST cannot have opened a round. Keep that true if a
+                    # future status ever joins this branch.
                     result = _mrtr_post_retry(client_id, txn, retry_id, retry_line)
                     if mrtr_txns.get(client_id) is not txn:
                         return
