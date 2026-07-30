@@ -975,14 +975,45 @@ def _handle_modern_special_method(
       capabilities; only a real discover response may seed those fields.
       The returned ``protocolVersion``
       is the client's OWN ``requested`` string, not ``negotiated_version``
-      (#350 review round 3): this relay never re-shapes request/response
-      BODIES based on protocol version (no code path here touches the new
-      ``resultType`` envelope or anything else version-gated), so the
-      downstream ``InitializeResult.protocolVersion`` field functions purely
-      as an acknowledgement the local client checks before deciding whether
-      to proceed — never as a promise this relay actually re-encodes traffic
-      into that version. Echoing the client's own ask keeps that promise
-      trivially true. ``negotiated_version`` (computed below, from the
+      (#350 review rounds 3 AND 4 — deliberate, analyzed twice; the full
+      contract, so it need not be re-litigated:
+
+      (1) What the echo promises: nothing about wire shapes. This relay
+      never re-shapes request/response BODIES based on protocol version,
+      and for every request type a stdio client itself SENDS through this
+      relay (``tools/list``/``tools/call``, ``resources/*``, ``prompts/*``,
+      ``ping``, ``completion/complete``, ``logging/setLevel``) spec rev
+      2026-07-28 changes the RESULT shapes only ADDITIVELY over 2025-06-18:
+      the new required ``resultType`` discriminator and the ``_meta``-nested
+      ``serverInfo`` are extra fields on otherwise-unchanged result shapes
+      (#270's verified change list, items 2/8 — every other 2026 change is
+      transport-level: sessions, streams, headers, cancellation — all
+      absorbed by this relay, never surfaced downstream). MCP result
+      objects are open/extensible, so a 2025 client ignores the additions.
+
+      (2) The ONE genuinely incompatible result shape is MRTR's
+      ``InputRequiredResult`` (``resultType: "input_required"`` REPLACES
+      the real result payload, SEP-2322) — it substitutes for
+      server-INITIATED sampling/elicitation/roots round-trips, so it only
+      arises when the local client advertised those capabilities, and
+      relaying it is explicitly Phase 2 (#270 "Phase 2 — MRTR
+      passthrough"). Until then a Phase 1 relay forwards such a result
+      verbatim — a KNOWN GAP documented in run()'s "Limitation — MRTR"
+      section, not a consequence of which version this field echoes: it
+      would be forwarded verbatim no matter what the echo said.
+
+      (3) Why not report ``negotiated_version`` (the reviewer-proposed
+      alternative): lifecycle spec, Version Negotiation — "If the client
+      does not support the version in the server's response, it SHOULD
+      disconnect." Reporting the upstream's 2026-07-28 to a 2025-only
+      client makes every spec-conformant legacy client disconnect from
+      every modern-only server at the handshake, destroying the additive-
+      compatible majority flows in (1) to guard against the single Phase 2
+      gap in (2). Rejecting the mismatch outright is the same outcome.
+      Echoing the client's own ask is therefore the honest maximum this
+      relay can promise — and the promise it actually keeps.)
+
+      ``negotiated_version`` (computed below, from the
       remote's OWN advertised ``supportedVersions``) remains the version
       used UPSTREAM in headers/``_meta`` — the actual wire protocol the
       remote server understands — and is symmetric: it diverges from the
@@ -3210,6 +3241,23 @@ def run(
     pinning ``--protocol-era legacy``. Acceptance criterion #3 (#270:
     headers/session/byte-identity) is unaffected: the legacy path never
     runs any of this.
+
+    Limitation — MRTR (``resultType: "input_required"``) results are
+    forwarded verbatim (#350 review round 4 / #270 Phase 2): a modern
+    upstream that needs client input mid-request replaces the real result
+    with an ``InputRequiredResult`` (SEP-2322) that the client must answer
+    by re-issuing the request with ``inputResponses``. Phase 1 does not
+    translate that exchange into the legacy server-initiated
+    sampling/elicitation/roots requests a 2025-era stdio client would
+    understand — the ``input_required`` result reaches the client
+    unchanged, and a client that does not know the discriminator will
+    misread it as an oddly-shaped success. Exposure requires the client to
+    have advertised ``sampling``/``elicitation``/``roots`` capabilities (a
+    modern server has no other reason to initiate MRTR) AND the upstream to
+    actually use them; the ordinary tools/resources/prompts flows are
+    unaffected (their 2026 result shapes are additive-only — see
+    ``_handle_modern_special_method``). MRTR passthrough is #270's
+    explicitly-phased Phase 2 work, not an oversight in Phase 1.
     """
 
     # Graceful shutdown on SIGTERM/SIGINT

@@ -10572,3 +10572,119 @@ class TestRunModernEra:
         # startup probe + ONE reseed attempt — the second initialize did
         # not trigger a third.
         assert len(httpx_mock.get_requests()) == 2
+
+    def test_additive_2026_result_shape_forwarded_verbatim_to_2025_client(
+        self, httpx_mock
+    ):
+        """#350 review round 4 finding 1, characterization of the KEPT
+        (rounds 3+4) version-echo decision: for the request types a stdio
+        client itself sends, spec rev 2026-07-28 changes result shapes
+        only ADDITIVELY (required resultType discriminator, _meta-nested
+        serverInfo) — this relay forwards them byte-identically and a 2025
+        client ignores the unknown extra fields (MCP result objects are
+        open/extensible). This is why echoing the client's own requested
+        version is honest: no wire shape it cannot parse is created by the
+        version divergence on these flows."""
+        upstream_result = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "resultType": "tools/call",
+                    "content": [{"type": "text", "text": "hi"}],
+                    "_meta": {
+                        "io.modelcontextprotocol/serverInfo": {
+                            "name": "modern-srv",
+                            "version": "1",
+                        }
+                    },
+                },
+            }
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text=upstream_result,
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {"name": "echo", "arguments": {}},
+                    }
+                ),
+            ],
+            protocol_era="modern",
+        )
+        lines = [line for line in output.strip().split("\n") if line]
+        # The 2026-shaped result reaches the 2025 client byte-identically —
+        # the relay never version-translates bodies in either direction.
+        assert lines[1] == upstream_result
+
+    def test_mrtr_input_required_result_forwarded_verbatim_phase2_gap(self, httpx_mock):
+        """Characterization of run()'s "Limitation — MRTR" section (#350
+        review round 4 finding 1 / #270 Phase 2): the ONE genuinely
+        non-additive 2026 result shape, InputRequiredResult
+        (resultType: "input_required" REPLACING the real payload,
+        SEP-2322), is forwarded verbatim by Phase 1 — translating it into
+        legacy server-initiated sampling/elicitation/roots requests is
+        #270's explicitly-phased Phase 2 work. This pins the documented
+        gap so Phase 2 has a test to flip, and so the gap can never become
+        an accidental rewrite instead of a deliberate translation."""
+        mrtr_result = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "resultType": "input_required",
+                    "inputRequests": [
+                        {"type": "elicitation", "id": "q1", "message": "confirm?"}
+                    ],
+                },
+            }
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text=mrtr_result,
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {"name": "needs-input", "arguments": {}},
+                    }
+                )
+            ],
+            protocol_era="modern",
+        )
+        assert output.strip() == mrtr_result
