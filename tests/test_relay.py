@@ -4448,6 +4448,79 @@ class TestCheckConnection:
         assert check_connection(self.URL, dict(self.HEADERS)) is True
         assert len(httpx_mock.get_requests()) == 2
 
+    def test_initialize_sse_result_on_open_stream_reports_promptly(
+        self, httpx_mock, capsys
+    ):
+        """#350 review round 5 (finding 5-1, adjacent pre-existing site):
+        the final JSON-RPC response only SHOULD terminate an SSE stream
+        (Streamable HTTP, "Receiving Messages"), so a server may answer the
+        initialize probe as an SSE event and keep the POST stream open. The
+        --check must report ✓ as soon as the InitializeResult arrives, not
+        buffer toward EOF until the read timeout. Post-yield raise =
+        tripwire for buffered reads."""
+        init_result = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "serverInfo": {"name": "sse-srv", "version": "1"},
+                    "capabilities": {"tools": {}},
+                },
+            }
+        )
+
+        def open_stream():
+            yield f"event: message\ndata: {init_result}\n\n".encode()
+            raise AssertionError(
+                "check_connection kept reading past the InitializeResult"
+            )
+
+        httpx_mock.add_response(
+            stream=IteratorStream(open_stream()),
+            headers={"content-type": "text/event-stream"},
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+        assert "server=sse-srv" in capsys.readouterr().err
+
+    def test_discover_retry_sse_result_on_open_stream_reports_promptly(
+        self, httpx_mock, capsys
+    ):
+        """#350 review round 5 (finding 5-1): same SSE-keeps-stream-open
+        hazard on the NEW server/discover fallback this branch added — the
+        retry must report the modern-only server alive promptly instead of
+        hanging the --check until the read timeout."""
+        discover_result = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "supportedVersions": ["2026-07-28"],
+                    "capabilities": {"tools": {}},
+                    "_meta": {
+                        "io.modelcontextprotocol/serverInfo": {
+                            "name": "modern-sse-srv",
+                            "version": "2",
+                        }
+                    },
+                },
+            }
+        )
+
+        def open_stream():
+            yield f"event: message\ndata: {discover_result}\n\n".encode()
+            raise AssertionError(
+                "discover retry kept reading past the JSON-RPC response"
+            )
+
+        httpx_mock.add_response(status_code=404, text="")
+        httpx_mock.add_response(
+            stream=IteratorStream(open_stream()),
+            headers={"content-type": "text/event-stream"},
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+        assert "server=modern-sse-srv" in capsys.readouterr().err
+
     def test_500_does_not_retry_with_discover(self, httpx_mock):
         """: 500 is NOT in the discover-fallback set — retrying it with a
         different method would not distinguish "legacy-dropped" from "broken"
@@ -9439,6 +9512,77 @@ class TestProbeProtocolEra:
             httpx_mock.get_requests()[1].headers["authorization"] == "Bearer stepped-up"
         )
 
+    def test_sse_result_on_open_stream_is_modern_without_reading_to_eof(
+        self, httpx_mock
+    ):
+        """#350 review round 5 (finding 5-1): the final JSON-RPC response
+        only SHOULD terminate an SSE stream (Streamable HTTP, "Receiving
+        Messages"), so a compliant server may answer the discover probe as
+        an SSE event and keep the POST stream open. The probe must stop
+        reading at that event and classify modern promptly — a buffered
+        read would block until the read timeout and then misclassify the
+        live modern server as legacy. The generator's post-yield raise is
+        the tripwire: it fires only if the probe keeps pulling chunks past
+        the response event (the buffered behavior)."""
+        result_body = json.dumps(
+            {"jsonrpc": "2.0", "id": 0, "result": {"resultType": "discover"}}
+        )
+
+        def open_stream():
+            yield f"event: message\ndata: {result_body}\n\n".encode()
+            raise AssertionError(
+                "probe kept reading past the JSON-RPC response on a stream "
+                "the server held open"
+            )
+
+        httpx_mock.add_response(
+            stream=IteratorStream(open_stream()),
+            headers={"content-type": "text/event-stream"},
+        )
+        client = httpx.Client()
+        era, result = _probe_protocol_era(client, self.URL, {})
+        assert era == "modern"
+        assert result["result"]["resultType"] == "discover"
+
+    def test_sse_notification_before_result_is_skipped_then_stop(self, httpx_mock):
+        """A server MAY interleave request-related notifications before the
+        final response on the SSE stream (Streamable HTTP, "Receiving
+        Messages"). The probe must skip past them to the actual response —
+        and still stop THERE, not read on toward EOF."""
+        notification = json.dumps(
+            {"jsonrpc": "2.0", "method": "notifications/message", "params": {}}
+        )
+        result_body = json.dumps({"jsonrpc": "2.0", "id": 0, "result": {}})
+
+        def open_stream():
+            yield (
+                f"event: message\ndata: {notification}\n\n"
+                f"event: message\ndata: {result_body}\n\n"
+            ).encode()
+            raise AssertionError("probe kept reading past the JSON-RPC response")
+
+        httpx_mock.add_response(
+            stream=IteratorStream(open_stream()),
+            headers={"content-type": "text/event-stream"},
+        )
+        client = httpx.Client()
+        era, result = _probe_protocol_era(client, self.URL, {})
+        assert era == "modern"
+        assert result == json.loads(result_body)
+
+    def test_sse_stream_closing_without_response_is_modern_with_none(self, httpx_mock):
+        """A 200 SSE stream that closes without ever carrying a JSON-RPC
+        response parses to None — same verdict as the buffered reader always
+        gave (200 + unparseable body -> modern, nothing to seed from)."""
+        httpx_mock.add_response(
+            stream=IteratorStream([b"event: ping\ndata: keepalive\n\n"]),
+            headers={"content-type": "text/event-stream"},
+        )
+        client = httpx.Client()
+        era, result = _probe_protocol_era(client, self.URL, {})
+        assert era == "modern"
+        assert result is None
+
 
 class TestBuildDiscoverProbeRequestStripsAllCaseVariants:
     """#350 review rounds 2 AND 3 (flagged independently by both):
@@ -9840,6 +9984,33 @@ class TestReseedDiscoverProbe:
         state = self._state_with_client_data()
         _reseed_discover_probe(httpx.Client(), self.URL, {}, state)  # no raise
         assert state.server_info is None
+
+    def test_sse_result_on_open_stream_seeds_state_promptly(self, httpx_mock):
+        """#350 review round 5 (finding 5-1): the reseed runs synchronously
+        before the synthesized InitializeResult is emitted, so a discover
+        result SSE-framed on a stream the server keeps open must seed the
+        state as soon as the response event arrives — not stall the client's
+        whole initialize until the read timeout. Post-yield raise = tripwire
+        for buffered reads, as in TestProbeProtocolEra."""
+        result_body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 0,
+                "result": {"capabilities": {"tools": {}}},
+            }
+        )
+
+        def open_stream():
+            yield f"event: message\ndata: {result_body}\n\n".encode()
+            raise AssertionError("reseed probe kept reading past the JSON-RPC response")
+
+        httpx_mock.add_response(
+            stream=IteratorStream(open_stream()),
+            headers={"content-type": "text/event-stream"},
+        )
+        state = self._state_with_client_data()
+        _reseed_discover_probe(httpx.Client(), self.URL, {}, state)
+        assert state.capabilities == {"tools": {}}
 
 
 class TestInjectModernMeta:

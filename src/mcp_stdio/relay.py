@@ -759,6 +759,74 @@ def _build_discover_probe_request(
     return discover_msg, probe_headers
 
 
+def _first_response_message(
+    events: Iterable[tuple[str, str]],
+) -> dict[str, Any] | None:
+    """Return the first SSE ``message`` event that is a JSON-RPC *response*.
+
+    A response is the message object carrying ``result`` or ``error``
+    (JSON-RPC 2.0 §5). Interleaved notifications — which a compliant server
+    MAY send before the final response (Streamable HTTP, "Receiving
+    Messages") — plus non-``message`` frames and non-JSON payloads are
+    skipped. Shared by the streaming probe reader (``_post_probe``) and the
+    buffered parser (``_parse_streamable_response``) so both apply the
+    identical keep-reading gate instead of independently-drifting copies.
+    """
+    for event_type, payload in events:
+        if event_type != "message":
+            continue
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and ("result" in parsed or "error" in parsed):
+            return parsed
+    return None
+
+
+def _post_probe(
+    client: httpx.Client,
+    url: str,
+    content: str,
+    headers: dict[str, str],
+) -> tuple[httpx.Response, dict[str, Any] | None]:
+    """POST a one-shot probe and return ``(response, parsed_response_or_None)``.
+
+    Streams the response instead of buffering it (#350 review round 5): a
+    server answering a probe over SSE is only SHOULD-bound to close the
+    stream after the response — "The final JSON-RPC *response* **SHOULD**
+    terminate the stream" (Streamable HTTP, "Receiving Messages") — so a
+    compliant server MAY deliver the probe's result as an SSE event and keep
+    the POST stream open afterwards. A buffered ``client.post()`` would then
+    block until the read timeout despite the result having already arrived:
+    ``auto`` era detection would misclassify a live modern server as legacy
+    (the timeout surfaces as a transport error), and a forced ``modern``
+    probe / ``--check`` fallback would stall for the full timeout and lose
+    the discovered capabilities. This reader instead stops at the first
+    JSON-RPC response message (``_first_response_message``) and closes the
+    stream — the same incremental SSE decoding the dispatch path uses
+    (``_iter_sse_lines``/``_iter_sse_events``), without its stdout / retry
+    state, which does not apply at probe time.
+
+    A plain-JSON (non-SSE) body is fully read inside the stream context and
+    parsed by ``_parse_streamable_response`` exactly as the buffered probes
+    always did. Either way the returned (closed) response still exposes
+    ``status_code`` / ``headers`` — everything probe callers inspect.
+    Transport errors propagate as ``httpx.HTTPError`` for the callers'
+    existing degrade-to-legacy / soft-fail handling; note a read error while
+    streaming surfaces HERE (inside the iteration) rather than inside
+    ``client.post()``, so callers must wrap this whole call, not just the
+    POST.
+    """
+    with client.stream("POST", url, content=content, headers=headers) as resp:
+        if "text/event-stream" in resp.headers.get("content-type", ""):
+            return resp, _first_response_message(
+                _iter_sse_events(_iter_sse_lines(resp.iter_text()))
+            )
+        resp.read()
+    return resp, _parse_streamable_response(resp)
+
+
 def _probe_protocol_era(
     client: httpx.Client,
     url: str,
@@ -819,13 +887,19 @@ def _probe_protocol_era(
     The probe request itself is built by ``_build_discover_probe_request``
     (headers AND body, including ``params._meta`` — see that function's
     docstring for why a discover probe needs ``_meta`` too, not just the
-    two headers).
+    two headers), and POSTed via ``_post_probe`` (#350 review round 5),
+    which streams the response and stops at the first JSON-RPC response
+    message — a server that SSE-frames the discover result and keeps the
+    stream open (the final response only SHOULD terminate the stream) must
+    classify as modern promptly, not block until the read timeout and fall
+    through to the legacy branch above.
     """
     discover_msg, probe_headers = _build_discover_probe_request(headers)
     resp: httpx.Response | None = None
+    parsed: dict[str, Any] | None = None
     for attempt in (0, 1):
         try:
-            resp = client.post(url, content=discover_msg, headers=probe_headers)
+            resp, parsed = _post_probe(client, url, discover_msg, probe_headers)
         except httpx.HTTPError as e:
             log(f"protocol-era probe failed ({e}); assuming legacy")
             return "legacy", None
@@ -845,7 +919,6 @@ def _probe_protocol_era(
         break
     assert resp is not None  # the loop always posts at least once
     if resp.status_code == 200:
-        parsed = _parse_streamable_response(resp)
         if isinstance(parsed, dict) and "error" in parsed:
             if _is_recognized_modern_error(parsed):
                 log(
@@ -860,7 +933,6 @@ def _probe_protocol_era(
             return "legacy", None
         return "modern", parsed
     if resp.status_code == 400:
-        parsed = _parse_streamable_response(resp)
         if _is_recognized_modern_error(parsed):
             log(
                 "protocol-era probe: 400 with a recognized-modern JSON-RPC "
@@ -917,7 +989,12 @@ def _reseed_discover_probe(
         headers, modern_state=modern_state
     )
     try:
-        resp = client.post(url, content=discover_msg, headers=probe_headers)
+        # _post_probe streams and stops at the first JSON-RPC response
+        # message (#350 review round 5) — an SSE-framed discover result on a
+        # stream the server keeps open must not stall this reseed (which runs
+        # synchronously before the synthesized InitializeResult is emitted)
+        # until the read timeout.
+        resp, parsed = _post_probe(client, url, discover_msg, probe_headers)
     except httpx.HTTPError as e:
         log(f"discover reseed probe failed ({e}); keeping unseeded state")
         return
@@ -927,7 +1004,6 @@ def _reseed_discover_probe(
             "keeping unseeded state"
         )
         return
-    parsed = _parse_streamable_response(resp)
     if isinstance(parsed, dict) and "error" in parsed:
         log("discover reseed probe returned a JSON-RPC error; keeping unseeded state")
         return
@@ -2612,35 +2688,29 @@ def _report_initialize(result_data: dict[str, Any] | None) -> bool:
 
 
 def _parse_streamable_response(resp: httpx.Response) -> dict[str, Any] | None:
-    """Parse a Streamable HTTP POST response body (JSON or SSE) into a dict.
+    """Parse a BUFFERED Streamable HTTP POST response body (JSON or SSE).
 
-    Shared by the ``initialize`` and ``server/discover`` probes in
-    ``check_connection``: both need the first JSON-RPC message on the
-    response that carries a ``result`` or ``error``, whether the body is a
-    plain JSON object or an SSE stream that may interleave notifications /
-    server-initiated requests first — a compliant server MAY do so before the
-    actual response, matching the keep-reading gate in ``_post_parsed`` /
-    ``_check_connection_sse``.
+    The probes reach this only through ``_post_probe`` (#350 review round
+    5), which streams an SSE body incrementally and stops at the first
+    JSON-RPC response — buffering an SSE body here would block until the
+    read timeout on a server that keeps the stream open after answering, as
+    the spec allows (the final response only SHOULD terminate the stream).
+    ``_post_probe`` therefore only calls this on an already-read non-SSE
+    body; the SSE branch below (via the shared ``_first_response_message``
+    gate, so both paths skip interleaved notifications identically) is kept
+    for parsing any fully-buffered response a caller already holds.
 
     Returns ``None`` — never a non-dict — for a body that parses as valid
     JSON but is not an object (a bare ``1``, ``"oops"``, ``[]``...): the
-    return type is declared ``dict[str, Any] | None``, and both callers
-    (``_report_initialize``/``_report_discover``) are written against that
-    contract. The SSE branch already enforced this (its own ``isinstance``
-    gate); the plain-JSON branch used not to (#350 review round 2/3).
+    return type is declared ``dict[str, Any] | None``, and the report
+    helpers (``_report_initialize``/``_report_discover``) are written
+    against that contract. The SSE branch already enforced this (its own
+    ``isinstance`` gate); the plain-JSON branch used not to (#350 review
+    round 2/3).
     """
     content_type = resp.headers.get("content-type", "")
     if "text/event-stream" in content_type:
-        for event_type, payload in _iter_sse_events(_split_sse_text(resp.text)):
-            if event_type != "message":
-                continue
-            try:
-                parsed = json.loads(payload)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(parsed, dict) and ("result" in parsed or "error" in parsed):
-                return parsed
-        return None
+        return _first_response_message(_iter_sse_events(_split_sse_text(resp.text)))
     try:
         parsed = json.loads(resp.text)
     except json.JSONDecodeError:
@@ -2879,6 +2949,12 @@ def check_connection(
     server can reject a discovery request missing its own required
     metadata, which would make THIS retry itself misreport a live modern
     server as down).
+
+    Both probes stream their responses via ``_post_probe`` and stop at the
+    first JSON-RPC response message (#350 review round 5) — see that
+    helper's docstring for why a buffered read would hang the --check until
+    the read timeout on a server that SSE-frames the response and keeps the
+    stream open.
     """
     if transport == "sse":
         return _check_connection_sse(
@@ -2909,7 +2985,12 @@ def check_connection(
 
     try:
         log(f"testing connection to {redact_url(url)}")
-        resp = client.post(url, content=initialize_msg, headers=headers)
+        # _post_probe streams both probes and stops at the first JSON-RPC
+        # response message (#350 review round 5): the final response only
+        # SHOULD terminate an SSE stream, so a server that keeps the POST
+        # stream open after answering must report ✓ promptly, not hang the
+        # --check until the read timeout.
+        resp, parsed = _post_probe(client, url, initialize_msg, headers)
 
         if resp.status_code != 200:
             if resp.status_code in _DISCOVER_FALLBACK_STATUSES:
@@ -2922,8 +3003,8 @@ def check_connection(
                     headers, request_id=2
                 )
                 try:
-                    discover_resp = client.post(
-                        url, content=discover_msg, headers=discover_headers
+                    discover_resp, discover_parsed = _post_probe(
+                        client, url, discover_msg, discover_headers
                     )
                 except httpx.HTTPError as e:
                     log(f"✗ server/discover retry failed: {e}")
@@ -2938,7 +3019,7 @@ def check_connection(
                 log(
                     f"✓ Connected via server/discover (HTTP {discover_resp.status_code})"
                 )
-                ok = _report_discover(_parse_streamable_response(discover_resp))
+                ok = _report_discover(discover_parsed)
                 if "mcp-session-id" in discover_resp.headers:
                     log(f"✓ Session ID: {discover_resp.headers['mcp-session-id']}")
                 return ok
@@ -2951,7 +3032,7 @@ def check_connection(
 
         log(f"✓ Connected (HTTP {resp.status_code})")
 
-        ok = _report_initialize(_parse_streamable_response(resp))
+        ok = _report_initialize(parsed)
 
         if "mcp-session-id" in resp.headers:
             log(f"✓ Session ID: {resp.headers['mcp-session-id']}")
