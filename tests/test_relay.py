@@ -9187,10 +9187,36 @@ class TestNegotiateModernVersion:
 
     def test_non_date_form_versions_are_not_trusted_as_modern(self):
         """A non-date-form string ("zzz") from a non-compliant server
-        compares above the floor by ASCII accident ("z" > "2") — the
-        shape check must exclude it from the modern subset rather than
-        advertise garbage upstream."""
+        compares above the floor by ASCII accident ("z" > "2") — round 7
+        excluded it via a date-form shape check; since round 9 (finding
+        9-1) exact membership in _RELAY_IMPLEMENTED_MODERN_VERSIONS
+        subsumes that check: garbage can never be a member."""
         assert _negotiate_modern_version(None, ["zzz"]) == "2026-07-28"
+
+    def test_future_advertised_version_is_not_selected(self):
+        """#350 review round 9 finding 9-1 (the exact reported scenario):
+        era membership (date-form >= floor) is not implementation
+        support. A server advertising a future revision alongside
+        2026-07-28 must get the version this relay actually implements —
+        max() over the modern-ERA subset falsely negotiated 2027-01-01
+        wire semantics the relay does not speak."""
+        assert (
+            _negotiate_modern_version("2025-06-18", ["2026-07-28", "2027-01-01"])
+            == "2026-07-28"
+        )
+
+    def test_future_only_advertised_falls_to_floor(self):
+        """Empty advertised-and-implemented intersection: advertising the
+        relay's own floor and letting the future-only server reject it
+        with UnsupportedProtocolVersionError (-32022) is honest — falsely
+        claiming 2027-01-01 semantics is not."""
+        assert _negotiate_modern_version(None, ["2027-01-01"]) == "2026-07-28"
+
+    def test_future_requested_and_advertised_still_falls_to_floor(self):
+        """Even a client REQUESTING the future revision the server
+        advertises cannot make the relay claim semantics it does not
+        implement — the relay sits on the wire between them."""
+        assert _negotiate_modern_version("2027-01-01", ["2027-01-01"]) == "2026-07-28"
 
 
 class TestSeedModernStateFromDiscover:
@@ -9908,7 +9934,8 @@ class TestHandleModernSpecialMethod:
         2025-06-18 must not be told the negotiated session is 2026-07-28
         just because that is the only version the modern-only upstream
         advertised in ``server/discover``. ``_negotiate_modern_version``
-        picking ``max(supported)`` is correct for what the RELAY sends
+        picking from the advertised-and-implemented set is correct for
+        what the RELAY sends
         UPSTREAM (headers / ``_meta`` — the remote genuinely only
         understands that version), but the synthesized ``InitializeResult``
         handed back DOWNSTREAM must acknowledge what the local client
