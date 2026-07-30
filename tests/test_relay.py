@@ -1,5 +1,6 @@
 """Tests for mcp_stdio.relay module."""
 
+import copy
 import email.utils
 import json
 import socket
@@ -21,6 +22,7 @@ from mcp_stdio.relay import (
     _ModernState,
     _SseState,
     _build_discover_probe_request,
+    _build_listen_params,
     _detect_paginated_list,
     _drain_pending,
     _emit,
@@ -34,9 +36,11 @@ from mcp_stdio.relay import (
     _extract_method_and_name,
     _extract_response_id,
     _extract_protocol_version,
+    _handle_listen_message,
     _handle_modern_special_method,
     _handle_rate_limit,
     _inject_modern_meta,
+    _listen_stream_loop,
     _is_initialize_request,
     _is_recognized_modern_error,
     _iter_sse_events,
@@ -62,6 +66,7 @@ from mcp_stdio.relay import (
     _seed_modern_state_from_discover,
     _start_proactive_refresh,
     _stop_proactive_refresh,
+    _strip_listen_subscription_id,
     _same_origin,
     _split_sse_text,
     _sse_reader_loop,
@@ -10188,6 +10193,27 @@ class TestBuildDiscoverProbeRequestStripsAllCaseVariants:
         assert "MCP-Protocol-Version" in probe_headers
 
 
+def _with_list_changed(caps):
+    """Expected synthesized-InitializeResult capabilities under the C8 union
+    (#270 Phase 2 PR A): the relay itself opens the subscriptions/listen
+    stream and forwards the three list_changed notification kinds, so the
+    synthesized modern InitializeResult must advertise ``listChanged: true``
+    on tools/resources/prompts regardless of what discover seeded —
+    forwarding a notification for an unadvertised capability violates the
+    lifecycle spec's "Only use capabilities that were successfully
+    negotiated", and a gating client would drop it. Every other seeded key
+    (and every other field of the three unioned keys) must survive
+    untouched."""
+    expected = copy.deepcopy(caps)
+    for key in ("tools", "resources", "prompts"):
+        entry = expected.get(key)
+        if not isinstance(entry, dict):
+            entry = {}
+        entry["listChanged"] = True
+        expected[key] = entry
+    return expected
+
+
 class TestHandleModernSpecialMethod:
     def test_initialize_is_synthesized_locally(self):
         state = _ModernState()
@@ -10209,7 +10235,8 @@ class TestHandleModernSpecialMethod:
         assert handled is True
         result = json.loads(reply)["result"]
         assert result["serverInfo"] == {"name": "srv", "version": "9"}
-        assert result["capabilities"] == {"tools": {}}
+        # C8 (#270 Phase 2 PR A): listChanged unioned onto the seeded set.
+        assert result["capabilities"] == _with_list_changed({"tools": {}})
         assert result["protocolVersion"] == "2026-07-28"
         # The client's own capabilities/clientInfo were captured for later
         # _meta injection.
@@ -10286,7 +10313,11 @@ class TestHandleModernSpecialMethod:
         )
         _, reply = _handle_modern_special_method(line, 1, state)
         result = json.loads(reply)["result"]
-        assert result["capabilities"] == {"tools": {}, "elicitation": {}}
+        # C8 (#270 Phase 2 PR A): the listChanged union applies on top of
+        # the (unfiltered) server capability echo — elicitation survives.
+        assert result["capabilities"] == _with_list_changed(
+            {"tools": {}, "elicitation": {}}
+        )
 
     def test_initialize_without_client_info_stays_none(self):
         """: clientInfo is a SHOULD, never fabricated — absent from the
@@ -10348,8 +10379,10 @@ class TestHandleModernSpecialMethod:
         )
         _, reply = _handle_modern_special_method(line, 1, state)
         result = json.loads(reply)["result"]
-        # Under-reports: empty capabilities, honest-unknown identity.
-        assert result["capabilities"] == {}
+        # Under-reports: empty capabilities (modulo the C8 listChanged
+        # union, which is the relay's OWN advertisement, not client data),
+        # honest-unknown identity.
+        assert result["capabilities"] == _with_list_changed({})
         assert "unknown" in result["serverInfo"]["name"].lower()
         # The real client data WAS captured (for _meta injection on later
         # requests) — it is simply never fed back into this synthesized
@@ -10472,7 +10505,8 @@ class TestDiscoverReseedRetry:
         result = json.loads(reply)["result"]
         # The reseeded discover data feeds the synthesized result...
         assert result["serverInfo"] == {"name": "reseeded-srv", "version": "2"}
-        assert result["capabilities"] == {"tools": {}}
+        # (...through the C8 listChanged union, #270 Phase 2 PR A.)
+        assert result["capabilities"] == _with_list_changed({"tools": {}})
         # ...and negotiation runs AFTER the reseed: the client asked
         # 2025-06-18, the reseeded remote advertises only 2026-07-28, so
         # the upstream negotiated version is the remote's (while the
@@ -10532,7 +10566,8 @@ class TestDiscoverReseedRetry:
         )
         assert calls == [1]
         result = json.loads(reply)["result"]
-        assert result["capabilities"] == {"tools": {}}
+        # C8 listChanged union on top of the reseeded capabilities.
+        assert result["capabilities"] == _with_list_changed({"tools": {}})
         # Identity seeded by the STARTUP probe survives a reseed payload
         # that only carried capabilities.
         assert result["serverInfo"] == {"name": "srv", "version": "1"}
@@ -10627,7 +10662,8 @@ class TestDiscoverReseedRetry:
         )
         assert calls == [1]
         result = json.loads(reply)["result"]
-        assert result["capabilities"] == {}
+        # Degraded to the empty seed — modulo the C8 listChanged union.
+        assert result["capabilities"] == _with_list_changed({})
         assert "unknown" in result["serverInfo"]["name"].lower()
         # Re-initialize: still no second probe.
         _, _ = _handle_modern_special_method(
@@ -10636,13 +10672,15 @@ class TestDiscoverReseedRetry:
         assert calls == [1]
 
     def test_no_hook_keeps_prior_behavior(self):
-        """Without a discover_retry hook (default None) the behavior is
-        byte-identical to before round 4 — the unit-level contract the
-        older tests in TestHandleModernSpecialMethod still pin."""
+        """Without a discover_retry hook (default None) the RETRY behavior
+        is identical to before round 4 — the unit-level contract the older
+        tests in TestHandleModernSpecialMethod still pin. (The capability
+        SHAPE carries the C8 listChanged union, #270 Phase 2 PR A, which
+        is orthogonal to the retry hook.)"""
         state = _ModernState()
         _, reply = _handle_modern_special_method(self._initialize_line(), 1, state)
         result = json.loads(reply)["result"]
-        assert result["capabilities"] == {}
+        assert result["capabilities"] == _with_list_changed({})
         assert state.discover_retry_attempted is False
 
 
@@ -10988,11 +11026,50 @@ class TestRunModernEra:
         result.update(extra_result)
         return json.dumps({"jsonrpc": "2.0", "id": 0, "result": result})
 
+    def _register_listen_stream(self, httpx_mock):
+        """Absorb the background subscriptions/listen POST (#270 Phase 2 PR A).
+
+        The listen thread starts on the first intercepted ``initialize`` and
+        races run()'s shutdown, so its POST may or may not fire before the
+        stop event is observed — the response must be ``is_optional``. It is
+        registered FIRST, guarded by an Mcp-Method matcher, so the racy
+        background POST can never steal a matcher-less response registered
+        for the main dispatch flow (pytest-httpx matches in registration
+        order). The graceful body — a result bearing the thread's first
+        listen id — ends the stream with no reconnect, keeping the test
+        hermetic. Every test whose stdin contains an ``initialize`` on a
+        modern-resolving era must call this before its other responses and
+        assert request counts via ``_non_listen_requests``.
+        """
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "subscriptions/listen"},
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "mcp-stdio/listen/1",
+                    "result": {"resultType": "complete"},
+                }
+            ),
+            headers={"content-type": "application/json"},
+            is_optional=True,
+            is_reusable=True,
+        )
+
+    def _non_listen_requests(self, httpx_mock):
+        """Recorded requests minus the racy background listen POST(s)."""
+        return [
+            r
+            for r in httpx_mock.get_requests()
+            if r.headers.get("mcp-method") != "subscriptions/listen"
+        ]
+
     def test_forced_modern_initialize_is_synthesized_no_post(self, httpx_mock):
         """: forcing --protocol-era modern still runs ONE discover probe
         (to seed serverInfo), but the client's own `initialize` never reaches
         the network — it is answered locally and echoes the discovered
         serverInfo."""
+        self._register_listen_stream(httpx_mock)
         httpx_mock.add_response(
             url=self.URL,
             text=self._discover_response(),
@@ -11017,12 +11094,12 @@ class TestRunModernEra:
         )
         reply = json.loads(output.strip())
         assert reply["result"]["serverInfo"] == {"name": "modern-srv", "version": "1"}
-        # Exactly one HTTP request total: the discover probe. initialize
-        # never hit the wire.
-        assert len(httpx_mock.get_requests()) == 1
-        assert json.loads(httpx_mock.get_requests()[0].content)["method"] == (
-            "server/discover"
-        )
+        # Exactly one HTTP request beyond the background listen stream
+        # (#270 Phase 2 PR A, filtered by _non_listen_requests): the
+        # discover probe. initialize never hit the wire.
+        requests = self._non_listen_requests(httpx_mock)
+        assert len(requests) == 1
+        assert json.loads(requests[0].content)["method"] == "server/discover"
 
     def test_legacy_client_initialize_ack_vs_upstream_version_diverge(self, httpx_mock):
         """#350 review round 3: a local client speaking only legacy
@@ -11036,6 +11113,7 @@ class TestRunModernEra:
         session, proving the two values coexist without one leaking into
         the other (header/_meta mismatch on the upstream side would itself
         be a HeaderMismatch -32020 per AC#4)."""
+        self._register_listen_stream(httpx_mock)
         httpx_mock.add_response(
             url=self.URL,
             text=self._discover_response(supportedVersions=["2026-07-28"]),
@@ -11069,7 +11147,7 @@ class TestRunModernEra:
         # Downstream: the local client's own request is acknowledged.
         assert init_reply["result"]["protocolVersion"] == "2025-06-18"
 
-        requests = httpx_mock.get_requests()
+        requests = self._non_listen_requests(httpx_mock)
         assert len(requests) == 2  # discover probe + tools/list
         list_req = requests[1]
         # Upstream: the header AND _meta both carry the version the remote
@@ -11234,6 +11312,7 @@ class TestRunModernEra:
         assert "mcp-session-id" not in requests[2].headers
 
     def test_client_info_forwarded_when_client_provided_it(self, httpx_mock):
+        self._register_listen_stream(httpx_mock)
         httpx_mock.add_response(
             url=self.URL,
             text=self._discover_response(),
@@ -11266,8 +11345,8 @@ class TestRunModernEra:
         # requests[0] is the discover probe; the client's own `initialize`
         # is intercepted locally and never dispatched (see
         # test_forced_modern_initialize_is_synthesized_no_post), so the
-        # tools/list is requests[1].
-        call_req = httpx_mock.get_requests()[1]
+        # tools/list is requests[1] (background listen POSTs filtered out).
+        call_req = self._non_listen_requests(httpx_mock)[1]
         meta = json.loads(call_req.content)["params"]["_meta"]
         assert meta["io.modelcontextprotocol/clientInfo"] == {
             "name": "my-client",
@@ -11592,6 +11671,7 @@ class TestRunModernEra:
         ... Only use capabilities that were successfully negotiated") sees
         the remote's real capabilities instead of {} and actually issues
         tools/resources/prompts requests."""
+        self._register_listen_stream(httpx_mock)
         httpx_mock.add_response(
             url=self.URL,
             status_code=400,
@@ -11628,10 +11708,11 @@ class TestRunModernEra:
             protocol_era="auto",
         )
         reply = json.loads(output.strip())
-        # The re-probe's discover data feeds the synthesized result.
+        # The re-probe's discover data feeds the synthesized result
+        # (through the C8 listChanged union, #270 Phase 2 PR A).
         assert reply["result"]["serverInfo"] == {"name": "modern-srv", "version": "1"}
-        assert reply["result"]["capabilities"] == {"tools": {}}
-        requests = httpx_mock.get_requests()
+        assert reply["result"]["capabilities"] == _with_list_changed({"tools": {}})
+        requests = self._non_listen_requests(httpx_mock)
         assert len(requests) == 2  # startup probe + ONE reseed re-probe
         reseed_body = json.loads(requests[1].content)
         assert reseed_body["method"] == "server/discover"
@@ -11652,6 +11733,7 @@ class TestRunModernEra:
         documented under-report (empty capabilities, honest-unknown
         serverInfo), and a second client initialize does NOT probe a third
         time (the attempt is latched)."""
+        self._register_listen_stream(httpx_mock)
         gated = json.dumps(
             {
                 "jsonrpc": "2.0",
@@ -11699,11 +11781,14 @@ class TestRunModernEra:
         lines = [json.loads(line) for line in output.strip().split("\n") if line]
         assert len(lines) == 2
         for reply in lines:
-            assert reply["result"]["capabilities"] == {}
+            # Degraded empty seed, modulo the C8 listChanged union.
+            assert reply["result"]["capabilities"] == _with_list_changed({})
             assert "unknown" in reply["result"]["serverInfo"]["name"].lower()
         # startup probe + ONE reseed attempt — the second initialize did
-        # not trigger a third.
-        assert len(httpx_mock.get_requests()) == 2
+        # not trigger a third (and no second listen thread either: the
+        # listen hook is latched one-shot, so at most one background POST,
+        # filtered out here).
+        assert len(self._non_listen_requests(httpx_mock)) == 2
 
     def test_unbridgeable_client_capabilities_stripped_from_upstream_meta(
         self, httpx_mock
@@ -11718,6 +11803,7 @@ class TestRunModernEra:
         advertisement — the reseed re-probe's ``_meta`` AND each ordinary
         request's ``_meta`` — must carry only the bridgeable remainder,
         while the SERVER capability set echoed downstream stays intact."""
+        self._register_listen_stream(httpx_mock)
         httpx_mock.add_response(
             url=self.URL,
             status_code=400,
@@ -11775,7 +11861,7 @@ class TestRunModernEra:
             "experimental": {"caching": {}},
             "tools": {"quirky": True},
         }
-        requests = httpx_mock.get_requests()
+        requests = self._non_listen_requests(httpx_mock)
         assert len(requests) == 3  # startup probe + reseed + tools/call
         reseed_meta = json.loads(requests[1].content)["params"]["_meta"]
         assert (
@@ -11784,9 +11870,10 @@ class TestRunModernEra:
         call_meta = json.loads(requests[2].content)["params"]["_meta"]
         assert call_meta["io.modelcontextprotocol/clientCapabilities"] == expected_caps
         # The synthesized InitializeResult echoes the SERVER's discover-
-        # seeded capabilities untouched — the filter never applies there.
+        # seeded capabilities untouched — the filter never applies there
+        # (the C8 listChanged union does, #270 Phase 2 PR A).
         reply = json.loads(output.strip().split("\n")[0])
-        assert reply["result"]["capabilities"] == {"tools": {}}
+        assert reply["result"]["capabilities"] == _with_list_changed({"tools": {}})
 
     def test_client_with_only_unbridgeable_caps_treated_as_empty_no_reseed(
         self, httpx_mock
@@ -11799,6 +11886,7 @@ class TestRunModernEra:
         the placeholder {} the -32021-gated startup probe already sent.
         Subsequent requests advertise clientCapabilities: {} — never the
         un-bridgeable keys."""
+        self._register_listen_stream(httpx_mock)
         httpx_mock.add_response(
             url=self.URL,
             status_code=400,
@@ -11844,7 +11932,7 @@ class TestRunModernEra:
             ],
             protocol_era="auto",
         )
-        requests = httpx_mock.get_requests()
+        requests = self._non_listen_requests(httpx_mock)
         # Startup probe + tools/list — NO reseed re-probe in between.
         assert len(requests) == 2
         call_meta = json.loads(requests[1].content)["params"]["_meta"]
@@ -11862,6 +11950,7 @@ class TestRunModernEra:
         open/extensible). This is why echoing the client's own requested
         version is honest: no wire shape it cannot parse is created by the
         version divergence on these flows."""
+        self._register_listen_stream(httpx_mock)
         upstream_result = json.dumps(
             {
                 "jsonrpc": "2.0",
@@ -12057,3 +12146,946 @@ class TestRunModernEra:
         err = capsys.readouterr().err
         assert "header-safe" in err
         assert "internal relay error" not in err
+
+    def test_listen_post_body_and_headers_deterministic(self, httpx_mock):
+        """#270 Phase 2 PR A, end-to-end wire shape: the relay ORIGINATES
+        subscriptions/listen after the first intercepted initialize. Made
+        deterministic without sleeps: a response callback flags the listen
+        POST and a generator-backed stdin holds run() open until it fired.
+        Pins the C1 snapshot rules (no logLevel although one was set
+        BEFORE the stream opened; _meta INSIDE params) and the spec item 4
+        headers (dual Accept, Mcp-Method, protocolVersion byte-matching
+        the MCP-Protocol-Version header, no Mcp-Name, no session id)."""
+        listen_posted = threading.Event()
+
+        def listen_callback(request):
+            listen_posted.set()
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": "mcp-stdio/listen/1",
+                    "result": {"resultType": "complete"},
+                },
+            )
+
+        httpx_mock.add_callback(
+            listen_callback,
+            url=self.URL,
+            match_headers={"Mcp-Method": "subscriptions/listen"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":1,"result":{}}',
+            headers={"content-type": "application/json"},
+        )
+        set_level = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "logging/setLevel",
+                "params": {"level": "debug"},
+            }
+        )
+        init = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": {"experimental": {}},
+                    "clientInfo": {"name": "c", "version": "1"},
+                },
+            }
+        )
+
+        def stdin_lines():
+            yield set_level + "\n"
+            yield init + "\n"
+            # Hold stdin open until the background listen POST has fired,
+            # so run()'s shutdown cannot win the race (event-driven wait).
+            assert listen_posted.wait(timeout=5)
+
+        with patch("sys.stdin", stdin_lines()), patch("sys.stdout", StringIO()):
+            run(self.URL, {"Content-Type": "application/json"}, protocol_era="modern")
+
+        listen_reqs = [
+            r
+            for r in httpx_mock.get_requests()
+            if r.headers.get("mcp-method") == "subscriptions/listen"
+        ]
+        assert len(listen_reqs) == 1
+        req = listen_reqs[0]
+        body = json.loads(req.content)
+        assert body["id"] == "mcp-stdio/listen/1"
+        assert body["method"] == "subscriptions/listen"
+        params = body["params"]
+        assert params["notifications"] == {
+            "toolsListChanged": True,
+            "promptsListChanged": True,
+            "resourcesListChanged": True,
+        }
+        assert "resourceSubscriptions" not in params
+        meta = params["_meta"]
+        # Byte-match: the _meta version IS the header value.
+        assert (
+            meta["io.modelcontextprotocol/protocolVersion"]
+            == req.headers["mcp-protocol-version"]
+        )
+        assert meta["io.modelcontextprotocol/clientCapabilities"] == {
+            "experimental": {}
+        }
+        assert meta["io.modelcontextprotocol/clientInfo"] == {
+            "name": "c",
+            "version": "1",
+        }
+        # logging/setLevel ran BEFORE the stream opened, yet the frozen
+        # body never carries logLevel (C1).
+        assert "io.modelcontextprotocol/logLevel" not in meta
+        assert req.headers["accept"] == "application/json, text/event-stream"
+        assert "mcp-name" not in req.headers
+        assert "mcp-session-id" not in req.headers
+
+    def test_legacy_era_never_opens_listen_stream(self, httpx_mock):
+        """AC 3 (#270): the legacy era has NO listen call site — an
+        initialize-bearing session produces zero subscriptions/listen
+        POSTs and the forwarded wire stays the legacy shape (no Mcp-Method
+        header at all). Deterministic without filtering: the thread is
+        never created, so no racy background POST can exist."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            httpx_mock,
+            [
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                        },
+                    }
+                )
+            ],
+            protocol_era="legacy",
+        )
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 1  # the forwarded initialize, nothing else
+        assert json.loads(requests[0].content)["method"] == "initialize"
+        assert "mcp-method" not in requests[0].headers
+
+    def test_shutdown_joins_listen_thread_before_client_close(self, httpx_mock):
+        """C11: run()'s finally must stop + join the listen thread BEFORE
+        client.close() — closing the shared httpx client under a live
+        stream races the transport teardown. The stub loop parks on the
+        stop event exactly like the real loop's stop.wait, so the recorded
+        order proves close ran only after the thread had exited (join
+        returns only once the thread finished appending)."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        order = []
+        real_close = httpx.Client.close
+
+        def recording_close(client_self):
+            order.append("client-close")
+            real_close(client_self)
+
+        def stub_loop(**kwargs):
+            assert kwargs["stop"].wait(timeout=5)
+            order.append("listen-exited")
+
+        with (
+            patch("mcp_stdio.relay._listen_stream_loop", stub_loop),
+            patch("httpx.Client.close", recording_close),
+        ):
+            self._run_with_stdin(
+                httpx_mock,
+                [
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "initialize",
+                            "params": {
+                                "protocolVersion": "2026-07-28",
+                                "capabilities": {},
+                            },
+                        }
+                    )
+                ],
+                protocol_era="modern",
+            )
+        assert "listen-exited" in order
+        assert "client-close" in order
+        assert order.index("listen-exited") < order.index("client-close")
+
+    def test_second_initialize_never_spawns_second_listen_thread(self, httpx_mock):
+        """Spec item 2: the listen hook is invoked on EVERY initialize but
+        latched one-shot — a client-driven re-initialize must never spawn
+        a second thread (a second concurrent listen stream would duplicate
+        every forwarded notification)."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        starts = []
+
+        def stub_loop(**kwargs):
+            starts.append(threading.current_thread().name)
+            assert kwargs["stop"].wait(timeout=5)
+
+        init = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2026-07-28", "capabilities": {}},
+        }
+        reinit = {**init, "id": 2}
+        with patch("mcp_stdio.relay._listen_stream_loop", stub_loop):
+            self._run_with_stdin(
+                httpx_mock,
+                [json.dumps(init), json.dumps(reinit)],
+                protocol_era="modern",
+            )
+        assert len(starts) == 1
+
+    def test_listen_read_timeout_reaches_the_stream_timeout(self, httpx_mock):
+        """C9: run()'s listen_read_timeout becomes the per-request READ
+        timeout of the listen stream (connect/write stay the ordinary
+        values), mirroring run_sse's post_timeout override pattern."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        captured = {}
+
+        def stub_loop(**kwargs):
+            captured["timeout"] = kwargs["timeout"]
+            assert kwargs["stop"].wait(timeout=5)
+
+        with patch("mcp_stdio.relay._listen_stream_loop", stub_loop):
+            self._run_with_stdin(
+                httpx_mock,
+                [
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "initialize",
+                            "params": {
+                                "protocolVersion": "2026-07-28",
+                                "capabilities": {},
+                            },
+                        }
+                    )
+                ],
+                protocol_era="modern",
+                timeout_connect=7.0,
+                listen_read_timeout=42.0,
+            )
+        assert captured["timeout"].read == 42.0
+        assert captured["timeout"].connect == 7.0
+
+
+# --- modern era: subscriptions/listen stream (#270 Phase 2 PR A) ---
+
+
+class TestBuildListenParams:
+    """The frozen listen body snapshot (C1)."""
+
+    def _state(self):
+        state = _ModernState()
+        state.negotiated_version = "2026-07-28"
+        state.client_capabilities = {"experimental": {"caching": {}}}
+        state.client_info = {"name": "c", "version": "1"}
+        return state
+
+    def test_meta_nests_inside_params_with_no_log_level(self):
+        """The body mirrors the modern request shape (_meta INSIDE params,
+        matching _inject_modern_meta) and requests all three list_changed
+        booleans — but never logLevel: modern_state.log_level is rewritten
+        on every logging/setLevel stdin line, and the frozen snapshot must
+        not drift with it (C1)."""
+        state = self._state()
+        state.log_level = "debug"
+        params = _build_listen_params(state)
+        assert params["notifications"] == {
+            "toolsListChanged": True,
+            "promptsListChanged": True,
+            "resourcesListChanged": True,
+        }
+        # PR B territory — must not be requested yet.
+        assert "resourceSubscriptions" not in params
+        meta = params["_meta"]
+        assert meta["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
+        assert meta["io.modelcontextprotocol/clientCapabilities"] == {
+            "experimental": {"caching": {}}
+        }
+        assert meta["io.modelcontextprotocol/clientInfo"] == {
+            "name": "c",
+            "version": "1",
+        }
+        assert "io.modelcontextprotocol/logLevel" not in meta
+
+    def test_client_info_omitted_when_never_provided(self):
+        state = self._state()
+        state.client_info = None
+        meta = _build_listen_params(state)["_meta"]
+        assert "io.modelcontextprotocol/clientInfo" not in meta
+
+    def test_client_capabilities_default_to_empty_dict(self):
+        """clientCapabilities is REQUIRED and presence-based — an uncaptured
+        (None) set is sent as {} exactly like _inject_modern_meta does."""
+        state = self._state()
+        state.client_capabilities = None
+        meta = _build_listen_params(state)["_meta"]
+        assert meta["io.modelcontextprotocol/clientCapabilities"] == {}
+
+    def test_protocol_version_falls_back_to_modern_floor(self):
+        """Byte-match contract: the same fallback expression
+        _prepare_headers' modern branch uses for MCP-Protocol-Version."""
+        state = self._state()
+        state.negotiated_version = None
+        meta = _build_listen_params(state)["_meta"]
+        assert meta["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
+
+    def test_snapshot_immune_to_later_state_mutation(self):
+        """C1: the snapshot deep-copies nested values, so a later in-place
+        mutation of modern_state (a re-initialize, a capability tweak) can
+        never reach the frozen body."""
+        state = self._state()
+        params = _build_listen_params(state)
+        state.client_capabilities["experimental"]["caching"]["evil"] = True
+        state.client_info["name"] = "mutated"
+        meta = params["_meta"]
+        assert meta["io.modelcontextprotocol/clientCapabilities"] == {
+            "experimental": {"caching": {}}
+        }
+        assert meta["io.modelcontextprotocol/clientInfo"]["name"] == "c"
+
+
+class TestStripListenSubscriptionId:
+    """subscriptionId stripping on forwarded list_changed notifications."""
+
+    def test_strips_key_keeps_other_meta(self):
+        msg = {
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/subscriptionId": "s-1",
+                    "keep": 1,
+                }
+            },
+        }
+        out = _strip_listen_subscription_id(msg)
+        assert out["params"]["_meta"] == {"keep": 1}
+
+    def test_drops_meta_entirely_when_it_becomes_empty(self):
+        msg = {
+            "jsonrpc": "2.0",
+            "method": "notifications/prompts/list_changed",
+            "params": {"_meta": {"io.modelcontextprotocol/subscriptionId": "s-1"}},
+        }
+        out = _strip_listen_subscription_id(msg)
+        assert "_meta" not in out["params"]
+
+    def test_message_without_params_or_meta_passes_through(self):
+        msg = {"jsonrpc": "2.0", "method": "notifications/resources/list_changed"}
+        assert _strip_listen_subscription_id(msg) is msg
+        with_meta = {
+            "jsonrpc": "2.0",
+            "method": "notifications/resources/list_changed",
+            "params": {"_meta": {"other": 1}},
+        }
+        assert _strip_listen_subscription_id(with_meta) is with_meta
+
+    def test_original_message_never_mutated(self):
+        msg = {
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed",
+            "params": {"_meta": {"io.modelcontextprotocol/subscriptionId": "s-1"}},
+        }
+        _strip_listen_subscription_id(msg)
+        assert msg["params"]["_meta"] == {
+            "io.modelcontextprotocol/subscriptionId": "s-1"
+        }
+
+
+class TestHandleListenMessage:
+    """Message classification on the listen stream (whitelist semantics)."""
+
+    LISTEN_ID = "mcp-stdio/listen/1"
+
+    def _handle(self, msg, state=None):
+        return _handle_listen_message(json.dumps(msg), self.LISTEN_ID, None, state)
+
+    def test_result_with_int_id_never_aliases_the_listen_id(self):
+        """C10 type-aware compare: the listen id is a namespaced STRING, so
+        a numeric client-style id — even one whose text appears inside the
+        listen id — is a foreign response, swallowed, never a graceful
+        end."""
+        assert self._handle({"jsonrpc": "2.0", "id": 1, "result": {}}) is None
+
+    def test_result_for_listen_id_is_graceful(self):
+        assert (
+            self._handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": self.LISTEN_ID,
+                    "result": {"resultType": "complete"},
+                }
+            )
+            == "graceful"
+        )
+
+    def test_cancelled_with_foreign_request_id_is_swallowed(self):
+        assert (
+            self._handle(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {"requestId": 5},
+                }
+            )
+            is None
+        )
+
+    def test_cancelled_for_listen_id_is_graceful(self):
+        assert (
+            self._handle(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {"requestId": self.LISTEN_ID},
+                }
+            )
+            == "graceful"
+        )
+
+    def test_error_for_listen_id_any_code_is_terminal(self):
+        assert (
+            self._handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": self.LISTEN_ID,
+                    "error": {"code": -32000, "message": "nope"},
+                }
+            )
+            == "terminal"
+        )
+
+    @pytest.mark.parametrize("code", [-32601, -32020, -32021, -32022])
+    def test_terminal_codes_terminal_even_under_null_id(self, code):
+        """C6: a server rejecting an unknown method may answer under id
+        null — the deterministic-rejection codes are terminal regardless of
+        the id they arrive under."""
+        assert (
+            self._handle(
+                {"jsonrpc": "2.0", "id": None, "error": {"code": code, "message": "x"}}
+            )
+            == "terminal"
+        )
+
+    def test_foreign_error_with_ordinary_code_is_swallowed(self):
+        assert (
+            self._handle(
+                {"jsonrpc": "2.0", "id": 7, "error": {"code": -32000, "message": "x"}}
+            )
+            is None
+        )
+
+    def test_ack_records_honored_subset_and_logs_divergence(self, capsys):
+        state = {}
+        honored = {"toolsListChanged": True}
+        assert (
+            self._handle(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/subscriptions/acknowledged",
+                    "params": {"notifications": honored},
+                },
+                state=state,
+            )
+            is None
+        )
+        assert state["honored"] == honored
+        assert "honored a subset" in capsys.readouterr().err
+
+    def test_ack_honoring_everything_stays_silent(self, capsys):
+        state = {}
+        honored = {
+            "toolsListChanged": True,
+            "promptsListChanged": True,
+            "resourcesListChanged": True,
+        }
+        self._handle(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/subscriptions/acknowledged",
+                "params": {"notifications": honored},
+            },
+            state=state,
+        )
+        assert state["honored"] == honored
+        assert "honored a subset" not in capsys.readouterr().err
+
+
+class TestListenStreamLoop:
+    """Unit tests for the listen reader loop, driven synchronously (no
+    threads, no wall-clock sleeps — reconnect tests patch RETRY_DELAY to 0
+    and the loop's stop.wait pattern honors it immediately)."""
+
+    URL = "https://example.com/mcp"
+
+    def _sse(self, *messages):
+        return IteratorStream(
+            [f"event: message\ndata: {json.dumps(m)}\n\n".encode() for m in messages]
+        )
+
+    def _ack(self, honored=None):
+        return {
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": {
+                "notifications": honored
+                if honored is not None
+                else {
+                    "toolsListChanged": True,
+                    "promptsListChanged": True,
+                    "resourcesListChanged": True,
+                }
+            },
+        }
+
+    def _graceful(self, attempt=1):
+        return {
+            "jsonrpc": "2.0",
+            "id": f"mcp-stdio/listen/{attempt}",
+            "result": {"resultType": "complete"},
+        }
+
+    def _default_params(self):
+        state = _ModernState()
+        state.negotiated_version = "2026-07-28"
+        state.client_capabilities = {"experimental": {}}
+        return _build_listen_params(state)
+
+    def _run_loop(
+        self,
+        *,
+        stop=None,
+        state=None,
+        prepare_headers=None,
+        tracker=None,
+        params=None,
+    ):
+        client = httpx.Client()
+        try:
+            _listen_stream_loop(
+                client=client,
+                url=self.URL,
+                params=params if params is not None else self._default_params(),
+                prepare_headers=prepare_headers
+                or (lambda body: {"Content-Type": "application/json"}),
+                tracker=tracker,
+                stop=stop or threading.Event(),
+                timeout=httpx.Timeout(connect=10, read=300, write=30, pool=10),
+                state=state,
+            )
+        finally:
+            client.close()
+
+    def test_happy_path_forwards_only_stripped_list_changed(self, httpx_mock):
+        """Design test 1: the ack is consumed (honored subset recorded,
+        nothing on stdout for it), the three list_changed notifications
+        reach stdout with subscriptionId stripped (empty _meta dropped),
+        and the terminal result ends the stream silently."""
+        tools_changed = {
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/subscriptionId": "s-1",
+                    "keep": 1,
+                }
+            },
+        }
+        prompts_changed = {
+            "jsonrpc": "2.0",
+            "method": "notifications/prompts/list_changed",
+            "params": {"_meta": {"io.modelcontextprotocol/subscriptionId": "s-1"}},
+        }
+        resources_changed = {
+            "jsonrpc": "2.0",
+            "method": "notifications/resources/list_changed",
+        }
+        httpx_mock.add_response(
+            stream=self._sse(
+                self._ack(),
+                tools_changed,
+                prompts_changed,
+                resources_changed,
+                self._graceful(),
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+        stdout = StringIO()
+        state = {}
+        with patch("sys.stdout", stdout):
+            self._run_loop(state=state)
+        lines = [json.loads(line) for line in stdout.getvalue().strip().split("\n")]
+        assert len(lines) == 3  # ack and the terminal result never forwarded
+        assert lines[0]["method"] == "notifications/tools/list_changed"
+        assert lines[0]["params"]["_meta"] == {"keep": 1}
+        assert lines[1]["method"] == "notifications/prompts/list_changed"
+        assert "_meta" not in lines[1]["params"]
+        assert lines[2] == resources_changed
+        assert state["honored"] == {
+            "toolsListChanged": True,
+            "promptsListChanged": True,
+            "resourcesListChanged": True,
+        }
+        assert len(httpx_mock.get_requests()) == 1  # graceful: no reconnect
+
+    def test_graceful_result_stops_without_reconnect(self, httpx_mock):
+        httpx_mock.add_response(
+            stream=self._sse(self._graceful()),
+            headers={"content-type": "text/event-stream"},
+        )
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            self._run_loop()
+        assert stdout.getvalue() == ""
+        assert len(httpx_mock.get_requests()) == 1
+
+    def test_graceful_cancelled_notification_stops_without_reconnect(self, httpx_mock):
+        """The OTHER graceful signal (the cancellation pattern's MUST): a
+        server honoring only notifications/cancelled must not look like an
+        abrupt drop and be reconnect-looped."""
+        cancelled = {
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": "mcp-stdio/listen/1"},
+        }
+        httpx_mock.add_response(
+            stream=self._sse(cancelled),
+            headers={"content-type": "text/event-stream"},
+        )
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            self._run_loop()
+        assert stdout.getvalue() == ""
+        assert len(httpx_mock.get_requests()) == 1
+
+    def test_json_200_graceful_result_is_a_legal_immediate_end(self, httpx_mock):
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(self._graceful()),
+            headers={"content-type": "application/json"},
+        )
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            self._run_loop()
+        assert stdout.getvalue() == ""
+        assert len(httpx_mock.get_requests()) == 1
+
+    def test_stream_end_without_signal_reconnects_with_reminted_id(self, httpx_mock):
+        """Design test 3: an abrupt drop (stream end with neither graceful
+        signal) reconnects — with a re-minted id and the SAME frozen body
+        (C1)."""
+        httpx_mock.add_response(
+            stream=self._sse(self._ack()),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            stream=self._sse(self._graceful(attempt=2)),
+            headers={"content-type": "text/event-stream"},
+        )
+        with (
+            patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            patch("sys.stdout", StringIO()),
+        ):
+            self._run_loop()
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 2
+        body1 = json.loads(requests[0].content)
+        body2 = json.loads(requests[1].content)
+        assert body1["id"] == "mcp-stdio/listen/1"
+        assert body2["id"] == "mcp-stdio/listen/2"
+        assert {k: v for k, v in body1.items() if k != "id"} == {
+            k: v for k, v in body2.items() if k != "id"
+        }
+
+    def test_http_error_after_establishment_reconnects_forever_arm(self, httpx_mock):
+        """Design test 3, exception variant: after a first successful
+        establishment an httpx.HTTPError is a drop, not a death — the loop
+        re-mints the id and tries again (fixed stop.wait(RETRY_DELAY)
+        backoff, patched to 0 here)."""
+        httpx_mock.add_response(
+            stream=self._sse(self._ack()),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_exception(httpx.ReadError("boom"), url=self.URL)
+        httpx_mock.add_response(
+            stream=self._sse(self._graceful(attempt=3)),
+            headers={"content-type": "text/event-stream"},
+        )
+        with (
+            patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            patch("sys.stdout", StringIO()),
+        ):
+            self._run_loop()
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 3
+        assert json.loads(requests[2].content)["id"] == "mcp-stdio/listen/3"
+
+    def test_http_error_before_establishment_fails_fast(self, httpx_mock, capsys):
+        """C7's established split: before ANY success, a transport error is
+        far more likely non-support than a blip — one POST, loud stderr,
+        thread exits, no retry."""
+        httpx_mock.add_exception(httpx.ConnectError("refused"), url=self.URL)
+        with patch("sys.stdout", StringIO()):
+            self._run_loop()
+        assert len(httpx_mock.get_requests()) == 1
+        assert "before it was ever established" in capsys.readouterr().err
+
+    def test_non_200_before_establishment_fails_fast(self, httpx_mock, capsys):
+        httpx_mock.add_response(url=self.URL, status_code=503, text="")
+        with patch("sys.stdout", StringIO()):
+            self._run_loop()
+        assert len(httpx_mock.get_requests()) == 1
+        assert "before the stream was ever established" in capsys.readouterr().err
+
+    def test_401_after_establishment_reconnects_with_fresh_headers(self, httpx_mock):
+        """C2/C3: a 401 mid-session is a drop (NO auth recovery runs on
+        this thread), and the next attempt's fresh _prepare_headers
+        snapshot picks up whatever the main loop / proactive daemon
+        refreshed in the meantime."""
+        calls = []
+
+        def prepare_headers(body):
+            calls.append(body)
+            return {"Authorization": f"Bearer t{len(calls)}"}
+
+        httpx_mock.add_response(
+            stream=self._sse(self._ack()),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(url=self.URL, status_code=401, text="")
+        httpx_mock.add_response(
+            stream=self._sse(self._graceful(attempt=3)),
+            headers={"content-type": "text/event-stream"},
+        )
+        with (
+            patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            patch("sys.stdout", StringIO()),
+        ):
+            self._run_loop(prepare_headers=prepare_headers)
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 3
+        assert requests[0].headers["authorization"] == "Bearer t1"
+        assert requests[1].headers["authorization"] == "Bearer t2"
+        assert requests[2].headers["authorization"] == "Bearer t3"
+
+    def test_404_with_method_not_found_terminal_one_post(self, httpx_mock, capsys):
+        """Design test 4 / C6: 404 + a -32601 body is the remote saying the
+        method does not exist — exactly one POST, loud stderr, no retry."""
+        httpx_mock.add_response(
+            url=self.URL,
+            status_code=404,
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32601, "message": "Method not found"},
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        with patch("sys.stdout", StringIO()):
+            self._run_loop()
+        assert len(httpx_mock.get_requests()) == 1
+        assert "does not support" in capsys.readouterr().err
+
+    def test_404_method_not_found_terminal_even_after_establishment(
+        self, httpx_mock, capsys
+    ):
+        """C6 beats the reconnect-forever arm: a deterministic -32601
+        rejection is terminal even mid-session (a server may drop the
+        method on redeploy) — retrying at 1 Hz forever would hammer a
+        server that will never say yes."""
+        httpx_mock.add_response(
+            stream=self._sse(self._ack()),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            status_code=404,
+            text=json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32601}}),
+            headers={"content-type": "application/json"},
+        )
+        with (
+            patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            patch("sys.stdout", StringIO()),
+        ):
+            self._run_loop()
+        assert len(httpx_mock.get_requests()) == 2
+        assert "does not support" in capsys.readouterr().err
+
+    def test_error_result_terminal_one_post(self, httpx_mock, capsys):
+        """Design test 4, error-result variant: a -32601 error result on a
+        200 (JSON-RPC-over-HTTP convention) is equally terminal."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "mcp-stdio/listen/1",
+                    "error": {"code": -32601, "message": "Method not found"},
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        with patch("sys.stdout", StringIO()):
+            self._run_loop()
+        assert len(httpx_mock.get_requests()) == 1
+        assert "rejected subscriptions/listen" in capsys.readouterr().err
+
+    def test_body_frozen_headers_fresh_across_reconnects(self, httpx_mock):
+        """Design test 5 (C1 x C2): log_level (and even the capability set)
+        mutated mid-stream must NOT change the reconnect body — only the id
+        is re-minted — while the headers ARE re-read fresh per attempt."""
+        state = _ModernState()
+        state.negotiated_version = "2026-07-28"
+        state.client_capabilities = {"experimental": {}}
+        params = _build_listen_params(state)
+        calls = []
+
+        def prepare_headers(body):
+            calls.append(body)
+            # Simulate mid-session mutations the stdin loop performs:
+            # logging/setLevel rewrites log_level on every line, and a
+            # re-initialize replaces the capability set.
+            state.log_level = "debug"
+            state.client_capabilities = {"mutated": True}
+            return {"Authorization": f"Bearer t{len(calls)}"}
+
+        httpx_mock.add_response(
+            stream=self._sse(self._ack()),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            stream=self._sse(self._graceful(attempt=2)),
+            headers={"content-type": "text/event-stream"},
+        )
+        with (
+            patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            patch("sys.stdout", StringIO()),
+        ):
+            self._run_loop(params=params, prepare_headers=prepare_headers)
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 2
+        body1 = json.loads(requests[0].content)
+        body2 = json.loads(requests[1].content)
+        assert {k: v for k, v in body1.items() if k != "id"} == {
+            k: v for k, v in body2.items() if k != "id"
+        }
+        meta2 = body2["params"]["_meta"]
+        assert "io.modelcontextprotocol/logLevel" not in meta2
+        assert meta2["io.modelcontextprotocol/clientCapabilities"] == {
+            "experimental": {}
+        }
+        assert requests[0].headers["authorization"] == "Bearer t1"
+        assert requests[1].headers["authorization"] == "Bearer t2"
+
+    def test_attempt_headers_accept_override_mcp_method_no_name(self, httpx_mock):
+        """Spec item 4: every attempt carries the dual Accept (any pinned
+        case-variant replaced), Mcp-Method: subscriptions/listen, and no
+        Mcp-Name."""
+        httpx_mock.add_response(
+            stream=self._sse(self._graceful()),
+            headers={"content-type": "text/event-stream"},
+        )
+        with patch("sys.stdout", StringIO()):
+            self._run_loop(
+                prepare_headers=lambda body: {
+                    "Content-Type": "application/json",
+                    "accept": "text/plain",
+                }
+            )
+        req = httpx_mock.get_requests()[0]
+        assert req.headers.get_list("accept") == ["application/json, text/event-stream"]
+        assert req.headers["mcp-method"] == "subscriptions/listen"
+        assert "mcp-name" not in req.headers
+
+    def test_stdout_oserror_is_terminal(self, httpx_mock, capsys):
+        """C12: a BrokenPipeError from _emit (client closed stdout) must end
+        the thread — reconnecting the upstream stream into a dead stdout
+        would spin forever."""
+
+        class _DeadStdout:
+            def write(self, s):
+                raise BrokenPipeError("stdout closed")
+
+            def flush(self):
+                pass
+
+        tools_changed = {
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed",
+        }
+        httpx_mock.add_response(
+            stream=self._sse(self._ack(), tools_changed),
+            headers={"content-type": "text/event-stream"},
+        )
+        with (
+            patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            patch("sys.stdout", _DeadStdout()),
+        ):
+            self._run_loop()
+        assert len(httpx_mock.get_requests()) == 1
+        assert "stdout write failed" in capsys.readouterr().err
+
+    def test_unknown_messages_swallowed_not_forwarded(self, httpx_mock):
+        """Whitelist semantics: an unrelated notification, a
+        server-initiated request, and a foreign response are all consumed
+        silently — only the three list_changed kinds may reach stdout."""
+        httpx_mock.add_response(
+            stream=self._sse(
+                {"jsonrpc": "2.0", "method": "notifications/message", "params": {}},
+                {"jsonrpc": "2.0", "id": 9, "method": "ping"},
+                {"jsonrpc": "2.0", "id": 7, "result": {}},
+                self._graceful(),
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            self._run_loop()
+        assert stdout.getvalue() == ""
+        assert len(httpx_mock.get_requests()) == 1
+
+    def test_stop_preset_makes_no_post(self, httpx_mock):
+        """Shutdown responsiveness: a stop set before the first attempt
+        produces zero network traffic (loop-top check)."""
+        stop = threading.Event()
+        stop.set()
+        self._run_loop(stop=stop)
+        assert len(httpx_mock.get_requests()) == 0
