@@ -3054,7 +3054,11 @@ def _handle_listen_message(
     reconnect), or ``None`` (message consumed; keep reading).
 
     Whitelist semantics: only the three ``list_changed`` notification
-    kinds are forwarded (subscriptionId stripped first). The ack records
+    kinds are forwarded (subscriptionId stripped first), and only as TRUE
+    notifications — a whitelisted method carrying an ``id`` is a JSON-RPC
+    request, not a notification, and is swallowed (#352 round-2 finding
+    3: a hostile upstream must not solicit a response from the legacy
+    client through the listen stream). The ack records
     the honored subset into ``state`` and logs one line iff it differs
     from the requested set. There are TWO graceful-end signals — a result
     bearing the listen id (SHOULD) and ``notifications/cancelled``
@@ -3087,7 +3091,16 @@ def _handle_listen_message(
             )
         return None
     if method in _LISTEN_FORWARDED_NOTIFICATIONS:
-        _emit(json.dumps(_strip_listen_subscription_id(msg)), tracker)
+        # #352 round-2 finding 3: JSON-RPC 2.0 defines any message that
+        # CARRIES an "id" member as a request — the sender expects a
+        # response. A hostile or malformed upstream could stamp an id onto
+        # a whitelisted method to smuggle a live request onto the stdio
+        # wire, and the legacy client may answer it — leaking a
+        # relay-internal interaction into the ordinary request path. Only a
+        # true notification (id absent) is forwarded; anything else is
+        # swallowed like every other non-whitelisted message.
+        if "id" not in msg:
+            _emit(json.dumps(_strip_listen_subscription_id(msg)), tracker)
         return None
     if method == "notifications/cancelled":
         params = msg.get("params")

@@ -12858,6 +12858,25 @@ class TestHandleListenMessage:
             == "graceful"
         )
 
+    def test_id_bearing_whitelisted_method_swallowed_never_forwarded(self):
+        """#352 round-2 finding 3: JSON-RPC 2.0 defines any message that
+        carries an "id" member as a REQUEST — the sender expects a
+        response. A hostile or malformed upstream stamping an id onto a
+        whitelisted list_changed method must not smuggle a live request
+        onto the stdio wire (the legacy client might answer it). Swallowed
+        — consumed, nothing on stdout."""
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            result = self._handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 13,
+                    "method": "notifications/tools/list_changed",
+                }
+            )
+        assert result is None
+        assert stdout.getvalue() == ""
+
     def test_cancelled_with_foreign_request_id_is_swallowed(self):
         assert (
             self._handle(
@@ -13460,13 +13479,21 @@ class TestListenStreamLoop:
 
     def test_unknown_messages_swallowed_not_forwarded(self, httpx_mock):
         """Whitelist semantics: an unrelated notification, a
-        server-initiated request, and a foreign response are all consumed
-        silently — only the three list_changed kinds may reach stdout."""
+        server-initiated request, a foreign response — and an id-bearing
+        message under a WHITELISTED method, which JSON-RPC 2.0 makes a
+        request, not a notification (#352 round-2 finding 3) — are all
+        consumed silently; only true list_changed notifications may reach
+        stdout."""
         httpx_mock.add_response(
             stream=self._sse(
                 {"jsonrpc": "2.0", "method": "notifications/message", "params": {}},
                 {"jsonrpc": "2.0", "id": 9, "method": "ping"},
                 {"jsonrpc": "2.0", "id": 7, "result": {}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 13,
+                    "method": "notifications/tools/list_changed",
+                },
                 self._graceful(),
             ),
             headers={"content-type": "text/event-stream"},
