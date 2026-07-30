@@ -605,10 +605,11 @@ class _ModernState:
     ``server_info`` / ``capabilities`` / ``supported_versions`` are seeded
     once from the era-detection ``server/discover`` probe (see
     ``_probe_protocol_era``) — plus at most ONE reseed retry when that
-    probe seeded nothing and the local client's real capabilities have
-    since become known (``discover_retry_attempted`` latches the attempt so
-    it can never repeat — see ``_handle_modern_special_method``, #350
-    review round 4). ``client_capabilities`` / ``client_info`` /
+    probe left ``capabilities`` empty and the local client's real,
+    non-empty capabilities have since become known
+    (``discover_retry_attempted`` latches the attempt so it can never
+    repeat — see ``_handle_modern_special_method``, #350 review rounds 4 +
+    9). ``client_capabilities`` / ``client_info`` /
     ``negotiated_version`` are captured once from the local stdio client's
     own ``initialize`` request (see ``_handle_modern_special_method`` — the
     modern path never forwards that request upstream, so this is the only
@@ -665,6 +666,15 @@ def _seed_modern_state_from_discover(
     relay's identity AS the remote's self-reported one, which is exactly
     what the #270 design says not to do ("source it from real discover data
     instead of inventing a placeholder").
+
+    Seeding never ERASES (#350 review round 9, finding 9-2): the reseed
+    retry can now fire with ``server_info``/``supported_versions`` already
+    seeded by the startup probe (it re-runs whenever ``capabilities`` came
+    back empty, not only when nothing seeded at all), so a reseed payload
+    that omits a field — or answers it with an empty ``{}``/``[]`` — must
+    keep the previously-seeded value rather than clobber it back to a
+    default. Skipping an empty value is lossless on the FIRST seed too:
+    the state's own defaults are exactly those empty values.
     """
     if not isinstance(discover_result, dict):
         return
@@ -672,10 +682,14 @@ def _seed_modern_state_from_discover(
     if not isinstance(result, dict):
         return
     caps = result.get("capabilities")
-    if isinstance(caps, dict):
+    if isinstance(caps, dict) and caps:
         modern_state.capabilities = caps
     versions = result.get("supportedVersions")
-    if isinstance(versions, list) and all(isinstance(v, str) for v in versions):
+    if (
+        isinstance(versions, list)
+        and versions
+        and all(isinstance(v, str) for v in versions)
+    ):
         modern_state.supported_versions = versions
     meta = result.get("_meta")
     if isinstance(meta, dict):
@@ -1100,17 +1114,26 @@ def _reseed_discover_probe(
     ``clientCapabilities: {}``. A remote that gates ``server/discover``
     itself on a real client capability (``-32021``
     ``MissingRequiredClientCapabilityError``) is still classified modern but
-    seeds nothing — and the lifecycle spec makes empty synthesized
-    capabilities NOT cosmetic: "Both parties MUST ... Only use capabilities
-    that were successfully negotiated", so a compliant client told
-    ``capabilities: {}`` will never issue ``tools/list`` at all. This
+    seeds nothing — and a server can equally answer the probe SUCCESSFULLY
+    with ``serverInfo``/``supportedVersions`` while filtering
+    ``capabilities`` down to ``{}`` against that placeholder (#350 review
+    round 9, finding 9-2). Either way the lifecycle spec makes empty
+    synthesized capabilities NOT cosmetic: "Both parties MUST ... Only use
+    capabilities that were successfully negotiated", so a compliant client
+    told ``capabilities: {}`` will never issue ``tools/list`` at all. This
     re-probe repeats discovery exactly once, now that
     ``modern_state.client_capabilities``/``client_info`` hold the client's
     real values (``_build_discover_probe_request`` puts them in
-    ``params._meta``), and reseeds ``modern_state`` from the result.
+    ``params._meta``), and reseeds ``modern_state`` from the result —
+    without erasing identity/version state the startup probe already
+    seeded, when the reseed only needed to fill capabilities (see
+    ``_seed_modern_state_from_discover``).
 
     Called only from ``_handle_modern_special_method``'s ``initialize``
-    branch, only when the startup probe seeded NOTHING, and at most once per
+    branch, only when the startup probe left ``capabilities`` empty AND the
+    client's own capabilities are non-empty (a re-probe carrying the same
+    ``{}`` the startup probe sent could not change the outcome), and at
+    most once per
     session (``modern_state.discover_retry_attempted`` is latched by the
     caller BEFORE this runs) — zero cost on the common already-seeded path,
     one extra round-trip only on the rare failure path, which is exactly the
@@ -1189,12 +1212,19 @@ def _handle_modern_special_method(
       for later ``_meta`` injection (``_inject_modern_meta``) — this is the
       ONLY place those values are ever observed, since the modern path never
       forwards the request that carries them. When the era-detection probe
-      seeded NOTHING (e.g. the remote gated ``server/discover`` itself on a
-      real client capability, ``-32021``), ``discover_retry`` — when the
-      caller provides one — re-runs discovery exactly ONCE, now that the
-      client's real ``capabilities``/``clientInfo`` are known, before the
-      result is synthesized (#350 review round 4; see
-      ``_reseed_discover_probe``). ``modern_state.discover_retry_attempted``
+      left ``capabilities`` EMPTY — it seeded nothing at all (e.g. the
+      remote gated ``server/discover`` itself on a real client capability,
+      ``-32021``, round 4), or it returned ``serverInfo``/
+      ``supportedVersions`` but a capability set filtered down to ``{}``
+      against the probe's placeholder ``clientCapabilities: {}`` (#350
+      review round 9, finding 9-2) — and the client's own capabilities are
+      non-empty, ``discover_retry`` — when the caller provides one —
+      re-runs discovery exactly ONCE, now that the client's real
+      ``capabilities``/``clientInfo`` are known, before the result is
+      synthesized (see ``_reseed_discover_probe``). Already-seeded
+      identity/version state survives a reseed that only fills
+      capabilities (``_seed_modern_state_from_discover`` never erases).
+      ``modern_state.discover_retry_attempted``
       latches the attempt so a client-driven re-``initialize`` can never
       probe again; a retry that fails degrades to the same under-reporting
       as before. The client's OWN data is still never copied into
@@ -1275,18 +1305,28 @@ def _handle_modern_special_method(
         modern_state.client_info = (
             client_info if isinstance(client_info, dict) else None
         )
-        # Reseed retry (#350 review round 4): only when the startup probe
-        # seeded NOTHING — a partially-seeded state (any of the three
-        # fields) means discovery already succeeded and must not be
-        # repeated (zero extra round-trips on the common path). Latch the
+        # Reseed retry (#350 review rounds 4 + 9): re-run discovery once,
+        # now that the client's REAL capabilities are known, when the
+        # startup probe left CAPABILITIES empty and the client actually
+        # has capabilities to advertise. Round 4 gated this on ALL three
+        # discover fields being unseeded, but seeded serverInfo/
+        # supportedVersions do not prove capability negotiation was
+        # complete: a server can return identity/versions fine while
+        # filtering ``capabilities`` down to {} against the probe's
+        # placeholder ``clientCapabilities: {}`` (finding 9-2) — and
+        # capabilities is the ONE field that placeholder can plausibly
+        # distort. A client that itself has no capabilities gets no
+        # retry: the re-probe would carry the same ``{}`` the startup
+        # probe already sent and cannot change the outcome. Latch the
         # attempt BEFORE probing so neither a failed retry nor a
-        # re-initialize can ever probe a second time.
+        # re-initialize can ever probe a second time (zero extra
+        # round-trips on the common path: a non-empty capabilities seed
+        # means discovery already answered).
         if (
             discover_retry is not None
             and not modern_state.discover_retry_attempted
-            and modern_state.server_info is None
             and not modern_state.capabilities
-            and not modern_state.supported_versions
+            and modern_state.client_capabilities
         ):
             modern_state.discover_retry_attempted = True
             discover_retry()
@@ -3436,7 +3476,7 @@ def run(
     (non-batch) request always gets a synthesized error on the same failures.
 
     Limitation — modern discover state and the one-shot reseed retry (#350
-    review rounds 3 + 4): the ``server/discover`` probe that seeds
+    review rounds 3 + 4 + 9): the ``server/discover`` probe that seeds
     ``modern_state.server_info`` / ``capabilities`` / ``supported_versions``
     runs BEFORE the stdin loop starts (see above), which is necessarily
     before the local client has sent its own ``initialize`` — so the probe
@@ -3446,7 +3486,10 @@ def run(
     recognized-modern error ``-32021``
     ``MissingRequiredClientCapabilityError``), the probe still correctly
     classifies the era as ``modern`` (see ``_probe_protocol_era``) but
-    seeds NOTHING. Round 3 documented that outcome as a tolerable
+    seeds NOTHING — and a remote can just as well answer the probe
+    successfully with ``serverInfo``/``supportedVersions`` while filtering
+    ``capabilities`` down to ``{}`` against that placeholder (round 9,
+    finding 9-2). Round 3 documented that outcome as a tolerable
     under-report; round 4 established it is NOT merely cosmetic — the
     lifecycle spec says both parties "MUST ... Only use capabilities that
     were successfully negotiated", so a compliant local client told
@@ -3454,22 +3497,33 @@ def run(
     ``prompts`` requests at all. The fix is a NARROW retry the round-3
     analysis never evaluated (it rejected only an unconditional
     every-session second probe): when the local client's ``initialize``
-    arrives and the startup probe seeded nothing, discovery is re-run
+    arrives with non-empty capabilities of its own and the startup probe
+    left ``capabilities`` empty (round 4 required ALL discover state
+    empty; round 9 widened the trigger to the one field the placeholder
+    can plausibly distort), discovery is re-run
     exactly ONCE with the client's now-known real
     ``clientCapabilities``/``clientInfo`` in ``params._meta``, before the
     ``InitializeResult`` is synthesized (``_reseed_discover_probe``, hooked
-    in via ``_handle_modern_special_method``'s ``discover_retry``). Cost:
+    in via ``_handle_modern_special_method``'s ``discover_retry``) —
+    preserving any identity/version state the startup probe already
+    seeded (``_seed_modern_state_from_discover`` never erases). Cost:
     zero on the common already-seeded path; one extra round-trip only on
-    the rare seeded-nothing path. It cannot loop
+    the rare empty-capabilities path. It cannot loop
     (``modern_state.discover_retry_attempted`` is latched before the
     attempt, so a failed retry or a client re-``initialize`` never probes
     again) and cannot race (it runs synchronously on the stdin loop
-    thread, before any other dispatch). RESIDUAL limitation: if the reseed
-    retry ALSO fails, the synthesized result degrades exactly as round 3
-    documented — honest-unknown ``serverInfo`` placeholder, empty
+    thread, before any other dispatch). RESIDUAL limitations: if the
+    reseed retry ALSO fails, the synthesized result degrades exactly as
+    round 3 documented — honest-unknown ``serverInfo`` placeholder, empty
     capabilities, an under-report that never over-claims — and the
     operator escapes remain fixing the upstream's discover-gating or
-    pinning ``--protocol-era legacy``. Acceptance criterion #3 (#270:
+    pinning ``--protocol-era legacy``. And a remote that returns a
+    NON-empty but capability-FILTERED subset against the placeholder is
+    still not re-probed: from this side it is indistinguishable from a
+    remote reporting its true capabilities, and detecting it would take
+    exactly the unconditional every-session second probe round 3 rejected
+    on cost — a knowingly-accepted under-report, never an over-claim.
+    Acceptance criterion #3 (#270:
     headers/session/byte-identity) is unaffected: the legacy path never
     runs any of this.
 

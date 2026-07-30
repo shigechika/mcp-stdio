@@ -9257,6 +9257,56 @@ class TestSeedModernStateFromDiscover:
         )
         assert state.server_info is None
 
+    def test_reseed_payload_missing_fields_does_not_clobber_seeded_state(self):
+        """#350 review round 9 finding 9-2: the reseed retry now fires with
+        server_info/supported_versions possibly already seeded by the
+        startup probe (empty-capabilities trigger). A reseed payload that
+        only carries capabilities must fill exactly that and preserve the
+        seeded identity/version state — seeding never erases."""
+        state = _ModernState()
+        state.server_info = {"name": "srv", "version": "1"}
+        state.supported_versions = ["2026-07-28"]
+        _seed_modern_state_from_discover(
+            state,
+            {
+                "jsonrpc": "2.0",
+                "id": 0,
+                "result": {
+                    "resultType": "discover",
+                    "capabilities": {"tools": {}},
+                },
+            },
+        )
+        assert state.capabilities == {"tools": {}}
+        assert state.server_info == {"name": "srv", "version": "1"}
+        assert state.supported_versions == ["2026-07-28"]
+
+    def test_reseed_payload_empty_values_do_not_erase_seeded_state(self):
+        """Same never-erase rule for a payload that answers the fields with
+        EMPTY values ({} / []) rather than omitting them: an empty value is
+        indistinguishable from the state's own defaults, so skipping the
+        assignment is lossless on a first seed and non-destructive on a
+        reseed (#350 review round 9, finding 9-2)."""
+        state = _ModernState()
+        state.server_info = {"name": "srv", "version": "1"}
+        state.capabilities = {"tools": {}}
+        state.supported_versions = ["2026-07-28"]
+        _seed_modern_state_from_discover(
+            state,
+            {
+                "jsonrpc": "2.0",
+                "id": 0,
+                "result": {
+                    "resultType": "discover",
+                    "supportedVersions": [],
+                    "capabilities": {},
+                },
+            },
+        )
+        assert state.capabilities == {"tools": {}}
+        assert state.supported_versions == ["2026-07-28"]
+        assert state.server_info == {"name": "srv", "version": "1"}
+
 
 class TestIsRecognizedModernError:
     """Base Protocol "Error Codes" (spec rev 2026-07-28): -32020..-32099 is
@@ -10043,26 +10093,104 @@ class TestDiscoverReseedRetry:
         assert state.negotiated_version == "2026-07-28"
         assert result["protocolVersion"] == "2025-06-18"
 
-    @pytest.mark.parametrize(
-        "seed",
-        [
-            {"server_info": {"name": "srv", "version": "1"}},
-            {"capabilities": {"tools": {}}},
-            {"supported_versions": ["2026-07-28"]},
-        ],
-    )
-    def test_no_retry_when_any_discover_field_was_seeded(self, seed):
-        """The retry exists ONLY for the seeded-nothing failure path. Any
-        partial seed means the startup discover succeeded — re-probing
-        would add the every-session round-trip round 3 rightly rejected."""
+    def test_no_retry_when_capabilities_were_seeded_non_empty(self):
+        """A non-empty capabilities seed means capability negotiation
+        already answered — re-probing would add the every-session
+        round-trip round 3 rightly rejected. (Round 4 suppressed the retry
+        on ANY seeded field; round 9 finding 9-2 narrowed the guard to
+        capabilities, the one field the startup probe's placeholder
+        clientCapabilities: {} can plausibly distort — see the two
+        retry-fires tests below for the flip side.)"""
         state = _ModernState()
-        for attr, value in seed.items():
-            setattr(state, attr, value)
+        state.capabilities = {"tools": {}}
         calls = []
         _handle_modern_special_method(
             self._initialize_line(), 1, state, discover_retry=lambda: calls.append(1)
         )
         assert calls == []
+
+    def test_retry_fires_when_identity_seeded_but_capabilities_empty(self):
+        """#350 review round 9 finding 9-2 (the exact reported scenario):
+        the startup probe seeded serverInfo + supportedVersions but the
+        server returned capabilities filtered down to {} against the
+        probe's placeholder clientCapabilities: {}. Round 4's all-empty
+        condition suppressed the reseed, so the synthesized
+        InitializeResult reported no tools/resources/prompts and a
+        compliant client (lifecycle: "MUST ... Only use capabilities that
+        were successfully negotiated") never attempted them. The reseed
+        must fire, fill capabilities, and PRESERVE the seeded identity/
+        version state when the reseed payload omits them
+        (_seed_modern_state_from_discover never erases)."""
+        state = _ModernState()
+        state.server_info = {"name": "srv", "version": "1"}
+        state.supported_versions = ["2026-07-28"]
+        calls = []
+
+        def retry():
+            calls.append(1)
+            _seed_modern_state_from_discover(
+                state,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "result": {
+                        "resultType": "discover",
+                        "capabilities": {"tools": {}},
+                    },
+                },
+            )
+
+        _, reply = _handle_modern_special_method(
+            self._initialize_line(), 1, state, discover_retry=retry
+        )
+        assert calls == [1]
+        result = json.loads(reply)["result"]
+        assert result["capabilities"] == {"tools": {}}
+        # Identity seeded by the STARTUP probe survives a reseed payload
+        # that only carried capabilities.
+        assert result["serverInfo"] == {"name": "srv", "version": "1"}
+        assert state.supported_versions == ["2026-07-28"]
+
+    def test_retry_fires_when_versions_seeded_but_capabilities_empty(self):
+        """Same round-9 trigger with only supportedVersions seeded: any
+        seeded field used to suppress the retry, but identity/version
+        metadata does not prove capability negotiation was complete."""
+        state = _ModernState()
+        state.supported_versions = ["2026-07-28"]
+        calls = []
+        _handle_modern_special_method(
+            self._initialize_line(), 1, state, discover_retry=lambda: calls.append(1)
+        )
+        assert calls == [1]
+
+    def test_no_retry_when_client_itself_has_no_capabilities(self):
+        """#350 review round 9 finding 9-2, the other bound: the reseed's
+        only new information is the client's REAL capabilities. A client
+        whose own capabilities are {} would make the re-probe carry exactly
+        the placeholder the startup probe already sent — it cannot change
+        the outcome, so no retry fires (this also keeps the round-4
+        -32021-gated path from burning its one latched attempt on a probe
+        that is doomed to the same rejection)."""
+        state = _ModernState()
+        line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": {},
+                },
+            }
+        )
+        calls = []
+        _handle_modern_special_method(
+            line, 1, state, discover_retry=lambda: calls.append(1)
+        )
+        assert calls == []
+        # Not latched either: a later re-initialize that DOES carry real
+        # capabilities may still use the one reseed attempt.
+        assert state.discover_retry_attempted is False
 
     def test_failed_retry_degrades_and_never_retries_again(self):
         """A retry that seeds nothing (the remote rejected discovery again)
