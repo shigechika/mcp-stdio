@@ -3119,6 +3119,8 @@ def _handle_listen_message(
     listen_id: str,
     tracker: "_CancelTracker | None",
     state: dict[str, Any] | None,
+    *,
+    acked: bool,
 ) -> str | None:
     """Dispatch one JSON-RPC message from the listen stream.
 
@@ -3140,7 +3142,15 @@ def _handle_listen_message(
     notifications — a whitelisted method carrying an ``id`` is a JSON-RPC
     request, not a notification, and is swallowed (#352 round-2 finding
     3: a hostile upstream must not solicit a response from the legacy
-    client through the listen stream). The ack records
+    client through the listen stream) — and only AFTER this attempt's
+    ack (``acked``, #352 round-7 finding): the spec makes the
+    acknowledgement the MANDATORY first stream message, so a pre-ack
+    ``list_changed`` is a protocol violation, and forwarding it would
+    write to stdout from a stream the loop may immediately afterwards
+    declare "never established" (a misrouted endpoint emitting a
+    matching method then closing). The caller passes ``acked`` per
+    ATTEMPT — each reconnect's stream must re-ack before anything is
+    forwarded again. The ack records
     the honored subset into ``state`` and logs one line iff it differs
     from the requested set. There are TWO graceful-end signals — a result
     bearing the listen id (SHOULD) and ``notifications/cancelled``
@@ -3211,7 +3221,7 @@ def _handle_listen_message(
         # starts.
         advertised = state.get("advertised") if state is not None else None
         family = method.split("/")[1]
-        if "id" not in msg and (advertised is None or family in advertised):
+        if acked and "id" not in msg and (advertised is None or family in advertised):
             _emit(json.dumps(_strip_listen_subscription_id(msg)), tracker)
         return None
     if method == "notifications/cancelled":
@@ -3450,6 +3460,13 @@ def _listen_stream_loop(
                     # inside the message handling, before stream end is
                     # ever reached.
                     if _is_sse_response(resp):
+                        # Per-ATTEMPT ack gate (#352 round-7 finding): the
+                        # spec makes the ack the mandatory FIRST stream
+                        # message, so nothing is forwarded until THIS
+                        # attempt's stream has acked — `established` is
+                        # once-per-thread (C7's reconnect patience) and
+                        # cannot serve as the forwarding gate.
+                        acked = False
                         for event_type, data in _iter_sse_events(
                             _iter_sse_lines(resp.iter_text())
                         ):
@@ -3458,10 +3475,11 @@ def _listen_stream_loop(
                             if event_type != "message":
                                 continue
                             outcome = _handle_listen_message(
-                                data, listen_id, tracker, state
+                                data, listen_id, tracker, state, acked=acked
                             )
                             if outcome == "ack":
                                 established = True
+                                acked = True
                             elif outcome is not None:
                                 return
                         # Stream ended with neither graceful signal.
@@ -3477,8 +3495,15 @@ def _listen_stream_loop(
                     else:
                         resp.read()
                         text = resp.text.strip()
+                        # acked=False: a single-JSON-body 200 carries at
+                        # most one message, which cannot have been preceded
+                        # by an ack on the same attempt — so a list_changed
+                        # here is never forwarded (#352 round-7 finding);
+                        # an ack/graceful/terminal still classifies.
                         outcome = (
-                            _handle_listen_message(text, listen_id, tracker, state)
+                            _handle_listen_message(
+                                text, listen_id, tracker, state, acked=False
+                            )
                             if text
                             else None
                         )

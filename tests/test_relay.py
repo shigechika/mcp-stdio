@@ -13000,8 +13000,12 @@ class TestHandleListenMessage:
 
     LISTEN_ID = "mcp-stdio/listen/1"
 
-    def _handle(self, msg, state=None):
-        return _handle_listen_message(json.dumps(msg), self.LISTEN_ID, None, state)
+    def _handle(self, msg, state=None, acked=True):
+        # acked=True default: most tests exercise post-ack classification;
+        # the round-7 pre-ack gate has its own dedicated tests below.
+        return _handle_listen_message(
+            json.dumps(msg), self.LISTEN_ID, None, state, acked=acked
+        )
 
     def test_result_with_int_id_never_aliases_the_listen_id(self):
         """C10 type-aware compare: the listen id is a namespaced STRING, so
@@ -13246,6 +13250,39 @@ class TestHandleListenMessage:
                 msg["params"] = params
             assert self._handle(msg, state=state) is None
         assert "honored" not in state
+
+    def test_pre_ack_notification_is_swallowed_not_forwarded(self, capsys):
+        """#352 round-7 finding: the spec makes the ack the mandatory FIRST
+        stream message, so a whitelisted list_changed arriving BEFORE this
+        attempt's ack is a protocol violation and must not reach stdout —
+        forwarding it would write from a stream the loop may immediately
+        afterwards declare never-established (misrouted endpoint emitting
+        a matching method then closing)."""
+        assert (
+            self._handle(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/tools/list_changed",
+                },
+                acked=False,
+            )
+            is None
+        )
+        assert capsys.readouterr().out == ""
+
+    def test_post_ack_notification_is_forwarded(self, capsys):
+        """The acked=True counterpart pinning the gate's polarity."""
+        assert (
+            self._handle(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/tools/list_changed",
+                },
+                acked=True,
+            )
+            is None
+        )
+        assert "notifications/tools/list_changed" in capsys.readouterr().out
 
     def test_empty_honored_subset_still_establishes(self, capsys):
         """Boundary pin for the round-6 validation: `notifications: {}` is
