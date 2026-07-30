@@ -3610,6 +3610,37 @@ class TestPagination:
         merged = json.loads(output.strip())["result"]
         assert merged["ttlMs"] == 0
 
+    def test_huge_integer_ttl_ms_does_not_crash_validation(self, httpx_mock):
+        """#350 review round 15: ``math.isfinite`` converts an int argument
+        to float first, and an arbitrarily large JSON integer (10**400
+        parses fine as a Python int) makes that conversion raise
+        OverflowError — a crash on untrusted response data. Python ints
+        are always finite, so a huge int is VALID (and simply loses the
+        min() merge to any smaller page); the request must succeed."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "a"}], "ttlMs": 5000, "nextCursor": "p2"},
+        }
+        page2 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "b"}], "ttlMs": 10**400},
+        }
+        for page in (page1, page2):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=json.dumps(page),
+                headers={"content-type": "application/json"},
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())["result"]
+        assert merged["tools"] == [{"name": "a"}, {"name": "b"}]
+        assert merged["ttlMs"] == 5000
+
     def test_unhashable_cache_scope_degrades_instead_of_crashing(self, httpx_mock):
         """#350 review round 12: ``"cacheScope": []`` is valid JSON a
         malformed page can carry, but a JSON array is UNHASHABLE — dict

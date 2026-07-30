@@ -2371,12 +2371,18 @@ def _is_valid_cacheable_value(key: str, value: Any) -> bool:
         # defined meaning, and accepting it would let a malformed page
         # BEAT the conservative default in the min() merge, emitting an
         # invalid cache policy downstream (#350 review round 13).
-        return (
-            isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and math.isfinite(value)
-            and value >= 0
-        )
+        # ``math.isfinite`` is applied to FLOATS ONLY (#350 review round
+        # 15): it converts an int argument to float first, and an
+        # arbitrarily large JSON integer (``10**400`` parses fine as a
+        # Python int) makes that conversion raise OverflowError — a crash
+        # on untrusted response data instead of the conservative degrade
+        # this function exists to deliver. Python ints are always finite,
+        # so ``>= 0`` alone is the complete check for them.
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, int):
+            return value >= 0
+        return isinstance(value, float) and math.isfinite(value) and value >= 0
     if key == "cacheScope":
         # The isinstance gate is not a type nicety: dict membership with an
         # UNHASHABLE value (a JSON array/object — ``"cacheScope": []`` is
