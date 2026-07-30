@@ -3130,6 +3130,20 @@ def _listen_stream_loop(
 ) -> None:
     """Reader thread: maintain the modern ``subscriptions/listen`` stream.
 
+    ``client`` is this thread's own DEDICATED httpx client (#352 round-2
+    finding 2) — never run()'s shared one. A read parked in
+    ``iter_text()`` can outlive any bounded join by up to
+    ``--listen-read-timeout`` (300 s default), so run()'s shutdown
+    ACTIVELY closes this client from the main thread: the parked read
+    raises a mapped ``httpx.TransportError`` at once (httpcore's pool
+    close is lock-guarded and its connection close is documented as
+    deliberately unilateral), the stop-set drop arm below exits silently,
+    the join then succeeds fast, and only afterwards does run() close the
+    shared client. The thread itself never closes this client — run()'s
+    finally owns that unconditionally (``httpx.Client.close`` is
+    idempotent), covering the natural exit arms too so no connection
+    leaks until process exit.
+
     Opened once per session by run()'s ``_start_listen_stream`` on the
     client's ``notifications/initialized`` (#352 review finding 1 — never
     before the synthesized InitializeResult reached stdout). Per attempt:
@@ -3300,6 +3314,13 @@ def _listen_stream_loop(
                 return
             log(f"listen stream dropped ({e}); reconnecting")
         except OSError as e:
+            if stop.is_set():
+                # Shutdown teardown (#352 round-2 finding 2): run()'s
+                # finally closed THIS thread's dedicated client to yank a
+                # parked read, so a raw OSError surfacing now is that
+                # teardown, not a stdout failure — exit silently, exactly
+                # like the HTTPError stop-set arm above.
+                return
             # C12: _emit's stdout write failed (BrokenPipeError is an
             # OSError) — the downstream reader is gone; reconnecting the
             # upstream stream would spin against a dead stdout.
@@ -4440,8 +4461,16 @@ def run(
     # time; None means no initialize was ever intercepted, so an orphan
     # `initialized` starts nothing. "honored" records the
     # server-acknowledged notification subset from the ack (logged on
-    # divergence; consumed for real by PR B).
-    listen_state: dict[str, Any] = {"thread": None, "params": None, "honored": None}
+    # divergence; consumed for real by PR B). "client" is the thread's
+    # DEDICATED httpx client (#352 round-2 finding 2), created alongside
+    # the thread and closed by the finally below — from the main thread —
+    # to actively unblock a parked read at shutdown.
+    listen_state: dict[str, Any] = {
+        "thread": None,
+        "params": None,
+        "honored": None,
+        "client": None,
+    }
 
     def _seed_listen_snapshot() -> None:
         """Freeze the listen body snapshot (C1) at initialize time.
@@ -4464,10 +4493,27 @@ def run(
         """
         if listen_state["thread"] is not None or listen_state["params"] is None:
             return
+        # DEDICATED client for the listen thread (#352 round-2 finding 2),
+        # mirroring the shared client's construction above. The thread must
+        # never touch the shared client: shutdown interrupts a read parked
+        # for up to --listen-read-timeout by closing THIS client from the
+        # main thread (run()'s finally), which a bounded join alone cannot
+        # do — and a long-parked stream no longer holds one of the shared
+        # client's pool=10 connections either.
+        listen_client = httpx.Client(
+            transport=_make_httpx_transport(tcp_keepalive=tcp_keepalive),
+            timeout=httpx.Timeout(
+                connect=timeout_connect,
+                read=timeout_read,
+                write=timeout_write,
+                pool=10,
+            ),
+        )
+        listen_state["client"] = listen_client
         listen_thread = threading.Thread(
             target=_listen_stream_loop,
             kwargs={
-                "client": client,
+                "client": listen_client,
                 "url": url,
                 # Frozen body snapshot (C1) — seeded at initialize time.
                 "params": listen_state["params"],
@@ -5007,14 +5053,23 @@ def run(
                 continue
     finally:
         _stop_proactive_refresh(refresh_timer, refresh_stop)
-        # Stop the modern listen thread and join it BEFORE client.close()
-        # (C11): closing the shared httpx client while the thread still
-        # holds a live response stream would race the transport teardown.
-        # daemon=True plus the bounded join keep process exit unblocked
-        # when the thread is parked mid-read (up to --listen-read-timeout);
-        # the loop's stop.wait()/stop checks make a non-parked thread exit
-        # promptly.
+        # Modern listen thread teardown (C11 + #352 round-2 finding 2), in
+        # this exact order: set the stop event, CLOSE the thread's
+        # dedicated client from here — a read parked in iter_text() can
+        # outlast any bounded join by up to --listen-read-timeout, and
+        # closing the client makes it raise immediately (httpcore's pool
+        # close is lock-guarded, its connection close deliberately
+        # unilateral), upon which the loop's stop-set arms exit silently —
+        # THEN join (now fast; the bound stays as a belt for a thread
+        # parked in connection setup, where close cannot interrupt), and
+        # only after that close the shared client, which the thread never
+        # touches. Closing here unconditionally also covers the thread's
+        # natural exits (graceful/terminal arms) so the dedicated client
+        # never leaks until process exit; httpx.Client.close is idempotent.
         listen_stop.set()
+        listen_client = listen_state["client"]
+        if listen_client is not None:
+            listen_client.close()
         listen_thread = listen_state["thread"]
         if listen_thread is not None:
             listen_thread.join(timeout=1.0)

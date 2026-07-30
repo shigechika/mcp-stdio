@@ -12354,31 +12354,50 @@ class TestRunModernEra:
         assert "mcp-method" not in requests[1].headers
 
     def test_shutdown_joins_listen_thread_before_client_close(self, httpx_mock):
-        """C11: run()'s finally must stop + join the listen thread BEFORE
-        client.close() — closing the shared httpx client under a live
-        stream races the transport teardown. The stub loop parks on the
-        stop event exactly like the real loop's stop.wait, so the recorded
-        order proves close ran only after the thread had exited (join
-        returns only once the thread finished appending)."""
+        """C11 + #352 round-2 finding 2: run()'s finally tears the listen
+        machinery down in this exact order — close the thread's DEDICATED
+        client (from the main thread, actively unblocking a read parked
+        for up to --listen-read-timeout, which a bounded join alone cannot
+        do), join the thread, and only then close the SHARED client the
+        thread never touches. The stub parks like a blocked iter_text()
+        and is released only by ITS OWN client's close — exactly the
+        cross-thread interrupt the real loop relies on, and one the stop
+        event alone must not provide — so the recorded order is
+        deterministic: listen-client-close -> listen-exited (join returns
+        only once the thread finished appending) -> shared-client-close."""
         httpx_mock.add_response(
             url=self.URL,
             text=self._discover_response(),
             headers={"content-type": "application/json"},
         )
         order = []
-        real_close = httpx.Client.close
+        created = []
+        released = threading.Event()
 
-        def recording_close(client_self):
-            order.append("client-close")
-            real_close(client_self)
+        class RecordingClient(httpx.Client):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                created.append(self)
+
+            def close(self):
+                # created[0] is run()'s shared client, created[1] the
+                # dedicated listen client (built by _start_listen_stream).
+                if len(created) > 1 and self is created[1]:
+                    order.append("listen-client-close")
+                    released.set()
+                elif created and self is created[0]:
+                    order.append("shared-client-close")
+                super().close()
 
         def stub_loop(**kwargs):
-            assert kwargs["stop"].wait(timeout=5)
+            # Park like a read blocked mid-stream: only the dedicated
+            # client's cross-thread close may release it.
+            assert released.wait(timeout=5)
             order.append("listen-exited")
 
         with (
             patch("mcp_stdio.relay._listen_stream_loop", stub_loop),
-            patch("httpx.Client.close", recording_close),
+            patch("mcp_stdio.relay.httpx.Client", RecordingClient),
         ):
             self._run_with_stdin(
                 httpx_mock,
@@ -12402,9 +12421,139 @@ class TestRunModernEra:
                 ],
                 protocol_era="modern",
             )
-        assert "listen-exited" in order
-        assert "client-close" in order
-        assert order.index("listen-exited") < order.index("client-close")
+        assert order == [
+            "listen-client-close",
+            "listen-exited",
+            "shared-client-close",
+        ]
+        assert len(created) == 2
+        assert all(c.is_closed for c in created)
+
+    def test_shutdown_unblocks_real_loop_parked_mid_stream(self, httpx_mock, capsys):
+        """#352 round-2 finding 2, end to end with the REAL loop: the
+        thread is parked mid-``iter_text()`` on an SSE stream that never
+        ends (no sleeps — the stream generator blocks on an event released
+        only by the dedicated client's close, then raises exactly the
+        mapped transport error a cross-thread socket close produces).
+        run()'s finally closes the DEDICATED client, the parked read
+        raises, the stop-set drop arm exits silently, and the bounded join
+        reaps the thread BEFORE run() returns — while every listen POST
+        went through the dedicated client and the shared client saw none
+        of them."""
+        streaming = threading.Event()
+        released = threading.Event()
+        done = threading.Event()
+        created = []
+        sends = []
+        captured = {}
+
+        class RecordingClient(httpx.Client):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                created.append(self)
+
+            def send(self, request, *args, **kwargs):
+                sends.append((self, request))
+                return super().send(request, *args, **kwargs)
+
+            def close(self):
+                # created[1] is the dedicated listen client.
+                if len(created) > 1 and self is created[1]:
+                    released.set()
+                super().close()
+
+        real_loop = _listen_stream_loop
+
+        def wrapped_loop(**kwargs):
+            captured["client"] = kwargs["client"]
+            try:
+                real_loop(**kwargs)
+            finally:
+                # Set INSIDE the thread just before it dies: after run()
+                # returns, this being set proves the join reaped the
+                # thread (a timed-out join would leave it unset).
+                done.set()
+
+        ack = {
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": {
+                "notifications": {
+                    "toolsListChanged": True,
+                    "promptsListChanged": True,
+                    "resourcesListChanged": True,
+                }
+            },
+        }
+
+        def never_ending_stream():
+            yield f"event: message\ndata: {json.dumps(ack)}\n\n".encode()
+            # The thread is now parked inside the stream pull.
+            streaming.set()
+            assert released.wait(timeout=5)
+            # What a read blocked on a socket raises when the client is
+            # closed from another thread (httpcore maps the dead-socket
+            # OSError to a TransportError).
+            raise httpx.ReadError("connection closed while reading")
+
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "subscriptions/listen"},
+            stream=IteratorStream(never_ending_stream()),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        init = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2026-07-28", "capabilities": {}},
+            }
+        )
+        initialized = json.dumps(
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        )
+
+        def stdin_lines():
+            yield init + "\n"
+            yield initialized + "\n"
+            # Hold stdin open until the thread is provably parked
+            # mid-stream, so shutdown races a LIVE blocked read.
+            assert streaming.wait(timeout=5)
+
+        with (
+            patch("mcp_stdio.relay._listen_stream_loop", wrapped_loop),
+            patch("mcp_stdio.relay.httpx.Client", RecordingClient),
+            patch("sys.stdin", stdin_lines()),
+            patch("sys.stdout", StringIO()),
+        ):
+            run(self.URL, {"Content-Type": "application/json"}, protocol_era="modern")
+
+        assert done.is_set()  # join succeeded; the thread was reaped
+        assert len(created) == 2
+        assert captured["client"] is created[1]  # dedicated, never shared
+        assert all(c.is_closed for c in created)
+        listen_sends = [
+            c
+            for (c, r) in sends
+            if r.headers.get("mcp-method") == "subscriptions/listen"
+        ]
+        assert listen_sends and all(c is created[1] for c in listen_sends)
+        assert all(
+            c is created[0]
+            for (c, r) in sends
+            if r.headers.get("mcp-method") != "subscriptions/listen"
+        )
+        err = capsys.readouterr().err
+        assert "Traceback" not in err
+        # The stop-set drop arm exits silently — no scary reconnect/drop
+        # line during an ordinary shutdown.
+        assert "listen stream dropped" not in err
 
     def test_second_initialize_never_spawns_second_listen_thread(self, httpx_mock):
         """Spec item 2: the start hook fires on EVERY
