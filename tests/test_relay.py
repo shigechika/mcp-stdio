@@ -9134,6 +9134,39 @@ class TestNegotiateModernVersion:
     def test_no_supported_and_no_requested_uses_floor(self):
         assert _negotiate_modern_version(None, []) == "2026-07-28"
 
+    def test_legacy_requested_on_dual_mode_server_gets_modern_upstream(self):
+        """#350 review round 7: a dual-mode server advertising both eras
+        while the local legacy client requests 2025-06-18 must get a
+        MODERN version upstream — everything else the modern path sends
+        (no initialize, no session id, per-request _meta) is the
+        2026-07-28 stateless lifecycle, and a 2025 version header on top
+        of that wire shape tells a version-sensitive server to expect the
+        legacy handshake this path deliberately never performs."""
+        assert (
+            _negotiate_modern_version("2025-06-18", ["2025-06-18", "2026-07-28"])
+            == "2026-07-28"
+        )
+
+    def test_legacy_requested_with_no_supported_falls_to_floor(self):
+        """Same coherence rule on the empty-supportedVersions fallback: a
+        legacy requested version must never become the upstream version
+        on the modern path (the old `requested or floor` fallback leaked
+        it through)."""
+        assert _negotiate_modern_version("2025-06-18", []) == "2026-07-28"
+
+    def test_legacy_only_supported_falls_to_floor(self):
+        assert (
+            _negotiate_modern_version("2025-06-18", ["2025-03-26", "2025-06-18"])
+            == "2026-07-28"
+        )
+
+    def test_non_date_form_versions_are_not_trusted_as_modern(self):
+        """A non-date-form string ("zzz") from a non-compliant server
+        compares above the floor by ASCII accident ("z" > "2") — the
+        shape check must exclude it from the modern subset rather than
+        advertise garbage upstream."""
+        assert _negotiate_modern_version(None, ["zzz"]) == "2026-07-28"
+
 
 class TestSeedModernStateFromDiscover:
     def test_seeds_server_info_capabilities_versions(self):

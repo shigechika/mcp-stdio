@@ -536,6 +536,27 @@ def _extract_log_level(line: str) -> str | None:
     return level if isinstance(level, str) and level else None
 
 
+_DATE_FORM_VERSION_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _is_modern_era_version(version: str) -> bool:
+    """True iff ``version`` provably belongs to the modern (stateless) era.
+
+    Date-form MCP version strings sort correctly as plain strings, so
+    "modern" is a lexicographic ``>=`` against this relay's known-modern
+    floor — but ONLY for values that actually ARE date-form. A
+    non-date-form string from a non-compliant server (``"v2"``, ``"abc"``)
+    could compare above the floor by accident of ASCII ordering
+    (``"a" > "2"``), so anything that fails the shape check is treated as
+    not-provably-modern rather than trusted into the modern subset — the
+    same degrade-don't-guess posture as ``_extract_protocol_version``.
+    """
+    return (
+        _DATE_FORM_VERSION_RE.fullmatch(version) is not None
+        and version >= _MODERN_PROTOCOL_VERSION_DEFAULT
+    )
+
+
 def _negotiate_modern_version(requested: str | None, supported: list[str]) -> str:
     """Pick the ``MCP-Protocol-Version`` to advertise UPSTREAM on the modern
     path (request headers and ``params._meta``) — the actual wire version
@@ -543,21 +564,32 @@ def _negotiate_modern_version(requested: str | None, supported: list[str]) -> st
     stdio client (that is the client's own requested string, verbatim —
     see ``_handle_modern_special_method``, #350 review round 3).
 
-    Mirrors what a real negotiation would produce: the local client's
-    requested version wins when the remote's ``server/discover`` advertised
-    it in ``supportedVersions``; otherwise the HIGHEST advertised version is
-    used (ISO 8601 date-form version strings sort correctly with a plain
-    string ``max()``, exactly like every other MCP version string in this
-    codebase). With no advertised versions at all (a discover probe that
-    never ran, or returned none), fall back to the client's request or,
-    absent that too, this relay's own known-modern floor
-    (``_MODERN_PROTOCOL_VERSION_DEFAULT``).
+    Only MODERN-era versions are eligible (``_is_modern_era_version``):
+    everything else this dispatch path does — no ``initialize`` handshake,
+    no ``Mcp-Session-Id``, per-request ``Mcp-Method``/``_meta`` — is the
+    2026-07-28 stateless lifecycle, and advertising a LEGACY version
+    string on top of that wire shape is incoherent. A dual-mode server
+    advertising both ``2025-06-18`` and ``2026-07-28`` while the local
+    legacy client requests ``2025-06-18`` must get the modern version
+    upstream — a server selecting behavior from the version header would
+    otherwise expect the legacy handshake/session this path deliberately
+    does not perform, or reject the modern request shape as a mismatch
+    (#350 review round 7). The client's requested version therefore wins
+    only when it is itself modern-era AND advertised; otherwise the
+    highest advertised modern-era version; with no modern-era version
+    advertised at all (a discover probe that never ran, or a legacy-only
+    ``supportedVersions``), a modern-era requested version, then this
+    relay's own known-modern floor (``_MODERN_PROTOCOL_VERSION_DEFAULT``)
+    — never a legacy string, for the same coherence reason.
     """
-    if requested and requested in supported:
+    modern_supported = [v for v in supported if _is_modern_era_version(v)]
+    if requested and requested in modern_supported:
         return requested
-    if supported:
-        return max(supported)
-    return requested or _MODERN_PROTOCOL_VERSION_DEFAULT
+    if modern_supported:
+        return max(modern_supported)
+    if requested and _is_modern_era_version(requested):
+        return requested
+    return _MODERN_PROTOCOL_VERSION_DEFAULT
 
 
 class _ModernState:
