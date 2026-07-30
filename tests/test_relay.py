@@ -9512,6 +9512,89 @@ class TestProbeProtocolEra:
             httpx_mock.get_requests()[1].headers["authorization"] == "Bearer stepped-up"
         )
 
+    def test_chained_401_then_403_recovery_detects_modern(self, httpx_mock):
+        """#350 review round 6: recovery is bounded PER STAGE, not per
+        probe. An expired token 401s; the refresh succeeds; the refreshed
+        token then 403s with insufficient_scope — a CHAINED challenge the
+        dispatch ladder repairs end-to-end (refresh, then step-up). Gating
+        recovery on "first attempt only" left no attempt for the 403 and
+        misclassified a healthy modern-only server as legacy. Each stage
+        (401 -> refresh, 403 -> step-up) must fire once: three posts, two
+        recoveries, modern verdict."""
+        httpx_mock.add_response(status_code=401, text="")
+        httpx_mock.add_response(
+            status_code=403,
+            text="",
+            headers={
+                "www-authenticate": (
+                    'Bearer error="insufficient_scope", scope="mcp:tools"'
+                )
+            },
+        )
+        httpx_mock.add_response(
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "result": {"supportedVersions": ["2026-07-28"]},
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        recovered = []
+
+        def recovery(resp):
+            recovered.append(resp.status_code)
+            if resp.status_code == 401:
+                return {"Authorization": "Bearer fresh"}
+            return {"Authorization": "Bearer stepped-up"}
+
+        client = httpx.Client()
+        era, result = _probe_protocol_era(
+            client,
+            self.URL,
+            {"Authorization": "Bearer stale"},
+            auth_recovery=recovery,
+        )
+        assert era == "modern"
+        assert result["result"]["supportedVersions"] == ["2026-07-28"]
+        assert recovered == [401, 403]
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 3
+        assert requests[0].headers["authorization"] == "Bearer stale"
+        assert requests[1].headers["authorization"] == "Bearer fresh"
+        assert requests[2].headers["authorization"] == "Bearer stepped-up"
+
+    def test_chained_recovery_is_bounded_per_stage_no_loop(self, httpx_mock):
+        """The per-stage bound (#350 review round 6) must not reopen the
+        round-4 no-loop guarantee: after 401 -> refresh and 403 -> step-up
+        have EACH fired once, a THIRD challenge of an already-recovered
+        status ends the probe (legacy fallback) rather than recovering
+        again — exactly three posts, two recoveries, no refresh loop."""
+        httpx_mock.add_response(status_code=401, text="")
+        httpx_mock.add_response(
+            status_code=403,
+            text="",
+            headers={
+                "www-authenticate": (
+                    'Bearer error="insufficient_scope", scope="mcp:tools"'
+                )
+            },
+        )
+        httpx_mock.add_response(status_code=403, text="")
+        recovered = []
+
+        def recovery(resp):
+            recovered.append(resp.status_code)
+            return {"Authorization": "Bearer refreshed"}
+
+        client = httpx.Client()
+        era, result = _probe_protocol_era(client, self.URL, {}, auth_recovery=recovery)
+        assert era == "legacy"
+        assert result is None
+        assert recovered == [401, 403]
+        assert len(httpx_mock.get_requests()) == 3
+
     def test_sse_result_on_open_stream_is_modern_without_reading_to_eof(
         self, httpx_mock
     ):

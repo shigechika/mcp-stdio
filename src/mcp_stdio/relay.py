@@ -872,10 +872,18 @@ def _probe_protocol_era(
       credentials, not the era). ``auth_recovery`` is handed the raw
       response (it needs the status and any ``WWW-Authenticate``
       challenge) and returns the FULL refreshed header set on successful
-      recovery — the probe is then rebuilt from those headers and retried
-      exactly ONCE. A recovery that declines/fails (``None``), or a retry
-      that fails again, falls through to the conservative rules below —
-      identical to not having ``auth_recovery`` at all.
+      recovery — the probe is then rebuilt from those headers and
+      retried. Each recovery STAGE fires at most once, keyed by status
+      code (401 -> token refresh, 403 -> step-up), so a CHAINED challenge
+      — 401, refresh succeeds, then the refreshed token 403s with
+      ``insufficient_scope`` (#350 review round 6) — is repaired
+      end-to-end exactly like the dispatch ladder would repair it, while
+      a REPEATED challenge of the same status (a refresh that still
+      401s) cannot loop: at most three posts total (the initial probe
+      plus one per stage). A recovery that declines/fails (``None``), or
+      a retry that fails with an already-recovered status, falls through
+      to the conservative rules below — identical to not having
+      ``auth_recovery`` at all.
     - HTTP 200 or HTTP 400 whose body is a GENERIC/unrecognized JSON-RPC
       error (e.g. ``-32601`` Method not found — the ordinary reply an
       unmodified LEGACY server sends for an unknown method), HTTP 404
@@ -905,22 +913,32 @@ def _probe_protocol_era(
     discover_msg, probe_headers = _build_discover_probe_request(headers)
     resp: httpx.Response | None = None
     parsed: dict[str, Any] | None = None
-    for attempt in (0, 1):
+    # Recovery is bounded PER STAGE, not per probe: gating on "first attempt
+    # only" (the round-4 shape) could repair a 401 but then had no attempt
+    # left when the refreshed token 403'd with insufficient_scope — a chained
+    # challenge the dispatch ladder handles fine, and exactly the case where
+    # falling back to legacy misclassifies a healthy modern-only server
+    # (#350 review round 6). Keying on status code lets each stage fire once
+    # (bounded: initial post + one per stage = three posts max) while a
+    # repeated same-status challenge still cannot loop.
+    recovered_statuses: set[int] = set()
+    while True:
         try:
             resp, parsed = _post_probe(client, url, discover_msg, probe_headers)
         except httpx.HTTPError as e:
             log(f"protocol-era probe failed ({e}); assuming legacy")
             return "legacy", None
         if (
-            attempt == 0
-            and resp.status_code in (401, 403)
+            resp.status_code in (401, 403)
+            and resp.status_code not in recovered_statuses
             and auth_recovery is not None
         ):
             refreshed = auth_recovery(resp)
             if refreshed is not None:
+                recovered_statuses.add(resp.status_code)
                 log(
                     f"protocol-era probe: HTTP {resp.status_code} recovered; "
-                    "re-probing once with refreshed credentials"
+                    "re-probing with refreshed credentials"
                 )
                 discover_msg, probe_headers = _build_discover_probe_request(refreshed)
                 continue
