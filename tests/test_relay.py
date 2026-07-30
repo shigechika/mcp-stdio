@@ -10183,6 +10183,134 @@ class TestReseedDiscoverProbe:
         _reseed_discover_probe(httpx.Client(), self.URL, {}, state)
         assert state.capabilities == {"tools": {}}
 
+    def test_401_with_auth_recovery_reprobes_and_seeds_real_capabilities(
+        self, httpx_mock
+    ):
+        """#350 review round 8 (finding 8-2), the exact reported chain:
+        startup discovery was gated (-32021, nothing seeded), the token
+        expires before the local ``initialize``, and the one-shot reseed
+        gets 401. Without recovery the reseed permanently synthesized empty
+        capabilities — and a compliant client told ``capabilities: {}``
+        issues no tools/resources/prompts requests, so normal dispatch
+        recovery never even gets a request to repair the token with. The
+        reseed must run the SAME bounded refresh recovery as the startup
+        probe and seed REAL capabilities from the re-probe."""
+        httpx_mock.add_response(status_code=401, text="")
+        httpx_mock.add_response(
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "result": {"capabilities": {"tools": {}}},
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        recovered = []
+
+        def recovery(resp):
+            recovered.append(resp.status_code)
+            return {"Authorization": "Bearer fresh"}
+
+        state = self._state_with_client_data()
+        _reseed_discover_probe(
+            httpx.Client(),
+            self.URL,
+            {"Authorization": "Bearer stale"},
+            state,
+            auth_recovery=recovery,
+        )
+        assert recovered == [401]
+        assert state.capabilities == {"tools": {}}
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 2
+        assert requests[0].headers["authorization"] == "Bearer stale"
+        assert requests[1].headers["authorization"] == "Bearer fresh"
+        # The recovery RETRY still advertises the client's REAL
+        # capabilities/info — the whole point of the reseed — because the
+        # shared loop rebuilds the request with the same modern_state.
+        meta = json.loads(requests[1].content)["params"]["_meta"]
+        assert meta["io.modelcontextprotocol/clientCapabilities"] == {"roots": {}}
+        assert meta["io.modelcontextprotocol/clientInfo"] == {
+            "name": "real-client",
+            "version": "3.0",
+        }
+
+    def test_401_recovery_declining_keeps_state_untouched_single_post(self, httpx_mock):
+        """A recovery that returns None (refresh failed / no refresh_token)
+        must degrade exactly like having no auth_recovery at all — one
+        post, state untouched (round-3 documented under-report)."""
+        httpx_mock.add_response(status_code=401, text="")
+        state = self._state_with_client_data()
+        _reseed_discover_probe(
+            httpx.Client(), self.URL, {}, state, auth_recovery=lambda resp: None
+        )
+        assert state.server_info is None
+        assert state.capabilities == {}
+        assert len(httpx_mock.get_requests()) == 1
+
+    def test_repeated_401_after_recovery_is_bounded_no_loop(self, httpx_mock):
+        """The reseed inherits the probe's no-loop guarantee (#350 review
+        rounds 4/6 via the shared ``_post_discover_with_recovery``): a
+        re-probe that 401s AGAIN must not invoke recovery a second time —
+        exactly two posts, recovery called once, state untouched."""
+        httpx_mock.add_response(status_code=401, text="")
+        httpx_mock.add_response(status_code=401, text="")
+        recovered = []
+
+        def recovery(resp):
+            recovered.append(resp.status_code)
+            return {"Authorization": "Bearer fresh"}
+
+        state = self._state_with_client_data()
+        _reseed_discover_probe(
+            httpx.Client(), self.URL, {}, state, auth_recovery=recovery
+        )
+        assert recovered == [401]
+        assert len(httpx_mock.get_requests()) == 2
+        assert state.capabilities == {}
+
+    def test_chained_401_then_403_recovery_seeds_state(self, httpx_mock):
+        """Chained-challenge mirror of the startup probe's round-6 test:
+        401 -> refresh, then the refreshed token 403s with
+        insufficient_scope -> step-up, then 200. Each stage fires once
+        (three posts, two recoveries) and the reseed still succeeds."""
+        httpx_mock.add_response(status_code=401, text="")
+        httpx_mock.add_response(
+            status_code=403,
+            text="",
+            headers={
+                "www-authenticate": (
+                    'Bearer error="insufficient_scope", scope="mcp:tools"'
+                )
+            },
+        )
+        httpx_mock.add_response(
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "result": {"capabilities": {"tools": {}}},
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        recovered = []
+
+        def recovery(resp):
+            recovered.append(resp.status_code)
+            if resp.status_code == 401:
+                return {"Authorization": "Bearer fresh"}
+            return {"Authorization": "Bearer stepped-up"}
+
+        state = self._state_with_client_data()
+        _reseed_discover_probe(
+            httpx.Client(), self.URL, {}, state, auth_recovery=recovery
+        )
+        assert recovered == [401, 403]
+        assert len(httpx_mock.get_requests()) == 3
+        assert state.capabilities == {"tools": {}}
+
 
 class TestInjectModernMeta:
     def test_injects_required_fields(self):

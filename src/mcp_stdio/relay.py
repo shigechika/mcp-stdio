@@ -892,6 +892,73 @@ def _post_probe(
     return resp, _parse_streamable_response(resp)
 
 
+def _post_discover_with_recovery(
+    client: httpx.Client,
+    url: str,
+    headers: dict[str, str],
+    auth_recovery: Callable[[httpx.Response], dict[str, str] | None] | None = None,
+    modern_state: "_ModernState | None" = None,
+    log_prefix: str = "protocol-era probe",
+) -> tuple[httpx.Response, dict[str, Any] | None]:
+    """POST a ``server/discover`` probe with bounded 401/403 credential
+    recovery; return the final ``(response, parsed_response_or_None)``.
+
+    ONE implementation of the recovery loop for both probe call sites —
+    ``_probe_protocol_era`` (startup) and ``_reseed_discover_probe`` (the
+    one-shot post-initialize reseed) — extracted in #350 review round 8
+    (finding 8-2): the reseed had NO recovery at all, so a token that
+    expired between a ``-32021``-gated startup probe and the local
+    ``initialize`` made the reseed 401 and permanently synthesize empty
+    capabilities — and a compliant client told ``capabilities: {}`` never
+    issues tools/resources/prompts requests, so the dispatch path's own
+    401 recovery never even gets a request to repair. Sharing the loop
+    (instead of duplicating it) follows the same rationale as
+    ``_build_discover_probe_request``: byte-identical behavior at every
+    call site instead of independently-drifting copies (#350 review
+    finding 1).
+
+    The loop is the round-6 shape, unchanged: recovery is bounded PER
+    STAGE, not per probe — gating on "first attempt only" (the round-4
+    shape) could repair a 401 but then had no attempt left when the
+    refreshed token 403'd with ``insufficient_scope``, a chained challenge
+    the dispatch ladder handles fine. Keying on status code lets each
+    stage fire once (bounded: initial post + one per stage = three posts
+    max) while a repeated same-status challenge still cannot loop. A
+    recovery that declines/fails (``None``) ends the loop with the
+    challenge response, identical to not having ``auth_recovery`` at all.
+
+    ``modern_state`` is forwarded to ``_build_discover_probe_request`` on
+    the initial build AND every recovery rebuild, so a reseed retry keeps
+    advertising the client's REAL capabilities/info after a token refresh.
+    ``log_prefix`` labels the recovery log lines with the caller's name.
+    Transport errors (``httpx.HTTPError``) propagate — each caller keeps
+    its own degrade path (startup: assume legacy; reseed: keep unseeded).
+    """
+    discover_msg, probe_headers = _build_discover_probe_request(
+        headers, modern_state=modern_state
+    )
+    recovered_statuses: set[int] = set()
+    while True:
+        resp, parsed = _post_probe(client, url, discover_msg, probe_headers)
+        if (
+            resp.status_code in (401, 403)
+            and resp.status_code not in recovered_statuses
+            and auth_recovery is not None
+        ):
+            refreshed = auth_recovery(resp)
+            if refreshed is not None:
+                recovered_statuses.add(resp.status_code)
+                log(
+                    f"{log_prefix}: HTTP {resp.status_code} recovered; "
+                    "re-probing with refreshed credentials"
+                )
+                discover_msg, probe_headers = _build_discover_probe_request(
+                    refreshed, modern_state=modern_state
+                )
+                continue
+        return resp, parsed
+
+
 def _probe_protocol_era(
     client: httpx.Client,
     url: str,
@@ -960,47 +1027,25 @@ def _probe_protocol_era(
     The probe request itself is built by ``_build_discover_probe_request``
     (headers AND body, including ``params._meta`` — see that function's
     docstring for why a discover probe needs ``_meta`` too, not just the
-    two headers), and POSTed via ``_post_probe`` (#350 review round 5),
+    two headers), and POSTed via ``_post_discover_with_recovery`` — the
+    build + bounded-recovery loop shared with ``_reseed_discover_probe``
+    (#350 review round 8, finding 8-2) — over ``_post_probe`` (#350 review
+    round 5),
     which streams the response and stops at the first JSON-RPC response
     message — a server that SSE-frames the discover result and keeps the
     stream open (the final response only SHOULD terminate the stream) must
     classify as modern promptly, not block until the read timeout and fall
     through to the legacy branch above.
     """
-    discover_msg, probe_headers = _build_discover_probe_request(headers)
-    resp: httpx.Response | None = None
-    parsed: dict[str, Any] | None = None
-    # Recovery is bounded PER STAGE, not per probe: gating on "first attempt
-    # only" (the round-4 shape) could repair a 401 but then had no attempt
-    # left when the refreshed token 403'd with insufficient_scope — a chained
-    # challenge the dispatch ladder handles fine, and exactly the case where
-    # falling back to legacy misclassifies a healthy modern-only server
-    # (#350 review round 6). Keying on status code lets each stage fire once
-    # (bounded: initial post + one per stage = three posts max) while a
-    # repeated same-status challenge still cannot loop.
-    recovered_statuses: set[int] = set()
-    while True:
-        try:
-            resp, parsed = _post_probe(client, url, discover_msg, probe_headers)
-        except httpx.HTTPError as e:
-            log(f"protocol-era probe failed ({e}); assuming legacy")
-            return "legacy", None
-        if (
-            resp.status_code in (401, 403)
-            and resp.status_code not in recovered_statuses
-            and auth_recovery is not None
-        ):
-            refreshed = auth_recovery(resp)
-            if refreshed is not None:
-                recovered_statuses.add(resp.status_code)
-                log(
-                    f"protocol-era probe: HTTP {resp.status_code} recovered; "
-                    "re-probing with refreshed credentials"
-                )
-                discover_msg, probe_headers = _build_discover_probe_request(refreshed)
-                continue
-        break
-    assert resp is not None  # the loop always posts at least once
+    # The posting + bounded per-stage 401/403 recovery loop lives in
+    # _post_discover_with_recovery, shared with _reseed_discover_probe
+    # (#350 review round 8, finding 8-2) — see that helper's docstring for
+    # the round-6 bounded-per-stage rationale it preserves verbatim.
+    try:
+        resp, parsed = _post_discover_with_recovery(client, url, headers, auth_recovery)
+    except httpx.HTTPError as e:
+        log(f"protocol-era probe failed ({e}); assuming legacy")
+        return "legacy", None
     if resp.status_code == 200:
         if isinstance(parsed, dict) and "error" in parsed:
             if _is_recognized_modern_error(parsed):
@@ -1038,6 +1083,7 @@ def _reseed_discover_probe(
     url: str,
     headers: dict[str, str],
     modern_state: "_ModernState",
+    auth_recovery: Callable[[httpx.Response], dict[str, str] | None] | None = None,
 ) -> None:
     """One-shot ``server/discover`` re-probe carrying the local client's REAL
     capabilities (#350 review round 4).
@@ -1067,17 +1113,32 @@ def _reseed_discover_probe(
     round-3 documented under-report. Runs synchronously on the stdin loop
     thread, before the synthesized ``InitializeResult`` is emitted, so there
     is no race with any other dispatch.
+
+    ``auth_recovery`` (#350 review round 8, finding 8-2): the reseed runs
+    the same bounded 401/403 refresh/step-up loop as the startup probe
+    (``_post_discover_with_recovery``, one shared implementation). Without
+    it, a token that expired between a ``-32021``-gated startup probe and
+    the local ``initialize`` made this reseed 401 and permanently
+    synthesize empty capabilities — and since a compliant client told
+    ``capabilities: {}`` issues no tools/resources/prompts requests at
+    all, the dispatch path's own 401 recovery never got a request to
+    repair the session with. Recovery declining/absent degrades to the
+    same keep-unseeded behavior as before.
     """
-    discover_msg, probe_headers = _build_discover_probe_request(
-        headers, modern_state=modern_state
-    )
     try:
-        # _post_probe streams and stops at the first JSON-RPC response
-        # message (#350 review round 5) — an SSE-framed discover result on a
-        # stream the server keeps open must not stall this reseed (which runs
-        # synchronously before the synthesized InitializeResult is emitted)
-        # until the read timeout.
-        resp, parsed = _post_probe(client, url, discover_msg, probe_headers)
+        # _post_discover_with_recovery streams via _post_probe and stops at
+        # the first JSON-RPC response message (#350 review round 5) — an
+        # SSE-framed discover result on a stream the server keeps open must
+        # not stall this reseed (which runs synchronously before the
+        # synthesized InitializeResult is emitted) until the read timeout.
+        resp, parsed = _post_discover_with_recovery(
+            client,
+            url,
+            headers,
+            auth_recovery,
+            modern_state=modern_state,
+            log_prefix="discover reseed probe",
+        )
     except httpx.HTTPError as e:
         log(f"discover reseed probe failed ({e}); keeping unseeded state")
         return
@@ -3481,14 +3542,19 @@ def run(
         from it and retries once) or ``None`` to decline (probe falls back
         to the conservative legacy classification, unchanged behavior).
 
-        Thread-safety: this runs BEFORE the proactive-refresh daemon and the
-        cold-start thread are started (both are created further down), so
-        nothing else can hold ``refresh_lock`` yet — it is taken anyway to
-        keep every ``token_refresher()`` call site uniformly serialised
-        against the AS's refresh-token rotation, exactly like the reactive
-        401 path. The refreshed headers are merged into the SHARED
-        ``headers`` dict so the whole session (not just the probe retry)
-        proceeds with the recovered credentials.
+        Thread-safety: at STARTUP-probe time this runs before the
+        proactive-refresh daemon and the cold-start thread are started
+        (both are created further down), so nothing else can hold
+        ``refresh_lock`` yet. But the same callback is ALSO invoked later
+        in the session by the one-shot discover reseed (#350 review round
+        8, finding 8-2 — ``_discover_reseed`` below, called from the stdin
+        loop's ``initialize`` handling), at which point the daemon MAY be
+        live: taking ``refresh_lock`` is then load-bearing, not stylistic —
+        it serialises this refresh against the timer's, so the two can
+        never race the AS's refresh-token rotation, exactly like the
+        reactive 401 path. The refreshed headers are merged into the SHARED
+        ``headers`` dict (under ``headers_lock``) so the whole session (not
+        just the probe retry) proceeds with the recovered credentials.
         """
         if resp.status_code == 401 and token_refresher is not None:
             log("protocol-era probe: 401, attempting token refresh")
@@ -3620,14 +3686,20 @@ def run(
         ``headers_lock``) so credentials refreshed since startup — by the
         probe-time recovery above or the proactive-refresh daemon — are
         honored, then delegates to ``_reseed_discover_probe`` (#350 review
-        round 4). Once-only/never-loops is enforced by the caller
-        (``_handle_modern_special_method`` latches
+        round 4) with the SAME ``_probe_auth_recovery`` the startup probe
+        used (#350 review round 8, finding 8-2): a token that expired
+        between the ``-32021``-gated startup probe and the local
+        ``initialize`` would otherwise 401 this one-shot reseed and
+        permanently synthesize empty capabilities. Once-only/never-loops is
+        enforced by the caller (``_handle_modern_special_method`` latches
         ``modern_state.discover_retry_attempted`` first), and it runs
         synchronously on the stdin loop thread, so no dispatch can race it.
         """
         with headers_lock:
             snapshot = dict(headers)
-        _reseed_discover_probe(client, url, snapshot, modern_state)
+        _reseed_discover_probe(
+            client, url, snapshot, modern_state, auth_recovery=_probe_auth_recovery
+        )
 
     refresh_timer, refresh_stop = _start_proactive_refresh(
         refresher=token_refresher,
