@@ -4724,6 +4724,31 @@ class TestParseStreamableResponseTypeContract:
         assert parsed == {"jsonrpc": "2.0", "id": 1, "result": {}}
 
 
+class TestParseStreamableResponseSseContentTypeCase:
+    """#350 review round 8 (finding 8-1): media types are case-insensitive
+    (RFC 9110 §8.3.1). A buffered response declaring ``Content-Type:
+    Text/Event-Stream`` used to fall through to the plain-JSON branch,
+    where an SSE-framed body never parses as bare JSON — the valid
+    response was silently dropped (``None``)."""
+
+    _SSE_BODY = 'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{}}\n\n'
+
+    def _sse_response(self, content_type: str) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=self._SSE_BODY.encode(),
+            headers={"content-type": content_type},
+        )
+
+    def test_mixed_case_sse_content_type_parses_the_sse_body(self):
+        parsed = _parse_streamable_response(self._sse_response("Text/Event-Stream"))
+        assert parsed == {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+    def test_lowercase_sse_content_type_still_parses(self):
+        parsed = _parse_streamable_response(self._sse_response("text/event-stream"))
+        assert parsed == {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+
 class TestReportInitializeAndDiscoverMalformedInput:
     """Direct unit coverage for #350 review round 2/3: even independent of
     ``check_connection``'s own outer ``except Exception`` (which happens to
@@ -9698,6 +9723,36 @@ class TestProbeProtocolEra:
         era, result = _probe_protocol_era(client, self.URL, {})
         assert era == "modern"
         assert result is None
+
+    def test_mixed_case_sse_content_type_is_modern_without_blocking(self, httpx_mock):
+        """#350 review round 8 (finding 8-1): media types are
+        case-insensitive (RFC 9110 §8.3.1), so ``Content-Type:
+        Text/Event-Stream`` is a fully compliant way to declare SSE. A
+        case-sensitive compare routed it to the buffered plain-JSON branch,
+        where ``resp.read()`` on a stream the server keeps open blocks
+        until the read timeout and ``auto`` misclassifies the live modern
+        server as legacy. Same post-yield tripwire as the lowercase SSE
+        test above: it fires only if the probe buffers past the response
+        event."""
+        result_body = json.dumps(
+            {"jsonrpc": "2.0", "id": 0, "result": {"resultType": "discover"}}
+        )
+
+        def open_stream():
+            yield f"event: message\ndata: {result_body}\n\n".encode()
+            raise AssertionError(
+                "probe kept reading past the JSON-RPC response on a "
+                "mixed-case SSE content-type"
+            )
+
+        httpx_mock.add_response(
+            stream=IteratorStream(open_stream()),
+            headers={"content-type": "Text/Event-Stream"},
+        )
+        client = httpx.Client()
+        era, result = _probe_protocol_era(client, self.URL, {})
+        assert era == "modern"
+        assert result["result"]["resultType"] == "discover"
 
 
 class TestBuildDiscoverProbeRequestStripsAllCaseVariants:

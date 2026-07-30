@@ -799,6 +799,31 @@ def _build_discover_probe_request(
     return discover_msg, probe_headers
 
 
+def _is_sse_response(resp: httpx.Response) -> bool:
+    """True when ``resp`` declares an SSE body (``text/event-stream``).
+
+    Media types are case-insensitive (RFC 9110 §8.3.1 / RFC 2045 §5.1), so
+    the containment test runs against the lowercased header value — a
+    compliant server answering ``Content-Type: Text/Event-Stream`` is still
+    an SSE stream (#350 review round 8, finding 8-1). A case-sensitive
+    compare routed such a response to the buffered plain-JSON branch, where
+    ``resp.read()`` on a stream the server keeps open (the final response
+    only SHOULD terminate it) blocks until the read timeout: ``auto`` then
+    misclassifies the live modern server as legacy, and forced-modern
+    discovery / ``--check`` stall and lose the valid response.
+
+    Shared by ``_post_probe`` and ``_parse_streamable_response`` — the two
+    detection sites THIS branch introduces — so both apply the identical
+    rule. The pre-existing legacy dispatch path (``_post_and_stream``,
+    ``_post_parsed``, ``_reinitialize``) shares the case-sensitive
+    comparison on main but is deliberately NOT routed through this helper:
+    this branch's discipline is that legacy wire behavior stays
+    byte-identical (acceptance criterion #3), so those sites are left for a
+    follow-up fix on their own review trail.
+    """
+    return "text/event-stream" in resp.headers.get("content-type", "").lower()
+
+
 def _first_response_message(
     events: Iterable[tuple[str, str]],
 ) -> dict[str, Any] | None:
@@ -859,7 +884,7 @@ def _post_probe(
     POST.
     """
     with client.stream("POST", url, content=content, headers=headers) as resp:
-        if "text/event-stream" in resp.headers.get("content-type", ""):
+        if _is_sse_response(resp):
             return resp, _first_response_message(
                 _iter_sse_events(_iter_sse_lines(resp.iter_text()))
             )
@@ -2766,8 +2791,7 @@ def _parse_streamable_response(resp: httpx.Response) -> dict[str, Any] | None:
     ``isinstance`` gate); the plain-JSON branch used not to (#350 review
     round 2/3).
     """
-    content_type = resp.headers.get("content-type", "")
-    if "text/event-stream" in content_type:
+    if _is_sse_response(resp):
         return _first_response_message(_iter_sse_events(_split_sse_text(resp.text)))
     try:
         parsed = json.loads(resp.text)
