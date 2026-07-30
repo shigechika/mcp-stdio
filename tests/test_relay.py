@@ -3581,6 +3581,35 @@ class TestPagination:
         merged = json.loads(output.strip())["result"]
         assert merged["ttlMs"] == 0
 
+    def test_negative_ttl_ms_degrades_to_zero_not_merged_minimum(self, httpx_mock):
+        """#350 review round 13: 0 is the spec's own ttlMs floor, so a
+        negative value has no defined meaning — but the min() merge would
+        happily let "ttlMs": -1 BEAT every valid page's value and emit an
+        invalid cache policy downstream. It must be treated like any other
+        invalid value: conservative degrade to 0."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "a"}], "ttlMs": 5000, "nextCursor": "p2"},
+        }
+        page2 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "b"}], "ttlMs": -1},
+        }
+        for page in (page1, page2):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=json.dumps(page),
+                headers={"content-type": "application/json"},
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())["result"]
+        assert merged["ttlMs"] == 0
+
     def test_unhashable_cache_scope_degrades_instead_of_crashing(self, httpx_mock):
         """#350 review round 12: ``"cacheScope": []`` is valid JSON a
         malformed page can carry, but a JSON array is UNHASHABLE — dict
@@ -9711,6 +9740,33 @@ class TestProbeProtocolEra:
         assert era == "modern"
         assert result["error"]["code"] == -32021
 
+    def test_200_with_empty_body_is_legacy(self, httpx_mock):
+        """#350 review round 13: a sloppy legacy endpoint (or an
+        intermediary) can 200 an unknown method with an EMPTY body. That
+        proves nothing about the protocol era — classifying it as modern
+        would swallow the client's initialize and send stateless requests
+        the server cannot process. Only a genuine result or a
+        recognized-modern error is proof."""
+        httpx_mock.add_response(status_code=200, text="")
+        client = httpx.Client()
+        era, result = _probe_protocol_era(client, self.URL, {})
+        assert era == "legacy"
+        assert result is None
+
+    def test_200_with_resultless_object_body_is_legacy(self, httpx_mock):
+        """#350 review round 13, the bare-{} variant: valid JSON with
+        neither result nor error is not a JSON-RPC response at all, so it
+        cannot prove the server understood server/discover."""
+        httpx_mock.add_response(
+            status_code=200,
+            text="{}",
+            headers={"content-type": "application/json"},
+        )
+        client = httpx.Client()
+        era, result = _probe_protocol_era(client, self.URL, {})
+        assert era == "legacy"
+        assert result is None
+
     def test_400_with_empty_body_is_legacy(self, httpx_mock):
         httpx_mock.add_response(status_code=400, text="")
         client = httpx.Client()
@@ -9998,17 +10054,20 @@ class TestProbeProtocolEra:
         assert era == "modern"
         assert result == json.loads(result_body)
 
-    def test_sse_stream_closing_without_response_is_modern_with_none(self, httpx_mock):
+    def test_sse_stream_closing_without_response_is_legacy(self, httpx_mock):
         """A 200 SSE stream that closes without ever carrying a JSON-RPC
-        response parses to None — same verdict as the buffered reader always
-        gave (200 + unparseable body -> modern, nothing to seed from)."""
+        response parses to None — which since #350 review round 13 is NOT
+        proof of a modern server (this test originally pinned the old
+        200-unparseable -> modern verdict; round 13 inverted it: only a
+        genuine result or recognized-modern error proves modern, and a
+        response-less stream proves nothing)."""
         httpx_mock.add_response(
             stream=IteratorStream([b"event: ping\ndata: keepalive\n\n"]),
             headers={"content-type": "text/event-stream"},
         )
         client = httpx.Client()
         era, result = _probe_protocol_era(client, self.URL, {})
-        assert era == "modern"
+        assert era == "legacy"
         assert result is None
 
     def test_mixed_case_sse_content_type_is_modern_without_blocking(self, httpx_mock):

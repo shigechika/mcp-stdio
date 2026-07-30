@@ -1022,10 +1022,15 @@ def _probe_protocol_era(
     replacement for ``initialize``) and classifies the remote from the
     response:
 
-    - HTTP 200 whose body has no ``error`` key (a JSON-RPC result, or an
-      unparseable/absent body) -> modern; the parsed body is returned for
-      the caller to seed ``_ModernState`` from (via
-      ``_seed_modern_state_from_discover``).
+    - HTTP 200 whose body is a JSON-RPC RESULT -> modern; the parsed body
+      is returned for the caller to seed ``_ModernState`` from (via
+      ``_seed_modern_state_from_discover``). A 200 with an
+      empty/unparseable/result-less body is NOT proof (#350 review round
+      13): a sloppy legacy endpoint or intermediary can 200 an unknown
+      method with an empty body or bare ``{}``, and classifying that as
+      modern would swallow the client's ``initialize`` and send stateless
+      requests the server cannot process — so it falls to legacy, the
+      same "empty or unrecognized" rule the 400 branch applies.
     - HTTP 200 or HTTP 400 whose body IS a recognized-modern JSON-RPC error
       per ``_is_recognized_modern_error`` -> STILL modern (spec: a modern
       server also uses 400 for ``UnsupportedProtocolVersionError`` /
@@ -1108,7 +1113,16 @@ def _probe_protocol_era(
                 "body; assuming legacy"
             )
             return "legacy", None
-        return "modern", parsed
+        if isinstance(parsed, dict) and "result" in parsed:
+            return "modern", parsed
+        # 200 with an empty/unparseable/result-less body proves nothing: a
+        # sloppy legacy endpoint (or an intermediary) can 200 an unknown
+        # method with an empty body or bare {}. Only a genuine
+        # DiscoverResult or a recognized-modern error is proof of modern —
+        # the same "empty or unrecognized -> fall back" rule the 400 branch
+        # applies (#350 review round 13).
+        log("protocol-era probe: 200 with an empty/unrecognized body; assuming legacy")
+        return "legacy", None
     if resp.status_code == 400:
         if _is_recognized_modern_error(parsed):
             log(
@@ -2344,10 +2358,16 @@ def _is_valid_cacheable_value(key: str, value: Any) -> bool:
     always False, so a NaN would silently survive as the merged value).
     """
     if key == "ttlMs":
+        # ``>= 0`` because 0 is the spec's own floor ("If ttlMs is absent,
+        # clients SHOULD assume a default of 0") — a negative value has no
+        # defined meaning, and accepting it would let a malformed page
+        # BEAT the conservative default in the min() merge, emitting an
+        # invalid cache policy downstream (#350 review round 13).
         return (
             isinstance(value, (int, float))
             and not isinstance(value, bool)
             and math.isfinite(value)
+            and value >= 0
         )
     if key == "cacheScope":
         # The isinstance gate is not a type nicety: dict membership with an
