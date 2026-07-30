@@ -471,10 +471,14 @@ def _encode_mcp_name(value: str) -> str:
     that would otherwise be mistaken for an already-encoded sentinel — is
     Base64-encoded as ``=?base64?{...}?=``: the exact literal markers the
     spec mandates (lowercase, no charset segment — unlike MIME
-    encoded-words). ``Mcp-Method`` never needs this: method names are
-    protocol-fixed identifiers (e.g. ``tools/call``), never arbitrary data,
-    so only ``Mcp-Name`` (mirroring a tool/prompt name or a resource URI,
-    both user- or server-supplied) can require it.
+    encoded-words). ``Mcp-Method`` must NOT go through this encoder: the
+    sentinel is defined only for ``Mcp-Name`` / ``Mcp-Param-{Name}`` — the
+    "Server Validation" section requires servers to decode exactly those two
+    before comparing against the body, so an encoded ``Mcp-Method`` would
+    fail header-body validation (-32020 ``HeaderMismatch``) on a compliant
+    server. A JSON-RPC ``method`` that is not itself header-safe therefore
+    cannot be mirrored at all and is rejected before dispatch (#350 review
+    round 5, finding 5-2 — see the gate in ``run()``'s modern branch).
     """
     if _is_header_safe_ascii(value) and not _BASE64_SENTINEL_RE.match(value):
         return value
@@ -487,7 +491,11 @@ def _mcp_request_headers(line: str) -> dict[str, str]:
 
     Returns ``{}`` for a batch / unparseable / methodless line — there is no
     single method to mirror. Used only on the modern path (see run()'s
-    ``_prepare_headers``).
+    ``_prepare_headers``). ``method`` rides verbatim: a non-header-safe
+    method never reaches this builder — run()'s modern branch rejects it
+    before dispatch, because the Base64 sentinel escape is spec-defined only
+    for ``Mcp-Name``/``Mcp-Param-{Name}``, never ``Mcp-Method`` (#350 review
+    round 5, finding 5-2 — see ``_encode_mcp_name``'s docstring).
     """
     method, name = _extract_method_and_name(line)
     if method is None:
@@ -3650,6 +3658,49 @@ def run(
                     if handled:
                         if modern_reply is not None:
                             _emit(modern_reply, tracker)
+                        continue
+                    # Reject a method that cannot ride the REQUIRED Mcp-Method
+                    # header (#350 review round 5, finding 5-2). JSON-RPC 2.0
+                    # allows ANY string as `method`, but Streamable HTTP
+                    # ("Standard Request Headers") mirrors it into Mcp-Method,
+                    # whose value must satisfy RFC 9110 field-value syntax —
+                    # and unlike Mcp-Name, Mcp-Method has NO escape hatch: the
+                    # Base64 sentinel is defined only for Mcp-Name /
+                    # Mcp-Param-{Name} ("Server Validation": servers "MUST
+                    # decode an encoded Mcp-Name or Mcp-Param-{Name} value
+                    # before comparing" — Mcp-Method is pointedly absent), so
+                    # an encoded Mcp-Method would fail header-body validation
+                    # with -32020 HeaderMismatch on a compliant server.
+                    # Sending it raw is no better: httpx raises
+                    # UnicodeEncodeError at request construction for a
+                    # non-ASCII header value (degrading to the opaque
+                    # "internal relay error" via the safety net below — the
+                    # #11 never-crash contract holds, but the failure tells
+                    # the client nothing), and some control characters pass
+                    # httpx/h11 validation onto the wire verbatim. Such a
+                    # request is unsendable on this transport, so reject it
+                    # through the normal error path: a request gets a JSON-RPC
+                    # error, a notification (no id) is dropped silently, and
+                    # the legacy path — which mirrors nothing into headers —
+                    # stays byte-identical (AC #3).
+                    unsafe_method, _ = _extract_method_and_name(line)
+                    if unsafe_method is not None and not _is_header_safe_ascii(
+                        unsafe_method
+                    ):
+                        log(
+                            "rejecting request: method is not a header-safe "
+                            "ASCII string and cannot be mirrored into the "
+                            "required Mcp-Method header (spec rev 2026-07-28)"
+                        )
+                        if req_has_id:
+                            _write_line(
+                                _error_response(
+                                    "method cannot be represented in the "
+                                    "required Mcp-Method header (spec rev "
+                                    "2026-07-28, Request Metadata)",
+                                    req_id,
+                                )
+                            )
                         continue
                     # Every other request/notification carries the modern
                     # per-request _meta block (protocol version, client

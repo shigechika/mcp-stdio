@@ -10859,3 +10859,90 @@ class TestRunModernEra:
             protocol_era="modern",
         )
         assert output.strip() == mrtr_result
+
+    def test_non_ascii_method_rejected_with_jsonrpc_error_not_crash(self, httpx_mock):
+        """#350 review round 5 (finding 5-2): JSON-RPC permits ANY string as
+        `method`, but the modern path mirrors it into the REQUIRED
+        Mcp-Method header (Streamable HTTP, "Standard Request Headers"),
+        and the Base64 sentinel escape is spec-defined only for Mcp-Name /
+        Mcp-Param-{Name} — never Mcp-Method ("Server Validation" requires
+        decoding exactly those two before comparing). A non-ASCII method
+        therefore cannot be sent compliantly at all; unguarded, httpx
+        raises UnicodeEncodeError at request construction, which the
+        per-line safety net degrades to an opaque "internal relay error".
+        The relay must instead reject it with a descriptive JSON-RPC error
+        and never POST it upstream."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                json.dumps(
+                    {"jsonrpc": "2.0", "id": 7, "method": "例/tools", "params": {}}
+                )
+            ],
+            protocol_era="modern",
+        )
+        reply = json.loads(output.strip())
+        assert reply["id"] == 7
+        assert "Mcp-Method" in reply["error"]["message"]
+        # Exactly one HTTP request total: the discover probe. The unsendable
+        # request never reached the wire.
+        assert len(httpx_mock.get_requests()) == 1
+
+    def test_control_character_method_rejected_with_jsonrpc_error(self, httpx_mock):
+        """#350 review round 5 (finding 5-2), control-character variant: a
+        CR in the method would be rejected by h11 only at send time (after
+        the relay's own retry loop burned its attempts), and other C0
+        controls pass httpx/h11 validation onto the wire verbatim — both
+        violate RFC 9110 field-value syntax (the "Value Encoding" section's
+        stated baseline). Rejected locally, before any POST."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 8,
+                        "method": "tools\rlist",
+                        "params": {},
+                    }
+                )
+            ],
+            protocol_era="modern",
+        )
+        reply = json.loads(output.strip())
+        assert reply["id"] == 8
+        assert "Mcp-Method" in reply["error"]["message"]
+        assert len(httpx_mock.get_requests()) == 1
+
+    def test_unsafe_method_notification_dropped_silently(self, httpx_mock, capsys):
+        """A NOTIFICATION with an unsendable method must never receive a
+        synthesized response (no JSON-RPC id — same gating as every other
+        synthesized error in run()) and must not be POSTed either: silent
+        drop, with the DESCRIPTIVE rejection logged to stderr — not the
+        pre-fix path of httpx's UnicodeEncodeError tripping the per-line
+        safety net's generic "internal relay error"."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "method": "例/notify", "params": {}})],
+            protocol_era="modern",
+        )
+        assert output.strip() == ""
+        assert len(httpx_mock.get_requests()) == 1
+        err = capsys.readouterr().err
+        assert "header-safe" in err
+        assert "internal relay error" not in err
