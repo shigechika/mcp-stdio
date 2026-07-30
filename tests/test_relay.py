@@ -9230,11 +9230,13 @@ class TestRunModernEra:
 
     URL = "https://example.com/mcp"
 
-    def _run_with_stdin(self, httpx_mock, stdin_lines, **kwargs):
+    def _run_with_stdin(self, httpx_mock, stdin_lines, headers=None, **kwargs):
         stdin_data = "\n".join(stdin_lines) + "\n"
         stdout = StringIO()
+        if headers is None:
+            headers = {"Content-Type": "application/json"}
         with patch("sys.stdin", StringIO(stdin_data)), patch("sys.stdout", stdout):
-            run(self.URL, {"Content-Type": "application/json"}, **kwargs)
+            run(self.URL, headers, **kwargs)
         return stdout.getvalue()
 
     def _discover_response(self, **extra_result):
@@ -9345,6 +9347,68 @@ class TestRunModernEra:
         meta = body["params"]["_meta"]
         assert meta["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
         assert meta["io.modelcontextprotocol/clientCapabilities"] == {}
+
+    def test_pinned_mcp_name_does_not_leak_onto_tools_list(self, httpx_mock):
+        """#350 review finding 3: an operator-pinned ``-H 'Mcp-Name: ...'``
+        must not survive on a request that derives no Mcp-Name of its own —
+        ``tools/list`` has no ``params.name`` to mirror. The old code only
+        stripped the operator's case-variant when THIS request supplied a
+        replacement value, so a pinned value rode along unchanged on
+        tools/list: a header/body mismatch (Streamable HTTP "Server
+        Validation": "Parameter not in arguments -> Client MUST omit the
+        header") a strict server rejects with HeaderMismatch."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":2,"result":{}}',
+            headers={"content-type": "application/json"},
+        )
+        self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})],
+            headers={
+                "Content-Type": "application/json",
+                "Mcp-Name": "operator-pinned",
+            },
+            protocol_era="modern",
+        )
+        call_req = httpx_mock.get_requests()[1]
+        assert "mcp-name" not in call_req.headers
+
+    def test_pinned_mcp_method_does_not_leak_onto_batch_line(self, httpx_mock):
+        """#350 review finding 3: a batch (top-level array) line has no
+        single ``method`` to mirror (``_mcp_request_headers`` returns
+        ``{}`` for it), so the OLD code never stripped an operator-pinned
+        ``Mcp-Method`` for it either — a stale pinned method header would
+        ride along on a methodless payload."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text="[]",
+            headers={"content-type": "application/json"},
+        )
+        batch_line = json.dumps(
+            [{"jsonrpc": "2.0", "method": "notifications/progress", "params": {}}]
+        )
+        self._run_with_stdin(
+            httpx_mock,
+            [batch_line],
+            headers={
+                "Content-Type": "application/json",
+                "Mcp-Method": "operator-pinned",
+            },
+            protocol_era="modern",
+        )
+        call_req = httpx_mock.get_requests()[1]
+        assert "mcp-method" not in call_req.headers
 
     def test_second_request_still_omits_session_id_after_echoed_header(
         self, httpx_mock

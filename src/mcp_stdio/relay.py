@@ -2990,7 +2990,17 @@ def run(
         Both branches drop any case-variant the operator pinned via ``-H``
         before re-adding the relay's own value, so httpx never serialises two
         header lines for the same field — a strict server treats these as
-        singleton fields and would reject or mis-select.
+        singleton fields and would reject or mis-select. This unconditional
+        strip-then-(maybe)-add applies to ``Mcp-Method``/``Mcp-Name`` exactly
+        like it already does to ``Mcp-Session-Id``/``MCP-Protocol-Version``:
+        an operator-pinned value is dropped regardless of whether THIS
+        request derives a replacement (#350 review finding 3). Deriving no
+        replacement — e.g. ``Mcp-Name`` on ``tools/list``, which has no
+        ``params.name`` to mirror — must leave the header ABSENT, not
+        leak a stale pinned value the request body no longer corroborates
+        (Streamable HTTP "Server Validation": "Parameter not in arguments ->
+        Client MUST omit the header"). A batch/methodless line similarly
+        must not carry a stale pinned ``Mcp-Method``.
         """
         with headers_lock:
             h = dict(headers)
@@ -3000,12 +3010,12 @@ def run(
             h["MCP-Protocol-Version"] = (
                 modern_state.negotiated_version or _MODERN_PROTOCOL_VERSION_DEFAULT
             )
+            h = {k: v for k, v in h.items() if k.lower() != "mcp-method"}
+            h = {k: v for k, v in h.items() if k.lower() != "mcp-name"}
             mcp_headers = _mcp_request_headers(line)
             if "Mcp-Method" in mcp_headers:
-                h = {k: v for k, v in h.items() if k.lower() != "mcp-method"}
                 h["Mcp-Method"] = mcp_headers["Mcp-Method"]
             if "Mcp-Name" in mcp_headers:
-                h = {k: v for k, v in h.items() if k.lower() != "mcp-name"}
                 h["Mcp-Name"] = mcp_headers["Mcp-Name"]
             return h
         # session_id / protocol_version are mutated only by this (main) thread,
