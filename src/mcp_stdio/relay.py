@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import email.utils
 import json
 import math
@@ -205,7 +206,11 @@ def redact_url(url: str) -> str:
 # responses) — and ``print`` is not atomic across the content and its
 # trailing newline, so without this lock a POST error coinciding with a
 # message event could interleave mid-line and corrupt the NDJSON wire
-# format. ``run`` is single-threaded and pays only an uncontended lock.
+# format. ``run`` drives concurrent writers too: the cold-start daemon's
+# gate-lift ``list_changed`` notifications (#296) and the modern era's
+# ``subscriptions/listen`` reader thread (#270 Phase 2) both ``_emit``
+# concurrently with the stdin loop, so the lock is load-bearing on both
+# transports.
 _STDOUT_LOCK = threading.Lock()
 
 
@@ -406,6 +411,11 @@ _META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
 # the modern path (there is no other per-request channel for it now that
 # initialize/session state is gone). See _extract_log_level.
 _META_LOG_LEVEL = "io.modelcontextprotocol/logLevel"
+# Correlation key a modern server stamps on every notification delivered
+# over a subscriptions/listen stream (spec rev 2026-07-28, subscriptions
+# pattern). Relay-internal: stripped before a forwarded notification
+# reaches the legacy stdio client (see _strip_listen_subscription_id).
+_META_SUBSCRIPTION_ID = "io.modelcontextprotocol/subscriptionId"
 
 # Client capability keys whose MODERN semantics this Phase 1 relay cannot
 # bridge (#350 review round 10, finding 10-1). Spec rev 2026-07-28
@@ -1240,6 +1250,8 @@ def _handle_modern_special_method(
     req_id: Any,
     modern_state: "_ModernState",
     discover_retry: Callable[[], None] | None = None,
+    listen_seed: Callable[[], None] | None = None,
+    listen_start: Callable[[], None] | None = None,
 ) -> tuple[bool, str | None]:
     """Intercept ``initialize`` / ``notifications/initialized`` /
     ``notifications/cancelled`` on the modern path, where none of the three
@@ -1336,6 +1348,42 @@ def _handle_modern_special_method(
       swallowed (``None`` reply — both are notifications, which never get a
       response either way).
 
+    ``listen_seed`` / ``listen_start`` (#270 Phase 2 PR A): ``listen_seed``
+    is invoked on every ``initialize`` — AFTER ``negotiated_version`` is
+    computed, so the frozen listen body snapshot (C1) sees the negotiated
+    state — while ``listen_start`` (the thread start) is invoked only on
+    ``notifications/initialized`` (#352 review finding 1): the lifecycle
+    spec (2025-06-18) has the client send ``initialized`` only after it
+    received the InitializeResult, and the server "SHOULD NOT send
+    requests other than pings and logging" before receiving it — starting
+    the thread on ``initialize`` let a fast server deliver a
+    ``list_changed`` notification to stdout BEFORE run()'s loop had even
+    emitted the synthesized InitializeResult, which a lifecycle-enforcing
+    client may reject or drop. Both hooks are guarded by the caller
+    (``_start_listen_stream`` is latched one-shot; an ``initialized``
+    with no prior ``initialize`` finds no seeded snapshot and starts
+    nothing), so a client-driven re-``initialize`` or a repeated
+    ``initialized`` can never spawn a second thread. The
+    synthesized ``InitializeResult`` unions ``listChanged: true`` into
+    the capability families ALREADY PRESENT in the discover-seeded
+    ``modern_state.capabilities`` — never creating an absent
+    ``tools``/``resources``/``prompts`` family (C8, narrowed by #352
+    round-3 finding 2): a capabilities object's mere presence advertises
+    the whole feature family, so fabricating e.g. ``resources`` over a
+    discover seed of ``{"tools": {}}`` would invite a capability-gated
+    client to issue ``resources/list`` against an upstream that never
+    claimed to support it. The relay forwards a ``list_changed`` kind
+    downstream only for families advertised here
+    (``_listen_advertised_families``, frozen into the listen state at
+    seed time and enforced by ``_handle_listen_message``), keeping the
+    lifecycle spec's "Only use capabilities that were successfully
+    negotiated" coherent in BOTH directions; with an empty discover seed
+    (the #350 chicken-and-egg case) nothing is advertised and every
+    listen notification is swallowed — the documented degraded mode
+    (precedent for advertising exactly what is forwarded:
+    ``_COLD_START_LIST_CHANGED``, which advertises the union it later
+    emits while the cold-start gate is closed).
+
     Returns ``(False, None)`` for every other line, which the caller
     dispatches normally (through ``_inject_modern_meta`` first).
     """
@@ -1410,17 +1458,77 @@ def _handle_modern_special_method(
         modern_state.negotiated_version = _negotiate_modern_version(
             requested, modern_state.supported_versions
         )
+        # Seed the frozen listen body snapshot (#270 Phase 2 PR A, C1) —
+        # AFTER negotiation so it carries the negotiated version. Only the
+        # SNAPSHOT is built here; the thread itself starts on
+        # notifications/initialized (#352 review finding 1, see the
+        # docstring): the InitializeResult synthesized below has not even
+        # been returned to run()'s loop yet, let alone emitted, so a
+        # thread started here could put a list_changed on stdout ahead of
+        # the handshake reply.
+        if listen_seed is not None:
+            listen_seed()
+        # C8 (#270 Phase 2 PR A), NARROWED by #352 round-3 finding 2:
+        # union `listChanged: true` into the capability families the
+        # discover seed actually advertised — never CREATING an absent
+        # family. A capabilities object's mere presence advertises the
+        # whole feature family (tools/resources/prompts), not just its
+        # change notifications, so fabricating e.g. `resources` over a
+        # seed of `{"tools": {}}` would send a capability-gated client
+        # after `resources/list` on an upstream that never claimed
+        # resources at all. Three distinct layers now cooperate: the
+        # listen FILTER still over-REQUESTS all three kinds
+        # (_LISTEN_REQUESTED_NOTIFICATIONS — spec-safe, see its comment),
+        # the server's ack narrows what ARRIVES, and the advertised set
+        # frozen at listen-seed time (_listen_advertised_families — the
+        # same helper used here) gates what the relay FORWARDS
+        # (_handle_listen_message). So a forwarded list_changed always has
+        # its family advertised ("Only use capabilities that were
+        # successfully negotiated" holds in BOTH directions), and an empty
+        # discover seed ({} — the #350 chicken-and-egg case) advertises
+        # nothing and forwards nothing: the documented degraded mode.
+        # Deep-copied so the union never leaks into the discover-seeded
+        # `modern_state.capabilities` (which every later re-initialize
+        # re-reads). Precedent for advertising exactly what is forwarded:
+        # _COLD_START_LIST_CHANGED. Advertising listChanged when the
+        # stream later turns out unsupported (the C6 terminal arm) merely
+        # promises notifications that never arrive, which listChanged
+        # never guarantees anyway.
+        capabilities = copy.deepcopy(modern_state.capabilities)
+        for key in _listen_advertised_families(capabilities):
+            entry = capabilities.get(key)
+            if not isinstance(entry, dict):
+                # Present but malformed (non-object): the family IS
+                # advertised, so coerce to an object we can flag.
+                entry = {}
+            entry["listChanged"] = True
+            capabilities[key] = entry
         result = {
             # Downstream ack: what the LOCAL client asked for (falling back
             # to the upstream-negotiated version only when the client sent
             # no usable protocolVersion at all — see this function's own
             # docstring for why these two are deliberately different).
             "protocolVersion": requested or modern_state.negotiated_version,
-            "capabilities": modern_state.capabilities,
+            "capabilities": capabilities,
             "serverInfo": modern_state.server_info or _UNKNOWN_UPSTREAM_SERVER_INFO,
         }
         return True, json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result})
-    if method in ("notifications/initialized", "notifications/cancelled"):
+    if method == "notifications/initialized":
+        # THE lifecycle-correct start point for the listen thread (#352
+        # review finding 1): the client only sends initialized after it
+        # has consumed the InitializeResult (lifecycle spec 2025-06-18:
+        # "After successful initialization, the client MUST send an
+        # initialized notification"), and the same spec forbids the
+        # server unsolicited pre-initialized traffic ("The server SHOULD
+        # NOT send requests other than pings and logging before receiving
+        # the initialized notification") — so nothing the thread forwards
+        # can now precede the handshake reply on stdout. One-shot latch
+        # and the no-prior-initialize guard live in the caller
+        # (_start_listen_stream).
+        if listen_start is not None:
+            listen_start()
+        return True, None
+    if method == "notifications/cancelled":
         return True, None
     return False, None
 
@@ -2841,6 +2949,680 @@ def _cold_start_loop(
         log(f"cold-start background error: {e}")
 
 
+# --- modern era: relay-originated subscriptions/listen stream (#270 Phase 2 PR A) ---
+#
+# Spec rev 2026-07-28 removed the legacy long-lived GET stream, so on the
+# modern era NO server-initiated notification can reach the stdio client
+# unless the relay opens a ``subscriptions/listen`` POST stream itself
+# (subscriptions pattern). A legacy stdio client never sends
+# ``subscriptions/listen`` — it does not know the method — so the relay
+# ORIGINATES the request once the client's ``notifications/initialized``
+# confirms the handshake is complete (#352 review finding 1; the body
+# snapshot is seeded earlier, at ``initialize`` interception —
+# ``_handle_modern_special_method`` -> run()'s ``_start_listen_stream``)
+# and forwards ONLY the three ``list_changed`` notification kinds
+# downstream — and only for capability families the synthesized
+# InitializeResult actually advertised (the C8 narrowing, #352 round-3
+# finding 2; see ``_listen_advertised_families``). Resource
+# subscriptions (``resourceSubscriptions`` +
+# ``resources/subscribe`` interception) are PR B; the MRTR bridge is PR C
+# (#270 Phase 2 phasing).
+_LISTEN_METHOD = "subscriptions/listen"
+_LISTEN_ACK_METHOD = "notifications/subscriptions/acknowledged"
+# Relay-minted JSON-RPC id prefix for the listen request (C10). STRING ids
+# under the relay's own "mcp-stdio/" namespace cannot collide with a
+# client-minted id unless the client maliciously adopts the relay's prefix:
+# _emit's cancel tracker compares ids by exact value (and `"1" == 1` is
+# False in Python, so even a numeric suffix can never alias an int id) —
+# and the listen request's own terminal result is swallowed here, never
+# emitted, so the tracker never even sees a listen id.
+_LISTEN_ID_PREFIX = "mcp-stdio/listen/"
+# The notification kinds requested on every listen POST: all three
+# list_changed booleans, no ``resourceSubscriptions`` until PR B. Also the
+# reference set the ack's honored subset is compared against.
+# DELIBERATELY broader than what may be forwarded (#352 round-3 finding
+# 2): over-requesting is spec-safe (the server merely sends kinds the
+# relay may then drop), and three distinct layers do three distinct jobs
+# — this REQUEST filter over-asks, the server's ack narrows what ARRIVES,
+# and the advertised-family set frozen at seed time
+# (``_listen_advertised_families``) gates what the relay FORWARDS.
+_LISTEN_REQUESTED_NOTIFICATIONS = {
+    "toolsListChanged": True,
+    "promptsListChanged": True,
+    "resourcesListChanged": True,
+}
+# The only methods a listen stream may forward downstream (whitelist
+# semantics — everything else, including the ack, the terminal result and
+# ``notifications/cancelled``, is relay-internal and swallowed). Same
+# three methods the cold-start gate emits, shared so they can never drift.
+_LISTEN_FORWARDED_NOTIFICATIONS = frozenset(_COLD_START_LIST_CHANGED)
+# The three capability families whose list_changed kinds the listen
+# stream can carry — the family is the middle segment of each
+# _LISTEN_FORWARDED_NOTIFICATIONS method name.
+_LISTEN_FAMILIES = ("tools", "resources", "prompts")
+
+
+def _listen_advertised_families(capabilities: dict[str, Any]) -> frozenset[str]:
+    """Families among tools/resources/prompts PRESENT in ``capabilities``.
+
+    The single source of truth for the C8 narrowing (#352 round-3 finding
+    2): ``_handle_modern_special_method`` sets ``listChanged: true`` on
+    exactly these families in the synthesized ``InitializeResult``, and
+    run()'s ``_seed_listen_snapshot`` records the same set (frozen
+    alongside the C1 body snapshot) for ``_handle_listen_message`` to gate
+    forwarding on — one helper, so the advertisement and the gate can
+    never drift. Presence-based like every MCP capabilities object: a
+    present-but-malformed family value still advertises the family (the
+    synthesis coerces it to an object it can flag).
+
+    Deliberate consequence (#352 round-4 finding, WONTFIX): with an empty
+    discover seed this set is empty, nothing is advertised, and every
+    ``list_changed`` from a nonetheless-working stream is swallowed. That
+    is the conservative side of a real trade-off, chosen on the spec's
+    authority: a compliant modern server MUST advertise its supported
+    families in ``server/discover`` capabilities, so "supports
+    subscriptions yet advertised no families (and the one-shot reseed
+    also got nothing)" describes a NON-compliant server — and forwarding
+    for families the synthesized ``InitializeResult`` never advertised
+    would violate the 2025-06-18 lifecycle MUST ("only use capabilities
+    that were successfully negotiated") for every COMPLIANT client, which
+    #350/#352 established twice as the binding rule. Possible future
+    widening if real-world servers need it: union the listen ACK's
+    honored subset into the forwarding gate (the ack is a legitimate
+    relay-to-upstream negotiation artifact) — but the client-side
+    advertisement can never be widened retroactively, so a strict client
+    would still be within its rights to drop those notifications.
+    """
+    return frozenset(k for k in _LISTEN_FAMILIES if k in capabilities)
+
+
+# Error codes that prove the remote will NEVER accept subscriptions/listen
+# (C6): -32601 Method not found, plus the modern reserved codes -32020
+# HeaderMismatch / -32021 MissingRequiredClientCapability / -32022
+# UnsupportedProtocolVersion — all deterministic rejections of this exact
+# request, so retrying at 1 Hz forever would hammer a server that will
+# never say yes. One loud stderr line, then the thread exits for good.
+_LISTEN_TERMINAL_ERROR_CODES = frozenset({-32601, -32020, -32021, -32022})
+
+
+def _build_listen_params(modern_state: "_ModernState") -> dict[str, Any]:
+    """Build the FROZEN ``subscriptions/listen`` request params (C1).
+
+    Snapshotted at ``initialize`` interception time (re-seeded by a
+    re-``initialize`` only until the thread starts on
+    ``notifications/initialized`` — see ``_handle_modern_special_method``)
+    and reused verbatim on every reconnect — only the JSON-RPC id is
+    re-minted per attempt. ``modern_state.log_level`` is rewritten on every
+    ``logging/setLevel`` stdin line and a repeat ``initialize`` rewrites
+    capabilities/version, so re-deriving the body per attempt would let it
+    drift mid-session; headers, by contrast, ARE re-read fresh per attempt
+    (C2) so token refreshes reach the stream. ``logLevel`` is deliberately
+    absent from this ``_meta`` for the same reason.
+
+    ``_meta`` nests INSIDE ``params`` — the established MCP convention
+    (``params._meta``) that ``_inject_modern_meta`` follows for every other
+    modern request. ``protocolVersion`` uses the exact expression
+    ``_prepare_headers``' modern branch uses for ``MCP-Protocol-Version``,
+    so the two byte-match at snapshot time — and ``_listen_stream_loop``
+    pins every attempt's header to THIS frozen value (#352 review finding
+    2), so they keep byte-matching even after a re-``initialize``
+    renegotiates the mutable state. ``clientCapabilities`` may be
+    ``{}`` (presence-based, like every modern request); ``clientInfo`` only
+    when the client supplied one (SHOULD, never fabricated). Nested values
+    are deep-copied so later mutations of ``modern_state`` can never reach
+    the frozen snapshot. No ``resourceSubscriptions`` until PR B.
+    """
+    meta: dict[str, Any] = {
+        _META_PROTOCOL_VERSION: (
+            modern_state.negotiated_version or _MODERN_PROTOCOL_VERSION_DEFAULT
+        ),
+        _META_CLIENT_CAPABILITIES: copy.deepcopy(modern_state.client_capabilities)
+        or {},
+    }
+    if modern_state.client_info:
+        meta[_META_CLIENT_INFO] = copy.deepcopy(modern_state.client_info)
+    return {
+        "_meta": meta,
+        "notifications": dict(_LISTEN_REQUESTED_NOTIFICATIONS),
+    }
+
+
+def _strip_listen_subscription_id(msg: dict[str, Any]) -> dict[str, Any]:
+    """Return ``msg`` with ``params._meta``'s subscriptionId key removed.
+
+    ``io.modelcontextprotocol/subscriptionId`` correlates a notification to
+    the listen request that subscribed to it — relay-internal state that is
+    meaningless to the legacy stdio client downstream. A ``_meta`` left
+    empty by the strip is dropped entirely: an empty ``_meta`` object the
+    upstream never sent carries no information and would only differ from
+    the legacy wire shape for nothing. Every other ``_meta`` key (e.g. a
+    server-stamped ``serverInfo``) passes through untouched. Copies are
+    shallow-per-level rebuilds, so the caller's parsed message is never
+    mutated in place.
+    """
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return msg
+    meta = params.get("_meta")
+    if not isinstance(meta, dict) or _META_SUBSCRIPTION_ID not in meta:
+        return msg
+    meta = {k: v for k, v in meta.items() if k != _META_SUBSCRIPTION_ID}
+    if meta:
+        params = {**params, "_meta": meta}
+    else:
+        params = {k: v for k, v in params.items() if k != "_meta"}
+    return {**msg, "params": params}
+
+
+def _handle_listen_message(
+    payload: str,
+    listen_id: str,
+    tracker: "_CancelTracker | None",
+    state: dict[str, Any] | None,
+    *,
+    acked: bool,
+) -> str | None:
+    """Dispatch one JSON-RPC message from the listen stream.
+
+    Returns ``"graceful"`` (server ended the stream on purpose — stop, no
+    reconnect, nothing on stdout), ``"terminal"`` (the remote will never
+    accept ``subscriptions/listen`` — C6: logged loudly once, stop, no
+    reconnect), ``"ack"`` (the acknowledgement — consumed like ``None``,
+    keep reading, but it is the protocol-valid establishment evidence
+    ``_listen_stream_loop`` records; #352 round-5 finding 2), or ``None``
+    (message consumed; keep reading).
+
+    Whitelist semantics: only the three ``list_changed`` notification
+    kinds are forwarded (subscriptionId stripped first) — and only those
+    whose capability family the synthesized ``InitializeResult`` actually
+    advertised (#352 round-3 finding 2: the advertised-family set rides
+    ``state["advertised"]``, frozen at listen-seed time; an unadvertised
+    family's notification is swallowed, ALL of them when the discover
+    seed was empty) — and only as TRUE
+    notifications — a whitelisted method carrying an ``id`` is a JSON-RPC
+    request, not a notification, and is swallowed (#352 round-2 finding
+    3: a hostile upstream must not solicit a response from the legacy
+    client through the listen stream) — and only AFTER this attempt's
+    ack (``acked``, #352 round-7 finding): the spec makes the
+    acknowledgement the MANDATORY first stream message, so a pre-ack
+    ``list_changed`` is a protocol violation, and forwarding it would
+    write to stdout from a stream the loop may immediately afterwards
+    declare "never established" (a misrouted endpoint emitting a
+    matching method then closing). The caller passes ``acked`` per
+    ATTEMPT — each reconnect's stream must re-ack before anything is
+    forwarded again. The ack records
+    the honored subset into ``state`` and logs one line iff it differs
+    from the requested set. There are TWO graceful-end signals — a result
+    bearing the listen id (SHOULD) and ``notifications/cancelled``
+    referencing it (MUST) — and either alone counts: a server honoring
+    only the MUST would otherwise look like an abrupt drop and be
+    reconnect-looped forever. Everything else is swallowed. Id compares
+    are type-aware by construction: the listen id is a namespaced STRING
+    (``_LISTEN_ID_PREFIX``), and ``==`` between an int and a str is always
+    False, so a client-style numeric id can never alias it.
+
+    ``_emit`` may raise ``OSError``/``BrokenPipeError`` (stdout closed);
+    that propagates to ``_listen_stream_loop``'s terminal handler (C12).
+    """
+    try:
+        msg = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(msg, dict):
+        return None
+    if msg.get("jsonrpc") != "2.0":
+        # #352 round-8 finding 1: everything this handler ACTS on —
+        # establishment evidence, graceful/terminal classification, and
+        # above all messages FORWARDED verbatim to the legacy client —
+        # must be a well-formed JSON-RPC 2.0 object. A misrouted endpoint
+        # emitting envelope-less JSON could otherwise establish the
+        # stream or put an invalid object on the stdio wire, which a
+        # strict client may reject or treat as a transport error. A
+        # compliant server always sends the member, so this swallows only
+        # protocol-invalid traffic.
+        return None
+    method = msg.get("method")
+    if method == _LISTEN_ACK_METHOD:
+        # #352 round-6 finding: establishment evidence must be a REAL ack.
+        # Since round 5, returning "ack" is what flips `established` and
+        # thereby earns C7's infinite reconnect patience — so a malformed
+        # look-alike from a broken/unsupported endpoint must not qualify.
+        # Two checks, same rules the rest of this function already applies:
+        # a true notification (id ABSENT — an id makes it a JSON-RPC
+        # request, the round-2 rule the forwarding branch below enforces)
+        # that actually CARRIES the honored subset (`params.notifications`,
+        # an object, per the ack's spec shape — an honored subset of {} is
+        # a valid "nothing honored" ack and still establishes). Anything
+        # else is swallowed, leaving the round-5 pre-establishment
+        # fail-fast in charge.
+        params = msg.get("params")
+        honored = params.get("notifications") if isinstance(params, dict) else None
+        if "id" in msg or not isinstance(honored, dict):
+            return None
+        if state is not None:
+            state["honored"] = honored
+        if honored != _LISTEN_REQUESTED_NOTIFICATIONS:
+            log(
+                "listen stream: server honored a subset of the requested "
+                f"notifications: {honored}"
+            )
+        return "ack"
+    if method in _LISTEN_FORWARDED_NOTIFICATIONS:
+        # #352 round-2 finding 3: JSON-RPC 2.0 defines any message that
+        # CARRIES an "id" member as a request — the sender expects a
+        # response. A hostile or malformed upstream could stamp an id onto
+        # a whitelisted method to smuggle a live request onto the stdio
+        # wire, and the legacy client may answer it — leaking a
+        # relay-internal interaction into the ordinary request path. Only a
+        # true notification (id absent) is forwarded; anything else is
+        # swallowed like every other non-whitelisted message.
+        #
+        # #352 round-3 finding 2 (the C8 narrowing's forwarding side):
+        # forward only when the notification's family was actually
+        # advertised (listChanged) in the synthesized InitializeResult —
+        # the advertised set is frozen into ``state`` at listen-seed time
+        # (run()'s ``_seed_listen_snapshot``). A family the discover seed
+        # never contained was never advertised downstream, so forwarding
+        # its list_changed would be exactly the un-negotiated-capability
+        # notification C8 exists to prevent; swallowed instead. With an
+        # empty discover seed ALL three are swallowed — the documented
+        # degraded mode. An unseeded carrier (``state`` is None or never
+        # saw a seed — direct callers in tests) keeps the permissive
+        # pre-narrowing behavior; run() always seeds before the thread
+        # starts.
+        # #352 round-8 finding 2: the ack's honored subset is the listen
+        # NEGOTIATION RESULT — a server that acknowledged
+        # ``{"toolsListChanged": false}`` (or omitted the flag) declared
+        # it will not send that kind, so one arriving anyway is malformed
+        # or misrouted traffic and must not be forwarded. The honored
+        # subset rides ``state["honored"]`` (recorded by the ack branch
+        # above, overwritten by each reconnect's fresh ack); an unseeded
+        # carrier keeps the permissive behavior like the advertised gate.
+        advertised = state.get("advertised") if state is not None else None
+        honored = state.get("honored") if state is not None else None
+        family = method.split("/")[1]
+        if (
+            acked
+            and "id" not in msg
+            and (advertised is None or family in advertised)
+            and (
+                not isinstance(honored, dict)
+                or bool(honored.get(f"{family}ListChanged"))
+            )
+        ):
+            _emit(json.dumps(_strip_listen_subscription_id(msg)), tracker)
+        return None
+    if method == "notifications/cancelled":
+        params = msg.get("params")
+        rid = params.get("requestId") if isinstance(params, dict) else None
+        if rid == listen_id:
+            log("listen stream: closed gracefully (notifications/cancelled)")
+            return "graceful"
+        return None
+    if "method" not in msg and ("result" in msg or "error" in msg):
+        if "error" in msg:
+            error = msg.get("error")
+            code = error.get("code") if isinstance(error, dict) else None
+            # Any error for our id, or a deterministic-rejection code under
+            # ANY id (a server may reject an unknown method with id null).
+            if msg.get("id") == listen_id or code in _LISTEN_TERMINAL_ERROR_CODES:
+                log(
+                    "listen stream: server rejected subscriptions/listen "
+                    f"({error}); list_changed forwarding disabled for this "
+                    "session"
+                )
+                return "terminal"
+            return None
+        if msg.get("id") == listen_id:
+            log("listen stream: closed gracefully (result for the listen request)")
+            return "graceful"
+        return None
+    return None
+
+
+def _listen_stream_loop(
+    *,
+    client: httpx.Client,
+    url: str,
+    params: dict[str, Any],
+    prepare_headers: Callable[[str], dict[str, str]],
+    tracker: "_CancelTracker | None",
+    stop: threading.Event,
+    timeout: httpx.Timeout,
+    state: dict[str, Any] | None = None,
+) -> None:
+    """Reader thread: maintain the modern ``subscriptions/listen`` stream.
+
+    ``client`` is this thread's own DEDICATED httpx client (#352 round-2
+    finding 2) — never run()'s shared one. A read parked in
+    ``iter_text()`` can outlive any bounded join by up to
+    ``--listen-read-timeout`` (300 s default), so run()'s shutdown
+    ACTIVELY closes this client from the main thread: the parked read
+    raises a mapped ``httpx.TransportError`` at once (httpcore's pool
+    close is lock-guarded and its connection close is documented as
+    deliberately unilateral), the stop-set drop arm below exits silently,
+    the join then succeeds fast, and only afterwards does run() close the
+    shared client. The thread itself never closes this client — run()'s
+    finally owns that unconditionally (``httpx.Client.close`` is
+    idempotent), covering the natural exit arms too so no connection
+    leaks until process exit.
+
+    Opened once per session by run()'s ``_start_listen_stream`` on the
+    client's ``notifications/initialized`` (#352 review finding 1 — never
+    before the synthesized InitializeResult reached stdout). Per attempt:
+    re-mint the id (``mcp-stdio/listen/1``, ``/2``, ...) into the FROZEN
+    ``params`` snapshot (C1), take a FRESH ``prepare_headers`` snapshot
+    (C2 — it locks internally, so token refreshes from the main loop /
+    proactive daemon are picked up on reconnect) with its
+    ``MCP-Protocol-Version`` re-pinned to the snapshot's frozen version
+    (#352 review finding 2 — see the comment at the pin), plus this
+    request's own ``Mcp-Method`` and a dual ``Accept``, and stream the
+    POST with the dedicated read timeout (``--listen-read-timeout``;
+    per-request override, like ``run_sse``'s ``post_timeout``).
+
+    Raw ``client.stream`` + the shared SSE decoders — deliberately NOT
+    ``_post_and_stream`` (its retry ladder and stdout plumbing must not
+    run) and NOT ``_first_response_message`` (it returns at the first
+    response; this stream must keep reading). A JSON (non-SSE) 200 is a
+    legal immediate end, judged by its content like any stream message.
+
+    Outcome arms:
+
+    - graceful (either signal — see ``_handle_listen_message``): stop, no
+      reconnect, nothing on stdout.
+    - non-support (C6): ANY non-200 whose body is a JSON-RPC error with a
+      terminal code (#352 round-3 finding 1 — a ``-32601``-bodied 404 is
+      the canonical case, but a reconnect answered 400 + ``-32020`` must
+      not be retried forever either; see ``_listen_error_code``), or a
+      terminal error result on-stream — one loud stderr line, stop, NEVER
+      retry (retrying would POST forever at 1 Hz against a server that
+      will never accept).
+    - abrupt drop: stream end without a signal, a non-200 without a
+      terminal-code body, or any
+      ``httpx.HTTPError`` — after a first successful establishment,
+      reconnect forever on a fixed ``stop.wait(RETRY_DELAY)`` backoff;
+      BEFORE any success, fail fast instead (C7's ``established`` split —
+      the first attempt runs moments after a successful probe/initialize,
+      so a first-attempt failure is far more likely non-support than a
+      blip). "Established" means the acknowledgement — the spec-mandated
+      FIRST stream message — was observed, NOT that some attempt got an
+      HTTP 200 (#352 round-5 finding 2: a misrouted endpoint answering a
+      generic empty/HTML 200, or a 200 SSE closing before any ack, must
+      hit this same fail-fast, not reconnect forever). It is deliberately
+      once-per-THREAD, not per-attempt: a server that once proved it
+      speaks the protocol has earned C7's infinite patience, so a
+      reconnect answered with ack-less junk is treated as the
+      transient blip (LB flap, mid-deploy proxy page) it almost certainly
+      is and retried — sudden genuine non-support still terminates via
+      the C6 terminal arms. 401/403 are EXEMPT from the fail-fast (#352 round-2
+      finding 1): an auth challenge is always a retryable drop (C3),
+      established or not — NO auth recovery runs on this thread
+      (``_probe_auth_recovery``'s lock ordering is not safe from a
+      third concurrent caller; ``_sse_reader_loop`` sets the precedent
+      that a reader owns no recovery), the next attempt's fresh header
+      snapshot picks up whatever the main loop / daemon refreshed.
+    - dead stdout (C12): ``OSError``/``BrokenPipeError`` from ``_emit`` is
+      terminal — reconnecting into a closed stdout would spin forever.
+    - shutdown race (#352 round-5 finding 1): a ``RuntimeError`` from an
+      attempt that raced run()'s teardown (stop set, dedicated client
+      closed, but this thread had already passed the loop-top stop check)
+      exits silently iff stop is set; with stop UNSET it re-raises — see
+      the handler's comment.
+    """
+    # C1 x C2 interaction guard (#352 review finding 2): the body is
+    # FROZEN (C1) but prepare_headers (the modern _prepare_headers) reads
+    # the MUTABLE modern_state.negotiated_version — a client-driven
+    # re-initialize can renegotiate it mid-session, and a reconnect would
+    # then send an MCP-Protocol-Version header disagreeing with the frozen
+    # params._meta protocolVersion. A compliant server rejects that as
+    # HeaderMismatch (-32020), which sits in _LISTEN_TERMINAL_ERROR_CODES:
+    # the C6 terminal arm would permanently disable listening over a mere
+    # renegotiation. Pin every attempt's header to the version frozen
+    # inside the snapshot; everything ELSE in the fresh snapshot — the
+    # credentials above all — stays fresh, which is C2's actual point.
+    frozen_version = params["_meta"][_META_PROTOCOL_VERSION]
+    attempt = 0
+    established = False
+    while not stop.is_set():
+        attempt += 1
+        listen_id = f"{_LISTEN_ID_PREFIX}{attempt}"
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": listen_id,
+                "method": _LISTEN_METHOD,
+                "params": params,
+            }
+        )
+        req_headers = prepare_headers(body)
+        # prepare_headers (the modern _prepare_headers) already derives
+        # Mcp-Method from the body; set it explicitly so this thread's
+        # request is correct even against a stub/legacy-shaped callable.
+        # No Mcp-Name: subscriptions/listen is not a name-bearing method.
+        req_headers = {k: v for k, v in req_headers.items() if k.lower() != "accept"}
+        req_headers["Accept"] = "application/json, text/event-stream"
+        req_headers["Mcp-Method"] = _LISTEN_METHOD
+        # Frozen-version pin (#352 review finding 2, comment above the
+        # loop): strip any case-variant first — the file's strip-then-set
+        # discipline — so httpx never serialises two header lines.
+        req_headers = {
+            k: v for k, v in req_headers.items() if k.lower() != "mcp-protocol-version"
+        }
+        req_headers["MCP-Protocol-Version"] = frozen_version
+        try:
+            with client.stream(
+                "POST", url, content=body, headers=req_headers, timeout=timeout
+            ) as resp:
+                if resp.status_code != 200:
+                    resp.read()
+                    # #352 round-3 finding 1: classify the BODY before the
+                    # status split. Round 2 read only a 404 body, so a
+                    # reconnect answered e.g. HTTP 400 with a -32020
+                    # JSON-RPC body was treated as an abrupt drop and
+                    # retried at 1 Hz forever — against a server rejecting
+                    # THIS exact request deterministically, exactly what
+                    # the C6 terminal arm exists to prevent. ANY non-200
+                    # whose body parses to a terminal JSON-RPC error code
+                    # (the same _LISTEN_TERMINAL_ERROR_CODES set
+                    # _handle_listen_message classifies on-stream) now
+                    # stops for good, established or not — and BEFORE the
+                    # 401/403 exemption: a body carrying one of the
+                    # reserved deterministic-rejection codes is the
+                    # remote's own verdict on this request, more specific
+                    # than the transport status around it. An absent or
+                    # unparseable body keeps the round-2 split below
+                    # exactly as it was.
+                    code = _listen_error_code(resp)
+                    if code in _LISTEN_TERMINAL_ERROR_CODES:
+                        log(
+                            "listen stream: server rejected "
+                            f"subscriptions/listen (HTTP {resp.status_code}, "
+                            f"JSON-RPC {code}); list_changed forwarding "
+                            "disabled for this session"
+                        )
+                        return
+                    # Three-way split (#352 round-2 finding 1): terminal
+                    # codes (C6 — classified from the body above, and the
+                    # terminal error results _handle_listen_message
+                    # classifies) stop for good; auth challenges 401/403
+                    # are ALWAYS retryable drops (C3), even before the
+                    # stream was ever established — they heal EXTERNALLY
+                    # (the main loop / proactive-refresh daemon refreshes
+                    # credentials, and the next attempt's fresh
+                    # _prepare_headers snapshot picks them up), so the
+                    # fail-fast below must never eat them or a token
+                    # expiring between initialize and the first listen
+                    # POST would disable the stream permanently; every
+                    # OTHER pre-establishment failure fails fast (C7 — a
+                    # server that will never say yes must not be hammered
+                    # at 1 Hz, a rationale that fits -32601/404/4xx
+                    # generally but NOT auth challenges).
+                    if resp.status_code in (401, 403):
+                        log(
+                            f"listen stream: HTTP {resp.status_code}; "
+                            "reconnecting with a fresh header snapshot"
+                        )
+                    elif not established:
+                        log(
+                            f"listen stream: HTTP {resp.status_code} before the "
+                            "stream was ever established; list_changed "
+                            "forwarding disabled for this session"
+                        )
+                        return
+                    else:
+                        log(f"listen stream: HTTP {resp.status_code}; reconnecting")
+                else:
+                    # #352 round-5 finding 2: an HTTP 200 alone is NOT
+                    # establishment. Establishment is recorded only on the
+                    # acknowledgement — the spec-mandated FIRST stream
+                    # message, the protocol-valid evidence the endpoint
+                    # actually speaks subscriptions/listen. Recording it
+                    # on any 200 let an unsupported/misrouted endpoint
+                    # answering a generic empty/HTML 200 (or a 200 SSE
+                    # that closes before any ack) flip the loop into the
+                    # post-establishment reconnect-forever arm — POSTing
+                    # at 1 Hz forever against an endpoint that never spoke
+                    # the protocol, exactly what C7's fail-fast exists to
+                    # prevent. Graceful/terminal classifications still win
+                    # over the no-ack fail-fast below: they return from
+                    # inside the message handling, before stream end is
+                    # ever reached.
+                    if _is_sse_response(resp):
+                        # Per-ATTEMPT ack gate (#352 round-7 finding): the
+                        # spec makes the ack the mandatory FIRST stream
+                        # message, so nothing is forwarded until THIS
+                        # attempt's stream has acked — `established` is
+                        # once-per-thread (C7's reconnect patience) and
+                        # cannot serve as the forwarding gate.
+                        acked = False
+                        for event_type, data in _iter_sse_events(
+                            _iter_sse_lines(resp.iter_text())
+                        ):
+                            if stop.is_set():
+                                return
+                            if event_type != "message":
+                                continue
+                            outcome = _handle_listen_message(
+                                data, listen_id, tracker, state, acked=acked
+                            )
+                            if outcome == "ack":
+                                established = True
+                                acked = True
+                            elif outcome is not None:
+                                return
+                        # Stream ended with neither graceful signal.
+                        if not established:
+                            log(
+                                "listen stream: 200 stream ended without the "
+                                "acknowledgement before the stream was ever "
+                                "established; list_changed forwarding "
+                                "disabled for this session"
+                            )
+                            return
+                        log("listen stream ended without a signal; reconnecting")
+                    else:
+                        resp.read()
+                        text = resp.text.strip()
+                        # acked=False: a single-JSON-body 200 carries at
+                        # most one message, which cannot have been preceded
+                        # by an ack on the same attempt — so a list_changed
+                        # here is never forwarded (#352 round-7 finding);
+                        # an ack/graceful/terminal still classifies.
+                        outcome = (
+                            _handle_listen_message(
+                                text, listen_id, tracker, state, acked=False
+                            )
+                            if text
+                            else None
+                        )
+                        if outcome == "ack":
+                            established = True
+                        elif outcome is not None:
+                            return
+                        if not established:
+                            log(
+                                "listen stream: 200 response carried no "
+                                "acknowledgement before the stream was ever "
+                                "established; list_changed forwarding "
+                                "disabled for this session"
+                            )
+                            return
+                        log(
+                            "listen stream: JSON 200 carried no terminal "
+                            "signal; reconnecting"
+                        )
+        except httpx.HTTPError as e:
+            if stop.is_set():
+                return
+            if not established:
+                log(
+                    f"listen stream failed before it was ever established "
+                    f"({e}); list_changed forwarding disabled for this session"
+                )
+                return
+            log(f"listen stream dropped ({e}); reconnecting")
+        except OSError as e:
+            if stop.is_set():
+                # Shutdown teardown (#352 round-2 finding 2): run()'s
+                # finally closed THIS thread's dedicated client to yank a
+                # parked read, so a raw OSError surfacing now is that
+                # teardown, not a stdout failure — exit silently, exactly
+                # like the HTTPError stop-set arm above.
+                return
+            # C12: _emit's stdout write failed (BrokenPipeError is an
+            # OSError) — the downstream reader is gone; reconnecting the
+            # upstream stream would spin against a dead stdout.
+            log(f"listen stream: stdout write failed ({e}); stopping")
+            return
+        except RuntimeError:
+            # Shutdown race (#352 round-5 finding 1): run()'s finally sets
+            # the stop event and THEN closes this thread's dedicated
+            # client, but an attempt that passed the loop-top stop check
+            # just before can still reach client.stream() afterwards —
+            # httpx (0.28.1: Client.send's ClientState.CLOSED guard)
+            # raises a plain RuntimeError("Cannot send a request, as the
+            # client has been closed."), not an HTTPError/OSError, so
+            # without this arm an ordinary shutdown smeared an unhandled
+            # daemon-thread traceback across stderr. httpx's StreamError
+            # family (e.g. StreamClosed, when the close lands mid-read)
+            # subclasses RuntimeError too and is covered by the same
+            # reasoning. stop set → this is the teardown's own doing (the
+            # set() happens-before the close() this thread just observed):
+            # exit silently, exactly like the stop-set arms above. stop
+            # NOT set → nothing legitimate produces this (run()'s finally
+            # is the ONLY closer of the dedicated client, and it sets stop
+            # first), so re-raise loudly: swallowing would mask a real
+            # logic bug as a quiet thread death.
+            if stop.is_set():
+                return
+            raise
+        if stop.wait(RETRY_DELAY):
+            return
+
+
+def _listen_error_code(resp: httpx.Response) -> int | None:
+    """JSON-RPC error code carried by a (fully-read) response body, or None.
+
+    Generalized from a 404-only ``-32601`` probe by #352 round-3 finding
+    1: ANY non-200 the listen POST gets back may carry the remote's real
+    JSON-RPC verdict (e.g. HTTP 400 with a ``-32020`` body), and only the
+    code decides whether the rejection is one of the deterministic
+    ``_LISTEN_TERMINAL_ERROR_CODES``. HTTP status alone stays ambiguous
+    (a legacy proxy, a wrong path, a transient 5xx) — an unparseable,
+    absent, or code-less body returns ``None`` and the caller falls back
+    to the status-based drop/fail-fast split.
+    """
+    try:
+        parsed = json.loads(resp.text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    error = parsed.get("error")
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, int) else None
+
+
 def _reinitialize(
     client: httpx.Client,
     url: str,
@@ -3524,6 +4306,7 @@ def run(
     refresh_leeway: float = 60.0,
     cold_start_login: Any = None,
     protocol_era: str = "legacy",
+    listen_read_timeout: float = 300.0,
 ) -> None:
     """Run the stdio-to-HTTP relay loop.
 
@@ -3607,6 +4390,18 @@ def run(
             compared to a pinned era, which is why it is NOT the default (see
             ``_probe_protocol_era``'s docstring for the exact classification
             rules per HTTP status).
+        listen_read_timeout: Read timeout (seconds, > 0) for the modern
+            era's relay-originated ``subscriptions/listen`` POST stream
+            (#270 Phase 2 PR A — see ``_listen_stream_loop``). Applied as a
+            per-request override on that stream only, so ``timeout_read``
+            still governs every ordinary request; a quiet-but-healthy
+            listen stream (servers are only encouraged to send keep-alive
+            comments) must not be classified as dropped by the ordinary
+            read timeout. No effect on the legacy era. Default 300, like
+            ``run_sse``'s SSE read timeout — but 0 (= disable) is NOT
+            honored here: the spec says clients SHOULD always enforce a
+            maximum timeout, and the CLI flag (``--listen-read-timeout``)
+            rejects 0 by construction.
 
     Limitation — JSON-RPC batches: a top-level array (a batch) is
     treated like a notification for error synthesis. ``_extract_id_and_presence``
@@ -3923,6 +4718,118 @@ def run(
             client, url, snapshot, modern_state, auth_recovery=_probe_auth_recovery
         )
 
+    # --- modern era: subscriptions/listen stream (#270 Phase 2 PR A) ---
+    # ARRANGED here (era-resolution scope); the body snapshot is SEEDED by
+    # each intercepted `initialize` (_handle_modern_special_method's
+    # `listen_seed` hook — the snapshot needs the client's captured
+    # capabilities and the negotiated version, which do not exist before
+    # then) and the thread is STARTED by `notifications/initialized`
+    # (`listen_start` hook, #352 review finding 1 — never before the
+    # synthesized InitializeResult reached stdout). The legacy era gets NO
+    # new call site (acceptance criterion #3): the only caller of either
+    # hook is the era == "modern" branch in the stdin loop below, so
+    # legacy wire bytes are untouched structurally.
+    listen_stop = threading.Event()
+    # Mutable holder shared with the thread. "thread" doubles as the
+    # one-shot latch — a client-driven re-`initialize`/repeat
+    # `initialized` invokes the hooks again but must never spawn a second
+    # thread. "params" is the frozen C1 snapshot, seeded at initialize
+    # time; None means no initialize was ever intercepted, so an orphan
+    # `initialized` starts nothing. "honored" records the
+    # server-acknowledged notification subset from the ack (logged on
+    # divergence; consumed for real by PR B). "advertised" is the frozen
+    # set of capability families the synthesized InitializeResult
+    # advertised listChanged on (#352 round-3 finding 2) — the forwarding
+    # gate _handle_listen_message applies. "client" is the thread's
+    # DEDICATED httpx client (#352 round-2 finding 2), created alongside
+    # the thread and closed by the finally below — from the main thread —
+    # to actively unblock a parked read at shutdown.
+    listen_state: dict[str, Any] = {
+        "thread": None,
+        "params": None,
+        "honored": None,
+        "advertised": None,
+        "client": None,
+    }
+
+    def _seed_listen_snapshot() -> None:
+        """Freeze the listen body snapshot (C1) at initialize time.
+
+        Re-seeded by a re-``initialize`` only until the thread starts —
+        the latest negotiation wins at start time; after that the running
+        thread's snapshot stays frozen (C1). The advertised-family set
+        (#352 round-3 finding 2) freezes on the same schedule, computed by
+        the SAME helper the InitializeResult synthesis uses
+        (``_listen_advertised_families``), so the gate and the
+        advertisement cannot drift. A re-``initialize`` AFTER the thread
+        started re-derives the synthesized result but never widens what
+        the running thread forwards — the conservative direction: an
+        over-advertised family merely gets no notifications (which
+        ``listChanged`` never guarantees), never a forwarded notification
+        for an unadvertised one.
+        """
+        if listen_state["thread"] is not None:
+            return
+        listen_state["params"] = _build_listen_params(modern_state)
+        listen_state["advertised"] = _listen_advertised_families(
+            modern_state.capabilities
+        )
+
+    def _start_listen_stream() -> None:
+        """Open the background subscriptions/listen stream, at most once.
+
+        Invoked on ``notifications/initialized`` (#352 review finding 1).
+        No seeded snapshot — an ``initialized`` with no prior
+        ``initialize`` — starts nothing: the snapshot would carry an
+        un-negotiated version and no captured client identity.
+        """
+        if listen_state["thread"] is not None or listen_state["params"] is None:
+            return
+        # DEDICATED client for the listen thread (#352 round-2 finding 2),
+        # mirroring the shared client's construction above. The thread must
+        # never touch the shared client: shutdown interrupts a read parked
+        # for up to --listen-read-timeout by closing THIS client from the
+        # main thread (run()'s finally), which a bounded join alone cannot
+        # do — and a long-parked stream no longer holds one of the shared
+        # client's pool=10 connections either.
+        listen_client = httpx.Client(
+            transport=_make_httpx_transport(tcp_keepalive=tcp_keepalive),
+            timeout=httpx.Timeout(
+                connect=timeout_connect,
+                read=timeout_read,
+                write=timeout_write,
+                pool=10,
+            ),
+        )
+        listen_state["client"] = listen_client
+        listen_thread = threading.Thread(
+            target=_listen_stream_loop,
+            kwargs={
+                "client": listen_client,
+                "url": url,
+                # Frozen body snapshot (C1) — seeded at initialize time.
+                "params": listen_state["params"],
+                # Fresh header snapshot per attempt (C2) — _prepare_headers
+                # locks internally, so refreshed tokens reach reconnects.
+                "prepare_headers": _prepare_headers,
+                "tracker": tracker,
+                "stop": listen_stop,
+                # Per-request timeout override, built like run_sse's
+                # post_timeout: same connect/write/pool, but the READ
+                # timeout is the dedicated --listen-read-timeout (C9).
+                "timeout": httpx.Timeout(
+                    connect=timeout_connect,
+                    read=listen_read_timeout,
+                    write=timeout_write,
+                    pool=10,
+                ),
+                "state": listen_state,
+            },
+            daemon=True,
+        )
+        listen_state["thread"] = listen_thread
+        listen_thread.start()
+
     refresh_timer, refresh_stop = _start_proactive_refresh(
         refresher=token_refresher,
         expiry_getter=token_expiry_getter,
@@ -4021,7 +4928,12 @@ def run(
                     # the initialize branch its one-shot reseed retry
                     # (#350 review round 4).
                     handled, modern_reply = _handle_modern_special_method(
-                        line, req_id, modern_state, discover_retry=_discover_reseed
+                        line,
+                        req_id,
+                        modern_state,
+                        discover_retry=_discover_reseed,
+                        listen_seed=_seed_listen_snapshot,
+                        listen_start=_start_listen_stream,
                     )
                     if handled:
                         if modern_reply is not None:
@@ -4433,6 +5345,26 @@ def run(
                 continue
     finally:
         _stop_proactive_refresh(refresh_timer, refresh_stop)
+        # Modern listen thread teardown (C11 + #352 round-2 finding 2), in
+        # this exact order: set the stop event, CLOSE the thread's
+        # dedicated client from here — a read parked in iter_text() can
+        # outlast any bounded join by up to --listen-read-timeout, and
+        # closing the client makes it raise immediately (httpcore's pool
+        # close is lock-guarded, its connection close deliberately
+        # unilateral), upon which the loop's stop-set arms exit silently —
+        # THEN join (now fast; the bound stays as a belt for a thread
+        # parked in connection setup, where close cannot interrupt), and
+        # only after that close the shared client, which the thread never
+        # touches. Closing here unconditionally also covers the thread's
+        # natural exits (graceful/terminal arms) so the dedicated client
+        # never leaks until process exit; httpx.Client.close is idempotent.
+        listen_stop.set()
+        listen_client = listen_state["client"]
+        if listen_client is not None:
+            listen_client.close()
+        listen_thread = listen_state["thread"]
+        if listen_thread is not None:
+            listen_thread.join(timeout=1.0)
         # The cold-start daemon self-exits after one OAuth attempt; briefly join
         # it so a clean shutdown does not race its final emit. daemon=True keeps
         # process exit unblocked if it is still parked in the interactive flow.

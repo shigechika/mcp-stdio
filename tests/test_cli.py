@@ -380,6 +380,7 @@ class TestMain:
             "--timeout-connect",
             "--timeout-read",
             "--sse-read-timeout",
+            "--listen-read-timeout",
             "--oauth-refresh-leeway",
             "--oauth-timeout",
         ],
@@ -426,6 +427,47 @@ class TestMain:
         ):
             main()
             assert mock_run_sse.call_args.kwargs["sse_read_timeout"] == 0.0
+
+    def test_listen_read_timeout_zero_rejected(self, capsys):
+        """#270 Phase 2 PR A (C9): --listen-read-timeout deliberately does
+        NOT inherit --sse-read-timeout's 0 = disable — an unbounded read on
+        the modern subscriptions/listen stream would violate the spec's
+        "SHOULD always enforce a maximum timeout". _positive_float rejects
+        0 at parse time, by construction."""
+        with patch(
+            "sys.argv",
+            ["mcp-stdio", "--listen-read-timeout", "0", "https://example.com/mcp"],
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 2
+        assert "must be > 0" in capsys.readouterr().err
+
+    def test_listen_read_timeout_default_and_passthrough(self):
+        """#270 Phase 2 PR A: --listen-read-timeout reaches run() (default
+        300.0, kept a float like the other timeout flags — argparse applies
+        ``type`` only to argv strings, never to the default object)."""
+        with (
+            patch("sys.argv", ["mcp-stdio", "https://example.com/mcp"]),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+            assert mock_run.call_args.kwargs["listen_read_timeout"] == 300.0
+            assert isinstance(mock_run.call_args.kwargs["listen_read_timeout"], float)
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--listen-read-timeout",
+                    "42.5",
+                    "https://example.com/mcp",
+                ],
+            ),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+            assert mock_run.call_args.kwargs["listen_read_timeout"] == 42.5
 
     def test_oauth_refresh_leeway_invalid_env_var_rejected(self, monkeypatch, capsys):
         """#56: invalid env var values surface as argparse errors, not ValueError."""

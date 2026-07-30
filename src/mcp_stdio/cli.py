@@ -31,7 +31,7 @@ def _non_negative_float(value: str) -> float:
     # nan/inf timeout makes httpx's elapsed-vs-deadline check always False, so a
     # connect/read never times out (a silent hang); a nan refresh-leeway forces
     # a refresh every call. Reject non-finite values up front. This also covers
-    # _positive_float and every flag that reuses these (one fix, five flags).
+    # _positive_float and every flag that reuses these (one fix, six flags).
     if not math.isfinite(f):
         raise argparse.ArgumentTypeError(f"value must be finite (got {value!r})")
     if f < 0:
@@ -44,7 +44,11 @@ def _positive_float(value: str) -> float:
 
     For ``--timeout-connect`` / ``--timeout-read`` a value of 0 is meaningless:
     httpx treats it as an immediate timeout, so every connect/read would fail at
-    once. Reject 0 at parse time. (``--sse-read-timeout`` keeps 0 = disable and
+    once. Reject 0 at parse time. ``--listen-read-timeout`` also uses this
+    validator, deliberately NOT inheriting ``--sse-read-timeout``'s 0 = disable:
+    an unbounded read on the modern listen stream would violate the spec's
+    "SHOULD always enforce a maximum timeout" (#270 Phase 2, C9).
+    (``--sse-read-timeout`` keeps 0 = disable and
     ``--oauth-refresh-leeway`` keeps 0 = no proactive refresh, so those stay on
     ``_non_negative_float``.) See #9.
     """
@@ -626,6 +630,23 @@ def _main() -> None:
         ),
     )
     parser.add_argument(
+        "--listen-read-timeout",
+        type=_positive_float,
+        # Float default: argparse applies ``type`` only to argv strings, never
+        # to the default object — keep the attribute a float like the other
+        # timeout flags.
+        default=300.0,
+        help=(
+            "Idle read timeout (seconds, > 0) on the modern protocol era's "
+            "long-lived subscriptions/listen POST stream (default: 300). A "
+            "silent half-open connection raises ReadTimeout and triggers "
+            "auto-reconnect instead of hanging. Unlike --sse-read-timeout, 0 "
+            "is rejected (the MCP spec says clients SHOULD always enforce a "
+            "maximum timeout). Only meaningful with --protocol-era "
+            "modern/auto. See #270."
+        ),
+    )
+    parser.add_argument(
         "--no-tcp-keepalive",
         action="store_true",
         help=(
@@ -984,8 +1005,11 @@ def _main() -> None:
         )
         sys.exit(0 if ok else 1)
 
-    # run() ignores sse_read_timeout (Streamable HTTP doesn't hold a
-    # long-lived GET), so only pass it through on the SSE path.
+    # run() ignores sse_read_timeout (that knob governs only the legacy SSE
+    # transport's GET stream), so only pass it through on the SSE path. The
+    # one long-lived stream run() CAN hold — the modern era's
+    # subscriptions/listen POST (#270 Phase 2) — has its own dedicated knob,
+    # --listen-read-timeout, passed only to run() and ignored by run_sse.
     # tcp_keepalive, cancel_filter and normalize_arguments apply to both.
     tcp_keepalive = not args.no_tcp_keepalive
     cancel_filter = not args.no_cancel_filter
@@ -1029,6 +1053,7 @@ def _main() -> None:
             refresh_leeway=args.oauth_refresh_leeway,
             cold_start_login=cold_start_login,
             protocol_era=args.protocol_era,
+            listen_read_timeout=args.listen_read_timeout,
         )
 
 
