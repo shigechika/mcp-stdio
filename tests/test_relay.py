@@ -58,6 +58,7 @@ from mcp_stdio.relay import (
     _reinitialize,
     _report_discover,
     _report_initialize,
+    _reseed_discover_probe,
     _seed_modern_state_from_discover,
     _start_proactive_refresh,
     _stop_proactive_refresh,
@@ -9550,21 +9551,19 @@ class TestHandleModernSpecialMethod:
         assert "unknown" in server_info["name"].lower()
 
     def test_unseeded_discover_state_is_not_backfilled_from_client_initialize(self):
-        """#350 review round 3, DOCUMENTED LIMITATION (see run()'s own
-        "Limitation" docstring section): the era-detection ``server/
-        discover`` probe runs BEFORE the stdin loop starts — necessarily
-        before the local client's own ``initialize`` — so it always
-        advertises ``clientCapabilities: {}``. A remote gating discover
-        itself on a real client capability (returning the recognized-modern
-        ``-32021`` with no ``result``) leaves ``modern_state.server_info``/
-        ``capabilities`` unseeded. This pins that the synthesized
-        InitializeResult reports that honest under-report REGARDLESS of
-        what real capabilities/clientInfo the local client's initialize
-        supplies — they are captured into ``modern_state`` for later
-        ``_meta`` injection (proven below), but never used to retroactively
-        backfill ``server_info``/``capabilities``, confirming this is a
-        deliberate, documented tradeoff rather than an accident a future
-        refactor could silently reintroduce or silently "fix" halfway."""
+        """#350 review rounds 3 + 4: when discover seeded nothing, the fix
+        (round 4) is a one-shot RE-PROBE of the server with the client's
+        real capabilities (``discover_retry`` — see
+        TestDiscoverReseedRetry), never a local fabrication. This pins the
+        invariant that survives that fix: WITHOUT a ``discover_retry`` hook
+        (as here), the client's own ``capabilities``/``clientInfo`` are
+        captured into ``modern_state`` for later ``_meta`` injection
+        (proven below) but are NEVER copied into
+        ``server_info``/``capabilities`` — client capabilities are not
+        server capabilities, and only a real ``server/discover`` response
+        may seed those fields. A refactor that "fixes" the under-report by
+        echoing client data back as server data would be strictly worse
+        than the honest under-report and must fail here."""
         state = _ModernState()
         line = json.dumps(
             {
@@ -9647,6 +9646,200 @@ class TestHandleModernSpecialMethod:
         handled, reply = _handle_modern_special_method(line, 1, state)
         assert handled is False
         assert reply is None
+
+
+class TestDiscoverReseedRetry:
+    """#350 review round 4 finding 2: when the startup probe seeded nothing
+    (e.g. the remote gated ``server/discover`` on a real client capability,
+    ``-32021``), the synthesized InitializeResult's empty ``capabilities``
+    is NOT cosmetic — lifecycle spec: both parties "MUST ... Only use
+    capabilities that were successfully negotiated", so a compliant client
+    told ``{}`` never issues tools/resources/prompts requests at all. The
+    fix is a NARROW one-shot retry of discovery inside the initialize
+    interception, once the client's real capabilities are known — zero
+    cost on the common already-seeded path."""
+
+    def _initialize_line(self, req_id=1, version="2025-06-18"):
+        return json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": version,
+                    "capabilities": {"roots": {}},
+                    "clientInfo": {"name": "real-client", "version": "3.0"},
+                },
+            }
+        )
+
+    def test_retry_runs_once_and_seeds_the_synthesized_result(self):
+        state = _ModernState()
+        calls = []
+
+        def retry():
+            # By the time the retry hook runs, the client's REAL
+            # capabilities/clientInfo must already be captured — that is
+            # the whole point of retrying at this moment and not earlier.
+            calls.append((dict(state.client_capabilities), dict(state.client_info)))
+            state.server_info = {"name": "reseeded-srv", "version": "2"}
+            state.capabilities = {"tools": {}}
+            state.supported_versions = ["2026-07-28"]
+
+        _, reply = _handle_modern_special_method(
+            self._initialize_line(), 1, state, discover_retry=retry
+        )
+        assert calls == [({"roots": {}}, {"name": "real-client", "version": "3.0"})]
+        result = json.loads(reply)["result"]
+        # The reseeded discover data feeds the synthesized result...
+        assert result["serverInfo"] == {"name": "reseeded-srv", "version": "2"}
+        assert result["capabilities"] == {"tools": {}}
+        # ...and negotiation runs AFTER the reseed: the client asked
+        # 2025-06-18, the reseeded remote advertises only 2026-07-28, so
+        # the upstream negotiated version is the remote's (while the
+        # downstream ack still echoes the client's own request).
+        assert state.negotiated_version == "2026-07-28"
+        assert result["protocolVersion"] == "2025-06-18"
+
+    @pytest.mark.parametrize(
+        "seed",
+        [
+            {"server_info": {"name": "srv", "version": "1"}},
+            {"capabilities": {"tools": {}}},
+            {"supported_versions": ["2026-07-28"]},
+        ],
+    )
+    def test_no_retry_when_any_discover_field_was_seeded(self, seed):
+        """The retry exists ONLY for the seeded-nothing failure path. Any
+        partial seed means the startup discover succeeded — re-probing
+        would add the every-session round-trip round 3 rightly rejected."""
+        state = _ModernState()
+        for attr, value in seed.items():
+            setattr(state, attr, value)
+        calls = []
+        _handle_modern_special_method(
+            self._initialize_line(), 1, state, discover_retry=lambda: calls.append(1)
+        )
+        assert calls == []
+
+    def test_failed_retry_degrades_and_never_retries_again(self):
+        """A retry that seeds nothing (the remote rejected discovery again)
+        degrades to exactly the pre-retry behavior — honest-unknown
+        serverInfo, empty capabilities — and the attempt is latched:
+        a client-driven re-initialize must NOT probe a second time."""
+        state = _ModernState()
+        calls = []
+
+        def failing_retry():
+            calls.append(1)  # seeds nothing
+
+        _, reply = _handle_modern_special_method(
+            self._initialize_line(), 1, state, discover_retry=failing_retry
+        )
+        assert calls == [1]
+        result = json.loads(reply)["result"]
+        assert result["capabilities"] == {}
+        assert "unknown" in result["serverInfo"]["name"].lower()
+        # Re-initialize: still no second probe.
+        _, _ = _handle_modern_special_method(
+            self._initialize_line(req_id=2), 2, state, discover_retry=failing_retry
+        )
+        assert calls == [1]
+
+    def test_no_hook_keeps_prior_behavior(self):
+        """Without a discover_retry hook (default None) the behavior is
+        byte-identical to before round 4 — the unit-level contract the
+        older tests in TestHandleModernSpecialMethod still pin."""
+        state = _ModernState()
+        _, reply = _handle_modern_special_method(self._initialize_line(), 1, state)
+        result = json.loads(reply)["result"]
+        assert result["capabilities"] == {}
+        assert state.discover_retry_attempted is False
+
+
+class TestReseedDiscoverProbe:
+    """Unit tests for the network half of the round-4 reseed retry."""
+
+    URL = "https://example.com/mcp"
+
+    def _state_with_client_data(self):
+        state = _ModernState()
+        state.client_capabilities = {"roots": {}}
+        state.client_info = {"name": "real-client", "version": "3.0"}
+        return state
+
+    def test_success_sends_real_client_meta_and_seeds_state(self, httpx_mock):
+        httpx_mock.add_response(
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "result": {
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"tools": {}},
+                        "_meta": {
+                            "io.modelcontextprotocol/serverInfo": {
+                                "name": "gated-srv",
+                                "version": "1",
+                            }
+                        },
+                    },
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        state = self._state_with_client_data()
+        _reseed_discover_probe(httpx.Client(), self.URL, {}, state)
+        req = httpx_mock.get_requests()[0]
+        body = json.loads(req.content)
+        assert body["method"] == "server/discover"
+        meta = body["params"]["_meta"]
+        # The re-probe advertises the client's REAL capabilities/info —
+        # the whole reason it can succeed where the startup probe's {}
+        # was rejected with -32021.
+        assert meta["io.modelcontextprotocol/clientCapabilities"] == {"roots": {}}
+        assert meta["io.modelcontextprotocol/clientInfo"] == {
+            "name": "real-client",
+            "version": "3.0",
+        }
+        # Header and _meta versions stay equal (HeaderMismatch guard).
+        assert (
+            req.headers["mcp-protocol-version"]
+            == meta["io.modelcontextprotocol/protocolVersion"]
+        )
+        assert state.server_info == {"name": "gated-srv", "version": "1"}
+        assert state.capabilities == {"tools": {}}
+        assert state.supported_versions == ["2026-07-28"]
+
+    def test_non_200_keeps_state_untouched(self, httpx_mock):
+        httpx_mock.add_response(status_code=401, text="")
+        state = self._state_with_client_data()
+        _reseed_discover_probe(httpx.Client(), self.URL, {}, state)
+        assert state.server_info is None
+        assert state.capabilities == {}
+        assert state.supported_versions == []
+
+    def test_jsonrpc_error_body_keeps_state_untouched(self, httpx_mock):
+        httpx_mock.add_response(
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "error": {"code": -32021, "message": "still gated"},
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        state = self._state_with_client_data()
+        _reseed_discover_probe(httpx.Client(), self.URL, {}, state)
+        assert state.server_info is None
+        assert state.capabilities == {}
+
+    def test_transport_error_is_swallowed(self, httpx_mock):
+        httpx_mock.add_exception(httpx.ConnectError("refused"))
+        state = self._state_with_client_data()
+        _reseed_discover_probe(httpx.Client(), self.URL, {}, state)  # no raise
+        assert state.server_info is None
 
 
 class TestInjectModernMeta:
@@ -10256,3 +10449,126 @@ class TestRunModernEra:
         # headers.
         assert json.loads(requests[1].content)["method"] == "initialize"
         assert "mcp-method" not in requests[1].headers
+
+    def test_capability_gated_discover_reseeded_once_with_real_capabilities(
+        self, httpx_mock
+    ):
+        """#350 review round 4 finding 2, end-to-end: the startup probe is
+        rejected with -32021 (recognized-modern -> era modern, but nothing
+        seeded); the local client's initialize then triggers exactly ONE
+        discover re-probe carrying the client's REAL
+        capabilities/clientInfo, whose result seeds the synthesized
+        InitializeResult — so a spec-compliant client (lifecycle: "MUST
+        ... Only use capabilities that were successfully negotiated") sees
+        the remote's real capabilities instead of {} and actually issues
+        tools/resources/prompts requests."""
+        httpx_mock.add_response(
+            url=self.URL,
+            status_code=400,
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "error": {"code": -32021, "message": "missing capability"},
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(),
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2026-07-28",
+                            "capabilities": {"roots": {}},
+                            "clientInfo": {"name": "real-client", "version": "3.0"},
+                        },
+                    }
+                )
+            ],
+            protocol_era="auto",
+        )
+        reply = json.loads(output.strip())
+        # The re-probe's discover data feeds the synthesized result.
+        assert reply["result"]["serverInfo"] == {"name": "modern-srv", "version": "1"}
+        assert reply["result"]["capabilities"] == {"tools": {}}
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 2  # startup probe + ONE reseed re-probe
+        reseed_body = json.loads(requests[1].content)
+        assert reseed_body["method"] == "server/discover"
+        meta = reseed_body["params"]["_meta"]
+        assert meta["io.modelcontextprotocol/clientCapabilities"] == {"roots": {}}
+        assert meta["io.modelcontextprotocol/clientInfo"] == {
+            "name": "real-client",
+            "version": "3.0",
+        }
+
+    def test_reseed_retry_failing_again_degrades_and_never_probes_again(
+        self, httpx_mock
+    ):
+        """Round-4 retry failure path: the re-probe is ALSO rejected with
+        -32021 — the synthesized result degrades to exactly the round-3
+        documented under-report (empty capabilities, honest-unknown
+        serverInfo), and a second client initialize does NOT probe a third
+        time (the attempt is latched)."""
+        gated = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 0,
+                "error": {"code": -32021, "message": "missing capability"},
+            }
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            status_code=400,
+            text=gated,
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            status_code=400,
+            text=gated,
+            headers={"content-type": "application/json"},
+        )
+        init_line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": {"roots": {}},
+                },
+            }
+        )
+        reinit_line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": {"roots": {}},
+                },
+            }
+        )
+        output = self._run_with_stdin(
+            httpx_mock, [init_line, reinit_line], protocol_era="auto"
+        )
+        lines = [json.loads(line) for line in output.strip().split("\n") if line]
+        assert len(lines) == 2
+        for reply in lines:
+            assert reply["result"]["capabilities"] == {}
+            assert "unknown" in reply["result"]["serverInfo"]["name"].lower()
+        # startup probe + ONE reseed attempt — the second initialize did
+        # not trigger a third.
+        assert len(httpx_mock.get_requests()) == 2

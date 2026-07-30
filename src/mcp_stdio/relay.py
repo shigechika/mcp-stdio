@@ -557,7 +557,11 @@ class _ModernState:
 
     ``server_info`` / ``capabilities`` / ``supported_versions`` are seeded
     once from the era-detection ``server/discover`` probe (see
-    ``_probe_protocol_era``). ``client_capabilities`` / ``client_info`` /
+    ``_probe_protocol_era``) — plus at most ONE reseed retry when that
+    probe seeded nothing and the local client's real capabilities have
+    since become known (``discover_retry_attempted`` latches the attempt so
+    it can never repeat — see ``_handle_modern_special_method``, #350
+    review round 4). ``client_capabilities`` / ``client_info`` /
     ``negotiated_version`` are captured once from the local stdio client's
     own ``initialize`` request (see ``_handle_modern_special_method`` — the
     modern path never forwards that request upstream, so this is the only
@@ -584,6 +588,7 @@ class _ModernState:
         "client_info",
         "negotiated_version",
         "log_level",
+        "discover_retry_attempted",
     )
 
     def __init__(self) -> None:
@@ -594,6 +599,7 @@ class _ModernState:
         self.client_info: dict[str, Any] | None = None
         self.negotiated_version: str | None = None
         self.log_level: str | None = None
+        self.discover_retry_attempted: bool = False
 
 
 def _seed_modern_state_from_discover(
@@ -670,14 +676,17 @@ def _is_recognized_modern_error(parsed: dict[str, Any] | None) -> bool:
 
 
 def _build_discover_probe_request(
-    headers: dict[str, str], request_id: int = 0
+    headers: dict[str, str],
+    request_id: int = 0,
+    modern_state: "_ModernState | None" = None,
 ) -> tuple[str, dict[str, str]]:
     """Build the body + headers for a spec-compliant ``server/discover`` probe.
 
-    Shared by ``_probe_protocol_era`` (the ``auto``/``modern`` startup probe)
-    and ``check_connection``'s discover retry, so both send byte-identical
-    request shapes instead of two independently-drifting probes (#350
-    review finding 1).
+    Shared by ``_probe_protocol_era`` (the ``auto``/``modern`` startup probe),
+    ``check_connection``'s discover retry, and ``_reseed_discover_probe``
+    (the one-shot post-initialize reseed, #350 review round 4), so all send
+    byte-identical request shapes instead of independently-drifting probes
+    (#350 review finding 1).
 
     Body: ``server/discover``'s own worked example (spec rev 2026-07-28,
     "Discovery") carries ``params._meta`` with
@@ -696,6 +705,17 @@ def _build_discover_probe_request(
     / ``MissingRequiredClientCapabilityError``, both in the spec-reserved
     ``-32020..-32099`` range) would otherwise reject an otherwise-valid probe.
 
+    ``modern_state``: pass the session's REAL state to build a discover
+    request that advertises the local client's actual
+    ``clientCapabilities``/``clientInfo`` in ``params._meta`` — used by the
+    reseed retry, which exists precisely because the startup probe could
+    only send ``{}``. The ``MCP-Protocol-Version`` header is derived from
+    the SAME state (``negotiated_version`` falling back to the modern
+    floor) as the ``_meta`` version ``_inject_modern_meta`` writes, keeping
+    the two equal — the spec's Server Validation section rejects a
+    header/``_meta`` version mismatch with ``HeaderMismatch`` (-32020).
+    Default ``None`` keeps the pre-negotiation throwaway-state behavior.
+
     Headers: ``Mcp-Method``/``MCP-Protocol-Version`` are REQUIRED on every
     POST (Streamable HTTP, "Standard Request Headers" / "Protocol Version
     Header") — including this one. Any case-variant the operator pinned via
@@ -713,6 +733,7 @@ def _build_discover_probe_request(
     mirrors ``_prepare_headers``' modern-era branch (#350 review finding 3),
     which strips both unconditionally for the identical reason.
     """
+    state = modern_state if modern_state is not None else _ModernState()
     discover_msg = json.dumps(
         {
             "jsonrpc": "2.0",
@@ -721,13 +742,15 @@ def _build_discover_probe_request(
             "params": {},
         }
     )
-    discover_msg = _inject_modern_meta(discover_msg, _ModernState())
+    discover_msg = _inject_modern_meta(discover_msg, state)
     probe_headers = {k: v for k, v in headers.items() if k.lower() != "mcp-method"}
     probe_headers["Mcp-Method"] = "server/discover"
     probe_headers = {
         k: v for k, v in probe_headers.items() if k.lower() != "mcp-protocol-version"
     }
-    probe_headers["MCP-Protocol-Version"] = _MODERN_PROTOCOL_VERSION_DEFAULT
+    probe_headers["MCP-Protocol-Version"] = (
+        state.negotiated_version or _MODERN_PROTOCOL_VERSION_DEFAULT
+    )
     probe_headers = {
         k: v
         for k, v in probe_headers.items()
@@ -855,10 +878,68 @@ def _probe_protocol_era(
     return "legacy", None
 
 
+def _reseed_discover_probe(
+    client: httpx.Client,
+    url: str,
+    headers: dict[str, str],
+    modern_state: "_ModernState",
+) -> None:
+    """One-shot ``server/discover`` re-probe carrying the local client's REAL
+    capabilities (#350 review round 4).
+
+    The startup era-detection probe necessarily runs before the local stdio
+    client's own ``initialize``, so it can only advertise
+    ``clientCapabilities: {}``. A remote that gates ``server/discover``
+    itself on a real client capability (``-32021``
+    ``MissingRequiredClientCapabilityError``) is still classified modern but
+    seeds nothing — and the lifecycle spec makes empty synthesized
+    capabilities NOT cosmetic: "Both parties MUST ... Only use capabilities
+    that were successfully negotiated", so a compliant client told
+    ``capabilities: {}`` will never issue ``tools/list`` at all. This
+    re-probe repeats discovery exactly once, now that
+    ``modern_state.client_capabilities``/``client_info`` hold the client's
+    real values (``_build_discover_probe_request`` puts them in
+    ``params._meta``), and reseeds ``modern_state`` from the result.
+
+    Called only from ``_handle_modern_special_method``'s ``initialize``
+    branch, only when the startup probe seeded NOTHING, and at most once per
+    session (``modern_state.discover_retry_attempted`` is latched by the
+    caller BEFORE this runs) — zero cost on the common already-seeded path,
+    one extra round-trip only on the rare failure path, which is exactly the
+    per-session-cost objection that killed the retry-on-every-session
+    variant in round 3. Any failure (transport error, non-200, JSON-RPC
+    error again) is logged and leaves the state untouched, degrading to the
+    round-3 documented under-report. Runs synchronously on the stdin loop
+    thread, before the synthesized ``InitializeResult`` is emitted, so there
+    is no race with any other dispatch.
+    """
+    discover_msg, probe_headers = _build_discover_probe_request(
+        headers, modern_state=modern_state
+    )
+    try:
+        resp = client.post(url, content=discover_msg, headers=probe_headers)
+    except httpx.HTTPError as e:
+        log(f"discover reseed probe failed ({e}); keeping unseeded state")
+        return
+    if resp.status_code != 200:
+        log(
+            f"discover reseed probe returned HTTP {resp.status_code}; "
+            "keeping unseeded state"
+        )
+        return
+    parsed = _parse_streamable_response(resp)
+    if isinstance(parsed, dict) and "error" in parsed:
+        log("discover reseed probe returned a JSON-RPC error; keeping unseeded state")
+        return
+    _seed_modern_state_from_discover(modern_state, parsed)
+    log("discover reseed probe succeeded with the client's real capabilities")
+
+
 def _handle_modern_special_method(
     line: str,
     req_id: Any,
     modern_state: "_ModernState",
+    discover_retry: Callable[[], None] | None = None,
 ) -> tuple[bool, str | None]:
     """Intercept ``initialize`` / ``notifications/initialized`` /
     ``notifications/cancelled`` on the modern path, where none of the three
@@ -880,13 +961,19 @@ def _handle_modern_special_method(
       the client's own ``capabilities``/``clientInfo`` into ``modern_state``
       for later ``_meta`` injection (``_inject_modern_meta``) — this is the
       ONLY place those values are ever observed, since the modern path never
-      forwards the request that carries them. NOTE: ``capabilities``/
-      ``server_info`` here are whatever the era-detection probe seeded
-      BEFORE this client-supplied data existed — they are never re-derived
-      from it, which can under-report real server capabilities in one
-      narrow case (documented in ``run()``'s own "Limitation" section,
-      #350 review round 3: never over-claims, ordinary requests are
-      unaffected). The returned ``protocolVersion``
+      forwards the request that carries them. When the era-detection probe
+      seeded NOTHING (e.g. the remote gated ``server/discover`` itself on a
+      real client capability, ``-32021``), ``discover_retry`` — when the
+      caller provides one — re-runs discovery exactly ONCE, now that the
+      client's real ``capabilities``/``clientInfo`` are known, before the
+      result is synthesized (#350 review round 4; see
+      ``_reseed_discover_probe``). ``modern_state.discover_retry_attempted``
+      latches the attempt so a client-driven re-``initialize`` can never
+      probe again; a retry that fails degrades to the same under-reporting
+      as before. The client's OWN data is still never copied into
+      ``server_info``/``capabilities`` — client capabilities are not server
+      capabilities; only a real discover response may seed those fields.
+      The returned ``protocolVersion``
       is the client's OWN ``requested`` string, not ``negotiated_version``
       (#350 review round 3): this relay never re-shapes request/response
       BODIES based on protocol version (no code path here touches the new
@@ -930,6 +1017,23 @@ def _handle_modern_special_method(
         modern_state.client_info = (
             client_info if isinstance(client_info, dict) else None
         )
+        # Reseed retry (#350 review round 4): only when the startup probe
+        # seeded NOTHING — a partially-seeded state (any of the three
+        # fields) means discovery already succeeded and must not be
+        # repeated (zero extra round-trips on the common path). Latch the
+        # attempt BEFORE probing so neither a failed retry nor a
+        # re-initialize can ever probe a second time.
+        if (
+            discover_retry is not None
+            and not modern_state.discover_retry_attempted
+            and modern_state.server_info is None
+            and not modern_state.capabilities
+            and not modern_state.supported_versions
+        ):
+            modern_state.discover_retry_attempted = True
+            discover_retry()
+        # Negotiated AFTER the possible reseed, so a retry that recovered
+        # the remote's real supportedVersions feeds the negotiation.
         modern_state.negotiated_version = _negotiate_modern_version(
             requested, modern_state.supported_versions
         )
@@ -3069,41 +3173,43 @@ def run(
     batching in spec rev 2025-06-18, so the exposure is minimal. A single
     (non-batch) request always gets a synthesized error on the same failures.
 
-    Limitation — modern discover-derived state is never re-seeded once the
-    local client's REAL capabilities are known (#350 review round 3): the
-    ``server/discover`` probe that seeds ``modern_state.server_info`` /
-    ``capabilities`` / ``supported_versions`` runs BEFORE the stdin loop
-    starts (see above), which is necessarily before the local client has
-    sent its own ``initialize`` — so the probe always advertises
-    ``clientCapabilities: {}`` (see ``_build_discover_probe_request``,
-    which seeds a throwaway, never-populated ``_ModernState()``). If the
-    remote requires a capability the local client would actually have
-    supplied to answer ``server/discover`` (returning the recognized-modern
-    error ``-32021`` ``MissingRequiredClientCapabilityError``), the probe
-    still correctly classifies the era as ``modern`` (see
-    ``_probe_protocol_era``), but seeds NOTHING: ``modern_state.server_info``
-    stays ``None`` and ``capabilities`` stays ``{}``. The synthesized
-    ``InitializeResult`` returned to the local client (in
-    ``_handle_modern_special_method``) then reports the honest-unknown
-    placeholder identity and empty capabilities — this UNDER-reports what
-    the remote actually supports, it never over-claims, and every ORDINARY
-    request is still dispatched upstream regardless (the local client can
-    still successfully call a tool its own initialize never got to hear
-    the server explicitly advertise). A retry-the-probe-once-real-
-    capabilities-are-known fix was considered and rejected for Phase 1: it
-    would add a second discover round-trip to EVERY session using
-    ``--protocol-era modern``/``auto`` against a server implementing this
-    specific (and unusual, since ``server/discover`` is explicitly
-    documented as the low-requirement backward-compatibility probe) gate,
-    for a purely cosmetic under-report that resolves itself the moment
-    ordinary traffic flows. If this under-reporting actually blocks a
-    client that gates its own tool usage on advertised capabilities,
-    operators have two escapes: fix the upstream server's discover-gating
-    (it is not spec-mandated), or pin ``--protocol-era legacy`` if the
-    remote also still speaks the old handshake. Acceptance criterion #3
-    (#270: headers/session/byte-identity) is unaffected — nothing here
-    changes what goes out on the wire, only what this one synthesized
-    field claims.
+    Limitation — modern discover state and the one-shot reseed retry (#350
+    review rounds 3 + 4): the ``server/discover`` probe that seeds
+    ``modern_state.server_info`` / ``capabilities`` / ``supported_versions``
+    runs BEFORE the stdin loop starts (see above), which is necessarily
+    before the local client has sent its own ``initialize`` — so the probe
+    always advertises ``clientCapabilities: {}`` (see
+    ``_build_discover_probe_request``). If the remote gates
+    ``server/discover`` itself on a real client capability (returning the
+    recognized-modern error ``-32021``
+    ``MissingRequiredClientCapabilityError``), the probe still correctly
+    classifies the era as ``modern`` (see ``_probe_protocol_era``) but
+    seeds NOTHING. Round 3 documented that outcome as a tolerable
+    under-report; round 4 established it is NOT merely cosmetic — the
+    lifecycle spec says both parties "MUST ... Only use capabilities that
+    were successfully negotiated", so a compliant local client told
+    ``capabilities: {}`` never issues ``tools/list``/``resources``/
+    ``prompts`` requests at all. The fix is a NARROW retry the round-3
+    analysis never evaluated (it rejected only an unconditional
+    every-session second probe): when the local client's ``initialize``
+    arrives and the startup probe seeded nothing, discovery is re-run
+    exactly ONCE with the client's now-known real
+    ``clientCapabilities``/``clientInfo`` in ``params._meta``, before the
+    ``InitializeResult`` is synthesized (``_reseed_discover_probe``, hooked
+    in via ``_handle_modern_special_method``'s ``discover_retry``). Cost:
+    zero on the common already-seeded path; one extra round-trip only on
+    the rare seeded-nothing path. It cannot loop
+    (``modern_state.discover_retry_attempted`` is latched before the
+    attempt, so a failed retry or a client re-``initialize`` never probes
+    again) and cannot race (it runs synchronously on the stdin loop
+    thread, before any other dispatch). RESIDUAL limitation: if the reseed
+    retry ALSO fails, the synthesized result degrades exactly as round 3
+    documented — honest-unknown ``serverInfo`` placeholder, empty
+    capabilities, an under-report that never over-claims — and the
+    operator escapes remain fixing the upstream's discover-gating or
+    pinning ``--protocol-era legacy``. Acceptance criterion #3 (#270:
+    headers/session/byte-identity) is unaffected: the legacy path never
+    runs any of this.
     """
 
     # Graceful shutdown on SIGTERM/SIGINT
@@ -3296,6 +3402,22 @@ def run(
             h["MCP-Protocol-Version"] = protocol_version
         return h
 
+    def _discover_reseed() -> None:
+        """One-shot discover reseed hook for the modern initialize branch.
+
+        Snapshots the SHARED ``headers`` fresh per invocation (under
+        ``headers_lock``) so credentials refreshed since startup — by the
+        probe-time recovery above or the proactive-refresh daemon — are
+        honored, then delegates to ``_reseed_discover_probe`` (#350 review
+        round 4). Once-only/never-loops is enforced by the caller
+        (``_handle_modern_special_method`` latches
+        ``modern_state.discover_retry_attempted`` first), and it runs
+        synchronously on the stdin loop thread, so no dispatch can race it.
+        """
+        with headers_lock:
+            snapshot = dict(headers)
+        _reseed_discover_probe(client, url, snapshot, modern_state)
+
     refresh_timer, refresh_stop = _start_proactive_refresh(
         refresher=token_refresher,
         expiry_getter=token_expiry_getter,
@@ -3390,8 +3512,11 @@ def run(
                     # initialize / notifications/initialized /
                     # notifications/cancelled do not exist on the wire to a
                     # modern remote — see _handle_modern_special_method.
+                    # _discover_reseed (defined once, above the loop) gives
+                    # the initialize branch its one-shot reseed retry
+                    # (#350 review round 4).
                     handled, modern_reply = _handle_modern_special_method(
-                        line, req_id, modern_state
+                        line, req_id, modern_state, discover_retry=_discover_reseed
                     )
                     if handled:
                         if modern_reply is not None:
