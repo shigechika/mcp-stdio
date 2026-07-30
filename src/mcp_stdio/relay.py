@@ -529,7 +529,11 @@ def _extract_log_level(line: str) -> str | None:
 
 
 def _negotiate_modern_version(requested: str | None, supported: list[str]) -> str:
-    """Pick the ``MCP-Protocol-Version`` to advertise on the modern path.
+    """Pick the ``MCP-Protocol-Version`` to advertise UPSTREAM on the modern
+    path (request headers and ``params._meta``) — the actual wire version
+    the remote server understands, NOT what is echoed back to the local
+    stdio client (that is the client's own requested string, verbatim —
+    see ``_handle_modern_special_method``, #350 review round 3).
 
     Mirrors what a real negotiation would produce: the local client's
     requested version wins when the remote's ``server/discover`` advertised
@@ -836,7 +840,22 @@ def _handle_modern_special_method(
       the client's own ``capabilities``/``clientInfo`` into ``modern_state``
       for later ``_meta`` injection (``_inject_modern_meta``) — this is the
       ONLY place those values are ever observed, since the modern path never
-      forwards the request that carries them.
+      forwards the request that carries them. The returned ``protocolVersion``
+      is the client's OWN ``requested`` string, not ``negotiated_version``
+      (#350 review round 3): this relay never re-shapes request/response
+      BODIES based on protocol version (no code path here touches the new
+      ``resultType`` envelope or anything else version-gated), so the
+      downstream ``InitializeResult.protocolVersion`` field functions purely
+      as an acknowledgement the local client checks before deciding whether
+      to proceed — never as a promise this relay actually re-encodes traffic
+      into that version. Echoing the client's own ask keeps that promise
+      trivially true. ``negotiated_version`` (computed below, from the
+      remote's OWN advertised ``supportedVersions``) remains the version
+      used UPSTREAM in headers/``_meta`` — the actual wire protocol the
+      remote server understands — and is symmetric: it diverges from the
+      client's ask whichever direction the mismatch runs (a legacy client
+      against a modern-only remote, or a modern-savvy client against a
+      remote that only advertised an older version).
     - ``notifications/initialized`` and ``notifications/cancelled`` are
       swallowed (``None`` reply — both are notifications, which never get a
       response either way).
@@ -869,7 +888,11 @@ def _handle_modern_special_method(
             requested, modern_state.supported_versions
         )
         result = {
-            "protocolVersion": modern_state.negotiated_version,
+            # Downstream ack: what the LOCAL client asked for (falling back
+            # to the upstream-negotiated version only when the client sent
+            # no usable protocolVersion at all — see this function's own
+            # docstring for why these two are deliberately different).
+            "protocolVersion": requested or modern_state.negotiated_version,
             "capabilities": modern_state.capabilities,
             "serverInfo": modern_state.server_info or _UNKNOWN_UPSTREAM_SERVER_INFO,
         }

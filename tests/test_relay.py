@@ -9202,6 +9202,41 @@ class TestHandleModernSpecialMethod:
         assert server_info["name"] != "mcp-stdio"
         assert "unknown" in server_info["name"].lower()
 
+    def test_synthesized_protocol_version_echoes_client_request_not_upstream(self):
+        """#350 review round 3: a local client that only speaks legacy
+        2025-06-18 must not be told the negotiated session is 2026-07-28
+        just because that is the only version the modern-only upstream
+        advertised in ``server/discover``. ``_negotiate_modern_version``
+        picking ``max(supported)`` is correct for what the RELAY sends
+        UPSTREAM (headers / ``_meta`` — the remote genuinely only
+        understands that version), but the synthesized ``InitializeResult``
+        handed back DOWNSTREAM must acknowledge what the local client
+        itself asked for, or a spec-conformant client that checks the
+        returned ``protocolVersion`` against its own supported set will
+        reject the handshake and disconnect. The two are now separate
+        values: ``modern_state.negotiated_version`` (upstream) vs. the
+        client's own ``requested`` string (downstream, echoed verbatim)."""
+        state = _ModernState()
+        state.supported_versions = ["2026-07-28"]
+        line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {}},
+            }
+        )
+        _, reply = _handle_modern_special_method(line, 1, state)
+        result = json.loads(reply)["result"]
+        # Downstream: exactly what the local client asked for.
+        assert result["protocolVersion"] == "2025-06-18"
+        # Upstream: still the real negotiated version for headers/_meta —
+        # unchanged from before this fix, and symmetrically correct for the
+        # REVERSE mismatch too (client asks 2026-07-28, upstream only
+        # advertises an older version): negotiated_version always reflects
+        # what the remote actually supports, never the client's request.
+        assert state.negotiated_version == "2026-07-28"
+
     def test_notifications_initialized_is_swallowed(self):
         state = _ModernState()
         line = '{"jsonrpc":"2.0","method":"notifications/initialized"}'
@@ -9352,6 +9387,62 @@ class TestRunModernEra:
         assert json.loads(httpx_mock.get_requests()[0].content)["method"] == (
             "server/discover"
         )
+
+    def test_legacy_client_initialize_ack_vs_upstream_version_diverge(self, httpx_mock):
+        """#350 review round 3: a local client speaking only legacy
+        2025-06-18 against a modern-only (2026-07-28) upstream must be told
+        its OWN version was accepted (or it may reject the handshake and
+        disconnect — AC unrelated to this repo's own AC#3, but a real
+        client-side risk), while the wire traffic to the actual remote
+        still uses the version the remote itself advertised. Drives a full
+        initialize -> tools/list sequence through run() so both the
+        downstream reply and the upstream POST are observed from the same
+        session, proving the two values coexist without one leaking into
+        the other (header/_meta mismatch on the upstream side would itself
+        be a HeaderMismatch -32020 per AC#4)."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text=self._discover_response(supportedVersions=["2026-07-28"]),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}',
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                        },
+                    }
+                ),
+                json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            ],
+            protocol_era="modern",
+        )
+        lines = [line for line in output.strip().split("\n") if line]
+        init_reply = json.loads(lines[0])
+        # Downstream: the local client's own request is acknowledged.
+        assert init_reply["result"]["protocolVersion"] == "2025-06-18"
+
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 2  # discover probe + tools/list
+        list_req = requests[1]
+        # Upstream: the header AND _meta both carry the version the remote
+        # actually advertised — the two must always agree with each other
+        # (a mismatch is HeaderMismatch -32020), and neither is the
+        # client's stale 2025-06-18 ask.
+        assert list_req.headers["mcp-protocol-version"] == "2026-07-28"
+        meta = json.loads(list_req.content)["params"]["_meta"]
+        assert meta["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
 
     def test_notifications_initialized_produces_no_post_no_reply(self, httpx_mock):
         httpx_mock.add_response(
