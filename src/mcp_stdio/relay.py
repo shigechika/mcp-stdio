@@ -5309,10 +5309,12 @@ def run(
         # Translate and gate the WHOLE round before emitting any of it.
         minted: list[tuple[Any, str, dict[str, Any]]] = []
         for key, entry in requests.items():
-            capability, envelope = _mrtr_translate(entry)
+            capability, translated = _mrtr_translate(entry)
             if capability is None:
-                _mrtr_abort(client_id, f"{envelope} (key {key!r})")
+                # `translated` is the failure reason on this branch.
+                _mrtr_abort(client_id, f"{translated} (key {key!r})")
                 return
+            envelope = translated
             if capability not in declared:
                 # MRTR server requirement 7: "Servers MUST NOT send an
                 # inputRequests that the client has not declared support
@@ -5413,6 +5415,17 @@ def run(
         waiting on. ``req_id`` is therefore passed explicitly as
         ``client_id`` all the way down, so every synthesized error
         ``_post_and_stream`` may write lands under the right id.
+
+        LIMITATION: a retry gets NO auth recovery. The stdin loop's
+        401-refresh / 403-step-up / 404-reinit ladder wraps ``_dispatch``,
+        which a retry deliberately bypasses (see above), so a token that
+        expires mid-transaction surfaces the upstream status as an error
+        under the client's id and drops the transaction — discarding
+        dialogs the user already answered. It self-heals on the client's
+        next request (that one runs the ladder and refreshes the shared
+        headers), and the transaction is short-lived by construction, so
+        the design settled on "upstream error on retry → error under N,
+        drop txn" rather than a second recovery ladder here.
         """
         while True:
             txn = mrtr_txns.get(client_id)
@@ -5579,7 +5592,26 @@ def run(
     def _mrtr_handle_cancel(cancel_id: Any) -> None:
         """Drop a transaction the client just cancelled (design change 11).
 
-        The client cancelled the id it is waiting on, so per the
+        TWO kinds of id can arrive here, and both must be handled or the
+        transaction hangs forever:
+
+        - a MINTED id — the client giving up on an input request the
+          bridge asked it. That answer is never coming, so the round can
+          never complete, the retry can never fire, and the transaction
+          would sit forever holding the client's OWN id hostage (the
+          reuse check in the stdin loop rejects every new request under
+          it). Abort the whole transaction instead. The client is still
+          waiting on the original call — it cancelled a nested question,
+          not the call — so this one DOES get an error under that id,
+          which is the #11 never-hang contract. (The spec's own way to
+          back out of an elicitation is the ``{"action": "decline"}`` /
+          ``{"action": "cancel"}`` RESULT, which rides ``inputResponses``
+          normally; this arm covers a client that reaches for
+          cancellation instead.)
+        - the CLIENT's own id, handled below.
+
+        For the client's own id: it cancelled the request it is waiting
+        on, so per the
         cancellation spec's receiver SHOULD ("Not send a response for the
         cancelled request") nothing is answered for it. What DOES go out is
         one ``notifications/cancelled`` per still-outstanding minted
@@ -5603,6 +5635,24 @@ def run(
         POST when a cancel arrives would require a second thread reading
         stdin concurrently with a blocking dispatch") — #270 Phase 2 PR D.
         """
+        minted_entry = mrtr_minted.get(cancel_id) if _is_scalar_id(cancel_id) else None
+        if minted_entry is not None:
+            owner_id, key = minted_entry
+            # Retire the cancelled request before the funnel runs, so the
+            # abort's downstream cancels cover only what is still
+            # outstanding — re-cancelling the one the client just
+            # cancelled would violate "are believed to still be
+            # in-progress".
+            mrtr_minted.pop(cancel_id, None)
+            owner = mrtr_txns.get(owner_id)
+            if owner is not None:
+                owner["minted"].pop(cancel_id, None)
+            _mrtr_abort(
+                owner_id,
+                f"client cancelled input request {key!r}",
+                code=-32000,
+            )
+            return
         txn = _mrtr_purge(cancel_id)
         if txn is None:
             return

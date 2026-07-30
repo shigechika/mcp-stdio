@@ -13837,6 +13837,56 @@ class TestRunModernMrtrBridge:
         assert not [line for line in lines if line.get("id") == 2]
         assert len(self._tool_calls(httpx_mock)) == 1
 
+    def test_cancel_of_a_minted_id_aborts_instead_of_hanging(self, httpx_mock):
+        """The #11 never-hang contract on the OTHER cancellable id. A
+        client that gives up on an input request by cancelling the MINTED
+        id (rather than answering `{"action": "cancel"}`) is never sending
+        that answer, so the round can never complete and the retry can
+        never fire — and the transaction would sit forever holding the
+        client's own id hostage, since the reuse check rejects every new
+        request under it. Abort to the client's id instead, cancel the
+        siblings still outstanding, and leave the id usable again."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(
+            httpx_mock,
+            self._input_required(2, {"a": self._elicit(), "b": self._elicit()}),
+        )
+        # The id must be free again afterwards, so a second tools/call
+        # under it reaches the wire.
+        self._register_json(
+            httpx_mock, {"jsonrpc": "2.0", "id": 2, "result": {"content": []}}
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"elicitation": {}}),
+                self._call(),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/cancelled",
+                        "params": {"requestId": "mcp-stdio/mrtr/1/a"},
+                    }
+                ),
+                self._call(),
+            ],
+            protocol_era="modern",
+        )
+        lines = self._out(output)
+        cancels = [
+            line for line in lines if line.get("method") == "notifications/cancelled"
+        ]
+        # Only the sibling still in progress is cancelled downstream.
+        assert [c["params"]["requestId"] for c in cancels] == ["mcp-stdio/mrtr/1/b"]
+        errors = [line for line in lines if "error" in line]
+        assert len(errors) == 1
+        assert errors[0]["id"] == 2
+        assert "cancelled input request 'a'" in errors[0]["error"]["message"]
+        # The transaction is gone: the id works again.
+        assert len(self._tool_calls(httpx_mock)) == 2
+        assert lines[-1] == {"jsonrpc": "2.0", "id": 2, "result": {"content": []}}
+
     def test_cancel_works_with_the_cancel_filter_disabled(self, httpx_mock):
         """The bridge extracts the cancel id itself rather than piggybacking
         on the cancel tracker (design change 11): `--no-cancel-filter`
