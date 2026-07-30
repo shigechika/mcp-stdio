@@ -2317,14 +2317,37 @@ def _reinitialize(
     return new_session_id, negotiated
 
 
+def _format_jsonrpc_error(err: Any) -> str:
+    """Render a JSON-RPC ``error`` value for a ``--check`` diagnostic log.
+
+    The spec guarantees ``error`` is an object with a ``message`` field, but
+    a non-compliant server could send anything valid-JSON there (a bare
+    string, a number, ``null``...). ``.get`` on a non-dict would raise
+    ``AttributeError`` — degrade instead of crashing (#350 review round
+    2/3): fall back to stringifying the raw value when it is not the
+    object the spec promises.
+    """
+    return str(err.get("message", err)) if isinstance(err, dict) else str(err)
+
+
 def _report_initialize(result_data: dict[str, Any] | None) -> bool:
     """Log a parsed ``initialize`` response and return the probe verdict.
 
     Shared by the Streamable HTTP and SSE ``--check`` paths. Returns False
     only when the response is a JSON-RPC error; an unparseable / missing
     result still counts as "the server responded" (True).
+
+    ``result_data`` is guarded with ``isinstance(..., dict)`` at both branch
+    entries below — not just ``if result_data`` — because a non-compliant
+    fallback response can be ANY valid JSON value (a bare ``1``, ``"oops"``,
+    ``[]``...), which is truthy but not a mapping: ``"result" in result_data``
+    on a scalar raises ``TypeError`` (#350 review round 2/3). Falling through
+    to the final "could not parse" log/``True`` for a non-dict is the
+    correct degrade — this function's whole contract is "never crash on
+    malformed-but-JSON-valid input, only report a genuine JSON-RPC error as
+    False."
     """
-    if result_data and "result" in result_data:
+    if isinstance(result_data, dict) and "result" in result_data:
         result = result_data["result"]
         if not isinstance(result, dict):
             # Spec guarantees an object, but a malformed server could send a
@@ -2346,9 +2369,8 @@ def _report_initialize(result_data: dict[str, Any] | None) -> bool:
         prompts = "yes" if "prompts" in caps else "no"
         log(f"✓ Capabilities: tools={tools}, resources={resources}, prompts={prompts}")
         return True
-    if result_data and "error" in result_data:
-        err = result_data["error"]
-        log(f"✗ MCP error: {err.get('message', err)}")
+    if isinstance(result_data, dict) and "error" in result_data:
+        log(f"✗ MCP error: {_format_jsonrpc_error(result_data['error'])}")
         return False
     log("✓ Server responded (could not parse initialize result)")
     return True
@@ -2364,6 +2386,13 @@ def _parse_streamable_response(resp: httpx.Response) -> dict[str, Any] | None:
     server-initiated requests first — a compliant server MAY do so before the
     actual response, matching the keep-reading gate in ``_post_parsed`` /
     ``_check_connection_sse``.
+
+    Returns ``None`` — never a non-dict — for a body that parses as valid
+    JSON but is not an object (a bare ``1``, ``"oops"``, ``[]``...): the
+    return type is declared ``dict[str, Any] | None``, and both callers
+    (``_report_initialize``/``_report_discover``) are written against that
+    contract. The SSE branch already enforced this (its own ``isinstance``
+    gate); the plain-JSON branch used not to (#350 review round 2/3).
     """
     content_type = resp.headers.get("content-type", "")
     if "text/event-stream" in content_type:
@@ -2378,9 +2407,10 @@ def _parse_streamable_response(resp: httpx.Response) -> dict[str, Any] | None:
                 return parsed
         return None
     try:
-        return json.loads(resp.text)
+        parsed = json.loads(resp.text)
     except json.JSONDecodeError:
         return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _report_discover(result_data: dict[str, Any] | None) -> bool:
@@ -2392,8 +2422,13 @@ def _report_discover(result_data: dict[str, Any] | None) -> bool:
     whose ``serverInfo`` lives at ``_meta["io.modelcontextprotocol/serverInfo"]``
     rather than as a top-level field — see the verified research fetched
     directly from the spec's own worked example).
+
+    ``result_data`` is guarded with ``isinstance(..., dict)`` for the same
+    reason as ``_report_initialize``'s identical guard: a non-compliant
+    fallback response can be any valid-JSON scalar/array, which is truthy
+    but not a mapping (#350 review round 2/3).
     """
-    if result_data and "result" in result_data:
+    if isinstance(result_data, dict) and "result" in result_data:
         result = result_data["result"]
         if not isinstance(result, dict):
             log("✓ Server responded (discover result is not an object)")
@@ -2425,9 +2460,8 @@ def _report_discover(result_data: dict[str, Any] | None) -> bool:
         prompts = "yes" if "prompts" in caps else "no"
         log(f"✓ Capabilities: tools={tools}, resources={resources}, prompts={prompts}")
         return True
-    if result_data and "error" in result_data:
-        err = result_data["error"]
-        log(f"✗ MCP error: {err.get('message', err)}")
+    if isinstance(result_data, dict) and "error" in result_data:
+        log(f"✗ MCP error: {_format_jsonrpc_error(result_data['error'])}")
         return False
     log("✓ Server responded (could not parse discover result)")
     return True

@@ -48,6 +48,7 @@ from mcp_stdio.relay import (
     _normalize_null_arguments,
     _parse_retry_after,
     _parse_auth_params,
+    _parse_streamable_response,
     _parse_www_authenticate_scope,
     _post_and_stream,
     _probe_protocol_era,
@@ -55,6 +56,8 @@ from mcp_stdio.relay import (
     _cold_start_response,
     _proactive_refresh_loop,
     _reinitialize,
+    _report_discover,
+    _report_initialize,
     _seed_modern_state_from_discover,
     _start_proactive_refresh,
     _stop_proactive_refresh,
@@ -4430,6 +4433,39 @@ class TestCheckConnection:
         httpx_mock.add_response(text=body, headers={"content-type": "application/json"})
         assert check_connection(self.URL, dict(self.HEADERS)) is True
 
+    def test_bare_scalar_top_level_body_does_not_report_down(self, httpx_mock, capsys):
+        """#350 review round 2/3: a fallback discovery response that is
+        valid JSON but not an OBJECT at all (e.g. HTTP 200 with body ``1``)
+        used to raise ``TypeError`` at ``"result" in result_data`` inside
+        ``_report_initialize`` — uncaught by that function itself, only
+        happening to be swallowed by ``check_connection``'s own outer
+        ``except Exception`` and misreported as "Connection failed: ...".
+        This is a genuine verdict flip: ``_report_initialize``'s own
+        docstring says an unparseable result still counts as "the server
+        responded" (True), but the escaped TypeError instead reported the
+        live server as DOWN. Must degrade to "could not parse" / True, not
+        a Python exception message."""
+        httpx_mock.add_response(text="1", headers={"content-type": "application/json"})
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+        err = capsys.readouterr().err
+        assert "Connection failed" not in err
+
+    def test_non_object_error_value_does_not_crash(self, httpx_mock, capsys):
+        """#350 review round 2/3: a JSON-RPC error body whose ``error``
+        value is a bare string rather than an object (``{"error":
+        "invalid"}``) used to raise ``AttributeError`` at ``err.get(...)``
+        inside ``_report_initialize`` — same escape-then-misreport failure
+        mode as the scalar-body case above, just triggered from the OTHER
+        branch. A malformed-but-still-an-error response must still be
+        reported as a genuine JSON-RPC error (False), not crash into a
+        generic connection-failed message."""
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "error": "invalid"})
+        httpx_mock.add_response(text=body, headers={"content-type": "application/json"})
+        assert check_connection(self.URL, dict(self.HEADERS)) is False
+        err = capsys.readouterr().err
+        assert "Connection failed" not in err
+        assert "MCP error" in err
+
     def test_connect_error_returns_false(self, httpx_mock):
         httpx_mock.add_exception(httpx.ConnectError("refused"))
         assert check_connection(self.URL, dict(self.HEADERS)) is False
@@ -4449,6 +4485,54 @@ class TestCheckConnection:
         assert check_connection(self.URL, dict(self.HEADERS)) is True
         captured = capsys.readouterr()
         assert "sess-xyz" in captured.err
+
+
+class TestParseStreamableResponseTypeContract:
+    """#350 review round 2/3: ``_parse_streamable_response`` is declared
+    ``-> dict[str, Any] | None`` but the plain-JSON branch used to return
+    whatever ``json.loads`` produced, including a bare scalar/list — a
+    contract violation its own callers (``_report_initialize`` /
+    ``_report_discover``) trusted blindly."""
+
+    def _response(self, text: str) -> httpx.Response:
+        return httpx.Response(
+            200, content=text.encode(), headers={"content-type": "application/json"}
+        )
+
+    def test_bare_scalar_body_returns_none_not_the_scalar(self):
+        assert _parse_streamable_response(self._response("1")) is None
+
+    def test_bare_list_body_returns_none(self):
+        assert _parse_streamable_response(self._response("[]")) is None
+
+    def test_object_body_still_returned_unchanged(self):
+        parsed = _parse_streamable_response(
+            self._response('{"jsonrpc":"2.0","id":1,"result":{}}')
+        )
+        assert parsed == {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+
+class TestReportInitializeAndDiscoverMalformedInput:
+    """Direct unit coverage for #350 review round 2/3: even independent of
+    ``check_connection``'s own outer ``except Exception`` (which happens to
+    swallow these today), ``_report_initialize``/``_report_discover`` must
+    not raise on malformed-but-JSON-valid input — any other/future caller
+    without that outer guard would otherwise crash outright."""
+
+    def test_report_initialize_bare_scalar_is_responded_not_crash(self):
+        assert _report_initialize(1) is True  # type: ignore[arg-type]
+
+    def test_report_initialize_bare_list_is_responded_not_crash(self):
+        assert _report_initialize([1, 2, 3]) is True  # type: ignore[arg-type]
+
+    def test_report_initialize_string_error_value_is_false_not_crash(self):
+        assert _report_initialize({"error": "invalid"}) is False
+
+    def test_report_discover_bare_scalar_is_responded_not_crash(self):
+        assert _report_discover(1) is True  # type: ignore[arg-type]
+
+    def test_report_discover_string_error_value_is_false_not_crash(self):
+        assert _report_discover({"error": "invalid"}) is False
 
 
 class TestCheckConnectionSse:
