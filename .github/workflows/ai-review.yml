@@ -127,20 +127,34 @@ jobs:
           # marker string, and that must not become the trusted ledger.
           # `--paginate` emits one JSON array per page; jq iterates each.
           comments=$(gh api "repos/$GH_REPO/issues/$PR/comments" --paginate 2>/dev/null || printf '[]')
+          # NEWEST matching comment wins (tail, not head): a transient PATCH
+          # failure makes the fallback below create a SECOND sticky carrying
+          # the newest ledger — selecting the oldest would then update the
+          # stale one with a stale round counter forever, reintroducing the
+          # duplicate-comment noise this workflow exists to remove.
           sticky_b64=$(printf '%s' "$comments" \
             | jq -r '.[]
                      | select(.user.login == "github-actions[bot]")
                      | select(.body | contains("<!-- ai-review-sticky -->"))
                      | ({id, body} | tojson | @base64)' 2>/dev/null \
-            | head -n 1 || true)
+            | tail -n 1 || true)
           COMMENT_ID=""
           ledger_json=""
           if [ -n "$sticky_b64" ]; then
             sticky=$(printf '%s' "$sticky_b64" | base64 -d 2>/dev/null || true)
             COMMENT_ID=$(printf '%s' "$sticky" | jq -r '.id // empty' 2>/dev/null || true)
+            # LAST marker match wins (tail, not head): model-authored prose
+            # (rendered.md) precedes the genuine ledger in the comment body,
+            # and a finding that QUOTES a marker-shaped line (a PR touching
+            # this workflow's docs, or a prompt-injected diff) would
+            # otherwise have its forged ledger adopted next round — letting
+            # an author plant last_sha to skip review or mark real findings
+            # dismissed. The genuine ledger is always appended last by this
+            # workflow, and rendered.md is additionally stripped of
+            # marker-shaped lines before composing (see the compose step).
             ledger_b64=$(printf '%s' "$sticky" | jq -r '.body // ""' 2>/dev/null \
               | sed -n 's/.*<!-- ai-review-ledger-v1: \([A-Za-z0-9+/=]*\) -->.*/\1/p' \
-              | head -n 1 || true)
+              | tail -n 1 || true)
             if [ -n "$ledger_b64" ]; then
               # A corrupt ledger (hand-edited comment, truncated base64)
               # decodes to nothing here and the round degrades to a full
@@ -200,17 +214,19 @@ jobs:
               else
                 printf '%s' "$compare" \
                   | jq -r '.files[]? | "--- " + .filename + " (" + .status + ")\n"
-                           + (.patch // "(no textual patch)") + "\n"' 2>/dev/null \
+                           + .patch + "\n"' 2>/dev/null \
                   > delta_raw.txt || true
                 # Third completeness guard (R2F1, same class as R1F1/R1F2):
-                # a delta that exceeds the prompt cap would be silently
-                # truncated while reporting stays scoped to it, making the
-                # truncated-away code unreviewable. Over-cap deltas degrade
+                # a delta exceeding the prompt cap cannot be included whole,
+                # and truncating it while reporting stays scoped to it would
+                # make the truncated-away code unreviewable. Over-cap deltas degrade
                 # to a full-diff round instead — full-diff's own cap
                 # truncation is the pre-existing, documented limitation and
                 # carries no scoped-reporting contract.
                 delta_bytes=$(wc -c < delta_raw.txt | tr -d ' ')
-                case "$delta_bytes" in ''|*[!0-9]*) delta_bytes=0 ;; esac
+                # Parse-failure default is over-cap (fail toward full-diff),
+                # matching missing_patch's fail-closed default of 1.
+                case "$delta_bytes" in ''|*[!0-9]*) delta_bytes=100001 ;; esac
                 if [ "$delta_bytes" -gt 100000 ]; then
                   echo "::notice::delta since $LAST_SHA exceeds the prompt cap (${delta_bytes} bytes) — degrading to a full-diff review"
                 elif [ -s delta_raw.txt ]; then
@@ -459,6 +475,15 @@ jobs:
             head -c 20000 review_body.txt > rendered.md || true
             VERIFIER_NOTE="Model output was unstructured this round — posted without verification."
           fi
+
+          # Strip marker-shaped lines from the model's prose before it is
+          # composed ABOVE the genuine ledger: a finding that quotes a
+          # ledger marker (a PR touching this file's docs, or an injected
+          # diff) must not be able to plant a decoy the next round's
+          # extraction could pick up. Paired with the tail-not-head
+          # extraction rule — defense in depth, either alone suffices.
+          grep -v 'ai-review-ledger-v1:' rendered.md > rendered_clean.md || true
+          mv rendered_clean.md rendered.md || true
 
           # ---------- Merge the ledger (model output is untrusted) ----------
           # Start from the old ledger; take the model status only for known
