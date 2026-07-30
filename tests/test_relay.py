@@ -3444,6 +3444,143 @@ class TestPagination:
         assert "cacheScope" not in merged
         assert "ttlMs" not in merged
 
+    def test_invalid_cache_scope_on_a_later_page_degrades_like_omission(
+        self, httpx_mock
+    ):
+        """#350 review round 11: page 1 says cacheScope="public"; page 2
+        supplies an INVALID scope ("internal" — not a spec value). The old
+        behavior "ignored" the invalid value inside _merge_cacheable_field,
+        which left page 1's "public" standing in the merged result — but an
+        unusable value grants no more caching permission than an absent
+        one, so it must degrade through the same conservative finalization
+        as an omission: merged cacheScope "private"."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [{"name": "a"}],
+                "cacheScope": "public",
+                "nextCursor": "p2",
+            },
+        }
+        page2 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "b"}], "cacheScope": "internal"},
+        }
+        for page in (page1, page2):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=json.dumps(page),
+                headers={"content-type": "application/json"},
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())["result"]
+        assert merged["cacheScope"] == "private"
+
+    def test_invalid_cache_scope_on_page1_does_not_ride_through_verbatim(
+        self, httpx_mock
+    ):
+        """#350 review round 11, the page-1 bypass half: page 1's values
+        enter merged_result via a plain dict-copy WITHOUT passing
+        _merge_cacheable_field's type guards, so an invalid first-page
+        scope ("internal") previously rode through to the merged output
+        verbatim — with a later page's valid "public" unable to displace
+        it (rank lookup of the garbage value made it unrankable). The
+        merged result must degrade to "private", never emit the garbage."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [{"name": "a"}],
+                "cacheScope": "internal",
+                "nextCursor": "p2",
+            },
+        }
+        page2 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "b"}], "cacheScope": "public"},
+        }
+        for page in (page1, page2):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=json.dumps(page),
+                headers={"content-type": "application/json"},
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())["result"]
+        assert merged["cacheScope"] == "private"
+
+    def test_invalid_ttl_ms_degrades_like_omission(self, httpx_mock):
+        """#350 review round 11, the ttlMs analogue: a non-numeric ttlMs
+        ("soon") on page 2 must not leave page 1's 5000 standing as the
+        merged freshness bound — same conservative degrade as an absent
+        field (0, immediately stale)."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "a"}], "ttlMs": 5000, "nextCursor": "p2"},
+        }
+        page2 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "b"}], "ttlMs": "soon"},
+        }
+        for page in (page1, page2):
+            httpx_mock.add_response(
+                url=self.URL,
+                text=json.dumps(page),
+                headers={"content-type": "application/json"},
+            )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())["result"]
+        assert merged["ttlMs"] == 0
+
+    def test_nan_ttl_ms_is_invalid_not_a_survivor(self, httpx_mock):
+        """#350 review round 11: NaN passes an isinstance(float) check but
+        poisons _merge_cacheable_field's min() comparison (NaN < x is
+        always False, so NaN silently survives as the merged value — and
+        json.dumps would then emit non-standard bare NaN). _is_valid_
+        cacheable_value must reject non-finite floats so a NaN page
+        degrades the merge to the conservative 0."""
+        page1 = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": [{"name": "a"}], "ttlMs": 5000, "nextCursor": "p2"},
+        }
+        # json.dumps refuses NaN only with allow_nan=False; produce the
+        # non-standard literal a non-compliant server would actually send.
+        page2_text = (
+            '{"jsonrpc": "2.0", "id": 1,'
+            ' "result": {"tools": [{"name": "b"}], "ttlMs": NaN}}'
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(page1),
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text=page2_text,
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})],
+        )
+        merged = json.loads(output.strip())["result"]
+        assert merged["ttlMs"] == 0
+
     def test_paginated_notification_no_id_produces_no_response(self, httpx_mock):
         """: a list method sent as a NOTIFICATION (no id key) must get
         NO response — the merged-response emit is gated on has_id, mirroring every

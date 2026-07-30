@@ -2327,6 +2327,33 @@ _CACHEABLE_FIELD_CONSERVATIVE_DEFAULT: dict[str, Any] = {
 }
 
 
+def _is_valid_cacheable_value(key: str, value: Any) -> bool:
+    """True iff ``value`` is a usable ``ttlMs``/``cacheScope`` per SEP-2549.
+
+    Feeds ``_paginate_and_stream``'s per-page bookkeeping: a page whose field
+    fails this check is recorded exactly like a page that OMITS the field
+    (#350 review round 11) — an unknown ``cacheScope`` (``"internal"``) or a
+    non-numeric/non-finite ``ttlMs`` grants no more caching permission than
+    silence does, so letting it be "ignored" would leave another page's
+    laxer value (``"public"``) standing in the merged result, failing OPEN
+    on exactly the conservative-security semantics the round-3 merge rule
+    exists to protect. ``bool`` is rejected for ``ttlMs`` despite being an
+    ``int`` subclass (``True`` is not a millisecond count a compliant
+    server would send); non-finite floats are rejected because ``NaN``
+    poisons the min() comparison in ``_merge_cacheable_field`` (NaN < x is
+    always False, so a NaN would silently survive as the merged value).
+    """
+    if key == "ttlMs":
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+        )
+    if key == "cacheScope":
+        return value in _CACHE_SCOPE_RESTRICTIVENESS
+    return False
+
+
 def _merge_cacheable_field(merged_result: dict[str, Any], key: str, value: Any) -> None:
     """Merge one page's ``ttlMs``/``cacheScope`` into ``merged_result`` in place.
 
@@ -2513,8 +2540,15 @@ def _paginate_and_stream(
             merged_result = {k: v for k, v in page_result.items() if k != "nextCursor"}
             if not isinstance(merged_result.get(result_key), list):
                 merged_result[result_key] = []
+            # Present-but-INVALID counts as missing (#350 review round 11):
+            # page 1's values enter merged_result via the dict-copy above
+            # WITHOUT passing _merge_cacheable_field's type guards, so an
+            # invalid first-page value would otherwise ride through to the
+            # merged output verbatim — and an invalid later-page value would
+            # be "ignored", leaving a laxer prior value standing. Both fail
+            # open; both now degrade via the same finalization as omission.
             for field in _CACHEABLE_MERGE_FIELDS:
-                if field not in page_result:
+                if not _is_valid_cacheable_value(field, page_result.get(field)):
                     cacheable_missing[field] = True
         else:
             items = page_result.get(result_key)
@@ -2541,11 +2575,13 @@ def _paginate_and_stream(
             # ttlMs/cacheScope entirely is not silence to skip over — it is
             # itself the non-compliant condition _CACHEABLE_FIELD_CONSERVATIVE_
             # DEFAULT exists to fail closed on (see cacheable_missing's
-            # finalization after this loop). Recorded here regardless of
-            # whether the field is present, then applied as a last-write-wins
-            # merge below only when it IS present.
+            # finalization after this loop). A page whose field is present
+            # but INVALID (unknown scope, non-numeric ttlMs) is recorded the
+            # same way (#350 review round 11) — an unusable value grants no
+            # more caching permission than an absent one, and merely
+            # "ignoring" it would leave another page's laxer value standing.
             for field in _CACHEABLE_MERGE_FIELDS:
-                if field not in page_result:
+                if not _is_valid_cacheable_value(field, page_result.get(field)):
                     cacheable_missing[field] = True
             for k, v in page_result.items():
                 if k in (result_key, "nextCursor"):
