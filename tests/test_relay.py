@@ -14392,6 +14392,136 @@ class TestRunModernMrtrBridge:
         assert len(answers) == 1
         assert answers[0]["error"]["message"] == "HTTP 401"
 
+    # --- the relay's reserved id namespace (#356 review R2F1) ---
+
+    RESERVED_CALL = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": "mcp-stdio/mrtr/1/who",
+            "method": "tools/call",
+            "params": {"name": "greet", "arguments": {}},
+        }
+    )
+
+    def test_reserved_namespace_request_id_is_rejected_on_modern(self, httpx_mock):
+        """#356 review R2F1. A client request whose OWN id is a minted id is
+        indistinguishable from the relay's bookkeeping afterwards: a cancel
+        naming it matches `mrtr_minted` and aborts ANOTHER transaction
+        instead of dropping this one. The relay owns "mcp-stdio/" on this
+        era, so the collision is refused where the id ENTERS — one check,
+        before any state can key on it — rather than tested for in every
+        consumer."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        # Registered but not expected: without the intake check the request
+        # is forwarded upstream, which is what this test must be able to
+        # observe rather than dying on an unmatched request.
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "mcp-stdio/mrtr/1/who",
+                    "result": {"content": []},
+                }
+            ),
+            headers={"content-type": "application/json"},
+            is_optional=True,
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [self._initialize({"elicitation": {}}), self.RESERVED_CALL],
+            protocol_era="modern",
+        )
+        assert self._tool_calls(httpx_mock) == []
+        reply = self._out(output)[-1]
+        assert reply["id"] == "mcp-stdio/mrtr/1/who"
+        assert reply["error"]["code"] == -32600
+        assert "reserved" in reply["error"]["message"]
+
+    def test_reserved_namespace_request_id_passes_through_on_legacy(self, httpx_mock):
+        """AC 3: the legacy era is untouched. Server-initiated requests are
+        still a real thing there, the relay mints nothing into this
+        namespace on that path, and a legacy client that happens to use such
+        an id keeps being forwarded byte-identically — the rejection lives
+        inside `era == "modern"`."""
+        httpx_mock.add_response(
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "mcp-stdio/mrtr/1/who",
+                    "result": {"content": []},
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(httpx_mock, [self.RESERVED_CALL])
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 1
+        assert requests[0].content.decode() == self.RESERVED_CALL
+        assert self._out(output)[-1]["result"] == {"content": []}
+
+    def test_cancel_of_a_client_id_leaves_other_transactions_alone(self, httpx_mock):
+        """The cancel lookup tries the client's own transactions BEFORE the
+        minted index (#356 review R2F1, defense in depth behind the intake
+        rejection). Two live transactions, each holding one minted request:
+        cancelling id 2 must cancel exactly ITS minted request downstream
+        and leave transaction 3 answerable — a misrouted cancel would abort
+        the wrong one and answer an id the client never cancelled."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(
+            httpx_mock, self._input_required(2, {"who": self._elicit()})
+        )
+        self._register_json(
+            httpx_mock, self._input_required(3, {"who": self._elicit()})
+        )
+        self._register_json(
+            httpx_mock,
+            {
+                "jsonrpc": "2.0",
+                "id": "mcp-stdio/mrtr-retry/2/1",
+                "result": {"content": [{"type": "text", "text": "three"}]},
+            },
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"elicitation": {}}),
+                self._call(),
+                self._call(req_id=3),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/cancelled",
+                        "params": {"requestId": 2},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mcp-stdio/mrtr/2/who",
+                        "result": {"action": "accept", "content": {}},
+                    }
+                ),
+            ],
+            protocol_era="modern",
+        )
+        lines = self._out(output)
+        cancels = [
+            line for line in lines if line.get("method") == "notifications/cancelled"
+        ]
+        # Only transaction 1's dialog is retired; transaction 2's survives.
+        assert [c["params"]["requestId"] for c in cancels] == ["mcp-stdio/mrtr/1/who"]
+        # ...and that survivor completes normally under its own id.
+        answers = [line for line in lines if line.get("id") == 3]
+        assert len(answers) == 1
+        assert answers[0]["result"]["content"][0]["text"] == "three"
+        # The cancelled request is answered with nothing at all ("Not send a
+        # response for the cancelled request").
+        assert [line for line in lines if line.get("id") == 2] == []
+
 
 # --- modern era: subscriptions/listen stream (#270 Phase 2 PR A) ---
 

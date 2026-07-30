@@ -489,15 +489,25 @@ _MRTR_REQUEST_CAPABILITY = {
     "sampling/createMessage": "sampling",
     "roots/list": "roots",
 }
-# Relay-minted JSON-RPC id namespaces (design change 8; ``_LISTEN_ID_PREFIX``
-# C10 precedent). STRING ids under the relay's own "mcp-stdio/" namespace
-# cannot collide with a client-minted id unless the client maliciously adopts
-# the prefix, and `"1" == 1` is False in Python so even a numeric-looking
-# suffix can never alias an int id. Two DISTINCT prefixes so a server-chosen
-# ``inputRequests`` key (arbitrary text) can never forge a retry id:
-# "<seq>/<key>" lives under the first, "<seq>/<round>" under the second.
-_MRTR_ID_PREFIX = "mcp-stdio/mrtr/"
-_MRTR_RETRY_ID_PREFIX = "mcp-stdio/mrtr-retry/"
+# The relay's RESERVED JSON-RPC id namespace. Every id the relay mints for
+# itself — the MRTR pair below, ``_LISTEN_ID_PREFIX`` (PR A, C10) — lives
+# under it, and on the modern era an incoming client REQUEST claiming a
+# string id in this namespace is REJECTED at intake (#356 review R2F1).
+# C10's original argument was that a collision needs a client that
+# "maliciously adopts the relay's prefix"; PR C made the consequence worse
+# than a curiosity — a client request whose own id is literally a minted id
+# routes its cancellation into ANOTHER transaction — so the namespace is now
+# owned rather than merely assumed. Everything derives from this one string
+# so the reservation and the minting cannot drift apart.
+_RELAY_ID_NAMESPACE = "mcp-stdio/"
+# Relay-minted MRTR id namespaces (design change 8; ``_LISTEN_ID_PREFIX``
+# C10 precedent). STRING ids, and `"1" == 1` is False in Python, so even a
+# numeric-looking suffix can never alias an int id. Two DISTINCT prefixes so
+# a server-chosen ``inputRequests`` key (arbitrary text) can never forge a
+# retry id: "<seq>/<key>" lives under the first, "<seq>/<round>" under the
+# second.
+_MRTR_ID_PREFIX = f"{_RELAY_ID_NAMESPACE}mrtr/"
+_MRTR_RETRY_ID_PREFIX = f"{_RELAY_ID_NAMESPACE}mrtr-retry/"
 # Round cap per transaction (design change 4). An InputRequiredResult that
 # carries ONLY ``requestState`` is legal ("Servers MUST include at least one
 # of inputRequests or requestState") and the client "MAY retry the original
@@ -3330,14 +3340,17 @@ def _cold_start_loop(
 # (#270 Phase 2 phasing).
 _LISTEN_METHOD = "subscriptions/listen"
 _LISTEN_ACK_METHOD = "notifications/subscriptions/acknowledged"
-# Relay-minted JSON-RPC id prefix for the listen request (C10). STRING ids
-# under the relay's own "mcp-stdio/" namespace cannot collide with a
-# client-minted id unless the client maliciously adopts the relay's prefix:
-# _emit's cancel tracker compares ids by exact value (and `"1" == 1` is
-# False in Python, so even a numeric suffix can never alias an int id) —
-# and the listen request's own terminal result is swallowed here, never
-# emitted, so the tracker never even sees a listen id.
-_LISTEN_ID_PREFIX = "mcp-stdio/listen/"
+# Relay-minted JSON-RPC id prefix for the listen request (C10), under the
+# relay's reserved ``_RELAY_ID_NAMESPACE``: _emit's cancel tracker compares
+# ids by exact value (and `"1" == 1` is False in Python, so even a numeric
+# suffix can never alias an int id) — and the listen request's own terminal
+# result is swallowed here, never emitted, so a listen id never reaches
+# stdout at all and no client response can ever be keyed to one. The intake
+# rejection that closes the modern era's namespace (#356 review R2F1)
+# therefore adds nothing this prefix needed; it covers the whole namespace
+# for uniformity, which is cheaper to reason about than a per-prefix
+# argument.
+_LISTEN_ID_PREFIX = f"{_RELAY_ID_NAMESPACE}listen/"
 # The notification kinds requested on every listen POST: all three
 # list_changed booleans, no ``resourceSubscriptions`` until PR B. Also the
 # reference set the ack's honored subset is compared against.
@@ -5708,8 +5721,19 @@ def run(
         """Drop a transaction the client just cancelled (design change 11).
 
         TWO kinds of id can arrive here, and both must be handled or the
-        transaction hangs forever:
+        transaction hangs forever. They are tried in that order — the
+        client's OWN transactions first, minted ids second (#356 review
+        R2F1, defense in depth behind the intake rejection that now keeps a
+        client id out of the relay's namespace entirely). A cancel names
+        something the CLIENT sent, so the client's own id is the more
+        authoritative reading of an ambiguous one; and this ordering is what
+        keeps a collision from aborting a DIFFERENT transaction. The
+        ``mrtr_txns`` probe is deliberately non-destructive: purging first
+        and returning on a miss would send every minted-id cancel down the
+        "unknown id" path and resurrect the hang the minted arm exists to
+        fix.
 
+        - the CLIENT's own id, handled first.
         - a MINTED id — the client giving up on an input request the
           bridge asked it. That answer is never coming, so the round can
           never complete, the retry can never fire, and the transaction
@@ -5723,7 +5747,6 @@ def run(
           ``{"action": "cancel"}`` RESULT, which rides ``inputResponses``
           normally; this arm covers a client that reaches for
           cancellation instead.)
-        - the CLIENT's own id, handled below.
 
         For the client's own id: it cancelled the request it is waiting
         on, so per the
@@ -5750,7 +5773,31 @@ def run(
         POST when a cancel arrives would require a second thread reading
         stdin concurrently with a blocking dispatch") — #270 Phase 2 PR D.
         """
-        minted_entry = mrtr_minted.get(cancel_id) if _is_scalar_id(cancel_id) else None
+        hashable = _is_scalar_id(cancel_id)
+        if hashable and cancel_id in mrtr_txns:
+            # The client's OWN id, checked FIRST and non-destructively (see
+            # the docstring): purging on a miss would swallow every
+            # minted-id cancel below.
+            txn = _mrtr_purge(cancel_id)
+            if txn is None:  # pragma: no cover — membership was just checked
+                return
+            log(f"MRTR transaction for id {cancel_id!r} cancelled by the client")
+            for minted_id in txn["minted"]:
+                _emit(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "notifications/cancelled",
+                            "params": {
+                                "requestId": minted_id,
+                                "reason": "originating request cancelled",
+                            },
+                        }
+                    ),
+                    tracker,
+                )
+            return
+        minted_entry = mrtr_minted.get(cancel_id) if hashable else None
         if minted_entry is not None:
             owner_id, key = minted_entry
             # Retire the cancelled request before the funnel runs, so the
@@ -5766,25 +5813,6 @@ def run(
                 owner_id,
                 f"client cancelled input request {key!r}",
                 code=-32000,
-            )
-            return
-        txn = _mrtr_purge(cancel_id)
-        if txn is None:
-            return
-        log(f"MRTR transaction for id {cancel_id!r} cancelled by the client")
-        for minted_id in txn["minted"]:
-            _emit(
-                json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "method": "notifications/cancelled",
-                        "params": {
-                            "requestId": minted_id,
-                            "reason": "originating request cancelled",
-                        },
-                    }
-                ),
-                tracker,
             )
 
     def _make_input_required_hook(
@@ -6128,6 +6156,57 @@ def run(
                             # id — never through `_dispatch`, whose
                             # closure would use THIS line's minted id.
                             _mrtr_run_retry(ready)
+                        continue
+                    # The relay OWNS the "mcp-stdio/" id namespace on this
+                    # era (#356 review R2F1). A client request whose own id
+                    # is literally a minted id — say "mcp-stdio/mrtr/1/a" —
+                    # is indistinguishable from the relay's own bookkeeping
+                    # afterwards: a `notifications/cancelled` naming it
+                    # matches `mrtr_minted` and aborts ANOTHER transaction
+                    # instead of dropping this one, and its own response
+                    # would be re-keyed or intercepted by whatever else
+                    # holds that id. C10 argued a collision needs a client
+                    # that "maliciously adopts the relay's prefix"; PR C
+                    # made the consequence a misrouted abort rather than a
+                    # curiosity, so the assumption is upgraded to a rule and
+                    # enforced where the id ENTERS — one check, before any
+                    # state can key on it, instead of a collision test in
+                    # every consumer.
+                    #
+                    # Placed AFTER the response interception above, so the
+                    # client's genuine answers to minted requests (which of
+                    # course carry minted ids) are consumed first, and
+                    # before the reuse check below, which this makes
+                    # unreachable for a reserved id. Deliberately gated on
+                    # `req_has_id` alone rather than on a parsed method: an
+                    # id-bearing line that is neither a response nor a
+                    # recognisable request must not be POSTed into the
+                    # relay's own namespace either. Notifications carry no
+                    # id and are untouched — including a
+                    # `notifications/cancelled` whose params.requestId names
+                    # a minted request, which is a legitimate thing for a
+                    # client to send. The legacy era is untouched (AC #3):
+                    # this whole block is inside `era == "modern"`, so a
+                    # legacy client using such an id is forwarded exactly as
+                    # before.
+                    if (
+                        req_has_id
+                        and isinstance(req_id, str)
+                        and req_id.startswith(_RELAY_ID_NAMESPACE)
+                    ):
+                        log(
+                            f"rejecting request: id {req_id!r} is inside the "
+                            f"relay's reserved {_RELAY_ID_NAMESPACE!r} namespace"
+                        )
+                        _write_line(
+                            _error_response(
+                                f"request id must not start with "
+                                f"{_RELAY_ID_NAMESPACE!r}: that namespace is "
+                                f"reserved for relay-minted requests",
+                                req_id,
+                                code=-32600,
+                            )
+                        )
                         continue
                     # Client id reuse while a transaction is pending
                     # (design change 6). JSON-RPC lets a client reuse an id
