@@ -697,6 +697,17 @@ def _build_discover_probe_request(
     Header") — including this one. Any case-variant the operator pinned via
     ``-H`` is dropped first so httpx never serialises two header lines for
     the same field (mirrors ``_prepare_headers``' strip-then-set discipline).
+
+    ``Mcp-Name``/``Mcp-Session-Id`` are unconditionally STRIPPED (never
+    re-added — unlike ``Mcp-Method``/``MCP-Protocol-Version`` above, this
+    probe derives no replacement value for either) and any case-variant the
+    operator pinned via ``-H`` is dropped too (#350 review rounds 2 AND 3,
+    flagged independently by both): ``server/discover`` has no ``name``
+    parameter at all — a header asserting one is exactly the header/body
+    mismatch ``HeaderMismatch`` (-32020) exists to reject — and, being the
+    pre-negotiation probe, must never carry a session id either. This
+    mirrors ``_prepare_headers``' modern-era branch (#350 review finding 3),
+    which strips both unconditionally for the identical reason.
     """
     discover_msg = json.dumps(
         {
@@ -713,6 +724,11 @@ def _build_discover_probe_request(
         k: v for k, v in probe_headers.items() if k.lower() != "mcp-protocol-version"
     }
     probe_headers["MCP-Protocol-Version"] = _MODERN_PROTOCOL_VERSION_DEFAULT
+    probe_headers = {
+        k: v
+        for k, v in probe_headers.items()
+        if k.lower() not in ("mcp-name", "mcp-session-id")
+    }
     return discover_msg, probe_headers
 
 

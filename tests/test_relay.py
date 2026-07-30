@@ -20,6 +20,7 @@ from mcp_stdio.relay import (
     _CancelTracker,
     _ModernState,
     _SseState,
+    _build_discover_probe_request,
     _detect_paginated_list,
     _drain_pending,
     _emit,
@@ -4270,6 +4271,28 @@ class TestCheckConnection:
             == (discover_req.headers["mcp-protocol-version"])
         )
         assert meta["io.modelcontextprotocol/clientCapabilities"] == {}
+
+    def test_discover_retry_strips_pinned_mcp_name_and_session_id(self, httpx_mock):
+        """#350 review rounds 2/3: one fix (``_build_discover_probe_request``),
+        two consumers — this check_connection retry and _probe_protocol_era's
+        startup probe both build their request through it, so pin both.
+        An operator-pinned ``-H 'Mcp-Name: ...'`` / ``-H 'Mcp-Session-Id:
+        ...'`` must not survive onto the ``server/discover`` retry: the
+        method has no ``name`` parameter at all, and a pre-negotiation
+        probe must never carry a session id."""
+        httpx_mock.add_response(status_code=400, text="")
+        httpx_mock.add_response(
+            text=json.dumps({"jsonrpc": "2.0", "id": 2, "result": {}}),
+            headers={"content-type": "application/json"},
+        )
+        pinned_headers = dict(self.HEADERS)
+        pinned_headers["Mcp-Name"] = "operator-pinned"
+        pinned_headers["Mcp-Session-Id"] = "old-session"
+        assert check_connection(self.URL, pinned_headers) is True
+        discover_req = httpx_mock.get_requests()[1]
+        lowered = {k.lower() for k in discover_req.headers}
+        assert "mcp-name" not in lowered
+        assert "mcp-session-id" not in lowered
 
     def test_404_falls_back_to_discover(self, httpx_mock):
         """: 404 (unrecognized method) is the OTHER fallback trigger
@@ -9067,6 +9090,46 @@ class TestProbeProtocolEra:
         era, result = _probe_protocol_era(client, self.URL, {})
         assert era == "legacy"
         assert result is None
+
+
+class TestBuildDiscoverProbeRequestStripsAllCaseVariants:
+    """#350 review rounds 2 AND 3 (flagged independently by both):
+    ``_build_discover_probe_request`` stripped only ``Mcp-Method`` and
+    ``MCP-Protocol-Version``, leaving an operator-pinned ``Mcp-Name`` /
+    ``Mcp-Session-Id`` untouched. ``server/discover`` has no ``name``
+    parameter at all (so any ``Mcp-Name`` value is unsupported by the
+    request body) and, being pre-negotiation, must never carry a session
+    id either — inconsistent with ``_prepare_headers``' modern-era branch,
+    which unconditionally strips both. Mixed-case header keys prove the
+    fix strips by ``.lower()``, not by exact string match (mirrors the
+    convention at test_relay.py's pinned-Mcp-Name/Mcp-Method tests)."""
+
+    def test_pinned_mcp_name_is_stripped(self):
+        _, probe_headers = _build_discover_probe_request(
+            {"Content-Type": "application/json", "mcp-name": "operator-pinned"}
+        )
+        assert "mcp-name" not in {k.lower() for k in probe_headers}
+
+    def test_pinned_mcp_session_id_is_stripped(self):
+        _, probe_headers = _build_discover_probe_request(
+            {"Content-Type": "application/json", "Mcp-Session-Id": "old-session"}
+        )
+        assert "mcp-session-id" not in {k.lower() for k in probe_headers}
+
+    def test_pinned_mixed_case_variants_of_both_are_stripped(self):
+        _, probe_headers = _build_discover_probe_request(
+            {
+                "Content-Type": "application/json",
+                "MCP-NAME": "operator-pinned",
+                "mcp-SESSION-id": "old-session",
+            }
+        )
+        lowered = {k.lower() for k in probe_headers}
+        assert "mcp-name" not in lowered
+        assert "mcp-session-id" not in lowered
+        # The two REQUIRED headers this function itself sets must survive.
+        assert probe_headers["Mcp-Method"] == "server/discover"
+        assert "MCP-Protocol-Version" in probe_headers
 
 
 class TestHandleModernSpecialMethod:
