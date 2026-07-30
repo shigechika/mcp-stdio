@@ -13027,6 +13027,43 @@ class TestListenStreamLoop:
         assert len(httpx_mock.get_requests()) == 1
         assert "before the stream was ever established" in capsys.readouterr().err
 
+    def test_auth_failures_before_establishment_retry_with_fresh_headers(
+        self, httpx_mock, capsys
+    ):
+        """#352 round-2 finding 1 (C3 over C7): 401/403 are ALWAYS
+        retryable drops, even before the stream was ever established —
+        auth heals externally (the main loop / proactive-refresh daemon
+        refreshes credentials) and each attempt's fresh _prepare_headers
+        snapshot picks the refresh up. The pre-establishment fail-fast
+        must not eat them: a token expiring between initialize and the
+        first listen POST would otherwise disable the stream permanently.
+        401 then 403 then 200 — the stream establishes on the third
+        attempt, each carrying that attempt's fresh credentials."""
+        calls = []
+
+        def prepare_headers(body):
+            calls.append(body)
+            return {"Authorization": f"Bearer t{len(calls)}"}
+
+        httpx_mock.add_response(url=self.URL, status_code=401, text="")
+        httpx_mock.add_response(url=self.URL, status_code=403, text="")
+        httpx_mock.add_response(
+            stream=self._sse(self._graceful(attempt=3)),
+            headers={"content-type": "text/event-stream"},
+        )
+        with (
+            patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            patch("sys.stdout", StringIO()),
+        ):
+            self._run_loop(prepare_headers=prepare_headers)
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 3
+        assert requests[0].headers["authorization"] == "Bearer t1"
+        assert requests[1].headers["authorization"] == "Bearer t2"
+        assert requests[2].headers["authorization"] == "Bearer t3"
+        # Never the fail-fast/terminal wording — auth is not non-support.
+        assert "disabled" not in capsys.readouterr().err
+
     def test_401_after_establishment_reconnects_with_fresh_headers(self, httpx_mock):
         """C2/C3: a 401 mid-session is a drop (NO auth recovery runs on
         this thread), and the next attempt's fresh _prepare_headers

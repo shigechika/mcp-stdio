@@ -3162,8 +3162,10 @@ def _listen_stream_loop(
       BEFORE any success, fail fast instead (C7's ``established`` split —
       the first attempt runs moments after a successful probe/initialize,
       so a first-attempt failure is far more likely non-support than a
-      blip). 401/403 land here too: NO auth recovery runs on this thread
-      (C3 — ``_probe_auth_recovery``'s lock ordering is not safe from a
+      blip). 401/403 are EXEMPT from that fail-fast (#352 round-2
+      finding 1): an auth challenge is always a retryable drop (C3),
+      established or not — NO auth recovery runs on this thread
+      (``_probe_auth_recovery``'s lock ordering is not safe from a
       third concurrent caller; ``_sse_reader_loop`` sets the precedent
       that a reader owns no recovery), the next attempt's fresh header
       snapshot picks up whatever the main loop / daemon refreshed.
@@ -3227,14 +3229,36 @@ def _listen_stream_loop(
                             "list_changed forwarding disabled for this session"
                         )
                         return
-                    if not established:
+                    # Three-way split (#352 round-2 finding 1): terminal
+                    # codes (C6 — the -32601-bodied 404 above, and the
+                    # terminal error results _handle_listen_message
+                    # classifies) stop for good; auth challenges 401/403
+                    # are ALWAYS retryable drops (C3), even before the
+                    # stream was ever established — they heal EXTERNALLY
+                    # (the main loop / proactive-refresh daemon refreshes
+                    # credentials, and the next attempt's fresh
+                    # _prepare_headers snapshot picks them up), so the
+                    # fail-fast below must never eat them or a token
+                    # expiring between initialize and the first listen
+                    # POST would disable the stream permanently; every
+                    # OTHER pre-establishment failure fails fast (C7 — a
+                    # server that will never say yes must not be hammered
+                    # at 1 Hz, a rationale that fits -32601/404/4xx
+                    # generally but NOT auth challenges).
+                    if resp.status_code in (401, 403):
+                        log(
+                            f"listen stream: HTTP {resp.status_code}; "
+                            "reconnecting with a fresh header snapshot"
+                        )
+                    elif not established:
                         log(
                             f"listen stream: HTTP {resp.status_code} before the "
                             "stream was ever established; list_changed "
                             "forwarding disabled for this session"
                         )
                         return
-                    log(f"listen stream: HTTP {resp.status_code}; reconnecting")
+                    else:
+                        log(f"listen stream: HTTP {resp.status_code}; reconnecting")
                 else:
                     established = True
                     if _is_sse_response(resp):
