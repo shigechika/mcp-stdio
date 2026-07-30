@@ -32,6 +32,7 @@ from mcp_stdio.relay import (
     _escape_js_line_separators,
     _extract_cancel_id,
     _extract_id_and_presence,
+    _extract_input_required,
     _extract_log_level,
     _extract_method_and_name,
     _extract_response_id,
@@ -277,6 +278,97 @@ class TestErrorResponse:
     def test_string_id(self):
         result = json.loads(_error_response("err", req_id="req-42"))
         assert result["id"] == "req-42"
+
+    def test_code_defaults_to_server_error_and_can_be_overridden(self):
+        """#270 PR C: the MRTR bridge needs -32600 Invalid Request for the
+        two cases where the fault is in the MESSAGE (an unbridgeable
+        input_required result; a client id already owning a pending
+        transaction) rather than in the relay's attempt to deliver it.
+        Every pre-existing caller must keep the -32000 default."""
+        assert json.loads(_error_response("e", 1))["error"]["code"] == -32000
+        assert (
+            json.loads(_error_response("e", 1, code=-32600))["error"]["code"] == -32600
+        )
+        # data and code compose.
+        err = json.loads(_error_response("e", 1, data={"x": 1}, code=-32600))["error"]
+        assert err["data"] == {"x": 1}
+        assert err["code"] == -32600
+
+
+# --- _extract_input_required (MRTR bridge, #270 Phase 2 PR C) ---
+
+
+class TestExtractInputRequired:
+    """The MRTR interception gate: is this streamed payload an
+    InputRequiredResult for the request WE sent?"""
+
+    def _payload(self, **over):
+        msg = {
+            "jsonrpc": "2.0",
+            "id": 5,
+            "result": {"resultType": "input_required", "requestState": "blob"},
+        }
+        msg.update(over)
+        return json.dumps(msg)
+
+    def test_matching_input_required_returns_the_result(self):
+        assert _extract_input_required(self._payload(), 5) == {
+            "resultType": "input_required",
+            "requestState": "blob",
+        }
+
+    def test_id_mismatch_is_not_ours(self):
+        """A retry POST carries the relay's OWN fresh id ("The JSON-RPC id
+        MUST be different between the initial request and the retry" —
+        MRTR client requirement 3), so id equality is the only way to tell
+        our answer from an unrelated frame interleaved on the stream."""
+        assert _extract_input_required(self._payload(), 6) is None
+
+    def test_id_compare_is_type_aware(self):
+        """`"5" == 5` is False in Python — the same property that makes the
+        relay's string id namespaces collision-proof (C10)."""
+        assert _extract_input_required(self._payload(id="5"), 5) is None
+
+    def test_other_result_type_passes_through(self):
+        """Gated EXACTLY: `resultType` is an open-ended string in the
+        schema, so a future discriminator the bridge does not understand
+        must fall through to verbatim forwarding, not be swallowed."""
+        assert (
+            _extract_input_required(
+                self._payload(result={"resultType": "input_required_v2"}), 5
+            )
+            is None
+        )
+        assert (
+            _extract_input_required(self._payload(result={"resultType": "cool"}), 5)
+            is None
+        )
+
+    def test_error_response_is_not_an_input_required(self):
+        msg = json.dumps(
+            {"jsonrpc": "2.0", "id": 5, "error": {"code": -1, "message": "x"}}
+        )
+        assert _extract_input_required(msg, 5) is None
+
+    def test_notification_and_server_request_pass_through(self):
+        """Only a PURE response can be ours; a notification or an
+        interleaved server-initiated request is not an answer to anything."""
+        note = json.dumps({"jsonrpc": "2.0", "method": "notifications/progress"})
+        assert _extract_input_required(note, 5) is None
+        req = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "ping",
+                "result": {"resultType": "input_required"},
+            }
+        )
+        assert _extract_input_required(req, 5) is None
+
+    def test_malformed_and_non_object_result_pass_through(self):
+        assert _extract_input_required("not json", 5) is None
+        assert _extract_input_required(self._payload(result="scalar"), 5) is None
+        assert _extract_input_required(json.dumps([1, 2]), 5) is None
 
 
 # --- _post_and_stream ---
@@ -2337,6 +2429,39 @@ class TestRun:
         # "id": null is echoed (key present, value None), not dropped.
         assert "id" in result and result["id"] is None
         assert result["error"]["message"] == "HTTP 401"
+
+    def test_legacy_response_shaped_stdin_line_is_posted_verbatim(self, httpx_mock):
+        """AC 3 pin (#270 Phase 2 PR C): a RESPONSE-shaped stdin line (an
+        id plus a result, no method — what a client sends when answering a
+        server-initiated sampling/elicitation/roots request) is POSTed
+        upstream verbatim on the legacy era, exactly as it always has been.
+
+        Pinned BEFORE PR C touches the stdin loop, because the modern era
+        gains a branch that intercepts precisely these lines (the MRTR
+        bridge routes them into its transaction state instead of the
+        wire). The legacy path must keep the pre-#270 behavior BYTE for
+        byte, warts included: the POST body is the untouched line, no
+        Mcp-Method header is derived (a response has no method), and the
+        server's spec-correct 202 Accepted for a client response
+        (Streamable HTTP "Sending Messages" rule 4) is turned into a
+        synthesized JSON-RPC error, because `_extract_id_and_presence`
+        sees the id and classifies the line as a REQUEST that was left
+        unanswered. That last part is a known wart — pin it, do not fix
+        it here: changing it would be a legacy-era behavior change PR C
+        has no mandate for."""
+        httpx_mock.add_response(status_code=202, text="")
+        line = '{"jsonrpc":"2.0","id":7,"result":{"action":"decline"}}'
+        output = self._run_with_stdin(httpx_mock, [line])
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 1
+        # Byte-identical body, and no request-metadata headers at all.
+        assert requests[0].content.decode() == line
+        assert "mcp-method" not in requests[0].headers
+        assert "mcp-name" not in requests[0].headers
+        # The 202 quirk, pinned verbatim.
+        reply = json.loads(output.strip())
+        assert reply["id"] == 7
+        assert reply["error"]["message"] == "HTTP 202 (no response body for request)"
 
 
 # --- MCP-Protocol-Version header (spec rev 2025-06-18, issue #69) ---
@@ -10299,6 +10424,72 @@ class TestHandleModernSpecialMethod:
             "tools": {"quirky": True},
         }
 
+    def test_declared_client_capabilities_retained_before_the_strip(self):
+        """#270 PR C design change 2: the UNFILTERED declaration is kept
+        alongside the advertised (stripped) one. This is the only place
+        the relay ever sees what the local client can actually do — the
+        modern path never forwards the initialize — and the MRTR bridge
+        needs it to decide whether a server-requested elicitation /
+        sampling / roots round-trip may legitimately be minted onto
+        stdout. Phase 1 discarded it, which is why the bridge could not
+        exist before this slot did."""
+        state = _ModernState()
+        line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": {
+                        "elicitation": {"form": {}},
+                        "roots": {"listChanged": True},
+                        "experimental": {"caching": {}},
+                    },
+                },
+            }
+        )
+        _handle_modern_special_method(line, 1, state)
+        # Advertised upstream: still stripped (the un-strip is a later,
+        # separately revertible commit).
+        assert state.client_capabilities == {"experimental": {"caching": {}}}
+        # Declared by the client: retained in full, including the keys the
+        # advertisement drops.
+        assert state.client_capabilities_declared == {
+            "elicitation": {"form": {}},
+            "roots": {"listChanged": True},
+            "experimental": {"caching": {}},
+        }
+
+    def test_declared_client_capabilities_is_a_copy_not_the_params_object(self):
+        """The retained declaration must not alias the parsed params: the
+        advertised set is built by comprehension (a fresh dict), so an
+        aliased declaration could be mutated from the other side and the
+        two would silently drift apart."""
+        state = _ModernState()
+        _handle_modern_special_method(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"capabilities": {"sampling": {}}},
+                }
+            ),
+            1,
+            state,
+        )
+        assert state.client_capabilities_declared == {"sampling": {}}
+        state.client_capabilities_declared["sampling"] = {"mutated": True}
+        assert state.client_capabilities == {}
+
+    def test_declared_client_capabilities_defaults_to_none(self):
+        """No initialize seen yet means NOTHING was declared — distinct
+        from "declared an empty set". The bridge treats both as "cannot
+        mint", but the None default keeps the two distinguishable in
+        logs."""
+        assert _ModernState().client_capabilities_declared is None
+
     def test_server_capability_echo_unaffected_by_client_capability_filter(self):
         """#350 review round 10, finding 10-1 (the non-goal pinned): the
         filter applies to what the relay claims the CLIENT can do upstream,
@@ -12067,30 +12258,33 @@ class TestRunModernEra:
         # the relay never version-translates bodies in either direction.
         assert lines[1] == upstream_result
 
-    def test_mrtr_input_required_result_forwarded_verbatim_phase2_gap(self, httpx_mock):
-        """Characterization of run()'s "Limitation — MRTR" section (#350
-        review round 4 finding 1 / #270 Phase 2): the ONE genuinely
-        non-additive 2026 result shape, InputRequiredResult
-        (resultType: "input_required" REPLACING the real payload,
-        SEP-2322), is forwarded verbatim by Phase 1 — translating it into
-        legacy server-initiated sampling/elicitation/roots requests is
-        #270's explicitly-phased Phase 2 work. Since round 10 (finding
-        10-1) the relay strips the client capability keys that would
-        invite this flow, so a COMPLIANT server no longer has reason to
-        send it — this pins the residual: a NON-compliant upstream that
-        sends input_required unprovoked (as here, where the client never
-        advertised those capabilities at all) is still forwarded verbatim,
-        so Phase 2 has a test to flip and the gap can never become an
-        accidental rewrite instead of a deliberate translation."""
+    def test_mrtr_unbridgeable_input_required_is_cleanly_rejected(self, httpx_mock):
+        """#270 Phase 2 PR C, commit 1 — THE FLIP of Phase 1's
+        characterization test (which pinned the verbatim forward and said
+        in so many words "so Phase 2 has a test to flip").
+
+        An InputRequiredResult the bridge cannot carry — here the client
+        never sent an `initialize` at all, so it declared NO capabilities
+        and MRTR server requirement 7 ("Servers MUST NOT send an
+        inputRequests that the client has not declared support for in its
+        capabilities") is violated outright — must reach the client as a
+        clean JSON-RPC error under its OWN id, never as the 2026 result
+        shape a 2025 client misreads as an oddly-shaped success. -32600
+        Invalid Request: the fault is in the server's message. This branch
+        is the PERMANENT fallback for every unbridgeable MRTR shape, not a
+        stepping stone."""
         mrtr_result = json.dumps(
             {
                 "jsonrpc": "2.0",
                 "id": 2,
                 "result": {
                     "resultType": "input_required",
-                    "inputRequests": [
-                        {"type": "elicitation", "id": "q1", "message": "confirm?"}
-                    ],
+                    "inputRequests": {
+                        "q1": {
+                            "method": "elicitation/create",
+                            "params": {"message": "confirm?"},
+                        }
+                    },
                 },
             }
         )
@@ -12118,7 +12312,16 @@ class TestRunModernEra:
             ],
             protocol_era="modern",
         )
-        assert output.strip() == mrtr_result
+        lines = [line for line in output.strip().split("\n") if line]
+        # EXACTLY one response for the one request — the swallowed
+        # input_required must not also trigger the "empty response from
+        # server" synthesis (_post_and_stream's emitted=False guard).
+        assert len(lines) == 1
+        reply = json.loads(lines[0])
+        assert reply["id"] == 2
+        assert reply["error"]["code"] == -32600
+        assert "MRTR" in reply["error"]["message"]
+        assert "resultType" not in lines[0]
 
     def test_non_ascii_method_rejected_with_jsonrpc_error_not_crash(self, httpx_mock):
         """#350 review round 5 (finding 5-2): JSON-RPC permits ANY string as
