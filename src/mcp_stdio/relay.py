@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import email.utils
 import json
 import math
@@ -334,6 +335,1143 @@ def _extract_protocol_version(payload: str) -> str | None:
     if isinstance(pv, str) and pv and all(0x21 <= ord(c) <= 0x7E for c in pv):
         return pv
     return None
+
+
+# --- modern (spec rev 2026-07-28) dispatch path ---
+#
+# The 2026-07-28 revision removes the initialize handshake and
+# Mcp-Session-Id from the wire entirely: every request instead carries its
+# own per-request metadata (protocol version, capabilities, ...) as
+# ``params._meta``, plus two new REQUIRED-on-every-POST headers. Everything
+# in this section is used ONLY when the relay has resolved (or been forced
+# via --protocol-era) onto that modern path — see ``run()``'s ``era``
+# variable. The legacy path (spec rev 2025-06-18 and earlier) is completely
+# untouched by any of this: it neither calls nor imports from here, so it
+# stays byte-identical to pre-#270 behaviour (acceptance criterion #3).
+
+# Default protocol version to advertise on the modern path when nothing
+# better is known (no server/discover ever ran, or it returned no
+# supportedVersions, or the local client's initialize omitted
+# protocolVersion). This is this relay's own floor for "definitely modern",
+# mirroring how "2024-11-05" already serves as the floor on the legacy path
+# (_cold_start_response, _reinitialize).
+_MODERN_PROTOCOL_VERSION_DEFAULT = "2026-07-28"
+
+# The modern protocol revisions this relay actually IMPLEMENTS. Everything
+# the modern dispatch path emits — the server/discover lifecycle,
+# per-request ``Mcp-Method``/``Mcp-Name`` headers, ``params._meta``
+# injection — is written against spec rev 2026-07-28, so that is the only
+# member today. Upstream version negotiation
+# (``_negotiate_modern_version``) selects EXCLUSIVELY from this set:
+# "date-form and >= the floor" proves only which ERA a version belongs to,
+# not that this relay speaks its wire semantics, and using era membership
+# as the eligibility rule falsely negotiated future revisions the relay
+# does not implement (#350 review round 9, finding 9-1). Add a revision
+# here ONLY when the modern path's wire behavior has actually been updated
+# to conform to it.
+_RELAY_IMPLEMENTED_MODERN_VERSIONS = frozenset({_MODERN_PROTOCOL_VERSION_DEFAULT})
+
+# Fallback ``serverInfo`` used by ``_handle_modern_special_method`` ONLY when
+# the era-detection ``server/discover`` probe never yielded a real one (probe
+# failed transport-level, or returned a recognized-modern JSON-RPC error with
+# no result, or a compliant server simply chose not to send the SHOULD-only
+# ``_meta.serverInfo`` field). The design goal (#270 revision comment) is to
+# source ``serverInfo`` from real discover data "instead of inventing a
+# placeholder" — this name is deliberately NOT a bare ``"mcp-stdio"`` (which
+# would misrepresent this relay's own identity AS the remote server's
+# self-reported identity, the exact thing #270 says not to do) but says
+# plainly that the real upstream identity is unknown, while still naming the
+# relay for troubleshooting. ``serverInfo`` is spec-documented as
+# "self-reported... intended for display, logging, and debugging" (server/
+# discover, "DiscoverResult") — never used for behavior/security decisions —
+# so an honestly-labelled placeholder here is display-only degraded-mode
+# behavior, not a protocol violation, as long as it does not claim to BE the
+# remote's own report.
+_UNKNOWN_UPSTREAM_SERVER_INFO = {
+    "name": "mcp-stdio (upstream identity unknown)",
+    "version": __version__,
+}
+
+# _meta keys mirrored per request/result on the modern path (spec rev
+# 2026-07-28, clientInfo/serverInfo revision comment of 2026-07-27 — see the
+# table in the issue: protocolVersion and clientCapabilities are REQUIRED;
+# clientInfo is a SHOULD (never fabricated — see _handle_modern_special_method);
+# serverInfo appears on RESULTS, nested under this same namespace, not as a
+# top-level field (confirmed against server/discover's own worked example).
+_META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion"
+_META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities"
+_META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo"
+_META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
+# Amendment added 2026-07-27: mirror a client-set logging level into _meta on
+# the modern path (there is no other per-request channel for it now that
+# initialize/session state is gone). See _extract_log_level.
+_META_LOG_LEVEL = "io.modelcontextprotocol/logLevel"
+
+# Client capability keys whose MODERN semantics this Phase 1 relay cannot
+# bridge (#350 review round 10, finding 10-1). Spec rev 2026-07-28
+# (SEP-2322) REPLACED the server-initiated ``sampling``/``elicitation``/
+# ``roots`` round-trips these keys advertise with MRTR: a server needing
+# client input answers the request itself with an ``InputRequiredResult``
+# (``resultType: "input_required"``) that the client must satisfy by
+# re-issuing the request with ``inputResponses``. Translating that exchange
+# back into the legacy server-initiated requests a 2025-era stdio client
+# understands is #270's explicitly-phased Phase 2 work — so forwarding these
+# keys upstream in ``_meta``'s ``clientCapabilities`` would ADVERTISE flows
+# this relay cannot deliver: a modern server, told the client supports them,
+# may legitimately answer e.g. a ``tools/call`` with an MRTR result that
+# Phase 1 forwards verbatim to a client that cannot answer it (misread as an
+# oddly-shaped success, or a hang). Stripping the keys at CAPTURE time
+# (``_handle_modern_special_method``'s ``initialize`` interception) removes
+# the invitation at every downstream use in one place — per-request
+# ``_meta`` injection AND the reseed re-probe's advertised capabilities —
+# and makes the reseed's "client has real capabilities" condition naturally
+# correct for a client whose ONLY capabilities are un-bridgeable ones.
+# Every other key (notably ``experimental``, and any future additions) does
+# not map to an MRTR-replaced flow and passes through untouched. Remove
+# entries here only when Phase 2 actually bridges the corresponding flow.
+_MRTR_REPLACED_CLIENT_CAPABILITIES = frozenset({"sampling", "elicitation", "roots"})
+
+# MCP request metadata headers (spec rev 2026-07-28, "Request Metadata",
+# SEP-2243). Every Streamable HTTP POST on the modern path mirrors the
+# request's `method` into an `Mcp-Method` header; `tools/call` /
+# `resources/read` / `prompts/get` additionally mirror `params.name` (or
+# `params.uri` for resources/read) into `Mcp-Name`. Sent ONLY on the modern
+# path — see the module docstring above and _prepare_headers in run().
+# `x-mcp-header` / `Mcp-Param-{Name}` (custom per-tool headers mirrored from
+# `inputSchema` annotations) is a separate, materially larger feature — it
+# requires caching each tool's schema from `tools/list` responses to know
+# which call arguments to mirror — and is deliberately out of scope here.
+#
+# Batches: MCP removed JSON-RPC batching in spec rev 2025-06-18, and a batch
+# has no single top-level `method` to mirror, so `_extract_method_and_name`
+# only recognises a top-level JSON object; an array (or unparseable content)
+# yields `(None, None)` and the caller sends neither header.
+_NAME_BEARING_METHODS = {
+    "tools/call": "name",
+    "resources/read": "uri",
+    "prompts/get": "name",
+}
+
+
+def _extract_method_and_name(line: str) -> tuple[str | None, str | None]:
+    """Return ``(method, name_or_uri)`` for the ``Mcp-Method``/``Mcp-Name`` headers.
+
+    ``name_or_uri`` is populated only for the three methods
+    ``_NAME_BEARING_METHODS`` lists; every other method (``tools/list``, the
+    plain list methods, notifications, ...) returns ``(method, None)`` so the
+    caller sends ``Mcp-Method`` alone, matching the spec's "Required For"
+    column.
+    """
+    try:
+        msg = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return None, None
+    if not isinstance(msg, dict):
+        return None, None  # batch array, or a scalar — no single method
+    method = msg.get("method")
+    if not isinstance(method, str):
+        return None, None
+    name_key = _NAME_BEARING_METHODS.get(method)
+    if name_key is None:
+        return method, None
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return method, None
+    value = params.get(name_key)
+    return method, value if isinstance(value, str) else None
+
+
+_BASE64_SENTINEL_RE = re.compile(r"\A=\?base64\?.*\?=\Z", re.DOTALL)
+
+
+def _is_header_safe_ascii(value: str) -> bool:
+    """True if ``value`` can ride an HTTP header verbatim, unencoded.
+
+    Per RFC 9110 field-value syntax (spec rev 2026-07-28 "Value Encoding"),
+    the safe set is visible ASCII (0x21-0x7E) plus space (0x20) and
+    horizontal tab (0x09) — but the spec additionally forbids
+    leading/trailing whitespace even though the wire grammar would allow it,
+    so a value with either is NOT header-safe here and must be encoded.
+    """
+    if not value:
+        return True
+    if value[0] in (" ", "\t") or value[-1] in (" ", "\t"):
+        return False
+    return all(c in (" ", "\t") or 0x21 <= ord(c) <= 0x7E for c in value)
+
+
+def _encode_mcp_name(value: str) -> str:
+    """Encode a ``Mcp-Name`` header value per spec rev 2026-07-28 Value Encoding.
+
+    A plain ASCII value with no leading/trailing whitespace, that does not
+    itself look like the sentinel, rides verbatim. Everything else —
+    non-ASCII, control characters, leading/trailing whitespace, or a value
+    that would otherwise be mistaken for an already-encoded sentinel — is
+    Base64-encoded as ``=?base64?{...}?=``: the exact literal markers the
+    spec mandates (lowercase, no charset segment — unlike MIME
+    encoded-words). ``Mcp-Method`` must NOT go through this encoder: the
+    sentinel is defined only for ``Mcp-Name`` / ``Mcp-Param-{Name}`` — the
+    "Server Validation" section requires servers to decode exactly those two
+    before comparing against the body, so an encoded ``Mcp-Method`` would
+    fail header-body validation (-32020 ``HeaderMismatch``) on a compliant
+    server. A JSON-RPC ``method`` that is not itself header-safe therefore
+    cannot be mirrored at all and is rejected before dispatch (#350 review
+    round 5, finding 5-2 — see the gate in ``run()``'s modern branch).
+    """
+    if _is_header_safe_ascii(value) and not _BASE64_SENTINEL_RE.match(value):
+        return value
+    encoded = base64.b64encode(value.encode("utf-8")).decode("ascii")
+    return f"=?base64?{encoded}?="
+
+
+def _mcp_request_headers(line: str) -> dict[str, str]:
+    """Build the ``Mcp-Method``/``Mcp-Name`` headers for one dispatched line.
+
+    Returns ``{}`` for a batch / unparseable / methodless line — there is no
+    single method to mirror. Used only on the modern path (see run()'s
+    ``_prepare_headers``). ``method`` rides verbatim: a non-header-safe
+    method never reaches this builder — run()'s modern branch rejects it
+    before dispatch, because the Base64 sentinel escape is spec-defined only
+    for ``Mcp-Name``/``Mcp-Param-{Name}``, never ``Mcp-Method`` (#350 review
+    round 5, finding 5-2 — see ``_encode_mcp_name``'s docstring).
+    """
+    method, name = _extract_method_and_name(line)
+    if method is None:
+        return {}
+    headers = {"Mcp-Method": method}
+    if name is not None:
+        headers["Mcp-Name"] = _encode_mcp_name(name)
+    return headers
+
+
+_SET_LEVEL_METHOD_RE = re.compile(r'"method"\s*:\s*"logging/setLevel"')
+
+
+def _extract_log_level(line: str) -> str | None:
+    """Return ``params.level`` from a ``logging/setLevel`` REQUEST, else None.
+
+    Tracked on BOTH eras — this is a cheap regex-gated READ, it never mutates
+    what is forwarded, so calling it unconditionally in run()'s loop cannot
+    change the legacy path's wire bytes. The captured level feeds the modern
+    path's ``io.modelcontextprotocol/logLevel`` _meta (amendment added
+    2026-07-27): a level set while the session was still on/resolving to
+    legacy is not lost if a later request needs it mirrored. The legacy
+    path's own forwarding of the raw ``logging/setLevel`` request is
+    completely unaffected — this function never rewrites the line.
+    """
+    if not _SET_LEVEL_METHOD_RE.search(line):
+        return None
+    try:
+        msg = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(msg, dict) or msg.get("method") != "logging/setLevel":
+        return None
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return None
+    level = params.get("level")
+    return level if isinstance(level, str) and level else None
+
+
+def _negotiate_modern_version(requested: str | None, supported: list[str]) -> str:
+    """Pick the ``MCP-Protocol-Version`` to advertise UPSTREAM on the modern
+    path (request headers and ``params._meta``) — the actual wire version
+    the remote server understands, NOT what is echoed back to the local
+    stdio client (that is the client's own requested string, verbatim —
+    see ``_handle_modern_special_method``, #350 review round 3).
+
+    Only versions this relay IMPLEMENTS are eligible
+    (``_RELAY_IMPLEMENTED_MODERN_VERSIONS``), which rules out BOTH
+    directions of over-claim:
+
+    - LEGACY strings (#350 review round 7): everything else this dispatch
+      path does — no ``initialize`` handshake, no ``Mcp-Session-Id``,
+      per-request ``Mcp-Method``/``_meta`` — is the 2026-07-28 stateless
+      lifecycle, and a legacy version string on top of that wire shape is
+      incoherent. A dual-mode server advertising both ``2025-06-18`` and
+      ``2026-07-28`` while the local legacy client requests ``2025-06-18``
+      must still get a modern version upstream.
+    - FUTURE modern revisions (#350 review round 9, finding 9-1): round 7
+      used era membership ("date-form and >= the floor") as the
+      eligibility rule, but that proves only which ERA a version belongs
+      to, not that this relay speaks its wire semantics — a server
+      advertising ``["2026-07-28", "2027-01-01"]`` was answered with
+      ``max()`` = ``2027-01-01``, falsely negotiating a revision whose
+      (potentially incompatible) requirements this relay does not
+      implement. Exact set membership also subsumes round 7's date-form
+      shape check: a non-compliant server's ``"zzz"`` can never be a
+      member, ASCII ordering notwithstanding.
+
+    Selection: the client's requested version wins when it is advertised
+    AND implemented; otherwise the highest advertised-and-implemented
+    version; with an EMPTY intersection (a probe that never ran, a
+    legacy-only ``supportedVersions``, or a future-only one), an
+    implemented requested version, then this relay's own floor
+    (``_MODERN_PROTOCOL_VERSION_DEFAULT``). Advertising a version the
+    relay actually speaks and letting a future-only server reject it with
+    ``UnsupportedProtocolVersionError`` (-32022) is honest; claiming wire
+    semantics the relay does not implement is not.
+    """
+    eligible = [v for v in supported if v in _RELAY_IMPLEMENTED_MODERN_VERSIONS]
+    if requested and requested in eligible:
+        return requested
+    if eligible:
+        return max(eligible)
+    if requested and requested in _RELAY_IMPLEMENTED_MODERN_VERSIONS:
+        return requested
+    return _MODERN_PROTOCOL_VERSION_DEFAULT
+
+
+class _ModernState:
+    """Per-session state for the modern (spec rev 2026-07-28) dispatch path.
+
+    ``server_info`` / ``capabilities`` / ``supported_versions`` are seeded
+    once from the era-detection ``server/discover`` probe (see
+    ``_probe_protocol_era``) — plus at most ONE reseed retry when that
+    probe left ``capabilities`` empty and the local client's real,
+    non-empty capabilities have since become known
+    (``discover_retry_attempted`` latches the attempt so it can never
+    repeat — see ``_handle_modern_special_method``, #350 review rounds 4 +
+    9). ``client_capabilities`` / ``client_info`` /
+    ``negotiated_version`` are captured once from the local stdio client's
+    own ``initialize`` request (see ``_handle_modern_special_method`` — the
+    modern path never forwards that request upstream, so this is the only
+    place those values are ever seen). ``client_capabilities`` holds the
+    client's set MINUS the MRTR-replaced keys this Phase 1 relay cannot
+    bridge (``_MRTR_REPLACED_CLIENT_CAPABILITIES``, #350 review round 10,
+    finding 10-1) — every upstream advertisement reads this field, so the
+    filter applies once, here. ``log_level`` is updated on every
+    ``logging/setLevel`` line regardless of era (see ``_extract_log_level``).
+
+    A single plain object (no lock): ``run()``'s stdin loop dispatches one
+    line at a time, fully synchronously, on both eras — including the
+    modern path (Phase 1 implements the "don't forward
+    notifications/cancelled upstream" half of cancellation, AC #5's easy
+    half; actually ABORTING an in-flight POST when a cancel arrives would
+    require a second thread reading stdin concurrently with a blocking
+    dispatch, which is deliberately deferred: several
+    single-threaded-mutation invariants elsewhere in ``run()`` —
+    ``protocol_version``, the 401/403/404 recovery ladder — depend on "at
+    most one dispatch in flight" and would need re-auditing first).
+    """
+
+    __slots__ = (
+        "server_info",
+        "capabilities",
+        "supported_versions",
+        "client_capabilities",
+        "client_info",
+        "negotiated_version",
+        "log_level",
+        "discover_retry_attempted",
+    )
+
+    def __init__(self) -> None:
+        self.server_info: dict[str, Any] | None = None
+        self.capabilities: dict[str, Any] = {}
+        self.supported_versions: list[str] = []
+        self.client_capabilities: dict[str, Any] | None = None
+        self.client_info: dict[str, Any] | None = None
+        self.negotiated_version: str | None = None
+        self.log_level: str | None = None
+        self.discover_retry_attempted: bool = False
+
+
+def _seed_modern_state_from_discover(
+    modern_state: "_ModernState", discover_result: dict[str, Any] | None
+) -> None:
+    """Populate ``modern_state`` from a parsed ``server/discover`` response.
+
+    A no-op (state keeps its empty defaults) when ``discover_result`` is
+    ``None`` (probe failed / forced ``--protocol-era modern`` skipped or
+    could not parse the probe) or is a JSON-RPC error rather than a result —
+    the synthesized InitializeResult then falls back to
+    ``_UNKNOWN_UPSTREAM_SERVER_INFO`` / empty capabilities / the client's own
+    requested version. That fallback name says plainly that the real
+    upstream identity is unknown (see ``_UNKNOWN_UPSTREAM_SERVER_INFO``'s own
+    comment) — never a bare ``"mcp-stdio"`` that would misrepresent this
+    relay's identity AS the remote's self-reported one, which is exactly
+    what the #270 design says not to do ("source it from real discover data
+    instead of inventing a placeholder").
+
+    Seeding never ERASES (#350 review round 9, finding 9-2): the reseed
+    retry can now fire with ``server_info``/``supported_versions`` already
+    seeded by the startup probe (it re-runs whenever ``capabilities`` came
+    back empty, not only when nothing seeded at all), so a reseed payload
+    that omits a field — or answers it with an empty ``{}``/``[]`` — must
+    keep the previously-seeded value rather than clobber it back to a
+    default. Skipping an empty value is lossless on the FIRST seed too:
+    the state's own defaults are exactly those empty values.
+    """
+    if not isinstance(discover_result, dict):
+        return
+    result = discover_result.get("result")
+    if not isinstance(result, dict):
+        return
+    caps = result.get("capabilities")
+    if isinstance(caps, dict) and caps:
+        modern_state.capabilities = caps
+    versions = result.get("supportedVersions")
+    if (
+        isinstance(versions, list)
+        and versions
+        and all(isinstance(v, str) for v in versions)
+    ):
+        modern_state.supported_versions = versions
+    meta = result.get("_meta")
+    if isinstance(meta, dict):
+        server_info = meta.get(_META_SERVER_INFO)
+        if isinstance(server_info, dict):
+            modern_state.server_info = server_info
+
+
+# Base Protocol "Error Codes" (spec rev 2026-07-28): JSON-RPC 2.0 reserves
+# -32000..-32099 for implementation-defined server errors. This revision
+# partitions that range further: -32000..-32019 is legacy/grandfathered
+# (no new allocations), while -32020..-32099 is "reserved for the MCP
+# specification... defined exclusively by the MCP specification" — currently
+# -32020 (HeaderMismatch), -32021 (MissingRequiredClientCapability), -32022
+# (UnsupportedProtocolVersion). Standard pre-existing JSON-RPC codes such as
+# -32601 (Method not found) are OUTSIDE this range entirely (they predate
+# the -32000..-32099 implementation-defined range's own sub-partitioning),
+# so they can never be mistaken for a spec-defined modern error by range
+# membership alone.
+_MCP_RESERVED_ERROR_CODES = range(-32099, -32019)
+
+
+def _is_recognized_modern_error(parsed: dict[str, Any] | None) -> bool:
+    """True iff ``parsed`` is a JSON-RPC error object whose ``error.code``
+    falls in ``_MCP_RESERVED_ERROR_CODES`` (see that constant's comment for
+    the exact spec citation) — i.e. a "recognized modern JSON-RPC error" in
+    the sense used by the Streamable HTTP "Backward Compatibility" section.
+
+    A generic/pre-existing JSON-RPC code such as ``-32601`` (``Method not
+    found``) sits outside that sub-range and is exactly what an unmodified
+    LEGACY server would send for an unrecognized ``server/discover`` method
+    — over HTTP 400 by some servers' conventions, or HTTP 200 by others
+    (JSON-RPC-over-HTTP commonly returns 200 with the error in the body).
+    Neither counts as proof the remote speaks a modern version of MCP.
+    Shared by ``_probe_protocol_era``'s HTTP 200 and HTTP 400 paths so both
+    are judged by the identical rule.
+    """
+    if not isinstance(parsed, dict):
+        return False
+    error = parsed.get("error")
+    if not isinstance(error, dict):
+        return False
+    code = error.get("code")
+    return isinstance(code, int) and code in _MCP_RESERVED_ERROR_CODES
+
+
+def _build_discover_probe_request(
+    headers: dict[str, str],
+    request_id: int = 0,
+    modern_state: "_ModernState | None" = None,
+) -> tuple[str, dict[str, str]]:
+    """Build the body + headers for a spec-compliant ``server/discover`` probe.
+
+    Shared by ``_probe_protocol_era`` (the ``auto``/``modern`` startup probe),
+    ``check_connection``'s discover retry, and ``_reseed_discover_probe``
+    (the one-shot post-initialize reseed, #350 review round 4), so all send
+    byte-identical request shapes instead of independently-drifting probes
+    (#350 review finding 1).
+
+    Body: ``server/discover``'s own worked example (spec rev 2026-07-28,
+    "Discovery") carries ``params._meta`` with
+    ``io.modelcontextprotocol/protocolVersion`` and
+    ``.../clientCapabilities`` even on this very first, pre-negotiation
+    request — neither field requires prior knowledge of the remote (the
+    version is this relay's own advertised floor, capabilities are the
+    client's own, always-known set). Reusing ``_inject_modern_meta`` against
+    a throwaway, never-seeded ``_ModernState()`` produces exactly that:
+    ``negotiated_version`` falls back to ``_MODERN_PROTOCOL_VERSION_DEFAULT``
+    and ``client_capabilities`` falls back to ``{}`` — the same defaults
+    ``_prepare_headers`` uses before any real negotiation has happened.
+    ``clientInfo`` is correctly omitted (SHOULD, never fabricated — no real
+    client has spoken yet at probe time). A server that treats a discover
+    request lacking this ``_meta`` as a header/body mismatch (``HeaderMismatch``
+    / ``MissingRequiredClientCapabilityError``, both in the spec-reserved
+    ``-32020..-32099`` range) would otherwise reject an otherwise-valid probe.
+
+    ``modern_state``: pass the session's REAL state to build a discover
+    request that advertises the local client's actual
+    ``clientCapabilities``/``clientInfo`` in ``params._meta`` — used by the
+    reseed retry, which exists precisely because the startup probe could
+    only send ``{}``. The ``MCP-Protocol-Version`` header is derived from
+    the SAME state (``negotiated_version`` falling back to the modern
+    floor) as the ``_meta`` version ``_inject_modern_meta`` writes, keeping
+    the two equal — the spec's Server Validation section rejects a
+    header/``_meta`` version mismatch with ``HeaderMismatch`` (-32020).
+    Default ``None`` keeps the pre-negotiation throwaway-state behavior.
+
+    Headers: ``Mcp-Method``/``MCP-Protocol-Version`` are REQUIRED on every
+    POST (Streamable HTTP, "Standard Request Headers" / "Protocol Version
+    Header") — including this one. Any case-variant the operator pinned via
+    ``-H`` is dropped first so httpx never serialises two header lines for
+    the same field (mirrors ``_prepare_headers``' strip-then-set discipline).
+
+    ``Mcp-Name``/``Mcp-Session-Id`` are unconditionally STRIPPED (never
+    re-added — unlike ``Mcp-Method``/``MCP-Protocol-Version`` above, this
+    probe derives no replacement value for either) and any case-variant the
+    operator pinned via ``-H`` is dropped too (#350 review rounds 2 AND 3,
+    flagged independently by both): ``server/discover`` has no ``name``
+    parameter at all — a header asserting one is exactly the header/body
+    mismatch ``HeaderMismatch`` (-32020) exists to reject — and, being the
+    pre-negotiation probe, must never carry a session id either. This
+    mirrors ``_prepare_headers``' modern-era branch (#350 review finding 3),
+    which strips both unconditionally for the identical reason.
+    """
+    state = modern_state if modern_state is not None else _ModernState()
+    discover_msg = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "method": "server/discover",
+            "id": request_id,
+            "params": {},
+        }
+    )
+    discover_msg = _inject_modern_meta(discover_msg, state)
+    probe_headers = {k: v for k, v in headers.items() if k.lower() != "mcp-method"}
+    probe_headers["Mcp-Method"] = "server/discover"
+    probe_headers = {
+        k: v for k, v in probe_headers.items() if k.lower() != "mcp-protocol-version"
+    }
+    probe_headers["MCP-Protocol-Version"] = (
+        state.negotiated_version or _MODERN_PROTOCOL_VERSION_DEFAULT
+    )
+    probe_headers = {
+        k: v
+        for k, v in probe_headers.items()
+        if k.lower() not in ("mcp-name", "mcp-session-id")
+    }
+    return discover_msg, probe_headers
+
+
+def _is_sse_response(resp: httpx.Response) -> bool:
+    """True when ``resp`` declares an SSE body (``text/event-stream``).
+
+    Media types are case-insensitive (RFC 9110 §8.3.1 / RFC 2045 §5.1), so
+    the containment test runs against the lowercased header value — a
+    compliant server answering ``Content-Type: Text/Event-Stream`` is still
+    an SSE stream (#350 review round 8, finding 8-1). A case-sensitive
+    compare routed such a response to the buffered plain-JSON branch, where
+    ``resp.read()`` on a stream the server keeps open (the final response
+    only SHOULD terminate it) blocks until the read timeout: ``auto`` then
+    misclassifies the live modern server as legacy, and forced-modern
+    discovery / ``--check`` stall and lose the valid response.
+
+    Shared by ``_post_probe`` and ``_parse_streamable_response`` — the two
+    detection sites THIS branch introduces — so both apply the identical
+    rule. The pre-existing legacy dispatch path (``_post_and_stream``,
+    ``_post_parsed``, ``_reinitialize``) shares the case-sensitive
+    comparison on main but is deliberately NOT routed through this helper:
+    this branch's discipline is that legacy wire behavior stays
+    byte-identical (acceptance criterion #3), so those sites are left for a
+    follow-up fix on their own review trail.
+    """
+    return "text/event-stream" in resp.headers.get("content-type", "").lower()
+
+
+def _first_response_message(
+    events: Iterable[tuple[str, str]],
+) -> dict[str, Any] | None:
+    """Return the first SSE ``message`` event that is a JSON-RPC *response*.
+
+    A response is the message object carrying ``result`` or ``error``
+    (JSON-RPC 2.0 §5). Interleaved notifications — which a compliant server
+    MAY send before the final response (Streamable HTTP, "Receiving
+    Messages") — plus non-``message`` frames and non-JSON payloads are
+    skipped. Shared by the streaming probe reader (``_post_probe``) and the
+    buffered parser (``_parse_streamable_response``) so both apply the
+    identical keep-reading gate instead of independently-drifting copies.
+    """
+    for event_type, payload in events:
+        if event_type != "message":
+            continue
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and ("result" in parsed or "error" in parsed):
+            return parsed
+    return None
+
+
+def _post_probe(
+    client: httpx.Client,
+    url: str,
+    content: str,
+    headers: dict[str, str],
+) -> tuple[httpx.Response, dict[str, Any] | None]:
+    """POST a one-shot probe and return ``(response, parsed_response_or_None)``.
+
+    Streams the response instead of buffering it (#350 review round 5): a
+    server answering a probe over SSE is only SHOULD-bound to close the
+    stream after the response — "The final JSON-RPC *response* **SHOULD**
+    terminate the stream" (Streamable HTTP, "Receiving Messages") — so a
+    compliant server MAY deliver the probe's result as an SSE event and keep
+    the POST stream open afterwards. A buffered ``client.post()`` would then
+    block until the read timeout despite the result having already arrived:
+    ``auto`` era detection would misclassify a live modern server as legacy
+    (the timeout surfaces as a transport error), and a forced ``modern``
+    probe / ``--check`` fallback would stall for the full timeout and lose
+    the discovered capabilities. This reader instead stops at the first
+    JSON-RPC response message (``_first_response_message``) and closes the
+    stream — the same incremental SSE decoding the dispatch path uses
+    (``_iter_sse_lines``/``_iter_sse_events``), without its stdout / retry
+    state, which does not apply at probe time.
+
+    A plain-JSON (non-SSE) body is fully read inside the stream context and
+    parsed by ``_parse_streamable_response`` exactly as the buffered probes
+    always did. Either way the returned (closed) response still exposes
+    ``status_code`` / ``headers`` — everything probe callers inspect.
+    Transport errors propagate as ``httpx.HTTPError`` for the callers'
+    existing degrade-to-legacy / soft-fail handling; note a read error while
+    streaming surfaces HERE (inside the iteration) rather than inside
+    ``client.post()``, so callers must wrap this whole call, not just the
+    POST.
+    """
+    with client.stream("POST", url, content=content, headers=headers) as resp:
+        if _is_sse_response(resp):
+            return resp, _first_response_message(
+                _iter_sse_events(_iter_sse_lines(resp.iter_text()))
+            )
+        resp.read()
+    return resp, _parse_streamable_response(resp)
+
+
+def _post_discover_with_recovery(
+    client: httpx.Client,
+    url: str,
+    headers: dict[str, str],
+    auth_recovery: Callable[[httpx.Response], dict[str, str] | None] | None = None,
+    modern_state: "_ModernState | None" = None,
+    log_prefix: str = "protocol-era probe",
+) -> tuple[httpx.Response, dict[str, Any] | None]:
+    """POST a ``server/discover`` probe with bounded 401/403 credential
+    recovery; return the final ``(response, parsed_response_or_None)``.
+
+    ONE implementation of the recovery loop for both probe call sites —
+    ``_probe_protocol_era`` (startup) and ``_reseed_discover_probe`` (the
+    one-shot post-initialize reseed) — extracted in #350 review round 8
+    (finding 8-2): the reseed had NO recovery at all, so a token that
+    expired between a ``-32021``-gated startup probe and the local
+    ``initialize`` made the reseed 401 and permanently synthesize empty
+    capabilities — and a compliant client told ``capabilities: {}`` never
+    issues tools/resources/prompts requests, so the dispatch path's own
+    401 recovery never even gets a request to repair. Sharing the loop
+    (instead of duplicating it) follows the same rationale as
+    ``_build_discover_probe_request``: byte-identical behavior at every
+    call site instead of independently-drifting copies (#350 review
+    finding 1).
+
+    The loop is the round-6 shape, unchanged: recovery is bounded PER
+    STAGE, not per probe — gating on "first attempt only" (the round-4
+    shape) could repair a 401 but then had no attempt left when the
+    refreshed token 403'd with ``insufficient_scope``, a chained challenge
+    the dispatch ladder handles fine. Keying on status code lets each
+    stage fire once (bounded: initial post + one per stage = three posts
+    max) while a repeated same-status challenge still cannot loop. A
+    recovery that declines/fails (``None``) ends the loop with the
+    challenge response, identical to not having ``auth_recovery`` at all.
+
+    ``modern_state`` is forwarded to ``_build_discover_probe_request`` on
+    the initial build AND every recovery rebuild, so a reseed retry keeps
+    advertising the client's REAL capabilities/info after a token refresh.
+    ``log_prefix`` labels the recovery log lines with the caller's name.
+    Transport errors (``httpx.HTTPError``) propagate — each caller keeps
+    its own degrade path (startup: assume legacy; reseed: keep unseeded).
+    """
+    discover_msg, probe_headers = _build_discover_probe_request(
+        headers, modern_state=modern_state
+    )
+    recovered_statuses: set[int] = set()
+    while True:
+        resp, parsed = _post_probe(client, url, discover_msg, probe_headers)
+        if (
+            resp.status_code in (401, 403)
+            and resp.status_code not in recovered_statuses
+            and auth_recovery is not None
+        ):
+            refreshed = auth_recovery(resp)
+            if refreshed is not None:
+                recovered_statuses.add(resp.status_code)
+                log(
+                    f"{log_prefix}: HTTP {resp.status_code} recovered; "
+                    "re-probing with refreshed credentials"
+                )
+                discover_msg, probe_headers = _build_discover_probe_request(
+                    refreshed, modern_state=modern_state
+                )
+                continue
+        return resp, parsed
+
+
+def _probe_protocol_era(
+    client: httpx.Client,
+    url: str,
+    headers: dict[str, str],
+    auth_recovery: Callable[[httpx.Response], dict[str, str] | None] | None = None,
+) -> tuple[str, dict[str, Any] | None]:
+    """One-shot ``server/discover`` probe implementing the spec's era-detection
+    algorithm (Streamable HTTP, "Backward Compatibility") for
+    ``--protocol-era auto``.
+
+    Sends a MODERN-shaped request first (``server/discover`` — the modern
+    replacement for ``initialize``) and classifies the remote from the
+    response:
+
+    - HTTP 200 whose body is a JSON-RPC RESULT -> modern; the parsed body
+      is returned for the caller to seed ``_ModernState`` from (via
+      ``_seed_modern_state_from_discover``). A 200 with an
+      empty/unparseable/result-less body is NOT proof (#350 review round
+      13): a sloppy legacy endpoint or intermediary can 200 an unknown
+      method with an empty body or bare ``{}``, and classifying that as
+      modern would swallow the client's ``initialize`` and send stateless
+      requests the server cannot process — so it falls to legacy, the
+      same "empty or unrecognized" rule the 400 branch applies.
+    - HTTP 200 or HTTP 400 whose body IS a recognized-modern JSON-RPC error
+      per ``_is_recognized_modern_error`` -> STILL modern (spec: a modern
+      server also uses 400 for ``UnsupportedProtocolVersionError`` /
+      ``MissingRequiredClientCapabilityError`` / header-validation
+      failures — a recognized-modern error body proves the server
+      UNDERSTOOD ``server/discover`` as a method, just rejected THIS
+      request, so the client should retry/correct rather than fall back).
+      The same rule applies at HTTP 200 because a recognized-modern error
+      code is diagnostic regardless of which HTTP status carried it.
+    - HTTP 401/403 with ``auth_recovery`` provided: the challenge is
+      AUTHENTICATION evidence, not protocol evidence (#350 review round 4)
+      — a modern-only server with an expired cached OAuth token 401s
+      before ever inspecting ``server/discover``, and classifying that as
+      legacy would permanently misconfigure the session (the relay would
+      later send ``initialize``, which the modern remote rejects, while
+      the first real dispatch's own 401 recovery silently fixes only the
+      credentials, not the era). ``auth_recovery`` is handed the raw
+      response (it needs the status and any ``WWW-Authenticate``
+      challenge) and returns the FULL refreshed header set on successful
+      recovery — the probe is then rebuilt from those headers and
+      retried. Each recovery STAGE fires at most once, keyed by status
+      code (401 -> token refresh, 403 -> step-up), so a CHAINED challenge
+      — 401, refresh succeeds, then the refreshed token 403s with
+      ``insufficient_scope`` (#350 review round 6) — is repaired
+      end-to-end exactly like the dispatch ladder would repair it, while
+      a REPEATED challenge of the same status (a refresh that still
+      401s) cannot loop: at most three posts total (the initial probe
+      plus one per stage). A recovery that declines/fails (``None``), or
+      a retry that fails with an already-recovered status, falls through
+      to the conservative rules below — identical to not having
+      ``auth_recovery`` at all.
+    - HTTP 200 or HTTP 400 whose body is a GENERIC/unrecognized JSON-RPC
+      error (e.g. ``-32601`` Method not found — the ordinary reply an
+      unmodified LEGACY server sends for an unknown method), HTTP 404
+      (method not recognized at all — the transport spec's mandated
+      response for an unknown method), any OTHER status (unrecovered
+      401/403, 5xx, ...), or a transport failure -> legacy, the
+      conservative default on anything ambiguous. Spec: "If the body is
+      empty or is not a recognized modern JSON-RPC error, fall back to
+      `initialize` and continue with the legacy version for subsequent
+      requests" (Streamable HTTP, "Backward Compatibility").
+
+    A transport-level exception is swallowed (not propagated) so a
+    detection-probe failure degrades to legacy rather than crashing startup;
+    the first REAL request from the local client still surfaces a genuine
+    connectivity problem through the normal legacy retry path.
+
+    The probe request itself is built by ``_build_discover_probe_request``
+    (headers AND body, including ``params._meta`` — see that function's
+    docstring for why a discover probe needs ``_meta`` too, not just the
+    two headers), and POSTed via ``_post_discover_with_recovery`` — the
+    build + bounded-recovery loop shared with ``_reseed_discover_probe``
+    (#350 review round 8, finding 8-2) — over ``_post_probe`` (#350 review
+    round 5),
+    which streams the response and stops at the first JSON-RPC response
+    message — a server that SSE-frames the discover result and keeps the
+    stream open (the final response only SHOULD terminate the stream) must
+    classify as modern promptly, not block until the read timeout and fall
+    through to the legacy branch above.
+    """
+    # The posting + bounded per-stage 401/403 recovery loop lives in
+    # _post_discover_with_recovery, shared with _reseed_discover_probe
+    # (#350 review round 8, finding 8-2) — see that helper's docstring for
+    # the round-6 bounded-per-stage rationale it preserves verbatim.
+    try:
+        resp, parsed = _post_discover_with_recovery(client, url, headers, auth_recovery)
+    except httpx.HTTPError as e:
+        log(f"protocol-era probe failed ({e}); assuming legacy")
+        return "legacy", None
+    if resp.status_code == 200:
+        if isinstance(parsed, dict) and "error" in parsed:
+            if _is_recognized_modern_error(parsed):
+                log(
+                    "protocol-era probe: 200 with a recognized-modern "
+                    "JSON-RPC error body; assuming modern"
+                )
+                return "modern", parsed
+            log(
+                "protocol-era probe: 200 with a generic JSON-RPC error "
+                "body; assuming legacy"
+            )
+            return "legacy", None
+        if isinstance(parsed, dict) and isinstance(parsed.get("result"), dict):
+            return "modern", parsed
+        # 200 with an empty/unparseable/result-less body proves nothing: a
+        # sloppy legacy endpoint (or an intermediary) can 200 an unknown
+        # method with an empty body or bare {}. Only a genuine
+        # DiscoverResult or a recognized-modern error is proof of modern —
+        # the same "empty or unrecognized -> fall back" rule the 400 branch
+        # applies (#350 review round 13). The result must itself be an
+        # OBJECT (#350 review round 14): a permissive legacy endpoint can
+        # answer an unknown method with ``"result": null`` (or a scalar),
+        # which is not a DiscoverResult shape either. Its FIELDS are
+        # deliberately not schema-validated beyond that — demanding
+        # resultType/supportedVersions would misclassify a slightly
+        # non-compliant but genuinely modern server, while a legacy server
+        # has no plausible reason to answer server/discover with an object
+        # result at all.
+        log("protocol-era probe: 200 with an empty/unrecognized body; assuming legacy")
+        return "legacy", None
+    if resp.status_code == 400:
+        if _is_recognized_modern_error(parsed):
+            log(
+                "protocol-era probe: 400 with a recognized-modern JSON-RPC "
+                "error body; assuming modern"
+            )
+            return "modern", parsed
+        log("protocol-era probe: 400 with an empty/generic body; assuming legacy")
+        return "legacy", None
+    # Any other status — 404 (unknown method), an unrecovered 401/403 (no
+    # auth_recovery configured, or recovery/retry failed), 5xx, ... — is the
+    # conservative legacy fallback. Logged explicitly so an operator whose
+    # modern-only server is being misclassified can see WHY (and knows the
+    # workaround: fix credentials, or pin --protocol-era modern).
+    log(f"protocol-era probe: HTTP {resp.status_code}; assuming legacy")
+    return "legacy", None
+
+
+def _reseed_discover_probe(
+    client: httpx.Client,
+    url: str,
+    headers: dict[str, str],
+    modern_state: "_ModernState",
+    auth_recovery: Callable[[httpx.Response], dict[str, str] | None] | None = None,
+) -> None:
+    """One-shot ``server/discover`` re-probe carrying the local client's REAL
+    capabilities (#350 review round 4).
+
+    The startup era-detection probe necessarily runs before the local stdio
+    client's own ``initialize``, so it can only advertise
+    ``clientCapabilities: {}``. A remote that gates ``server/discover``
+    itself on a real client capability (``-32021``
+    ``MissingRequiredClientCapabilityError``) is still classified modern but
+    seeds nothing — and a server can equally answer the probe SUCCESSFULLY
+    with ``serverInfo``/``supportedVersions`` while filtering
+    ``capabilities`` down to ``{}`` against that placeholder (#350 review
+    round 9, finding 9-2). Either way the lifecycle spec makes empty
+    synthesized capabilities NOT cosmetic: "Both parties MUST ... Only use
+    capabilities that were successfully negotiated", so a compliant client
+    told ``capabilities: {}`` will never issue ``tools/list`` at all. This
+    re-probe repeats discovery exactly once, now that
+    ``modern_state.client_capabilities``/``client_info`` hold the client's
+    real values (``_build_discover_probe_request`` puts them in
+    ``params._meta``), and reseeds ``modern_state`` from the result —
+    without erasing identity/version state the startup probe already
+    seeded, when the reseed only needed to fill capabilities (see
+    ``_seed_modern_state_from_discover``).
+
+    Called only from ``_handle_modern_special_method``'s ``initialize``
+    branch, only when the startup probe left ``capabilities`` empty AND the
+    client's own capabilities are non-empty (a re-probe carrying the same
+    ``{}`` the startup probe sent could not change the outcome), and at
+    most once per
+    session (``modern_state.discover_retry_attempted`` is latched by the
+    caller BEFORE this runs) — zero cost on the common already-seeded path,
+    one extra round-trip only on the rare failure path, which is exactly the
+    per-session-cost objection that killed the retry-on-every-session
+    variant in round 3. Any failure (transport error, non-200, JSON-RPC
+    error again) is logged and leaves the state untouched, degrading to the
+    round-3 documented under-report. Runs synchronously on the stdin loop
+    thread, before the synthesized ``InitializeResult`` is emitted, so there
+    is no race with any other dispatch.
+
+    ``auth_recovery`` (#350 review round 8, finding 8-2): the reseed runs
+    the same bounded 401/403 refresh/step-up loop as the startup probe
+    (``_post_discover_with_recovery``, one shared implementation). Without
+    it, a token that expired between a ``-32021``-gated startup probe and
+    the local ``initialize`` made this reseed 401 and permanently
+    synthesize empty capabilities — and since a compliant client told
+    ``capabilities: {}`` issues no tools/resources/prompts requests at
+    all, the dispatch path's own 401 recovery never got a request to
+    repair the session with. Recovery declining/absent degrades to the
+    same keep-unseeded behavior as before.
+    """
+    try:
+        # _post_discover_with_recovery streams via _post_probe and stops at
+        # the first JSON-RPC response message (#350 review round 5) — an
+        # SSE-framed discover result on a stream the server keeps open must
+        # not stall this reseed (which runs synchronously before the
+        # synthesized InitializeResult is emitted) until the read timeout.
+        resp, parsed = _post_discover_with_recovery(
+            client,
+            url,
+            headers,
+            auth_recovery,
+            modern_state=modern_state,
+            log_prefix="discover reseed probe",
+        )
+    except httpx.HTTPError as e:
+        log(f"discover reseed probe failed ({e}); keeping unseeded state")
+        return
+    if resp.status_code != 200:
+        log(
+            f"discover reseed probe returned HTTP {resp.status_code}; "
+            "keeping unseeded state"
+        )
+        return
+    if isinstance(parsed, dict) and "error" in parsed:
+        log("discover reseed probe returned a JSON-RPC error; keeping unseeded state")
+        return
+    _seed_modern_state_from_discover(modern_state, parsed)
+    log("discover reseed probe succeeded with the client's real capabilities")
+
+
+def _handle_modern_special_method(
+    line: str,
+    req_id: Any,
+    modern_state: "_ModernState",
+    discover_retry: Callable[[], None] | None = None,
+) -> tuple[bool, str | None]:
+    """Intercept ``initialize`` / ``notifications/initialized`` /
+    ``notifications/cancelled`` on the modern path, where none of the three
+    exist on the wire to the remote: there is no initialize handshake
+    (``server/discover`` replaces it, already run before the stdin loop
+    starts) and no ``Mcp-Session-Id``, and cancellation is signalled by
+    closing the response stream, not a forwarded notification (spec rev
+    2026-07-28).
+
+    Returns ``(True, reply_or_None)`` when the line was fully handled
+    locally — the caller must NOT dispatch it upstream:
+
+    - ``initialize`` synthesizes a legacy-SHAPED ``InitializeResult`` (the
+      local stdio client still expects one) from ``modern_state``'s
+      discover-seeded ``server_info``/``capabilities``/``supported_versions``
+      — ``serverInfo`` falls back to ``_UNKNOWN_UPSTREAM_SERVER_INFO`` (never
+      a bare ``"mcp-stdio"`` claiming to BE the remote — see that constant's
+      comment) only when the probe never yielded a real one — and captures
+      the client's own ``capabilities``/``clientInfo`` into ``modern_state``
+      for later ``_meta`` injection (``_inject_modern_meta``) — this is the
+      ONLY place those values are ever observed, since the modern path never
+      forwards the request that carries them. When the era-detection probe
+      left ``capabilities`` EMPTY — it seeded nothing at all (e.g. the
+      remote gated ``server/discover`` itself on a real client capability,
+      ``-32021``, round 4), or it returned ``serverInfo``/
+      ``supportedVersions`` but a capability set filtered down to ``{}``
+      against the probe's placeholder ``clientCapabilities: {}`` (#350
+      review round 9, finding 9-2) — and the client's own capabilities are
+      non-empty, ``discover_retry`` — when the caller provides one —
+      re-runs discovery exactly ONCE, now that the client's real
+      ``capabilities``/``clientInfo`` are known, before the result is
+      synthesized (see ``_reseed_discover_probe``). Already-seeded
+      identity/version state survives a reseed that only fills
+      capabilities (``_seed_modern_state_from_discover`` never erases).
+      ``modern_state.discover_retry_attempted``
+      latches the attempt so a client-driven re-``initialize`` can never
+      probe again; a retry that fails degrades to the same under-reporting
+      as before. The client's OWN data is still never copied into
+      ``server_info``/``capabilities`` — client capabilities are not server
+      capabilities; only a real discover response may seed those fields.
+      The returned ``protocolVersion``
+      is the client's OWN ``requested`` string, not ``negotiated_version``
+      (#350 review rounds 3 AND 4 — deliberate, analyzed twice; the full
+      contract, so it need not be re-litigated:
+
+      (1) What the echo promises: nothing about wire shapes. This relay
+      never re-shapes request/response BODIES based on protocol version,
+      and for every request type a stdio client itself SENDS through this
+      relay (``tools/list``/``tools/call``, ``resources/*``, ``prompts/*``,
+      ``ping``, ``completion/complete``, ``logging/setLevel``) spec rev
+      2026-07-28 changes the RESULT shapes only ADDITIVELY over 2025-06-18:
+      the new required ``resultType`` discriminator and the ``_meta``-nested
+      ``serverInfo`` are extra fields on otherwise-unchanged result shapes
+      (#270's verified change list, items 2/8 — every other 2026 change is
+      transport-level: sessions, streams, headers, cancellation — all
+      absorbed by this relay, never surfaced downstream). MCP result
+      objects are open/extensible, so a 2025 client ignores the additions.
+
+      (2) The ONE genuinely incompatible result shape is MRTR's
+      ``InputRequiredResult`` (``resultType: "input_required"`` REPLACES
+      the real result payload, SEP-2322) — it substitutes for
+      server-INITIATED sampling/elicitation/roots round-trips, so a
+      COMPLIANT server only initiates it when the client's advertised
+      capabilities include those flows. Since round 10 (finding 10-1)
+      this relay never advertises them upstream — the capture above
+      strips ``_MRTR_REPLACED_CLIENT_CAPABILITIES`` — so a compliant
+      modern server has no standing invitation to send MRTR at all;
+      relaying/bridging it is explicitly Phase 2 (#270 "Phase 2 — MRTR
+      passthrough"). A NON-compliant server that sends
+      ``input_required`` unprovoked is still forwarded verbatim — a
+      KNOWN residual documented in run()'s "Limitation — MRTR" section,
+      not a consequence of which version this field echoes: it would be
+      forwarded verbatim no matter what the echo said.
+
+      (3) Why not report ``negotiated_version`` (the reviewer-proposed
+      alternative): lifecycle spec, Version Negotiation — "If the client
+      does not support the version in the server's response, it SHOULD
+      disconnect." Reporting the upstream's 2026-07-28 to a 2025-only
+      client makes every spec-conformant legacy client disconnect from
+      every modern-only server at the handshake, destroying the additive-
+      compatible majority flows in (1) to guard against the single Phase 2
+      gap in (2). Rejecting the mismatch outright is the same outcome.
+      Echoing the client's own ask is therefore the honest maximum this
+      relay can promise — and the promise it actually keeps.)
+
+      ``negotiated_version`` (computed below, from the
+      remote's OWN advertised ``supportedVersions``) remains the version
+      used UPSTREAM in headers/``_meta`` — the actual wire protocol the
+      remote server understands — and is symmetric: it diverges from the
+      client's ask whichever direction the mismatch runs (a legacy client
+      against a modern-only remote, or a modern-savvy client against a
+      remote that only advertised an older version).
+    - ``notifications/initialized`` and ``notifications/cancelled`` are
+      swallowed (``None`` reply — both are notifications, which never get a
+      response either way).
+
+    Returns ``(False, None)`` for every other line, which the caller
+    dispatches normally (through ``_inject_modern_meta`` first).
+    """
+    try:
+        msg = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return False, None
+    if not isinstance(msg, dict):
+        return False, None
+    method = msg.get("method")
+    if method == "initialize":
+        params = msg.get("params")
+        params = params if isinstance(params, dict) else {}
+        requested = params.get("protocolVersion")
+        requested = requested if isinstance(requested, str) and requested else None
+        # Presence-based, like every other MCP capabilities object (see
+        # _report_initialize's own note) — an absent/malformed capabilities
+        # object becomes {} (present, empty), never omitted downstream.
+        # Un-bridgeable keys are stripped HERE, at the single capture site
+        # (#350 review round 10, finding 10-1): sampling/elicitation/roots
+        # map to the MRTR flows Phase 1 defers to Phase 2 (see
+        # _MRTR_REPLACED_CLIENT_CAPABILITIES), so advertising them upstream
+        # would invite exactly the input_required results this relay can
+        # only forward verbatim. Filtering at capture covers every
+        # downstream use at once — _inject_modern_meta's per-request _meta
+        # and the reseed re-probe — and the reseed condition below then
+        # correctly treats a client whose ONLY capabilities are
+        # un-bridgeable as having none to advertise. The SERVER capability
+        # set echoed in the synthesized result is untouched: this filter
+        # applies to what the relay claims the CLIENT can do, never to what
+        # the remote reported.
+        caps = params.get("capabilities")
+        caps = caps if isinstance(caps, dict) else {}
+        modern_state.client_capabilities = {
+            k: v for k, v in caps.items() if k not in _MRTR_REPLACED_CLIENT_CAPABILITIES
+        }
+        client_info = params.get("clientInfo")
+        modern_state.client_info = (
+            client_info if isinstance(client_info, dict) else None
+        )
+        # Reseed retry (#350 review rounds 4 + 9): re-run discovery once,
+        # now that the client's REAL capabilities are known, when the
+        # startup probe left CAPABILITIES empty and the client actually
+        # has capabilities to advertise. Round 4 gated this on ALL three
+        # discover fields being unseeded, but seeded serverInfo/
+        # supportedVersions do not prove capability negotiation was
+        # complete: a server can return identity/versions fine while
+        # filtering ``capabilities`` down to {} against the probe's
+        # placeholder ``clientCapabilities: {}`` (finding 9-2) — and
+        # capabilities is the ONE field that placeholder can plausibly
+        # distort. A client that itself has no capabilities gets no
+        # retry: the re-probe would carry the same ``{}`` the startup
+        # probe already sent and cannot change the outcome. That includes
+        # (round 10, finding 10-1) a client whose only capabilities were
+        # the MRTR-replaced keys stripped at capture above — after
+        # filtering it HAS nothing this relay may advertise, so the
+        # re-probe would again carry ``{}``. Latch the
+        # attempt BEFORE probing so neither a failed retry nor a
+        # re-initialize can ever probe a second time (zero extra
+        # round-trips on the common path: a non-empty capabilities seed
+        # means discovery already answered).
+        if (
+            discover_retry is not None
+            and not modern_state.discover_retry_attempted
+            and not modern_state.capabilities
+            and modern_state.client_capabilities
+        ):
+            modern_state.discover_retry_attempted = True
+            discover_retry()
+        # Negotiated AFTER the possible reseed, so a retry that recovered
+        # the remote's real supportedVersions feeds the negotiation.
+        modern_state.negotiated_version = _negotiate_modern_version(
+            requested, modern_state.supported_versions
+        )
+        result = {
+            # Downstream ack: what the LOCAL client asked for (falling back
+            # to the upstream-negotiated version only when the client sent
+            # no usable protocolVersion at all — see this function's own
+            # docstring for why these two are deliberately different).
+            "protocolVersion": requested or modern_state.negotiated_version,
+            "capabilities": modern_state.capabilities,
+            "serverInfo": modern_state.server_info or _UNKNOWN_UPSTREAM_SERVER_INFO,
+        }
+        return True, json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result})
+    if method in ("notifications/initialized", "notifications/cancelled"):
+        return True, None
+    return False, None
+
+
+def _inject_modern_meta(line: str, modern_state: "_ModernState") -> str:
+    """Merge the modern per-request ``_meta`` block into ``params._meta``.
+
+    Placement follows the MCP base protocol's established ``_meta``
+    convention (``params._meta`` — unchanged since 2025-03-26, already used
+    for e.g. ``progressToken``), not a new location invented for spec rev
+    2026-07-28.
+
+    ``io.modelcontextprotocol/protocolVersion`` and
+    ``.../clientCapabilities`` are ALWAYS present (both REQUIRED per the
+    clientInfo/serverInfo revision comment — capabilities uses presence-based
+    semantics like every other MCP capabilities object, so an empty client
+    capabilities set is sent as ``{}`` rather than omitted).
+    ``client_capabilities`` arrives here already stripped of the
+    MRTR-replaced keys Phase 1 cannot bridge — the filter lives at the
+    single capture site (``_handle_modern_special_method``, #350 review
+    round 10, finding 10-1), never re-applied per request.
+    ``.../clientInfo`` is sent only when the LOCAL client's own ``initialize``
+    actually provided one (SHOULD, never fabricated — see
+    ``_handle_modern_special_method``). ``.../logLevel`` is sent only once
+    the client has issued a ``logging/setLevel`` (see ``_extract_log_level``).
+
+    Returns ``line`` unchanged for a batch / unparseable / methodless line —
+    mirrors ``_extract_method_and_name``'s batch exemption (a batch has no
+    single top-level ``params`` to attach ``_meta`` to).
+    """
+    try:
+        msg = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return line
+    if not isinstance(msg, dict) or "method" not in msg:
+        return line
+    params = msg.get("params")
+    params = dict(params) if isinstance(params, dict) else {}
+    existing_meta = params.get("_meta")
+    meta = dict(existing_meta) if isinstance(existing_meta, dict) else {}
+    meta[_META_PROTOCOL_VERSION] = (
+        modern_state.negotiated_version or _MODERN_PROTOCOL_VERSION_DEFAULT
+    )
+    meta[_META_CLIENT_CAPABILITIES] = modern_state.client_capabilities or {}
+    if modern_state.client_info:
+        meta[_META_CLIENT_INFO] = modern_state.client_info
+    if modern_state.log_level:
+        meta[_META_LOG_LEVEL] = modern_state.log_level
+    params["_meta"] = meta
+    msg["params"] = params
+    return json.dumps(msg)
 
 
 # Cancel-aware response filter (MCP cancellation spec SHOULDs).
@@ -1182,6 +2320,131 @@ def _normalize_null_arguments(line: str) -> str:
     return line
 
 
+# CacheableResult fields (spec rev 2026-07-28, SEP-2549): ``tools/list`` /
+# ``prompts/list`` / ``resources/list`` / ``resources/read`` /
+# ``resources/templates/list`` results now carry ``ttlMs`` (a freshness
+# hint, in milliseconds) and ``cacheScope`` (``"public"`` lets shared
+# intermediaries cache the response; ``"private"`` restricts caching to the
+# requesting client). Rank higher = more restrictive, so
+# ``_merge_cacheable_field`` can compare across pages without special-casing
+# each field's own value semantics.
+_CACHE_SCOPE_RESTRICTIVENESS = {"public": 0, "private": 1}
+_CACHEABLE_MERGE_FIELDS = frozenset({"ttlMs", "cacheScope"})
+
+# Conservative fallback fed into ``_merge_cacheable_field`` by
+# ``_paginate_and_stream`` for a page that OMITS the field entirely, per the
+# spec's own stated behavior for absence (#350 review round 3): "Caching"
+# says "If ttlMs is absent, clients SHOULD assume a default of 0 (immediately
+# stale)", and separately "Servers MUST apply the same cacheScope to all
+# response pages for a given list request" — an omission is therefore itself
+# non-compliant and must not let another page's laxer/present value leak
+# into the merged result. Both values already sit at the most-restrictive
+# extreme of their own domain (0 is the global minimum ttlMs the spec allows;
+# "private" is the highest ``_CACHE_SCOPE_RESTRICTIVENESS`` rank), so feeding
+# them into the existing min/most-restrictive merge rule "just works"
+# regardless of which page (first or later) is the one that omits the field.
+_CACHEABLE_FIELD_CONSERVATIVE_DEFAULT: dict[str, Any] = {
+    "ttlMs": 0,
+    "cacheScope": "private",
+}
+
+
+def _is_valid_cacheable_value(key: str, value: Any) -> bool:
+    """True iff ``value`` is a usable ``ttlMs``/``cacheScope`` per SEP-2549.
+
+    Feeds ``_paginate_and_stream``'s per-page bookkeeping: a page whose field
+    fails this check is recorded exactly like a page that OMITS the field
+    (#350 review round 11) — an unknown ``cacheScope`` (``"internal"``) or a
+    non-numeric/non-finite ``ttlMs`` grants no more caching permission than
+    silence does, so letting it be "ignored" would leave another page's
+    laxer value (``"public"``) standing in the merged result, failing OPEN
+    on exactly the conservative-security semantics the round-3 merge rule
+    exists to protect. ``bool`` is rejected for ``ttlMs`` despite being an
+    ``int`` subclass (``True`` is not a millisecond count a compliant
+    server would send); non-finite floats are rejected because ``NaN``
+    poisons the min() comparison in ``_merge_cacheable_field`` (NaN < x is
+    always False, so a NaN would silently survive as the merged value).
+    """
+    if key == "ttlMs":
+        # ``>= 0`` because 0 is the spec's own floor ("If ttlMs is absent,
+        # clients SHOULD assume a default of 0") — a negative value has no
+        # defined meaning, and accepting it would let a malformed page
+        # BEAT the conservative default in the min() merge, emitting an
+        # invalid cache policy downstream (#350 review round 13).
+        # ``math.isfinite`` is applied to FLOATS ONLY (#350 review round
+        # 15): it converts an int argument to float first, and an
+        # arbitrarily large JSON integer (``10**400`` parses fine as a
+        # Python int) makes that conversion raise OverflowError — a crash
+        # on untrusted response data instead of the conservative degrade
+        # this function exists to deliver. Python ints are always finite,
+        # so ``>= 0`` alone is the complete check for them.
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, int):
+            return value >= 0
+        return isinstance(value, float) and math.isfinite(value) and value >= 0
+    if key == "cacheScope":
+        # The isinstance gate is not a type nicety: dict membership with an
+        # UNHASHABLE value (a JSON array/object — ``"cacheScope": []`` is
+        # valid JSON a malformed page can carry) raises TypeError instead
+        # of returning False, turning the page into a failed request rather
+        # than the conservative degrade this function exists to deliver
+        # (#350 review round 12).
+        return isinstance(value, str) and value in _CACHE_SCOPE_RESTRICTIVENESS
+    return False
+
+
+def _merge_cacheable_field(merged_result: dict[str, Any], key: str, value: Any) -> None:
+    """Merge one page's ``ttlMs``/``cacheScope`` into ``merged_result`` in place.
+
+    ``ttlMs``: keep the MINIMUM seen across pages — the merged list's true
+    freshness bound is set by its least-fresh member, not by whichever page
+    happened to be merged last. ``cacheScope``: keep the MOST RESTRICTIVE
+    value seen (``"private"`` wins over ``"public"``) — a merged list that
+    combines a private-scoped page with a public-scoped one must not be
+    reported as publicly cacheable, or a shared intermediary could legally
+    cache and leak the private page's items.
+
+    A value of the wrong type (a non-compliant server) is ignored rather
+    than raising or silently adopted — same "degrade, don't guess" posture
+    as ``_extract_protocol_version``. This function itself has no notion of
+    "the field was absent" — it only ever sees a VALUE, never a missing key.
+    The caller (``_paginate_and_stream``) decides what value to pass for a
+    page that omits the field: the conservative default
+    (``_CACHEABLE_FIELD_CONSERVATIVE_DEFAULT``, #350 review round 3) when at
+    least one OTHER page in the same merge did supply a value, or nothing at
+    all (no call, field left absent) when the field is missing on every page
+    seen — see that function for the bookkeeping.
+    """
+    if key == "ttlMs":
+        if not isinstance(value, (int, float)):
+            return
+        existing = merged_result.get("ttlMs")
+        if not isinstance(existing, (int, float)) or value < existing:
+            merged_result["ttlMs"] = value
+        return
+    if key == "cacheScope":
+        # Both isinstance gates guard hashability, not just type (#350
+        # review round 12): ``.get()`` on an UNHASHABLE value raises
+        # TypeError. ``value`` can be a JSON array/object from a malformed
+        # page; ``existing`` can be the same garbage when page 1's
+        # dict-copy put it into merged_result unvetted (the finalization
+        # degrades it afterwards, but THIS call happens first).
+        if not isinstance(value, str):
+            return
+        new_rank = _CACHE_SCOPE_RESTRICTIVENESS.get(value)
+        if new_rank is None:
+            return
+        existing = merged_result.get("cacheScope")
+        existing_rank = (
+            _CACHE_SCOPE_RESTRICTIVENESS.get(existing, -1)
+            if isinstance(existing, str)
+            else -1
+        )
+        if new_rank > existing_rank:
+            merged_result["cacheScope"] = value
+
+
 def _detect_paginated_list(line: str) -> tuple[str, str] | None:
     """Return ``(method, result_key)`` if the request should auto-paginate.
 
@@ -1244,6 +2507,14 @@ def _paginate_and_stream(
     # failure or the page-cap). Re-exposed as ``nextCursor`` on the merged
     # result so a truncated list is resumable instead of silently complete.
     pending_cursor: str | None = None
+    # Per-CacheableResult-field bookkeeping (#350 review round 3): True once
+    # ANY page seen so far omitted the field entirely. Checked after the
+    # loop (below) against whether the field ended up present in
+    # merged_result at all — present-and-missing-somewhere degrades to the
+    # conservative default (_CACHEABLE_FIELD_CONSERVATIVE_DEFAULT); missing
+    # everywhere leaves the field absent, matching a fully cache-unaware
+    # (e.g. legacy) server's existing behavior unchanged.
+    cacheable_missing: dict[str, bool] = dict.fromkeys(_CACHEABLE_MERGE_FIELDS, False)
 
     for page in range(1, MAX_LIST_PAGES + 1):
         page_request = dict(request)
@@ -1320,6 +2591,16 @@ def _paginate_and_stream(
             merged_result = {k: v for k, v in page_result.items() if k != "nextCursor"}
             if not isinstance(merged_result.get(result_key), list):
                 merged_result[result_key] = []
+            # Present-but-INVALID counts as missing (#350 review round 11):
+            # page 1's values enter merged_result via the dict-copy above
+            # WITHOUT passing _merge_cacheable_field's type guards, so an
+            # invalid first-page value would otherwise ride through to the
+            # merged output verbatim — and an invalid later-page value would
+            # be "ignored", leaving a laxer prior value standing. Both fail
+            # open; both now degrade via the same finalization as omission.
+            for field in _CACHEABLE_MERGE_FIELDS:
+                if not _is_valid_cacheable_value(field, page_result.get(field)):
+                    cacheable_missing[field] = True
         else:
             items = page_result.get(result_key)
             if isinstance(items, list):
@@ -1327,9 +2608,39 @@ def _paginate_and_stream(
             # Preserve top-level result fields (e.g. a late ``_meta``) that arrive
             # only on a later page — last-write-wins. The accumulated list and the
             # ``nextCursor`` are managed explicitly above, so skip them here.
+            #
+            # ``ttlMs``/``cacheScope`` (``CacheableResult``, spec rev 2026-07-28)
+            # are excluded from last-write-wins and merged via
+            # ``_merge_cacheable_field`` instead: last-write-wins can UNDERSTATE
+            # the true constraint on the combined list — e.g. page 1 says
+            # cacheScope="private" (must not be shared-cached) but page 2 says
+            # "public", and naive last-write-wins would report the merged list
+            # (whose page-1-derived items are still private-scoped data) as
+            # publicly cacheable, which a shared intermediary could then legally
+            # cache and leak. ``ttlMs`` has the same shape of bug: the merged
+            # list's true freshness bound is its LEAST fresh member, not
+            # whichever page happened to arrive last.
+            #
+            # Handled UNCONDITIONALLY (not gated on the key being present in
+            # THIS page's result, #350 review round 3): a page that OMITS
+            # ttlMs/cacheScope entirely is not silence to skip over — it is
+            # itself the non-compliant condition _CACHEABLE_FIELD_CONSERVATIVE_
+            # DEFAULT exists to fail closed on (see cacheable_missing's
+            # finalization after this loop). A page whose field is present
+            # but INVALID (unknown scope, non-numeric ttlMs) is recorded the
+            # same way (#350 review round 11) — an unusable value grants no
+            # more caching permission than an absent one, and merely
+            # "ignoring" it would leave another page's laxer value standing.
+            for field in _CACHEABLE_MERGE_FIELDS:
+                if not _is_valid_cacheable_value(field, page_result.get(field)):
+                    cacheable_missing[field] = True
             for k, v in page_result.items():
-                if k not in (result_key, "nextCursor"):
-                    merged_result[k] = v
+                if k in (result_key, "nextCursor"):
+                    continue
+                if k in _CACHEABLE_MERGE_FIELDS:
+                    _merge_cacheable_field(merged_result, k, v)
+                    continue
+                merged_result[k] = v
 
         next_cursor = page_result.get("nextCursor")
         # An empty-string nextCursor is treated as terminal alongside null /
@@ -1351,6 +2662,16 @@ def _paginate_and_stream(
     # cannot be constructed).
     if merged_result is None:
         merged_result = {result_key: []}
+
+    # Finalize ttlMs/cacheScope (#350 review round 3): a field missing on AT
+    # LEAST ONE processed page but present (from some OTHER page) cannot be
+    # trusted at whatever value the present page(s) supplied — degrade the
+    # WHOLE merged result to the conservative default. A field missing on
+    # EVERY processed page is left untouched (never fabricated from nothing
+    # — see test_cacheable_fields_absent_on_every_page_are_not_fabricated).
+    for field, conservative in _CACHEABLE_FIELD_CONSERVATIVE_DEFAULT.items():
+        if cacheable_missing[field] and field in merged_result:
+            merged_result[field] = conservative
 
     # A truncated list (a later page failed, or the page cap was hit) must NOT be
     # reported as complete: re-expose the cursor for the unfetched page so the
@@ -1642,14 +2963,37 @@ def _reinitialize(
     return new_session_id, negotiated
 
 
+def _format_jsonrpc_error(err: Any) -> str:
+    """Render a JSON-RPC ``error`` value for a ``--check`` diagnostic log.
+
+    The spec guarantees ``error`` is an object with a ``message`` field, but
+    a non-compliant server could send anything valid-JSON there (a bare
+    string, a number, ``null``...). ``.get`` on a non-dict would raise
+    ``AttributeError`` — degrade instead of crashing (#350 review round
+    2/3): fall back to stringifying the raw value when it is not the
+    object the spec promises.
+    """
+    return str(err.get("message", err)) if isinstance(err, dict) else str(err)
+
+
 def _report_initialize(result_data: dict[str, Any] | None) -> bool:
     """Log a parsed ``initialize`` response and return the probe verdict.
 
     Shared by the Streamable HTTP and SSE ``--check`` paths. Returns False
     only when the response is a JSON-RPC error; an unparseable / missing
     result still counts as "the server responded" (True).
+
+    ``result_data`` is guarded with ``isinstance(..., dict)`` at both branch
+    entries below — not just ``if result_data`` — because a non-compliant
+    fallback response can be ANY valid JSON value (a bare ``1``, ``"oops"``,
+    ``[]``...), which is truthy but not a mapping: ``"result" in result_data``
+    on a scalar raises ``TypeError`` (#350 review round 2/3). Falling through
+    to the final "could not parse" log/``True`` for a non-dict is the
+    correct degrade — this function's whole contract is "never crash on
+    malformed-but-JSON-valid input, only report a genuine JSON-RPC error as
+    False."
     """
-    if result_data and "result" in result_data:
+    if isinstance(result_data, dict) and "result" in result_data:
         result = result_data["result"]
         if not isinstance(result, dict):
             # Spec guarantees an object, but a malformed server could send a
@@ -1671,12 +3015,113 @@ def _report_initialize(result_data: dict[str, Any] | None) -> bool:
         prompts = "yes" if "prompts" in caps else "no"
         log(f"✓ Capabilities: tools={tools}, resources={resources}, prompts={prompts}")
         return True
-    if result_data and "error" in result_data:
-        err = result_data["error"]
-        log(f"✗ MCP error: {err.get('message', err)}")
+    if isinstance(result_data, dict) and "error" in result_data:
+        log(f"✗ MCP error: {_format_jsonrpc_error(result_data['error'])}")
         return False
     log("✓ Server responded (could not parse initialize result)")
     return True
+
+
+def _parse_streamable_response(resp: httpx.Response) -> dict[str, Any] | None:
+    """Parse a BUFFERED Streamable HTTP POST response body (JSON or SSE).
+
+    The probes reach this only through ``_post_probe`` (#350 review round
+    5), which streams an SSE body incrementally and stops at the first
+    JSON-RPC response — buffering an SSE body here would block until the
+    read timeout on a server that keeps the stream open after answering, as
+    the spec allows (the final response only SHOULD terminate the stream).
+    ``_post_probe`` therefore only calls this on an already-read non-SSE
+    body; the SSE branch below (via the shared ``_first_response_message``
+    gate, so both paths skip interleaved notifications identically) is kept
+    for parsing any fully-buffered response a caller already holds.
+
+    Returns ``None`` — never a non-dict — for a body that parses as valid
+    JSON but is not an object (a bare ``1``, ``"oops"``, ``[]``...): the
+    return type is declared ``dict[str, Any] | None``, and the report
+    helpers (``_report_initialize``/``_report_discover``) are written
+    against that contract. The SSE branch already enforced this (its own
+    ``isinstance`` gate); the plain-JSON branch used not to (#350 review
+    round 2/3).
+    """
+    if _is_sse_response(resp):
+        return _first_response_message(_iter_sse_events(_split_sse_text(resp.text)))
+    try:
+        parsed = json.loads(resp.text)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _report_discover(result_data: dict[str, Any] | None) -> bool:
+    """Log a parsed ``server/discover`` response and return the probe verdict.
+
+    Mirrors ``_report_initialize``'s verdict rule: False only for a JSON-RPC
+    error; a missing/unparseable result still counts as "the server
+    responded" (spec rev 2026-07-28, ``server/discover``'s ``DiscoverResult``,
+    whose ``serverInfo`` lives at ``_meta["io.modelcontextprotocol/serverInfo"]``
+    rather than as a top-level field — see the verified research fetched
+    directly from the spec's own worked example).
+
+    ``result_data`` is guarded with ``isinstance(..., dict)`` for the same
+    reason as ``_report_initialize``'s identical guard: a non-compliant
+    fallback response can be any valid-JSON scalar/array, which is truthy
+    but not a mapping (#350 review round 2/3).
+    """
+    if isinstance(result_data, dict) and "result" in result_data:
+        result = result_data["result"]
+        if not isinstance(result, dict):
+            log("✓ Server responded (discover result is not an object)")
+            return True
+        meta = result.get("_meta")
+        server_info = (
+            meta.get("io.modelcontextprotocol/serverInfo", {})
+            if isinstance(meta, dict)
+            else {}
+        )
+        name = (
+            server_info.get("name", "unknown")
+            if isinstance(server_info, dict)
+            else "unknown"
+        )
+        version = (
+            server_info.get("version", "?") if isinstance(server_info, dict) else "?"
+        )
+        versions = result.get("supportedVersions")
+        versions_str = versions if isinstance(versions, list) else "?"
+        log(
+            f"✓ MCP server/discover: server={name} v{version}, "
+            f"supportedVersions={versions_str}"
+        )
+        caps = result.get("capabilities")
+        caps = caps if isinstance(caps, dict) else {}
+        tools = "yes" if "tools" in caps else "no"
+        resources = "yes" if "resources" in caps else "no"
+        prompts = "yes" if "prompts" in caps else "no"
+        log(f"✓ Capabilities: tools={tools}, resources={resources}, prompts={prompts}")
+        return True
+    if isinstance(result_data, dict) and "error" in result_data:
+        log(f"✗ MCP error: {_format_jsonrpc_error(result_data['error'])}")
+        return False
+    log("✓ Server responded (could not parse discover result)")
+    return True
+
+
+# HTTP statuses on which the legacy `initialize` probe in check_connection()
+# falls back to a `server/discover` retry (spec rev 2026-07-28, "Backward
+# Compatibility" / "Protocol Version Header"): 404 is what the transport spec
+# mandates for an unrecognized method, which `initialize` now IS on a server
+# that has fully removed the legacy handshake; 400 is what the same server
+# returns when the request is also missing required per-request
+# `_meta`/headers a modern-only server demands. Neither code is unique to
+# "server doesn't speak legacy" — a 400/404 can equally mean a genuinely
+# broken/misconfigured endpoint — so this is a best-effort diagnostic
+# heuristic, not a protocol requirement: worst case, a broken endpoint gets
+# one extra POST before check_connection reports it down. Every OTHER
+# status (500, 503, ...) is left alone deliberately: retrying those with a
+# different method would not distinguish "legacy-dropped" from "broken" any
+# better, and would cost every genuinely-broken endpoint a second round-trip
+# for no diagnostic gain.
+_DISCOVER_FALLBACK_STATUSES = (400, 404)
 
 
 def _check_connection_sse(
@@ -1824,6 +3269,26 @@ def check_connection(
     the probe: ``"streamable-http"`` (default) POSTs ``initialize`` directly,
     while ``"sse"`` runs the legacy GET/endpoint/POST handshake so the probe
     matches what ``run_sse`` would actually do.
+
+    On the Streamable HTTP path, a 400/404 response to the ``initialize``
+    probe retries once with ``server/discover`` (spec rev 2026-07-28,
+    ``_DISCOVER_FALLBACK_STATUSES``) before reporting the connection down —
+    a server that has dropped the legacy handshake entirely no longer
+    recognizes ``initialize`` at all, and would otherwise be misreported as
+    unreachable rather than "alive, modern-only". The retry is built by
+    ``_build_discover_probe_request`` — the SAME modern-shaped body/headers
+    (``Mcp-Method``, ``MCP-Protocol-Version``, ``params._meta``) that
+    ``_probe_protocol_era`` sends, not the bare ``initialize`` probe's
+    unmodified ``headers`` (#350 review finding 1: a strict modern-only
+    server can reject a discovery request missing its own required
+    metadata, which would make THIS retry itself misreport a live modern
+    server as down).
+
+    Both probes stream their responses via ``_post_probe`` and stop at the
+    first JSON-RPC response message (#350 review round 5) — see that
+    helper's docstring for why a buffered read would hang the --check until
+    the read timeout on a server that SSE-frames the response and keeps the
+    stream open.
     """
     if transport == "sse":
         return _check_connection_sse(
@@ -1854,9 +3319,44 @@ def check_connection(
 
     try:
         log(f"testing connection to {redact_url(url)}")
-        resp = client.post(url, content=initialize_msg, headers=headers)
+        # _post_probe streams both probes and stops at the first JSON-RPC
+        # response message (#350 review round 5): the final response only
+        # SHOULD terminate an SSE stream, so a server that keeps the POST
+        # stream open after answering must report ✓ promptly, not hang the
+        # --check until the read timeout.
+        resp, parsed = _post_probe(client, url, initialize_msg, headers)
 
         if resp.status_code != 200:
+            if resp.status_code in _DISCOVER_FALLBACK_STATUSES:
+                log(
+                    f"initialize probe got HTTP {resp.status_code}; retrying "
+                    "with server/discover in case the server dropped the "
+                    "legacy handshake (spec rev 2026-07-28)"
+                )
+                discover_msg, discover_headers = _build_discover_probe_request(
+                    headers, request_id=2
+                )
+                try:
+                    discover_resp, discover_parsed = _post_probe(
+                        client, url, discover_msg, discover_headers
+                    )
+                except httpx.HTTPError as e:
+                    log(f"✗ server/discover retry failed: {e}")
+                    log(f"✗ HTTP {resp.status_code}")
+                    return False
+                if discover_resp.status_code != 200:
+                    log(
+                        f"✗ server/discover retry also failed: HTTP {discover_resp.status_code}"
+                    )
+                    log(f"✗ HTTP {resp.status_code}")
+                    return False
+                log(
+                    f"✓ Connected via server/discover (HTTP {discover_resp.status_code})"
+                )
+                ok = _report_discover(discover_parsed)
+                if "mcp-session-id" in discover_resp.headers:
+                    log(f"✓ Session ID: {discover_resp.headers['mcp-session-id']}")
+                return ok
             # Do not surface the response body — server error responses
             # commonly carry session IDs, stack traces, or echoed request
             # data. The status code alone is the right operational signal
@@ -1866,37 +3366,7 @@ def check_connection(
 
         log(f"✓ Connected (HTTP {resp.status_code})")
 
-        # Parse initialize response from JSON or SSE
-        content_type = resp.headers.get("content-type", "")
-        result_data: dict[str, Any] | None = None
-
-        if "text/event-stream" in content_type:
-            for event_type, payload in _iter_sse_events(_split_sse_text(resp.text)):
-                if event_type != "message":
-                    continue
-                try:
-                    parsed = json.loads(payload)
-                except json.JSONDecodeError:
-                    continue
-                # A compliant server MAY interleave notifications / server-
-                # initiated requests on the POST's SSE stream BEFORE the JSON-RPC
-                # response, so keep reading until a message carries result/error —
-                # matching the keep-reading gate in _post_parsed /
-                # _check_connection_sse. Breaking on the first message would
-                # mis-report a server that sends a notification frame first as
-                # "could not parse initialize result".
-                if isinstance(parsed, dict) and (
-                    "result" in parsed or "error" in parsed
-                ):
-                    result_data = parsed
-                    break
-        else:
-            try:
-                result_data = json.loads(resp.text)
-            except json.JSONDecodeError:
-                pass
-
-        ok = _report_initialize(result_data)
+        ok = _report_initialize(parsed)
 
         if "mcp-session-id" in resp.headers:
             log(f"✓ Session ID: {resp.headers['mcp-session-id']}")
@@ -2053,6 +3523,7 @@ def run(
     proactive_refresh: bool = True,
     refresh_leeway: float = 60.0,
     cold_start_login: Any = None,
+    protocol_era: str = "legacy",
 ) -> None:
     """Run the stdio-to-HTTP relay loop.
 
@@ -2113,6 +3584,29 @@ def run(
             the gate and emits ``list_changed`` so the client fetches the
             now-available lists — so a long OAuth flow does not blow the
             client's initialize timeout (#296). Streamable HTTP only.
+            Ignored (a warning is logged and cold-start is disabled) when
+            ``protocol_era`` resolves to ``"modern"``: cold-start's
+            ``_reinitialize`` sends a legacy ``initialize`` handshake to
+            establish a session, which is meaningless on a path with no
+            sessions at all (#270 Phase 1).
+        protocol_era: One of ``"legacy"`` (default), ``"modern"``, or
+            ``"auto"``. ``"legacy"`` is today's behaviour — the initialize
+            handshake, ``Mcp-Session-Id`` tracking, and 401/403/404 recovery,
+            completely unchanged (spec rev 2025-06-18 and earlier; this is
+            the default specifically so an unmodified deployment's wire
+            traffic never changes — see #270). ``"modern"`` forces the spec
+            rev 2026-07-28 path unconditionally: no initialize handshake (the
+            local stdio client's own ``initialize``/``notifications/initialized``
+            are intercepted and answered/swallowed locally), no
+            ``Mcp-Session-Id``, per-request ``Mcp-Method``/``Mcp-Name``
+            headers and ``_meta`` (protocol version, client capabilities,
+            optionally clientInfo/logLevel) on every POST. ``"auto"`` runs a
+            one-shot ``server/discover`` probe before the stdin loop starts
+            (``_probe_protocol_era``) and picks whichever path the probe
+            indicates — this costs one extra HTTP request at startup
+            compared to a pinned era, which is why it is NOT the default (see
+            ``_probe_protocol_era``'s docstring for the exact classification
+            rules per HTTP status).
 
     Limitation — JSON-RPC batches: a top-level array (a batch) is
     treated like a notification for error synthesis. ``_extract_id_and_presence``
@@ -2124,6 +3618,82 @@ def run(
     ``id:null`` error for a batch would itself violate JSON-RPC, and MCP removed
     batching in spec rev 2025-06-18, so the exposure is minimal. A single
     (non-batch) request always gets a synthesized error on the same failures.
+
+    Limitation — modern discover state and the one-shot reseed retry (#350
+    review rounds 3 + 4 + 9): the ``server/discover`` probe that seeds
+    ``modern_state.server_info`` / ``capabilities`` / ``supported_versions``
+    runs BEFORE the stdin loop starts (see above), which is necessarily
+    before the local client has sent its own ``initialize`` — so the probe
+    always advertises ``clientCapabilities: {}`` (see
+    ``_build_discover_probe_request``). If the remote gates
+    ``server/discover`` itself on a real client capability (returning the
+    recognized-modern error ``-32021``
+    ``MissingRequiredClientCapabilityError``), the probe still correctly
+    classifies the era as ``modern`` (see ``_probe_protocol_era``) but
+    seeds NOTHING — and a remote can just as well answer the probe
+    successfully with ``serverInfo``/``supportedVersions`` while filtering
+    ``capabilities`` down to ``{}`` against that placeholder (round 9,
+    finding 9-2). Round 3 documented that outcome as a tolerable
+    under-report; round 4 established it is NOT merely cosmetic — the
+    lifecycle spec says both parties "MUST ... Only use capabilities that
+    were successfully negotiated", so a compliant local client told
+    ``capabilities: {}`` never issues ``tools/list``/``resources``/
+    ``prompts`` requests at all. The fix is a NARROW retry the round-3
+    analysis never evaluated (it rejected only an unconditional
+    every-session second probe): when the local client's ``initialize``
+    arrives with non-empty capabilities of its own and the startup probe
+    left ``capabilities`` empty (round 4 required ALL discover state
+    empty; round 9 widened the trigger to the one field the placeholder
+    can plausibly distort), discovery is re-run
+    exactly ONCE with the client's now-known real
+    ``clientCapabilities``/``clientInfo`` in ``params._meta``, before the
+    ``InitializeResult`` is synthesized (``_reseed_discover_probe``, hooked
+    in via ``_handle_modern_special_method``'s ``discover_retry``) —
+    preserving any identity/version state the startup probe already
+    seeded (``_seed_modern_state_from_discover`` never erases). Cost:
+    zero on the common already-seeded path; one extra round-trip only on
+    the rare empty-capabilities path. It cannot loop
+    (``modern_state.discover_retry_attempted`` is latched before the
+    attempt, so a failed retry or a client re-``initialize`` never probes
+    again) and cannot race (it runs synchronously on the stdin loop
+    thread, before any other dispatch). RESIDUAL limitations: if the
+    reseed retry ALSO fails, the synthesized result degrades exactly as
+    round 3 documented — honest-unknown ``serverInfo`` placeholder, empty
+    capabilities, an under-report that never over-claims — and the
+    operator escapes remain fixing the upstream's discover-gating or
+    pinning ``--protocol-era legacy``. And a remote that returns a
+    NON-empty but capability-FILTERED subset against the placeholder is
+    still not re-probed: from this side it is indistinguishable from a
+    remote reporting its true capabilities, and detecting it would take
+    exactly the unconditional every-session second probe round 3 rejected
+    on cost — a knowingly-accepted under-report, never an over-claim.
+    Acceptance criterion #3 (#270:
+    headers/session/byte-identity) is unaffected: the legacy path never
+    runs any of this.
+
+    Limitation — MRTR (``resultType: "input_required"``) results are
+    forwarded verbatim (#350 review round 4 / #270 Phase 2): a modern
+    upstream that needs client input mid-request replaces the real result
+    with an ``InputRequiredResult`` (SEP-2322) that the client must answer
+    by re-issuing the request with ``inputResponses``. Phase 1 does not
+    translate that exchange into the legacy server-initiated
+    sampling/elicitation/roots requests a 2025-era stdio client would
+    understand — the ``input_required`` result reaches the client
+    unchanged, and a client that does not know the discriminator will
+    misread it as an oddly-shaped success. Since round 10 (finding 10-1)
+    the relay no longer INVITES that flow: the client capability keys MRTR
+    replaced (``sampling``/``elicitation``/``roots``) are stripped before
+    anything is advertised upstream (``_MRTR_REPLACED_CLIENT_CAPABILITIES``,
+    applied at capture in ``_handle_modern_special_method``), and a server
+    may only use "capabilities that were successfully negotiated"
+    (lifecycle spec) — so a COMPLIANT modern server now has no legitimate
+    reason to send ``input_required`` through this relay. The
+    verbatim-forward caveat therefore covers only a NON-compliant upstream
+    that initiates MRTR despite the client never advertising the flows; the
+    ordinary tools/resources/prompts flows are unaffected (their 2026
+    result shapes are additive-only — see
+    ``_handle_modern_special_method``). MRTR passthrough is #270's
+    explicitly-phased Phase 2 work, not an oversight in Phase 1.
     """
 
     # Graceful shutdown on SIGTERM/SIGINT
@@ -2160,20 +3730,167 @@ def run(
     headers_lock = threading.Lock()
     refresh_lock = threading.Lock()
 
-    def _prepare_headers() -> dict[str, str]:
-        """Build per-request headers with the current session + protocol version.
+    # Resolve the protocol era BEFORE the stdin loop starts (#270 Phase 1).
+    # "legacy" (the default) does NOTHING here — zero extra network traffic,
+    # zero new state — so an unmodified deployment's wire bytes are
+    # untouched (acceptance criterion #3). "modern" and "auto" both run the
+    # server/discover probe: "modern" to SEED modern_state (serverInfo /
+    # capabilities / supportedVersions for the synthesized InitializeResult)
+    # while forcing the era regardless of what the probe reports; "auto" to
+    # additionally CLASSIFY the era from the probe's outcome
+    # (_probe_protocol_era). This is why "auto" is opt-in rather than the
+    # default: it costs one extra POST at startup that a pinned era does not.
+    modern_state = _ModernState()
 
-        When the relay injects a value, it first drops any case-variant the
-        operator pinned via ``-H`` (e.g. ``-H 'mcp-protocol-version: x'``), so
-        httpx never serialises TWO ``MCP-Protocol-Version`` / ``Mcp-Session-Id``
-        header lines — a strict 2025-06-18 server treats these as singleton
-        fields and would reject or mis-select. Mirrors the initialize-path strip
-        in ``_dispatch`` / ``_reinitialize``. The strip is gated on the relay
-        actually having a value, so an operator pin still rides through on the
-        paths where the relay manages no value of its own.
+    def _probe_auth_recovery(resp: httpx.Response) -> dict[str, str] | None:
+        """Recover credentials for a 401/403 at PROBE time (#350 round 4).
+
+        Mirrors the stdin loop's own recovery ladder — 401 -> token refresh,
+        403 + parseable ``insufficient_scope`` challenge -> RFC 9470 step-up
+        — so an auth challenge to the era-detection probe is repaired with
+        the SAME machinery a real dispatch would use, instead of being
+        misread as protocol evidence for "legacy". Returns the full updated
+        header set on success (``_probe_protocol_era`` rebuilds the probe
+        from it and retries once) or ``None`` to decline (probe falls back
+        to the conservative legacy classification, unchanged behavior).
+
+        Thread-safety: at STARTUP-probe time this runs before the
+        proactive-refresh daemon and the cold-start thread are started
+        (both are created further down), so nothing else can hold
+        ``refresh_lock`` yet. But the same callback is ALSO invoked later
+        in the session by the one-shot discover reseed (#350 review round
+        8, finding 8-2 — ``_discover_reseed`` below, called from the stdin
+        loop's ``initialize`` handling), at which point the daemon MAY be
+        live: taking ``refresh_lock`` is then load-bearing, not stylistic.
+        BOTH recovery stages serialise against the daemon's rotation under
+        that one lock (#350 review round 10, finding 10-2 — round 8 locked
+        only the 401 refresh; the 403 ``scope_upgrader`` ran bare, so a
+        step-up racing the timer's refresh could fail the refresh
+        mid-rotation, or let an old-scope refreshed token overwrite the
+        just-upgraded credentials in the shared ``headers``). The recovered
+        headers are merged into the SHARED ``headers`` dict (under
+        ``headers_lock``) so the whole session (not just the probe retry)
+        proceeds with the recovered credentials.
+        """
+        if resp.status_code == 401 and token_refresher is not None:
+            log("protocol-era probe: 401, attempting token refresh")
+            with refresh_lock:
+                new_headers = token_refresher()
+            if new_headers:
+                with headers_lock:
+                    headers.update(new_headers)
+                    return dict(headers)
+            log("protocol-era probe: token refresh failed")
+            return None
+        if resp.status_code == 403 and scope_upgrader is not None:
+            required_scope = _parse_www_authenticate_scope(
+                resp.headers.get("www-authenticate")
+            )
+            if required_scope is not None:
+                log(
+                    f"protocol-era probe: 403 insufficient_scope "
+                    f"(required: {required_scope}), attempting step-up"
+                )
+                # Same lock as the 401 branch (#350 review round 10,
+                # finding 10-2): the discover reseed can invoke this while
+                # the proactive-refresh daemon is live, and an unserialised
+                # step-up races the timer's token rotation — see the
+                # docstring's thread-safety note.
+                with refresh_lock:
+                    new_headers = scope_upgrader(required_scope)
+                if new_headers:
+                    with headers_lock:
+                        headers.update(new_headers)
+                        return dict(headers)
+                log("protocol-era probe: step-up authorization failed")
+            return None
+        return None
+
+    if protocol_era == "modern":
+        era = "modern"
+        with headers_lock:
+            probe_headers = dict(headers)
+        _, discover_result = _probe_protocol_era(
+            client, url, probe_headers, auth_recovery=_probe_auth_recovery
+        )
+        _seed_modern_state_from_discover(modern_state, discover_result)
+        log("protocol era: modern (forced via --protocol-era)")
+    elif protocol_era == "auto":
+        with headers_lock:
+            probe_headers = dict(headers)
+        era, discover_result = _probe_protocol_era(
+            client, url, probe_headers, auth_recovery=_probe_auth_recovery
+        )
+        _seed_modern_state_from_discover(modern_state, discover_result)
+        log(f"protocol era: {era} (auto-detected)")
+    else:
+        era = "legacy"
+
+    if era == "modern" and cold_start_login is not None:
+        # _cold_start_loop's _reinitialize sends a legacy `initialize`
+        # handshake to establish a session — meaningless on a path with no
+        # sessions at all. Disable rather than silently sending a legacy
+        # handshake to a modern remote.
+        log(
+            "cold-start (--oauth-eager) is not supported on the modern "
+            "protocol era; disabling cold-start for this session"
+        )
+        cold_start_login = None
+
+    def _prepare_headers(line: str) -> dict[str, str]:
+        """Build per-request headers for ``line``.
+
+        LEGACY era (the ``else`` branch below): session + protocol version,
+        completely UNCHANGED from pre-#270 — this is the code that makes
+        acceptance criterion #3 ("byte-identical" wire bytes against a
+        legacy remote) hold structurally rather than by assertion. ``line``
+        is accepted but ignored on this branch.
+
+        MODERN era: per spec rev 2026-07-28 there is no ``Mcp-Session-Id`` at
+        all (the relay's own ``session_id`` never gets set on this path — see
+        run()'s three session-adoption sites, all additionally gated on
+        ``era == "legacy"``); instead every request carries
+        ``MCP-Protocol-Version`` (the negotiated modern version, from
+        ``modern_state.negotiated_version``) plus THIS request's
+        ``Mcp-Method``/``Mcp-Name`` (``_mcp_request_headers``, mirroring
+        ``_extract_method_and_name``).
+
+        Both branches drop any case-variant the operator pinned via ``-H``
+        before re-adding the relay's own value, so httpx never serialises two
+        header lines for the same field — a strict server treats these as
+        singleton fields and would reject or mis-select. This unconditional
+        strip-then-(maybe)-add applies to ``Mcp-Method``/``Mcp-Name`` exactly
+        like it already does to ``Mcp-Session-Id``/``MCP-Protocol-Version``:
+        an operator-pinned value is dropped regardless of whether THIS
+        request derives a replacement (#350 review finding 3). Deriving no
+        replacement — e.g. ``Mcp-Name`` on ``tools/list``, which has no
+        ``params.name`` to mirror — must leave the header ABSENT, not
+        leak a stale pinned value the request body no longer corroborates
+        (Streamable HTTP "Server Validation": "Parameter not in arguments ->
+        Client MUST omit the header"). A batch/methodless line similarly
+        must not carry a stale pinned ``Mcp-Method`` — it ends up with NO
+        ``Mcp-Method`` header at all, which is itself non-compliant with
+        "Required For: All requests" (MCP removed batching in spec rev
+        2025-06-18, so this is legacy-batch dead code territory; inventing
+        a synthetic method value for a line with none would be worse than
+        omitting the header).
         """
         with headers_lock:
             h = dict(headers)
+        if era == "modern":
+            h = {k: v for k, v in h.items() if k.lower() != "mcp-session-id"}
+            h = {k: v for k, v in h.items() if k.lower() != "mcp-protocol-version"}
+            h["MCP-Protocol-Version"] = (
+                modern_state.negotiated_version or _MODERN_PROTOCOL_VERSION_DEFAULT
+            )
+            h = {k: v for k, v in h.items() if k.lower() != "mcp-method"}
+            h = {k: v for k, v in h.items() if k.lower() != "mcp-name"}
+            mcp_headers = _mcp_request_headers(line)
+            if "Mcp-Method" in mcp_headers:
+                h["Mcp-Method"] = mcp_headers["Mcp-Method"]
+            if "Mcp-Name" in mcp_headers:
+                h["Mcp-Name"] = mcp_headers["Mcp-Name"]
+            return h
         # session_id / protocol_version are mutated only by this (main) thread,
         # so they need no lock; only the shared ``headers`` object is contended.
         if session_id:
@@ -2183,6 +3900,28 @@ def run(
             h = {k: v for k, v in h.items() if k.lower() != "mcp-protocol-version"}
             h["MCP-Protocol-Version"] = protocol_version
         return h
+
+    def _discover_reseed() -> None:
+        """One-shot discover reseed hook for the modern initialize branch.
+
+        Snapshots the SHARED ``headers`` fresh per invocation (under
+        ``headers_lock``) so credentials refreshed since startup — by the
+        probe-time recovery above or the proactive-refresh daemon — are
+        honored, then delegates to ``_reseed_discover_probe`` (#350 review
+        round 4) with the SAME ``_probe_auth_recovery`` the startup probe
+        used (#350 review round 8, finding 8-2): a token that expired
+        between the ``-32021``-gated startup probe and the local
+        ``initialize`` would otherwise 401 this one-shot reseed and
+        permanently synthesize empty capabilities. Once-only/never-loops is
+        enforced by the caller (``_handle_modern_special_method`` latches
+        ``modern_state.discover_retry_attempted`` first), and it runs
+        synchronously on the stdin loop thread, so no dispatch can race it.
+        """
+        with headers_lock:
+            snapshot = dict(headers)
+        _reseed_discover_probe(
+            client, url, snapshot, modern_state, auth_recovery=_probe_auth_recovery
+        )
 
     refresh_timer, refresh_stop = _start_proactive_refresh(
         refresher=token_refresher,
@@ -2266,7 +4005,82 @@ def run(
                             _emit(reply, tracker)
                         continue
 
-                req_headers = _prepare_headers()
+                # Track a client-set logging level on BOTH eras (a cheap,
+                # side-effect-free read — see _extract_log_level) so a level
+                # set before/while still resolving is available if the modern
+                # path later needs to mirror it into _meta.
+                level = _extract_log_level(line)
+                if level is not None:
+                    modern_state.log_level = level
+
+                if era == "modern":
+                    # initialize / notifications/initialized /
+                    # notifications/cancelled do not exist on the wire to a
+                    # modern remote — see _handle_modern_special_method.
+                    # _discover_reseed (defined once, above the loop) gives
+                    # the initialize branch its one-shot reseed retry
+                    # (#350 review round 4).
+                    handled, modern_reply = _handle_modern_special_method(
+                        line, req_id, modern_state, discover_retry=_discover_reseed
+                    )
+                    if handled:
+                        if modern_reply is not None:
+                            _emit(modern_reply, tracker)
+                        continue
+                    # Reject a method that cannot ride the REQUIRED Mcp-Method
+                    # header (#350 review round 5, finding 5-2). JSON-RPC 2.0
+                    # allows ANY string as `method`, but Streamable HTTP
+                    # ("Standard Request Headers") mirrors it into Mcp-Method,
+                    # whose value must satisfy RFC 9110 field-value syntax —
+                    # and unlike Mcp-Name, Mcp-Method has NO escape hatch: the
+                    # Base64 sentinel is defined only for Mcp-Name /
+                    # Mcp-Param-{Name} ("Server Validation": servers "MUST
+                    # decode an encoded Mcp-Name or Mcp-Param-{Name} value
+                    # before comparing" — Mcp-Method is pointedly absent), so
+                    # an encoded Mcp-Method would fail header-body validation
+                    # with -32020 HeaderMismatch on a compliant server.
+                    # Sending it raw is no better: httpx raises
+                    # UnicodeEncodeError at request construction for a
+                    # non-ASCII header value (degrading to the opaque
+                    # "internal relay error" via the safety net below — the
+                    # #11 never-crash contract holds, but the failure tells
+                    # the client nothing), and some control characters pass
+                    # httpx/h11 validation onto the wire verbatim. Such a
+                    # request is unsendable on this transport, so reject it
+                    # through the normal error path: a request gets a JSON-RPC
+                    # error, a notification (no id) is dropped silently, and
+                    # the legacy path — which mirrors nothing into headers —
+                    # stays byte-identical (AC #3).
+                    unsafe_method, _ = _extract_method_and_name(line)
+                    if unsafe_method is not None and not _is_header_safe_ascii(
+                        unsafe_method
+                    ):
+                        log(
+                            "rejecting request: method is not a header-safe "
+                            "ASCII string and cannot be mirrored into the "
+                            "required Mcp-Method header (spec rev 2026-07-28)"
+                        )
+                        if req_has_id:
+                            _write_line(
+                                _error_response(
+                                    "method cannot be represented in the "
+                                    "required Mcp-Method header (spec rev "
+                                    "2026-07-28, Request Metadata)",
+                                    req_id,
+                                )
+                            )
+                        continue
+                    # Every other request/notification carries the modern
+                    # per-request _meta block (protocol version, client
+                    # capabilities, optionally clientInfo/logLevel). Reassigning
+                    # `line` here means every dispatch call site below (initial
+                    # + the 401/403 retry branches, which all re-read the SAME
+                    # `line` variable) automatically sends the meta-injected
+                    # body — no separate threading of the injected content
+                    # through the recovery branches.
+                    line = _inject_modern_meta(line, modern_state)
+
+                req_headers = _prepare_headers(line)
 
                 def _dispatch(content: str, h: dict[str, str]) -> _StreamResult | None:
                     nonlocal protocol_version
@@ -2394,7 +4208,8 @@ def run(
                 # admits 202, so exclude a 202-to-request explicitly, matching the
                 # authoritative post-recovery gate's `not is_error`.
                 if (
-                    result.session_id
+                    era == "legacy"
+                    and result.session_id
                     and not (result.status_code == 202 and req_has_id)
                     and (result.status_code < 400 or feeds_recovery)
                 ):
@@ -2434,7 +4249,7 @@ def run(
                     if new_headers:
                         with headers_lock:
                             headers.update(new_headers)
-                        req_headers = _prepare_headers()
+                        req_headers = _prepare_headers(line)
                         result = _dispatch(line, req_headers)
                         if result is None:
                             # Transport exhaustion on the refreshed retry (None is
@@ -2456,7 +4271,8 @@ def run(
                         # excluded: its branch reinitializes from scratch, ignoring any
                         # rotated id, and a cold 404 must stay a terminal error.)
                         if (
-                            result.session_id
+                            era == "legacy"
+                            and result.session_id
                             and not (
                                 result.status_code == 202 and req_has_id
                             )  #: a 202-to-request is errored, not adopted
@@ -2495,7 +4311,7 @@ def run(
                         if new_headers:
                             with headers_lock:
                                 headers.update(new_headers)
-                            req_headers = _prepare_headers()
+                            req_headers = _prepare_headers(line)
                             result = _dispatch(line, req_headers)
                             if result is None:
                                 # Transport exhaustion on the stepped-up retry (None
@@ -2508,7 +4324,8 @@ def run(
                             # scratch (ignoring any rotated id), so a terminal status
                             # echoing a session id must not poison the next line.
                             if (
-                                result.session_id
+                                era == "legacy"
+                                and result.session_id
                                 and not (result.status_code == 202 and req_has_id)
                                 and result.status_code < 400
                             ):  #: a 202-to-request is errored, not adopted
@@ -2521,8 +4338,13 @@ def run(
                                 )
                             continue
 
-                # Session expired (404) — reset, re-initialize, then retry
-                if result.status_code == 404 and session_id:
+                # Session expired (404) — reset, re-initialize, then retry.
+                # LEGACY ONLY: this is dead code on the modern era regardless
+                # (session_id can never be set there — every adoption site
+                # above is gated on era == "legacy" — but the explicit
+                # conjunct documents that a 404 on the modern path is a
+                # genuine "not found", never a session recovery trigger).
+                if era == "legacy" and result.status_code == 404 and session_id:
                     log("session expired, re-initializing and retrying")
                     session_id = None
                     with headers_lock:
@@ -2541,7 +4363,7 @@ def run(
                     if renegotiated and renegotiated != protocol_version:
                         log(f"re-negotiated MCP protocol version: {renegotiated}")
                         protocol_version = renegotiated
-                    req_headers = _prepare_headers()
+                    req_headers = _prepare_headers(line)
                     result = _dispatch(line, req_headers)
                     if result is None:
                         continue
@@ -2567,7 +4389,7 @@ def run(
                 # known-bad state forward. The inline 401/403 re-adoptions above
                 # stay unconditional — they feed the very next chained recovery
                 # dispatch, not the next stdin line.
-                if result.session_id and not is_error:
+                if era == "legacy" and result.session_id and not is_error:
                     session_id = result.session_id
 
                 if is_error:
