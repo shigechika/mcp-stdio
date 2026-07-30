@@ -4246,6 +4246,31 @@ class TestCheckConnection:
         assert json.loads(requests[0].content)["method"] == "initialize"
         assert json.loads(requests[1].content)["method"] == "server/discover"
 
+    def test_discover_retry_matches_probe_protocol_era_request_shape(self, httpx_mock):
+        """#350 review finding 1: the discover retry used to POST with the
+        operator's raw ``headers`` unmodified -- no Mcp-Method, no
+        MCP-Protocol-Version override, no params._meta -- unlike
+        _probe_protocol_era's probe. Both REQUIRED headers (Streamable HTTP,
+        "Standard Request Headers": Mcp-Method is "Required For: All
+        requests") must be present and params._meta must carry a
+        protocolVersion matching the header, exactly like the startup
+        probe."""
+        httpx_mock.add_response(status_code=400, text="")
+        httpx_mock.add_response(
+            text=json.dumps({"jsonrpc": "2.0", "id": 2, "result": {}}),
+            headers={"content-type": "application/json"},
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is True
+        discover_req = httpx_mock.get_requests()[1]
+        assert discover_req.headers["mcp-method"] == "server/discover"
+        assert "mcp-protocol-version" in discover_req.headers
+        meta = json.loads(discover_req.content)["params"]["_meta"]
+        assert (
+            meta["io.modelcontextprotocol/protocolVersion"]
+            == (discover_req.headers["mcp-protocol-version"])
+        )
+        assert meta["io.modelcontextprotocol/clientCapabilities"] == {}
+
     def test_404_falls_back_to_discover(self, httpx_mock):
         """: 404 (unrecognized method) is the OTHER fallback trigger
         alongside 400 — a server that fully removed initialize returns 404 for
@@ -4277,14 +4302,16 @@ class TestCheckConnection:
 
     def test_400_discover_retry_gets_jsonrpc_error(self, httpx_mock):
         """: the discover retry itself may come back HTTP 200 but with a
-        JSON-RPC error body (e.g. the endpoint exists but rejects empty
-        params) — that is still "the server responded", just unhealthily, and
-        the probe's verdict must be False (mirrors _report_initialize). The
-        request-count assertion is what discriminates this from the
-        no-fallback behavior: without the fix only ONE request is ever sent
-        and the (unconsumed) discover mock would leave httpx_mock's teardown
-        assertion failing, not this one — assert the count directly so the
-        fallback path is unambiguously exercised."""
+        JSON-RPC error body (e.g. the endpoint rejects this particular
+        discover request for some other reason even though it carries the
+        full modern-shaped body/headers) — that is still "the server
+        responded", just unhealthily, and the probe's verdict must be False
+        (mirrors _report_initialize). The request-count assertion is what
+        discriminates this from the no-fallback behavior: without the fix
+        only ONE request is ever sent and the (unconsumed) discover mock
+        would leave httpx_mock's teardown assertion failing, not this one —
+        assert the count directly so the fallback path is unambiguously
+        exercised."""
         httpx_mock.add_response(status_code=400, text="")
         httpx_mock.add_response(
             text=json.dumps(
@@ -8906,6 +8933,31 @@ class TestProbeProtocolEra:
         req = httpx_mock.get_requests()[0]
         assert json.loads(req.content)["method"] == "server/discover"
         assert req.headers["mcp-method"] == "server/discover"
+
+    def test_probe_carries_meta_matching_protocol_version_header(self, httpx_mock):
+        """#350 review finding 1: server/discover's own worked example (spec
+        rev 2026-07-28, "Discovery") carries params._meta with
+        protocolVersion/clientCapabilities even on this pre-negotiation
+        probe -- and the Server Validation section requires the
+        MCP-Protocol-Version HEADER to match _meta's protocolVersion FIELD
+        exactly, on pain of a HeaderMismatch rejection. A probe sending
+        params: {} (no _meta at all) violates that invariant."""
+        httpx_mock.add_response(
+            text=json.dumps(
+                {"jsonrpc": "2.0", "id": 0, "result": {"resultType": "discover"}}
+            ),
+            headers={"content-type": "application/json"},
+        )
+        client = httpx.Client()
+        _probe_protocol_era(client, self.URL, {})
+        req = httpx_mock.get_requests()[0]
+        meta = json.loads(req.content)["params"]["_meta"]
+        assert (
+            meta["io.modelcontextprotocol/protocolVersion"]
+            == (req.headers["mcp-protocol-version"])
+        )
+        assert meta["io.modelcontextprotocol/clientCapabilities"] == {}
+        assert "io.modelcontextprotocol/clientInfo" not in meta
 
     def test_404_is_legacy(self, httpx_mock):
         httpx_mock.add_response(status_code=404, text="")

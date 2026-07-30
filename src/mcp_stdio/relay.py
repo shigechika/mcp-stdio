@@ -639,6 +639,57 @@ def _is_recognized_modern_error(parsed: dict[str, Any] | None) -> bool:
     return isinstance(code, int) and code in _MCP_RESERVED_ERROR_CODES
 
 
+def _build_discover_probe_request(
+    headers: dict[str, str], request_id: int = 0
+) -> tuple[str, dict[str, str]]:
+    """Build the body + headers for a spec-compliant ``server/discover`` probe.
+
+    Shared by ``_probe_protocol_era`` (the ``auto``/``modern`` startup probe)
+    and ``check_connection``'s discover retry, so both send byte-identical
+    request shapes instead of two independently-drifting probes (#350
+    review finding 1).
+
+    Body: ``server/discover``'s own worked example (spec rev 2026-07-28,
+    "Discovery") carries ``params._meta`` with
+    ``io.modelcontextprotocol/protocolVersion`` and
+    ``.../clientCapabilities`` even on this very first, pre-negotiation
+    request — neither field requires prior knowledge of the remote (the
+    version is this relay's own advertised floor, capabilities are the
+    client's own, always-known set). Reusing ``_inject_modern_meta`` against
+    a throwaway, never-seeded ``_ModernState()`` produces exactly that:
+    ``negotiated_version`` falls back to ``_MODERN_PROTOCOL_VERSION_DEFAULT``
+    and ``client_capabilities`` falls back to ``{}`` — the same defaults
+    ``_prepare_headers`` uses before any real negotiation has happened.
+    ``clientInfo`` is correctly omitted (SHOULD, never fabricated — no real
+    client has spoken yet at probe time). A server that treats a discover
+    request lacking this ``_meta`` as a header/body mismatch (``HeaderMismatch``
+    / ``MissingRequiredClientCapabilityError``, both in the spec-reserved
+    ``-32020..-32099`` range) would otherwise reject an otherwise-valid probe.
+
+    Headers: ``Mcp-Method``/``MCP-Protocol-Version`` are REQUIRED on every
+    POST (Streamable HTTP, "Standard Request Headers" / "Protocol Version
+    Header") — including this one. Any case-variant the operator pinned via
+    ``-H`` is dropped first so httpx never serialises two header lines for
+    the same field (mirrors ``_prepare_headers``' strip-then-set discipline).
+    """
+    discover_msg = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "method": "server/discover",
+            "id": request_id,
+            "params": {},
+        }
+    )
+    discover_msg = _inject_modern_meta(discover_msg, _ModernState())
+    probe_headers = {k: v for k, v in headers.items() if k.lower() != "mcp-method"}
+    probe_headers["Mcp-Method"] = "server/discover"
+    probe_headers = {
+        k: v for k, v in probe_headers.items() if k.lower() != "mcp-protocol-version"
+    }
+    probe_headers["MCP-Protocol-Version"] = _MODERN_PROTOCOL_VERSION_DEFAULT
+    return discover_msg, probe_headers
+
+
 def _probe_protocol_era(
     client: httpx.Client, url: str, headers: dict[str, str]
 ) -> tuple[str, dict[str, Any] | None]:
@@ -678,16 +729,13 @@ def _probe_protocol_era(
     detection-probe failure degrades to legacy rather than crashing startup;
     the first REAL request from the local client still surfaces a genuine
     connectivity problem through the normal legacy retry path.
+
+    The probe request itself is built by ``_build_discover_probe_request``
+    (headers AND body, including ``params._meta`` — see that function's
+    docstring for why a discover probe needs ``_meta`` too, not just the
+    two headers).
     """
-    discover_msg = json.dumps(
-        {"jsonrpc": "2.0", "method": "server/discover", "id": 0, "params": {}}
-    )
-    probe_headers = {k: v for k, v in headers.items() if k.lower() != "mcp-method"}
-    probe_headers["Mcp-Method"] = "server/discover"
-    probe_headers = {
-        k: v for k, v in probe_headers.items() if k.lower() != "mcp-protocol-version"
-    }
-    probe_headers["MCP-Protocol-Version"] = _MODERN_PROTOCOL_VERSION_DEFAULT
+    discover_msg, probe_headers = _build_discover_probe_request(headers)
     try:
         resp = client.post(url, content=discover_msg, headers=probe_headers)
     except httpx.HTTPError as e:
@@ -2487,7 +2535,14 @@ def check_connection(
     ``_DISCOVER_FALLBACK_STATUSES``) before reporting the connection down —
     a server that has dropped the legacy handshake entirely no longer
     recognizes ``initialize`` at all, and would otherwise be misreported as
-    unreachable rather than "alive, modern-only".
+    unreachable rather than "alive, modern-only". The retry is built by
+    ``_build_discover_probe_request`` — the SAME modern-shaped body/headers
+    (``Mcp-Method``, ``MCP-Protocol-Version``, ``params._meta``) that
+    ``_probe_protocol_era`` sends, not the bare ``initialize`` probe's
+    unmodified ``headers`` (#350 review finding 1: a strict modern-only
+    server can reject a discovery request missing its own required
+    metadata, which would make THIS retry itself misreport a live modern
+    server as down).
     """
     if transport == "sse":
         return _check_connection_sse(
@@ -2527,17 +2582,12 @@ def check_connection(
                     "with server/discover in case the server dropped the "
                     "legacy handshake (spec rev 2026-07-28)"
                 )
-                discover_msg = json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "method": "server/discover",
-                        "id": 2,
-                        "params": {},
-                    }
+                discover_msg, discover_headers = _build_discover_probe_request(
+                    headers, request_id=2
                 )
                 try:
                     discover_resp = client.post(
-                        url, content=discover_msg, headers=headers
+                        url, content=discover_msg, headers=discover_headers
                     )
                 except httpx.HTTPError as e:
                     log(f"✗ server/discover retry failed: {e}")
