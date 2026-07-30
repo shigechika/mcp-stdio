@@ -184,11 +184,26 @@ jobs:
                 echo "::notice::docs-only delta since $LAST_SHA (all *.md) — skipping this review round"
                 exit 0
               fi
-              printf '%s' "$compare" \
-                | jq -r '.files[]? | "--- " + .filename + " (" + .status + ")\n"
-                         + (.patch // "(no textual patch — binary or too large)") + "\n"' 2>/dev/null \
-                | head -c 100000 > delta.txt || true
-              if [ -s delta.txt ]; then DELTA_MODE=1; fi
+              # Delta mode only when the delta is COMPLETE (round-1 findings
+              # R1F1/R1F2 of this PR's own review): the compare API caps
+              # .files at 300 entries, and a file can come back with a null
+              # .patch (binary, or a patch too large to inline). In either
+              # case the delta under-represents the push, and since the
+              # system prompt scopes REPORTING to the delta, code missing
+              # from it would become unreviewable. An incomplete delta
+              # therefore degrades this round to a full-diff review instead.
+              missing_patch=$(printf '%s' "$compare" \
+                | jq -r '[.files[]? | select(.patch == null)] | length' 2>/dev/null || true)
+              case "$missing_patch" in ''|*[!0-9]*) missing_patch=1 ;; esac
+              if [ "$nfiles" -ge 300 ] || [ "$missing_patch" -gt 0 ]; then
+                echo "::notice::delta since $LAST_SHA is incomplete (files=$nfiles, missing patches=$missing_patch) — degrading to a full-diff review"
+              else
+                printf '%s' "$compare" \
+                  | jq -r '.files[]? | "--- " + .filename + " (" + .status + ")\n"
+                           + (.patch // "(no textual patch)") + "\n"' 2>/dev/null \
+                  | head -c 100000 > delta.txt || true
+                if [ -s delta.txt ]; then DELTA_MODE=1; fi
+              fi
             fi
             # compare failed (force-push made LAST_SHA unreachable, or a
             # transient API error): DELTA_MODE stays 0 and this round
