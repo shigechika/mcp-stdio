@@ -418,14 +418,21 @@ jobs:
             <id>: KEEP - <short reason>
             <id>: DROP - <short reason>
             DROP only findings you can refute or whose cited evidence does
-            not support them; otherwise KEEP. Keep each reason under 15
+            not support them; otherwise KEEP. The diff may be truncated: a
+            cited hunk being absent from it is NOT grounds to DROP — only
+            an affirmative refutation is. Keep each reason under 15
             words.'
             {
               echo "Candidate findings:"
               cat review_body.txt
               echo
               echo "=== Diff (ground truth) ==="
-              head -c 40000 scope.txt
+              # The SAME capped scope the reviewer reported against
+              # (fulldiff.txt and delta.txt are each already capped at
+              # 100000 bytes). A smaller slice here made correct findings
+              # citing code beyond it look uncited and get dropped as
+              # unsupported.
+              cat scope.txt
             } > vprompt.txt
             verdicts=""
             if jq -n --arg model "$MODEL" --arg system "$vsystem" \
@@ -441,19 +448,24 @@ jobs:
               verdicts=$(printf '%s' "$vresp" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
             fi
             if [ -n "$verdicts" ]; then
+              # Ids are uppercased: the tolerant grep accepts "r1f1: drop",
+              # and a lowercase id would otherwise sail past the awk
+              # consumers below, which match uppercased ids against it.
               DROPPED_IDS=$(printf '%s\n' "$verdicts" \
                 | grep -oiE '^[A-Za-z0-9]+[[:space:]]*:[[:space:]]*DROP' \
-                | cut -d: -f1 | tr -d ' \t' | paste -sd, - || true)
+                | cut -d: -f1 | tr -d ' \t' \
+                | tr '[:lower:]' '[:upper:]' | paste -sd, - || true)
             else
               VERIFIER_NOTE="Verifier pass unavailable this round — findings above are unverified."
             fi
           fi
 
           # Keep only finding blocks the verifier did not drop. Ids the
-          # verifier invents match no block, so they are inert.
+          # verifier invents match no block, so they are inert. Matched in
+          # uppercase (DROPPED_IDS is uppercased at collection).
           awk -v list="$DROPPED_IDS" '
             BEGIN { n = split(list, a, ","); for (i = 1; i <= n; i++) if (a[i] != "") drop[a[i]] = 1 }
-            /^===FINDING / { id = $2; sub(/=+$/, "", id); inb = 1; skip = (id in drop); if (!skip) print; next }
+            /^===FINDING / { id = $2; sub(/=+$/, "", id); inb = 1; skip = (toupper(id) in drop); if (!skip) print; next }
             /^===END FINDING===/ { if (inb && !skip) print; inb = 0; skip = 0; next }
             { if (inb && !skip) print }
           ' review_body.txt > kept.txt || true
@@ -516,7 +528,7 @@ jobs:
           if [ -z "$kept_json" ]; then kept_json='[]'; fi
           dropped_json=$(awk -v list="$DROPPED_IDS" '
             BEGIN { n = split(list, a, ","); for (i = 1; i <= n; i++) if (a[i] != "") d[a[i]] = 1 }
-            /^===FINDING / { id = $2; sub(/=+$/, "", id); if (id in d) { getline s; printf "%s\t%s\n", id, s } }
+            /^===FINDING / { id = $2; sub(/=+$/, "", id); if (toupper(id) in d) { getline s; printf "%s\t%s\n", id, s } }
           ' review_body.txt 2>/dev/null \
             | jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
                         | {id: .[0], summary: ((.[1:] | join(" "))[0:200]), status: "dismissed"})' 2>/dev/null || true)
