@@ -3170,6 +3170,17 @@ def _handle_listen_message(
         return None
     if not isinstance(msg, dict):
         return None
+    if msg.get("jsonrpc") != "2.0":
+        # #352 round-8 finding 1: everything this handler ACTS on —
+        # establishment evidence, graceful/terminal classification, and
+        # above all messages FORWARDED verbatim to the legacy client —
+        # must be a well-formed JSON-RPC 2.0 object. A misrouted endpoint
+        # emitting envelope-less JSON could otherwise establish the
+        # stream or put an invalid object on the stdio wire, which a
+        # strict client may reject or treat as a transport error. A
+        # compliant server always sends the member, so this swallows only
+        # protocol-invalid traffic.
+        return None
     method = msg.get("method")
     if method == _LISTEN_ACK_METHOD:
         # #352 round-6 finding: establishment evidence must be a REAL ack.
@@ -3219,9 +3230,26 @@ def _handle_listen_message(
         # saw a seed — direct callers in tests) keeps the permissive
         # pre-narrowing behavior; run() always seeds before the thread
         # starts.
+        # #352 round-8 finding 2: the ack's honored subset is the listen
+        # NEGOTIATION RESULT — a server that acknowledged
+        # ``{"toolsListChanged": false}`` (or omitted the flag) declared
+        # it will not send that kind, so one arriving anyway is malformed
+        # or misrouted traffic and must not be forwarded. The honored
+        # subset rides ``state["honored"]`` (recorded by the ack branch
+        # above, overwritten by each reconnect's fresh ack); an unseeded
+        # carrier keeps the permissive behavior like the advertised gate.
         advertised = state.get("advertised") if state is not None else None
+        honored = state.get("honored") if state is not None else None
         family = method.split("/")[1]
-        if acked and "id" not in msg and (advertised is None or family in advertised):
+        if (
+            acked
+            and "id" not in msg
+            and (advertised is None or family in advertised)
+            and (
+                not isinstance(honored, dict)
+                or bool(honored.get(f"{family}ListChanged"))
+            )
+        ):
             _emit(json.dumps(_strip_listen_subscription_id(msg)), tracker)
         return None
     if method == "notifications/cancelled":

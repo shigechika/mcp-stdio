@@ -13251,6 +13251,60 @@ class TestHandleListenMessage:
             assert self._handle(msg, state=state) is None
         assert "honored" not in state
 
+    def test_envelope_less_message_is_swallowed_even_post_ack(self, capsys):
+        """#352 round-8 finding 1: a payload without `jsonrpc: "2.0"` is
+        not a well-formed JSON-RPC object — forwarding it could break a
+        strict legacy client, and an envelope-less "ack" must not
+        establish. Compliant servers always send the member, so only
+        protocol-invalid traffic is swallowed."""
+        assert (
+            self._handle(
+                {"method": "notifications/tools/list_changed"},
+                acked=True,
+            )
+            is None
+        )
+        assert capsys.readouterr().out == ""
+        state = {}
+        assert (
+            self._handle(
+                {
+                    "method": "notifications/subscriptions/acknowledged",
+                    "params": {"notifications": {"toolsListChanged": True}},
+                },
+                state=state,
+            )
+            is None
+        )
+        assert "honored" not in state
+
+    def test_unhonored_kind_is_swallowed_despite_advertisement(self, capsys):
+        """#352 round-8 finding 2: the ack's honored subset is the listen
+        negotiation result. A server that honored {} declared it will not
+        send any kind — a tools/list_changed arriving anyway is malformed
+        or misrouted and must not be forwarded, even though tools was
+        advertised downstream."""
+        state = {"advertised": frozenset({"tools"}), "honored": {}}
+        assert (
+            self._handle(
+                {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"},
+                state=state,
+                acked=True,
+            )
+            is None
+        )
+        assert capsys.readouterr().out == ""
+        state["honored"] = {"toolsListChanged": True}
+        assert (
+            self._handle(
+                {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"},
+                state=state,
+                acked=True,
+            )
+            is None
+        )
+        assert "notifications/tools/list_changed" in capsys.readouterr().out
+
     def test_pre_ack_notification_is_swallowed_not_forwarded(self, capsys):
         """#352 round-7 finding: the spec makes the ack the mandatory FIRST
         stream message, so a whitelisted list_changed arriving BEFORE this
