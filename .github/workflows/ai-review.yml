@@ -1,9 +1,40 @@
 name: AI review
 
-# First-pass AI code review via a self-hosted OpenAI-compatible endpoint
+# Advisory AI code review via a self-hosted OpenAI-compatible endpoint
 # (Azure AI Foundry v1 API). The prompt steers the model toward
 # repository-guidance violations, cross-file consistency and security, which
 # is a deliberately different lens from a generic review pass.
+#
+# Noise controls (added after two PRs accumulated 16 and 9 append-only
+# review rounds that re-litigated settled points):
+#
+#   * Sticky comment: ONE bot-authored comment per PR, updated in place
+#     (marker <!-- ai-review-sticky -->). A machine-readable findings ledger
+#     rides inside it, base64-encoded in an HTML comment — base64 because a
+#     raw "--" inside JSON would terminate the HTML comment, and because it
+#     survives GitHub markdown rendering untouched. The ledger carries a
+#     per-finding status (open/fixed/dismissed) across rounds: settled
+#     findings are never re-reported or re-argued, and only a compact
+#     id/status/summary digest — never prior comment prose — is fed back to
+#     the model, to avoid anchoring on its own earlier wording.
+#   * Delta rounds: after the first round, findings are scoped to commits
+#     pushed since the last reviewed head (compare API); the full PR diff is
+#     still supplied as context. A failed compare (force-push rewrote the
+#     recorded head away, API error) degrades to a full-diff round.
+#   * Docs-only skip: a push whose delta touches only *.md files ends the
+#     round early with no comment update. Deliberately narrow — no attempt
+#     to detect comment-only code changes, which is too error-prone.
+#   * Reporting bar + verifier: the system prompt demands a concrete failing
+#     input and the resulting wrong behavior per finding (max 3 per round),
+#     and a second, cheap verifier call against the same deployment drops
+#     findings it can refute before posting. Dropped findings enter the
+#     ledger as dismissed so they stay dead in later rounds. If the
+#     verifier call fails, findings post unverified with a note.
+#
+# Trust boundary for the ledger: only comments authored by
+# github-actions[bot] are considered (anyone can post a comment containing
+# the marker text), and last_sha / rounds are sanitized before use in URLs
+# or arithmetic — ledger content is model-influenced data, never code.
 #
 # Advisory only: every failure path soft-fails so this job can never block a
 # PR. Skips release-please version bumps (same-repo scoped — a fork controls
@@ -28,15 +59,15 @@ on:
   pull_request:
     # synchronize (a push to the PR branch) is included so a follow-up commit
     # addressing review findings is re-reviewed instead of silently going
-    # unchecked — without it the only way to re-run was closing and reopening
-    # the PR by hand, which nobody remembers to do. The concurrency group
-    # below cancels a run still in flight when the next push lands, so a burst
-    # of commits costs roughly one review, not one per commit.
+    # unchecked — per-push delta rounds are the whole point of the ledger
+    # design above. The concurrency group below cancels a run still in
+    # flight when the next push lands, so a burst of commits costs roughly
+    # one review, not one per commit.
     types: [opened, reopened, ready_for_review, synchronize]
 
 permissions:
   contents: read
-  pull-requests: write # post the review comment
+  pull-requests: write # post / update the review comment
 
 concurrency:
   group: ai-review-${{ github.event.pull_request.number }}
@@ -65,6 +96,9 @@ jobs:
           # Guidance is read at the BASE revision, never the PR head — see the
           # loop below for why.
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # Head SHA is recorded in the ledger so the next round can compute
+          # the new-commits delta with the compare API.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           # Via env, not inline ${{ }} in run:, so a crafted title can't
           # inject shell (same hygiene as the other workflows here).
           TITLE: ${{ github.event.pull_request.title }}
@@ -87,11 +121,138 @@ jobs:
           # scheme+host — the same pitfall the summarizer hit before.
           ENDPOINT=$(printf '%s' "$ENDPOINT" | sed -E 's#^([a-zA-Z]+://[^/]+).*#\1#')
 
-          # The default run shell is bash with errexit+pipefail, so guard the
-          # prompt-building calls too — a transient GitHub API error must
-          # degrade the prompt, not fail the job (advisory-only contract).
+          # ---------- Sticky comment + findings ledger ----------
+          # Find OUR previous sticky comment. Author-filtered to
+          # github-actions[bot]: any user can post a comment containing the
+          # marker string, and that must not become the trusted ledger.
+          # `--paginate` emits one JSON array per page; jq iterates each.
+          comments=$(gh api "repos/$GH_REPO/issues/$PR/comments" --paginate 2>/dev/null || printf '[]')
+          # NEWEST matching comment wins (tail, not head): a transient PATCH
+          # failure makes the fallback below create a SECOND sticky carrying
+          # the newest ledger — selecting the oldest would then update the
+          # stale one with a stale round counter forever, reintroducing the
+          # duplicate-comment noise this workflow exists to remove.
+          sticky_b64=$(printf '%s' "$comments" \
+            | jq -r '.[]
+                     | select(.user.login == "github-actions[bot]")
+                     | select(.body | contains("<!-- ai-review-sticky -->"))
+                     | ({id, body} | tojson | @base64)' 2>/dev/null \
+            | tail -n 1 || true)
+          COMMENT_ID=""
+          ledger_json=""
+          if [ -n "$sticky_b64" ]; then
+            sticky=$(printf '%s' "$sticky_b64" | base64 -d 2>/dev/null || true)
+            COMMENT_ID=$(printf '%s' "$sticky" | jq -r '.id // empty' 2>/dev/null || true)
+            # LAST marker match wins (tail, not head): model-authored prose
+            # (rendered.md) precedes the genuine ledger in the comment body,
+            # and a finding that QUOTES a marker-shaped line (a PR touching
+            # this workflow's docs, or a prompt-injected diff) would
+            # otherwise have its forged ledger adopted next round — letting
+            # an author plant last_sha to skip review or mark real findings
+            # dismissed. The genuine ledger is always appended last by this
+            # workflow, and rendered.md is additionally stripped of
+            # marker-shaped lines before composing (see the compose step).
+            ledger_b64=$(printf '%s' "$sticky" | jq -r '.body // ""' 2>/dev/null \
+              | sed -n 's/.*<!-- ai-review-ledger-v1: \([A-Za-z0-9+/=]*\) -->.*/\1/p' \
+              | tail -n 1 || true)
+            if [ -n "$ledger_b64" ]; then
+              # A corrupt ledger (hand-edited comment, truncated base64)
+              # decodes to nothing here and the round degrades to a full
+              # review — never a job failure.
+              ledger_json=$(printf '%s' "$ledger_b64" | base64 -d 2>/dev/null \
+                | jq -c 'select((.findings | type) == "array")' 2>/dev/null || true)
+            fi
+          fi
+          OLD_FINDINGS=$(printf '%s' "$ledger_json" | jq -c '.findings // []' 2>/dev/null || true)
+          if [ -z "$OLD_FINDINGS" ]; then OLD_FINDINGS='[]'; fi
+          prev_rounds=$(printf '%s' "$ledger_json" | jq -r '.rounds // 0' 2>/dev/null || true)
+          case "$prev_rounds" in ''|*[!0-9]*) prev_rounds=0 ;; esac
+          ROUND=$((prev_rounds + 1))
+          LAST_SHA=$(printf '%s' "$ledger_json" | jq -r '.last_sha // empty' 2>/dev/null || true)
+          # Sanitized before interpolation into an API path below.
+          case "$LAST_SHA" in *[!0-9a-f]*) LAST_SHA="" ;; esac
+
+          # ---------- Delta scope + docs-only skip ----------
+          DELTA_MODE=0
+          : > delta.txt
+          if [ -n "$LAST_SHA" ]; then
+            if [ "$LAST_SHA" = "$HEAD_SHA" ]; then
+              echo "::notice::head $HEAD_SHA already reviewed in round $prev_rounds — nothing new, skipping"
+              exit 0
+            fi
+            compare=$(gh api "repos/$GH_REPO/compare/$LAST_SHA...$HEAD_SHA" 2>/dev/null || true)
+            if [ -n "$compare" ]; then
+              files_json=$(printf '%s' "$compare" | jq -c '[.files[]?.filename]' 2>/dev/null || true)
+              if [ -z "$files_json" ]; then files_json='[]'; fi
+              nfiles=$(printf '%s' "$files_json" | jq -r 'length' 2>/dev/null || true)
+              case "$nfiles" in ''|*[!0-9]*) nfiles=0 ;; esac
+              if [ "$nfiles" -eq 0 ]; then
+                echo "::notice::no file changes since last reviewed commit $LAST_SHA — skipping this round"
+                exit 0
+              fi
+              # Docs-only skip: only when EVERY changed file in the delta is
+              # *.md. The compare API caps .files at 300 entries, so never
+              # conclude docs-only from a possibly-truncated list.
+              docs_only=$(printf '%s' "$files_json" | jq -r 'all(endswith(".md"))' 2>/dev/null || true)
+              if [ "$docs_only" = "true" ] && [ "$nfiles" -lt 300 ]; then
+                echo "::notice::docs-only delta since $LAST_SHA (all *.md) — skipping this review round"
+                exit 0
+              fi
+              # Delta mode only when the delta is COMPLETE (round-1 findings
+              # R1F1/R1F2 of this PR's own review): the compare API caps
+              # .files at 300 entries, and a file can come back with a null
+              # .patch (binary, or a patch too large to inline). In either
+              # case the delta under-represents the push, and since the
+              # system prompt scopes REPORTING to the delta, code missing
+              # from it would become unreviewable. An incomplete delta
+              # therefore degrades this round to a full-diff review instead.
+              missing_patch=$(printf '%s' "$compare" \
+                | jq -r '[.files[]? | select(.patch == null)] | length' 2>/dev/null || true)
+              case "$missing_patch" in ''|*[!0-9]*) missing_patch=1 ;; esac
+              if [ "$nfiles" -ge 300 ] || [ "$missing_patch" -gt 0 ]; then
+                echo "::notice::delta since $LAST_SHA is incomplete (files=$nfiles, missing patches=$missing_patch) — degrading to a full-diff review"
+              else
+                printf '%s' "$compare" \
+                  | jq -r '.files[]? | "--- " + .filename + " (" + .status + ")\n"
+                           + .patch + "\n"' 2>/dev/null \
+                  > delta_raw.txt || true
+                # Third completeness guard (R2F1, same class as R1F1/R1F2):
+                # a delta exceeding the prompt cap cannot be included whole,
+                # and truncating it while reporting stays scoped to it would
+                # make the truncated-away code unreviewable. Over-cap deltas degrade
+                # to a full-diff round instead — full-diff's own cap
+                # truncation is the pre-existing, documented limitation and
+                # carries no scoped-reporting contract.
+                delta_bytes=$(wc -c < delta_raw.txt | tr -d ' ')
+                # Parse-failure default is over-cap (fail toward full-diff),
+                # matching missing_patch's fail-closed default of 1.
+                case "$delta_bytes" in ''|*[!0-9]*) delta_bytes=100001 ;; esac
+                if [ "$delta_bytes" -gt 100000 ]; then
+                  echo "::notice::delta since $LAST_SHA exceeds the prompt cap (${delta_bytes} bytes) — degrading to a full-diff review"
+                elif [ -s delta_raw.txt ]; then
+                  mv delta_raw.txt delta.txt
+                  DELTA_MODE=1
+                fi
+              fi
+            fi
+            # compare failed (force-push made LAST_SHA unreachable, or a
+            # transient API error): DELTA_MODE stays 0 and this round
+            # degrades to a full-diff review (advisory contract).
+          fi
+
+          gh pr diff "$PR" 2>/dev/null | head -c 100000 > fulldiff.txt || true
+          if [ ! -s fulldiff.txt ]; then
+            echo "::warning::could not fetch the PR diff (GitHub API error?) — skipping AI review"
+            exit 0
+          fi
+
+          # ---------- Build the review prompt ----------
+          # The prompt-building calls are guarded — a transient GitHub API
+          # error must degrade the prompt, not fail the job (advisory-only
+          # contract).
           {
             echo "PR title: $TITLE"
+            echo "Review round: $ROUND (use finding ids R${ROUND}F1, R${ROUND}F2, ...)"
             echo
             echo "PR description:"
             gh pr view "$PR" --json body -q .body 2>/dev/null | head -c 4000 || true
@@ -138,29 +299,68 @@ jobs:
                 printf '%s\n' "$body"
               fi
             done
-            echo "=== Unified diff ==="
-            gh pr diff "$PR" 2>/dev/null | head -c 100000 || true
+            if [ "$OLD_FINDINGS" != "[]" ]; then
+              # Compact digest only — injecting prior comment prose causes
+              # anchoring, and heavier judge prompts inflate false positives.
+              echo "=== Findings ledger from prior rounds ==="
+              printf '%s' "$OLD_FINDINGS" \
+                | jq -r '.[] | "\(.id) [\(.status)] \(.summary)"' 2>/dev/null || true
+              echo
+            fi
+            echo "=== Full PR diff (context only) ==="
+            cat fulldiff.txt
+            if [ "$DELTA_MODE" = "1" ]; then
+              echo
+              echo "=== New-commits diff since the last reviewed commit (REPORT SCOPE) ==="
+              cat delta.txt
+            fi
           } > prompt.txt
 
-          # If gh pr diff failed above, the marker is the last line — nothing
-          # to review; skip rather than send an empty diff to the model.
-          if [ "$(tail -n 1 prompt.txt)" = "=== Unified diff ===" ]; then
-            echo "::warning::could not fetch the PR diff (GitHub API error?) — skipping AI review"
-            exit 0
-          fi
-
-          system='You are reviewing a pull request for this repository.
+          system='You are an advisory reviewer for pull requests in this repository.
           Focus on: real bugs and logic errors introduced by the diff,
           violations of the repository guidance included in the prompt,
-          cross-file inconsistencies, and security issues. Do NOT report
-          style nitpicks, formatting, or anything a linter, typechecker or
-          test suite would catch. For each finding cite the file and the
-          diff hunk it occurs in, and briefly give the concrete failure
-          scenario. If you find nothing significant, say so in one short
-          paragraph — do not invent findings. Write the review in English,
-          whatever language the PR description is in: this is a public
-          repository and the review is published with it. Keep the review
-          under 500 words.'
+          cross-file inconsistencies, and security issues.
+
+          Reporting bar: report a finding only if you can name the concrete
+          failing input or state and the resulting wrong behavior, citing
+          file and line from the diff. Do NOT report: pre-existing issues on
+          lines the diff does not modify; documentation or comment accuracy;
+          style or formatting; anything a linter, typechecker or test suite
+          already catches; a speculative scenario that requires a
+          non-compliant peer or component, unless you name the concrete
+          malformed input; anything the findings ledger marks fixed or
+          dismissed. Prefer missing a borderline issue over reporting a
+          speculative one. Report at most 3 findings, most severe first.
+
+          Scope: when the prompt contains a section titled "New-commits
+          diff", report findings only on hunks in that section — the full PR
+          diff is context for understanding, not report scope. Otherwise the
+          full PR diff is the scope.
+
+          Ledger: the prompt may contain a findings ledger from prior
+          rounds. Entries marked fixed or dismissed are settled — do not
+          re-report or re-argue them. Entries marked open may be re-verified
+          against the new commits (mark them fixed in the ledger if the new
+          commits resolve them) but do not repeat their argument. Finding
+          blocks are for NEW findings only.
+
+          Output format, exactly and with no code fences (write in English —
+          this is a public repository). For each new finding:
+          ===FINDING R<round>F<n>===
+          <file>:<line> - <one-line summary>
+          <2-4 sentences: the concrete failing input or state and the wrong
+          behavior>
+          ===END FINDING===
+          Use the round number given in the prompt. If nothing clears the
+          bar, write this single line instead of any finding block:
+          No findings clear the reporting bar this round.
+          Always end with the updated ledger (every prior entry with its
+          updated status, plus one open entry per new finding; summaries
+          under 20 words):
+          ===LEDGER===
+          [{"id":"R1F1","summary":"...","status":"open|fixed|dismissed"}]
+          ===END LEDGER===
+          Output nothing after the ledger block.'
 
           jq -n --arg model "$MODEL" --arg system "$system" \
                 --rawfile user prompt.txt \
@@ -190,12 +390,196 @@ jobs:
             exit 0
           fi
 
+          # ---------- Parse model output (untrusted) ----------
+          printf '%s\n' "$review" > review_raw.txt
+          awk '/^===LEDGER===/{exit} {print}' review_raw.txt > review_body.txt
+          # Tolerate code fences the model may wrap the ledger in despite the
+          # instruction not to.
+          awk '/^===LEDGER===/{f=1; next} /^===END LEDGER===/{f=0} f' review_raw.txt \
+            | grep -v '^```' > model_ledger.txt || true
+          MODEL_FINDINGS=$(jq -c 'select(type == "array")' model_ledger.txt 2>/dev/null || true)
+          if [ -z "$MODEL_FINDINGS" ]; then MODEL_FINDINGS='[]'; fi
+          ids=$(awk '/^===FINDING /{id=$2; sub(/=+$/, "", id); print id}' review_body.txt || true)
+
+          # ---------- Verifier pass (second, cheap call) ----------
+          # A skeptical second opinion on each candidate finding; refuted
+          # ones are dropped before posting and ledgered as dismissed so
+          # they stay dead. Kept deliberately light: a heavier verifier
+          # prompt overcorrects and drops real findings.
+          if [ "$DELTA_MODE" = "1" ]; then cp delta.txt scope.txt; else cp fulldiff.txt scope.txt; fi
+          VERIFIER_NOTE=""
+          DROPPED_IDS=""
+          if [ -n "$ids" ]; then
+            vsystem='You are a skeptical verifier of candidate code-review findings.
+            Judge each candidate against the diff: can it be refuted? Does
+            the cited evidence actually support it? Would the concern change
+            observed behavior? Output exactly one line per candidate id and
+            nothing else, no formatting or bold:
+            <id>: KEEP - <short reason>
+            <id>: DROP - <short reason>
+            DROP only findings you can refute or whose cited evidence does
+            not support them; otherwise KEEP. Keep each reason under 15
+            words.'
+            {
+              echo "Candidate findings:"
+              cat review_body.txt
+              echo
+              echo "=== Diff (ground truth) ==="
+              head -c 40000 scope.txt
+            } > vprompt.txt
+            verdicts=""
+            if jq -n --arg model "$MODEL" --arg system "$vsystem" \
+                  --rawfile user vprompt.txt \
+                  '{model: $model,
+                    messages: [{role: "system", content: $system},
+                               {role: "user", content: $user}]}' > vpayload.json 2>/dev/null; then
+              vresp=$(curl -fsS -m 120 --retry 2 --retry-delay 5 --retry-all-errors \
+                        -H "Authorization: Bearer $API_KEY" \
+                        -H "Content-Type: application/json" \
+                        -d @vpayload.json \
+                        "${ENDPOINT%/}/openai/v1/chat/completions" 2>/dev/null || true)
+              verdicts=$(printf '%s' "$vresp" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+            fi
+            if [ -n "$verdicts" ]; then
+              DROPPED_IDS=$(printf '%s\n' "$verdicts" \
+                | grep -oiE '^[A-Za-z0-9]+[[:space:]]*:[[:space:]]*DROP' \
+                | cut -d: -f1 | tr -d ' \t' | paste -sd, - || true)
+            else
+              VERIFIER_NOTE="Verifier pass unavailable this round — findings above are unverified."
+            fi
+          fi
+
+          # Keep only finding blocks the verifier did not drop. Ids the
+          # verifier invents match no block, so they are inert.
+          awk -v list="$DROPPED_IDS" '
+            BEGIN { n = split(list, a, ","); for (i = 1; i <= n; i++) if (a[i] != "") drop[a[i]] = 1 }
+            /^===FINDING / { id = $2; sub(/=+$/, "", id); inb = 1; skip = (id in drop); if (!skip) print; next }
+            /^===END FINDING===/ { if (inb && !skip) print; inb = 0; skip = 0; next }
+            { if (inb && !skip) print }
+          ' review_body.txt > kept.txt || true
+
+          # ---------- Render the visible review body ----------
+          if [ -s kept.txt ]; then
+            awk '
+              /^===FINDING / { id = $2; sub(/=+$/, "", id); printf "**%s** — ", id; next }
+              /^===END FINDING===/ { print ""; next }
+              { print }
+            ' kept.txt > rendered.md || true
+          elif [ -n "$ids" ]; then
+            echo "All candidate findings this round were refuted by the verifier pass — no new findings." > rendered.md
+          elif grep -qi "no findings clear the reporting bar" review_body.txt 2>/dev/null; then
+            echo "No findings clear the reporting bar this round." > rendered.md
+          else
+            # Unstructured model output: post it as-is rather than discard a
+            # possibly useful review (advisory degrade).
+            head -c 20000 review_body.txt > rendered.md || true
+            VERIFIER_NOTE="Model output was unstructured this round — posted without verification."
+          fi
+
+          # Strip marker-shaped lines from the model's prose before it is
+          # composed ABOVE the genuine ledger: a finding that quotes a
+          # ledger marker (a PR touching this file's docs, or an injected
+          # diff) must not be able to plant a decoy the next round's
+          # extraction could pick up. Paired with the tail-not-head
+          # extraction rule — defense in depth, either alone suffices.
+          grep -v 'ai-review-ledger-v1:' rendered.md > rendered_clean.md || true
+          mv rendered_clean.md rendered.md || true
+
+          # ---------- Merge the ledger (model output is untrusted) ----------
+          # Start from the old ledger; take the model status only for known
+          # ids and only with a valid value; a finding once fixed/dismissed
+          # is never resurrected; unknown-but-valid model entries append.
+          merged=$(jq -n -c --argjson old "$OLD_FINDINGS" --argjson model "$MODEL_FINDINGS" '
+            def valid: map(select(type == "object"
+              and ((.id? | type) == "string") and (.id != "")
+              and ((.summary? | type) == "string")
+              and ((.status? // "") | IN("open", "fixed", "dismissed"))));
+            ($model | valid) as $m
+            | ($old | valid) as $o
+            | ($o | map(.id)) as $known
+            | ($o | map(. as $f
+                | ([$m[] | select(.id == $f.id)] | first) as $u
+                | if $u == null or ($f.status | IN("fixed", "dismissed")) then $f
+                  else $f + {status: $u.status} end))
+              + [$m[] | select(.id as $i | $known | index($i) | not)]
+          ' 2>/dev/null || true)
+          if [ -z "$merged" ]; then merged="$OLD_FINDINGS"; fi
+
+          # Defensive supplements built from the finding blocks themselves,
+          # so a malformed model ledger cannot lose this round: kept
+          # findings enter as open, verifier-dropped ones as dismissed.
+          kept_json=$(awk '
+            /^===FINDING / { id = $2; sub(/=+$/, "", id); getline s; printf "%s\t%s\n", id, s }
+          ' kept.txt 2>/dev/null \
+            | jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
+                        | {id: .[0], summary: ((.[1:] | join(" "))[0:200]), status: "open"})' 2>/dev/null || true)
+          if [ -z "$kept_json" ]; then kept_json='[]'; fi
+          dropped_json=$(awk -v list="$DROPPED_IDS" '
+            BEGIN { n = split(list, a, ","); for (i = 1; i <= n; i++) if (a[i] != "") d[a[i]] = 1 }
+            /^===FINDING / { id = $2; sub(/=+$/, "", id); if (id in d) { getline s; printf "%s\t%s\n", id, s } }
+          ' review_body.txt 2>/dev/null \
+            | jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
+                        | {id: .[0], summary: ((.[1:] | join(" "))[0:200]), status: "dismissed"})' 2>/dev/null || true)
+          if [ -z "$dropped_json" ]; then dropped_json='[]'; fi
+
+          FINAL_FINDINGS=$(jq -n -c --argjson base "$merged" \
+              --argjson kept "$kept_json" --argjson dropped "$dropped_json" '
+            ($base | map(.id)) as $ids
+            | [$dropped[].id] as $droppedids
+            | ($base
+               + [$kept[] | select(.id as $i | $ids | index($i) | not)]
+               + [$dropped[] | select(.id as $i | $ids | index($i) | not)])
+            | map(. as $f
+                  | if ($droppedids | index($f.id)) and $f.status == "open"
+                    then $f + {status: "dismissed"} else $f end)
+            | map(.summary |= (tostring | .[0:200]))
+            | .[-50:]
+          ' 2>/dev/null || true)
+          if [ -z "$FINAL_FINDINGS" ]; then FINAL_FINDINGS="$merged"; fi
+
+          LEDGER_B64=$(jq -n -c --argjson f "$FINAL_FINDINGS" --argjson r "$ROUND" --arg sha "$HEAD_SHA" \
+            '{schema: 1, rounds: $r, last_sha: $sha, findings: $f}' 2>/dev/null | base64 -w0 || true)
+
+          # ---------- Compose and post the sticky comment ----------
           {
+            echo "<!-- ai-review-sticky -->"
             echo "### AI review (${MODEL})"
             echo
-            printf '%s\n' "$review"
+            if [ "$DELTA_MODE" = "1" ]; then
+              echo "_Scope: new commits since \`${LAST_SHA:0:7}\` (full PR diff supplied to the model as context)._"
+            else
+              echo "_Scope: full PR diff._"
+            fi
             echo
-            echo "<sub>Advisory first-pass review generated by ai-review.yml — verify findings before acting.</sub>"
+            cat rendered.md
+            echo
+            if [ "$FINAL_FINDINGS" != "[]" ]; then
+              echo "<details><summary>Findings ledger (all rounds)</summary>"
+              echo
+              printf '%s' "$FINAL_FINDINGS" \
+                | jq -r '.[] | "- **\(.id)** [\(.status)] — \(.summary)"' 2>/dev/null || true
+              echo
+              echo "</details>"
+              echo
+            fi
+            if [ -n "$VERIFIER_NOTE" ]; then
+              echo "<sub>${VERIFIER_NOTE}</sub>"
+              echo
+            fi
+            if [ -n "$LEDGER_B64" ]; then
+              echo "<!-- ai-review-ledger-v1: $LEDGER_B64 -->"
+            fi
+            echo "<sub>Advisory per-push review (round ${ROUND}) generated by ai-review.yml — verify findings before acting.</sub>"
           } > comment.md
-          gh pr comment "$PR" --body-file comment.md \
-            || echo "::warning::failed to post AI review comment"
+
+          if [ -n "$COMMENT_ID" ]; then
+            # Update in place; if the old comment was deleted meanwhile, fall
+            # back to creating a fresh one.
+            gh api --method PATCH "repos/$GH_REPO/issues/comments/$COMMENT_ID" \
+                -F body=@comment.md >/dev/null 2>&1 \
+              || gh pr comment "$PR" --body-file comment.md \
+              || echo "::warning::failed to post AI review comment"
+          else
+            gh pr comment "$PR" --body-file comment.md \
+              || echo "::warning::failed to post AI review comment"
+          fi
