@@ -107,15 +107,31 @@ def _classify(msg: Any) -> str:
     return "invalid"
 
 
-def _error_body(message: str, req_id: Any = None) -> str:
-    """Build a JSON-RPC error response line (-32000 server error)."""
-    return json.dumps(
-        {
-            "jsonrpc": "2.0",
-            "error": {"code": -32000, "message": message},
-            "id": req_id,
-        }
-    )
+def _error_body(
+    message: str, req_id: Any = None, *, code: int = -32000, data: Any = None
+) -> str:
+    """Build a JSON-RPC error response line.
+
+    ``code`` defaults to ``-32000`` — the implementation-defined
+    server-error range — so every pre-existing call site keeps emitting
+    byte-identical bytes, which is what lets #270 Phase 3 P3-A widen the
+    MODERN path's codes without touching a single legacy rejection (AC2,
+    and the P3-0 pin suite is the judge).
+
+    ``data`` is attached as the optional ``error.data`` member (JSON-RPC
+    2.0 §5.1) when not None — INSIDE the error object, not beside it.
+    Spec rev 2026-07-28 makes it mandatory on exactly one code:
+    ``-32022 UnsupportedProtocolVersion`` must carry the versions the
+    server does support, so a client can renegotiate instead of guessing.
+
+    Deliberately NOT relay's ``_error_response``: that one is
+    line-oriented for the stdio wire and carries its own defaults. Same
+    shape, different transport, no import.
+    """
+    error: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    return json.dumps({"jsonrpc": "2.0", "error": error, "id": req_id})
 
 
 class _DuplicateInFlightId(Exception):
