@@ -47,4 +47,11 @@ jobs:
           "
 
       - name: Integration tests
-        run: pytest tests_integration/ -v
+        # `-s` (no capture) on purpose: scenario 6 measures and prints how
+        # long the reference peer took to turn the relay's aborted POST into
+        # a cancellation, and that number differs by an order of magnitude
+        # between platforms (see the comment at that wait). Captured output
+        # is only shown for FAILING tests, so without `-s` the healthy value
+        # never reaches the log and a slow drift toward the timeout would be
+        # invisible until the day it goes red.
+        run: pytest tests_integration/ -v -s

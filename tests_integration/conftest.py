@@ -7,9 +7,15 @@
    `expect_*(..., timeout=)` helpers.
 3. Every test carries a pytest-timeout budget (default 30 s, injected by
    `pytest_collection_modifyitems`; override per test with
-   `@pytest.mark.timeout(N)` only downward-justified in a comment).
+   `@pytest.mark.timeout(N)` only when a comment justifies the number).
    Deadline hierarchy: per-step expect timeout (default 5 s)
    < per-test timeout (30 s) < CI job `timeout-minutes: 10`.
+   One test raises its budget rather than lowering it: scenario 6 must
+   outwait the reference peer's 15 s SSE keep-alive interval, because on
+   Linux a closed connection is not observed until the server's next write
+   (see the comment at that wait). A raised budget still has to stay well
+   under the job timeout, and the number must be justified by a measured
+   mechanism, never by tuning until green.
 4. Assert on observed events (a message arrived, a flag flipped, a process
    exited), never on elapsed wall-clock time.
 5. Negative assertions ("nothing arrived") are allowed ONLY where a comment

@@ -10,6 +10,10 @@ precedent), never a quiet adjustment inside a scenario.
 
 from __future__ import annotations
 
+import time
+
+import pytest
+
 from . import _reference_server
 from .conftest import wait_until
 
@@ -247,6 +251,11 @@ def test_listen_graceful_end_does_not_reconnect(dedicated_server, relay_factory)
     )
 
 
+# Above the injected 30 s default (rule 3), not below it: the wait inside
+# this test must be allowed to exceed the reference peer's 15 s
+# `_SSE_PING_INTERVAL` — see the comment on that wait — and a 30 s wait
+# inside a 30 s per-test budget would race.
+@pytest.mark.timeout(90)
 def test_cancel_aborts_the_in_flight_post(dedicated_server, relay_factory):
     """Scenario 6 — PR D (#362): disconnect-as-cancellation, end to end.
 
@@ -291,9 +300,22 @@ def test_cancel_aborts_the_in_flight_post(dedicated_server, relay_factory):
     assert progress["params"]["progressToken"] == "harness/cancel"
     client.notify("notifications/cancelled", {"requestId": call_id})
 
+    # 40 s, and the number is measured rather than tuned. On ubuntu the
+    # server does NOT see the closed connection promptly: it has paused
+    # reading while it owns an open SSE response, so the client's FIN is not
+    # observed until uvicorn next tries to WRITE — and this tool emits
+    # nothing after its progress report, so the next write is the SSE
+    # keep-alive at `_SSE_PING_INTERVAL` (15 s). A budget under that interval
+    # cannot pass on Linux however healthy the relay is; the first CI run
+    # failed here at 10 s with `relay aborted the POST: True` in the log.
+    # macOS surfaces the same disconnect in well under a second, so this is a
+    # platform property of the peer, not of the relay. 40 s clears two ping
+    # intervals; the observed latency is printed below so a regression shows
+    # up as a NUMBER in CI rather than as a pass.
+    started = time.monotonic()
     wait_until(
         harness.cancelled.is_set,
-        timeout=10.0,
+        timeout=40.0,
         what="the reference peer's tool to observe anyio cancellation",
         # On failure the FIRST question is whether the relay aborted at all.
         # "cancelling id N: closing the in-flight upstream POST" present means
@@ -304,6 +326,9 @@ def test_cancel_aborts_the_in_flight_post(dedicated_server, relay_factory):
             f"\nrelay stderr tail:\n{client.stderr.tail()}"
         ),
     )
+    # Diagnostic only — rule 4 forbids ASSERTING on elapsed time, not
+    # recording it. Visible under `pytest -v`, which is how CI runs.
+    print(f"\ncancellation observed after {time.monotonic() - started:.2f}s")
 
     # Bounded quiescence (rule 5), justified by the PR D record: a cancelled
     # id must never produce a late response on stdout — the cancel tracker
