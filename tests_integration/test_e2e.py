@@ -211,6 +211,7 @@ def test_listen_graceful_end_does_not_reconnect(dedicated_server, relay_factory)
         lambda: client.stderr.contains("closed gracefully"),
         timeout=10.0,
         what="the relay to recognize the graceful end",
+        diagnose=lambda: f"relay stderr tail:\n{client.stderr.tail()}",
     )
 
     # Clear the decks BEFORE the quiescence check, or it is unsound. Two
@@ -294,6 +295,14 @@ def test_cancel_aborts_the_in_flight_post(dedicated_server, relay_factory):
         harness.cancelled.is_set,
         timeout=10.0,
         what="the reference peer's tool to observe anyio cancellation",
+        # On failure the FIRST question is whether the relay aborted at all.
+        # "cancelling id N: closing the in-flight upstream POST" present means
+        # the relay did its job and the disconnect did not become a
+        # cancellation server-side; absent means the relay never acted.
+        diagnose=lambda: (
+            f"relay aborted the POST: {client.stderr.contains('closing the in-flight')}"
+            f"\nrelay stderr tail:\n{client.stderr.tail()}"
+        ),
     )
 
     # Bounded quiescence (rule 5), justified by the PR D record: a cancelled

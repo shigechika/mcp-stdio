@@ -89,17 +89,33 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 
 
 def wait_until(
-    predicate: Callable[[], bool], timeout: float, what: str = "condition"
+    predicate: Callable[[], bool],
+    timeout: float,
+    what: str = "condition",
+    diagnose: Callable[[], str] | None = None,
 ) -> None:
     """Block until `predicate()` is true, or fail the test (rules 1 + 2).
 
     The single permitted sleep in the suite lives here. Callers assert on
     the OBSERVED state afterwards (rule 4); this only bounds the wait.
+
+    `diagnose` is called ONLY on timeout and its text is appended to the
+    error. Without it a timeout here says just "it did not happen", which is
+    the least useful sentence in a CI log — `StdioClient.expect_*` already
+    dumps the relay's stderr tail on failure, and a wait on a SERVER-side
+    condition needs the same, because the interesting question is almost
+    always what the relay did (or did not) do first.
     """
     deadline = time.monotonic() + timeout
     while not predicate():
         if time.monotonic() > deadline:
-            raise TimeoutError(f"timed out after {timeout}s waiting for {what}")
+            extra = ""
+            if diagnose is not None:
+                try:
+                    extra = f"\n{diagnose()}"
+                except Exception as exc:  # noqa: BLE001 — diagnostics must not mask
+                    extra = f"\n<diagnose() raised {exc!r}>"
+            raise TimeoutError(f"timed out after {timeout}s waiting for {what}{extra}")
         time.sleep(_POLL_TICK)
 
 
