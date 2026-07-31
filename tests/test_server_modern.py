@@ -186,12 +186,35 @@ class TestRequestEra:
 
 
 class TestMetaRung:
-    def test_non_mapping_meta_is_invalid_params(self, gateway):
+    def test_non_mapping_meta_on_an_ordinary_method_stays_legacy(self, gateway):
+        """`_meta: "..."` is not modern evidence — no protocolVersion key
+        can be read out of a string — so the predicate classifies legacy
+        and the ladder never sees it. Pinned so the boundary is explicit
+        rather than incidental, and named for what it asserts."""
         body = _modern_body(meta=None, params={"_meta": "not-an-object"})
-        # `_meta` is a string, so the predicate reads no protocolVersion
-        # key and this is LEGACY — the ladder never sees it. Pinned so the
-        # boundary is explicit rather than incidental.
         _assert_rejected(_post(gateway, body), LEGACY_ERROR)
+
+    def test_non_mapping_meta_on_discover_is_invalid_params(self, gateway):
+        """The ONLY live path into rung 1's non-mapping branch — and the
+        reason that branch is not dead code.
+
+        The era predicate returns "modern" for `server/discover` BEFORE it
+        looks at `params`, so a discover whose `_meta` is a string reaches
+        rung 1 and is rejected there. For every other method a non-mapping
+        `_meta` classifies legacy (the test above), which is why this
+        branch looks unreachable until you follow the discover arm.
+        Without this test a reviewer marks it `# pragma: no cover` by
+        analogy with rung 3, or P3-B deletes it, and a malformed discover
+        then falls somewhere nobody chose.
+        """
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": {"_meta": "not-an-object"},
+        }
+        error = _assert_rejected(_post(gateway, body), INVALID_PARAMS)
+        assert META_VERSION in error["message"]
 
     def test_missing_client_capabilities_is_invalid_params(self, gateway):
         body = _modern_body(meta=_meta(caps=False))
