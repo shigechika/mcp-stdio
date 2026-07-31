@@ -3455,7 +3455,9 @@ def _cold_start_loop(
 # ``_handle_listen_message``, parameterized rather than forked, so the
 # hard-won reconnect/terminal/ack arms cannot drift apart; the resource
 # stream's extras are its own id prefix (``_LISTEN_RES_ID_PREFIX``), a
-# per-attempt body provider, a ``restart`` event, and the
+# per-attempt body provider (whose notification filter asks for
+# ``resourceSubscriptions`` and nothing else — Design A9), a ``restart``
+# event, and the
 # ``state["resource_stream"]`` role flag that keeps the two streams from
 # both forwarding the same ``list_changed`` (see
 # ``_handle_listen_message``).
@@ -3482,20 +3484,43 @@ _LISTEN_ID_PREFIX = f"{_RELAY_ID_NAMESPACE}listen/"
 # never mistake each other's graceful-end signals for their own
 # (``_handle_listen_message`` compares the attempt id by exact value).
 _LISTEN_RES_ID_PREFIX = f"{_RELAY_ID_NAMESPACE}listen-res/"
-# The notification kinds requested on every listen POST: all three
-# list_changed booleans. Also the
+# The notification filter of the LIST_CHANGED stream's listen POST: all
+# three list_changed booleans. Also the
 # reference set the ack's honored subset is compared against.
 # DELIBERATELY broader than what may be forwarded (#352 round-3 finding
-# 2): over-requesting is spec-safe (the server merely sends kinds the
-# relay may then drop), and three distinct layers do three distinct jobs
+# 2): over-requesting these three is spec-safe (the server merely sends
+# kinds the relay may then drop), and three distinct layers do three
+# distinct jobs
 # — this REQUEST filter over-asks, the server's ack narrows what ARRIVES,
 # and the advertised-family set frozen at seed time
 # (``_listen_advertised_families``) gates what the relay FORWARDS.
+#
+# The RESOURCE stream (#270 Phase 2 PR B) does NOT reuse this filter: it
+# requests ``resourceSubscriptions`` and nothing else (Design A9, see
+# ``_with_resource_subscriptions``). "The server MUST NOT send
+# notification types the client has not explicitly requested", so asking
+# each stream for exactly what it consumes is both the narrowest reading
+# and the only way two concurrent streams cannot be sent — and forward —
+# the same ``list_changed`` twice.
 _LISTEN_REQUESTED_NOTIFICATIONS = {
     "toolsListChanged": True,
     "promptsListChanged": True,
     "resourcesListChanged": True,
 }
+# Field name of the resource-subscription filter, INSIDE the
+# ``notifications`` object of both the request and the acknowledgement
+# (Design A9). The spec's Notification Filter table lists
+# ``resourceSubscriptions: string[]`` as the fourth field of that filter,
+# beside the three listChanged booleans, and its verbatim
+# ``subscriptions/listen`` example nests it there — as does the
+# acknowledgement example (``params.notifications.resourceSubscriptions``).
+# Named once so the request builder and both echo readers cannot drift:
+# a top-level placement is not an ERROR on a compliant server, it is
+# silently IGNORED (the reference SDK models the filter with
+# ``extra="ignore"``), which would leave the relay subscribed to nothing
+# while every URI read back as unhonored — two silent no-ops that cancel
+# out into "no updates, no diagnosis".
+_LISTEN_RESOURCE_SUBSCRIPTIONS_KEY = "resourceSubscriptions"
 # The only methods a listen stream may forward downstream (whitelist
 # semantics — everything else, including the ack, the terminal result and
 # ``notifications/cancelled``, is relay-internal and swallowed). Same
@@ -3600,14 +3625,15 @@ def _build_listen_params(modern_state: "_ModernState") -> dict[str, Any]:
     are deep-copied so later mutations of ``modern_state`` can never reach
     the frozen snapshot.
 
-    ``resourceSubscriptions`` is NOT built here (#270 Phase 2 PR B). The
-    resource stream's URI list must be CURRENT on every attempt — "the
-    client MUST re-send the request with the updated filter" is the only
-    way to change it — while everything this function builds must stay
-    FROZEN, so the two cannot come from one call. The resource stream
-    therefore seeds its base body here exactly like the list_changed
-    stream (base change 4: "version pinned as PR A") and overlays the
-    live URI set per attempt in ``_with_resource_subscriptions``.
+    The ``notifications`` filter built here is the LIST_CHANGED stream's
+    (#270 Phase 2 PR B): three booleans and no
+    ``resourceSubscriptions``. The resource stream shares this function
+    for ``_meta`` — its version must be pinned identically (base change
+    4: "version pinned as PR A") — and then REPLACES the filter per
+    attempt in ``_with_resource_subscriptions``, because its URI list
+    must be CURRENT on every attempt ("To modify the subscription
+    filter, the client MUST send a new subscriptions/listen request")
+    while everything else here must stay FROZEN. One call cannot be both.
     """
     meta: dict[str, Any] = {
         _META_PROTOCOL_VERSION: (
@@ -3627,7 +3653,7 @@ def _build_listen_params(modern_state: "_ModernState") -> dict[str, Any]:
 def _with_resource_subscriptions(
     params: dict[str, Any], uris: frozenset[str]
 ) -> dict[str, Any]:
-    """Overlay the CURRENT resource URI set onto a frozen listen body.
+    """The resource stream's per-attempt body: frozen ``_meta``, live URIs.
 
     #270 Phase 2 PR B, base changes 2 and 4 ("snapshot-per-open body, not
     frozen ... C1 stays frozen only on the listChanged stream"). Spec rev
@@ -3637,12 +3663,29 @@ def _with_resource_subscriptions(
     the CURRENT filter — so the resource stream rebuilds its body per
     attempt.
 
-    Only ``resourceSubscriptions`` is rebuilt. ``_meta`` and
-    ``notifications`` are carried over from the frozen
-    ``_build_listen_params`` snapshot BY REFERENCE (never mutated: the
-    return value is a fresh dict), because ``_listen_stream_loop`` pins
-    every attempt's ``MCP-Protocol-Version`` header to the version inside
-    that frozen ``_meta`` (#352 review finding 2). Re-deriving ``_meta``
+    PLACEMENT (Design A9, spec-verified): ``resourceSubscriptions`` is a
+    field of the ``notifications`` FILTER OBJECT, not a sibling of it.
+    The Notification Filter table lists it as that object's fourth field
+    (``resourceSubscriptions: string[]``) beside the three listChanged
+    booleans, and the spec's own ``subscriptions/listen`` example nests
+    it there. Getting this wrong is not a visible failure: a compliant
+    server ignores unknown top-level params keys, so the relay would
+    subscribe to nothing, receive nothing, and read every URI back as
+    unhonored — a silent no-op that only a wire-shape assertion catches.
+
+    The filter is REPLACED, not merged: this stream requests
+    ``resourceSubscriptions`` and NOTHING else. "The server MUST NOT
+    send notification types the client has not explicitly requested", so
+    each of the two concurrent streams asks for exactly what it
+    consumes — the list_changed kinds are the first stream's job, and
+    requesting them here would invite the server to send (and this relay
+    to have to drop) every one of them twice.
+
+    ``_meta`` is carried over from the frozen ``_build_listen_params``
+    snapshot BY REFERENCE (never mutated: every level of the return
+    value is a fresh dict), because ``_listen_stream_loop`` pins every
+    attempt's ``MCP-Protocol-Version`` header to the version inside that
+    frozen ``_meta`` (#352 review finding 2). Re-deriving ``_meta``
     from the live ``modern_state`` would let a client-driven
     re-``initialize`` renegotiate the body version out from under the
     pinned header — a HeaderMismatch (-32020) on a compliant server,
@@ -3653,7 +3696,28 @@ def _with_resource_subscriptions(
     generation counter the only thing that decides whether a reopen is
     needed, and makes the wire bytes reproducible in tests.
     """
-    return {**params, "resourceSubscriptions": sorted(uris)}
+    return {
+        **params,
+        "notifications": {_LISTEN_RESOURCE_SUBSCRIPTIONS_KEY: sorted(uris)},
+    }
+
+
+def _listen_resource_subscriptions(params: Any) -> Any:
+    """``params.notifications.resourceSubscriptions``, or ``None``.
+
+    ONE reader for both directions (Design A9), because the field sits at
+    the same nested path in a ``subscriptions/listen`` REQUEST and in the
+    ``notifications/subscriptions/acknowledged`` echo — so what the relay
+    asked for and what the server honored can never be read from
+    different places. Returned RAW: base change 5's defensive reading
+    ("an absent field means the feature is unsupported, not everything
+    honored") belongs to the caller, and a non-object ``notifications``
+    reads the same way as an absent one.
+    """
+    notifications = params.get("notifications") if isinstance(params, dict) else None
+    if not isinstance(notifications, dict):
+        return None
+    return notifications.get(_LISTEN_RESOURCE_SUBSCRIPTIONS_KEY)
 
 
 def _strip_listen_subscription_id(msg: dict[str, Any]) -> dict[str, Any]:
@@ -3783,23 +3847,23 @@ def _handle_listen_message(
             state["honored"] = honored
             # The honored-subset echo for resource subscriptions (#270
             # Phase 2 PR B, base change 5): "the server MUST include the
-            # subscriptions it has honored". Recorded RAW — the absent
+            # subscriptions it has honored". Read from INSIDE the
+            # ``notifications`` filter — the same nested path the REQUEST
+            # uses (Design A9) — through the one shared reader, so what
+            # was asked and what was honored cannot be read from
+            # different places. Recorded RAW: the absent
             # field is recorded as None and read as "nothing honored"
             # (feature unsupported) by the forwarding gate below, which is
             # the defensive reading base change 5 mandates: the spec only
             # defines type-level omission, so a per-URI narrowing is not
             # something the relay may assume away. Overwritten by every
             # reconnect's fresh ack, exactly like ``honored``.
-            state["honored_resources"] = (
-                params.get("resourceSubscriptions")
-                if isinstance(params, dict)
-                else None
-            )
-        # The resource stream over-requests all three list_changed kinds
-        # (it reuses the frozen body) but FORWARDS none of them — the
-        # list_changed stream owns those. A compliant server therefore
-        # honors none, which is not news worth a stderr line on every
-        # reopen, and reopens happen on every subscribe.
+            state["honored_resources"] = _listen_resource_subscriptions(params)
+        # The resource stream requests ONLY resourceSubscriptions (Design
+        # A9), so its ack legitimately honors none of the three
+        # list_changed booleans this compares against — not news worth a
+        # stderr line on every reopen, and reopens happen on every
+        # subscribe.
         if honored != _LISTEN_REQUESTED_NOTIFICATIONS and not resource_stream:
             log(
                 "listen stream: server honored a subset of the requested "
@@ -3881,16 +3945,17 @@ def _handle_listen_message(
         # carrier keeps the permissive behavior like the advertised gate.
         #
         # #270 Phase 2 PR B: with TWO concurrent listen streams up, only
-        # the list_changed stream may forward these. Both streams request
-        # all three kinds (the resource stream reuses the same frozen
-        # body), so a server that honors them on both would otherwise put
-        # every list_changed on stdout TWICE — and the resource stream
-        # reopens on every subscribe, multiplying it further. Narrowing
-        # here rather than by requesting fewer kinds upstream follows the
-        # rule ``_LISTEN_REQUESTED_NOTIFICATIONS`` already states: over-
-        # requesting is spec-safe, and the forwarding layer is where the
-        # relay narrows. An unseeded carrier (``state`` is None, direct
-        # callers in tests) keeps the permissive pre-PR-B behavior.
+        # the list_changed stream may forward these. The primary defense
+        # is on the REQUEST side — the resource stream's filter asks for
+        # ``resourceSubscriptions`` and nothing else (Design A9), and
+        # "the server MUST NOT send notification types the client has not
+        # explicitly requested" — so a compliant server never sends a
+        # list_changed on that stream at all. This gate is the second
+        # layer, for the server that sends one anyway: forwarding it would
+        # put every list_changed on stdout TWICE, and the resource stream
+        # reopens on every subscribe, which would multiply it further. An
+        # unseeded carrier (``state`` is None, direct callers in tests)
+        # keeps the permissive pre-PR-B behavior.
         advertised = state.get("advertised") if state is not None else None
         honored = state.get("honored") if state is not None else None
         resource_stream = bool(state.get("resource_stream")) if state else False
@@ -4115,7 +4180,10 @@ def _log_unhonored_subscriptions(
     """
     if state is None:
         return
-    requested = attempt_params.get("resourceSubscriptions")
+    # Same nested reader as the ack echo (Design A9): comparing a request
+    # read one way against an echo read another is how a placement bug
+    # hides as "the server honored nothing".
+    requested = _listen_resource_subscriptions(attempt_params)
     if not requested:
         return
     honored = state.get("honored_resources")
@@ -4259,7 +4327,10 @@ def _listen_stream_loop(
       returns ``(params, generation)``. There is no in-band way to change
       a live subscription filter, so a changed URI set means a new
       request — the loop simply re-opens with what the provider now
-      returns. ``None`` keeps the frozen ``params`` of PR A (C1).
+      returns. The body it returns carries a
+      ``resourceSubscriptions``-ONLY notification filter (Design A9), so
+      a compliant server sends this stream no ``list_changed`` at all.
+      ``None`` keeps the frozen ``params`` of PR A (C1).
       ``params`` is still required either way: the ``MCP-Protocol-Version``
       pin below reads its frozen ``_meta``, which the provider's overlay
       preserves (``_with_resource_subscriptions``).
@@ -4327,10 +4398,12 @@ def _listen_stream_loop(
         attempt_params = params
         if body_provider is not None:
             attempt_params, generation = body_provider()
-            if not attempt_params.get("resourceSubscriptions"):
-                # Nothing subscribed: park rather than POST a filter-less
-                # request, which would only duplicate the list_changed
-                # stream. Woken by the stdin thread's next subscribe — or
+            if not _listen_resource_subscriptions(attempt_params):
+                # Nothing subscribed: park rather than POST a listen whose
+                # filter requests nothing at all (Design A9 — this stream
+                # asks for `resourceSubscriptions` and nothing else, so an
+                # empty set leaves it with no reason to exist). Woken by
+                # the stdin thread's next subscribe — or
                 # by teardown, which sets `restart` AFTER `stop` precisely
                 # so this wait cannot outlive run() (Design A4); an
                 # `Event.wait()` is deaf to both `stop.set()` and the
@@ -6687,11 +6760,13 @@ def run(
         ``listChanged`` never guarantees), never a forwarded notification
         for an unadvertised one.
 
-        Both streams seed from the SAME call (#270 Phase 2 PR B): the
-        resource stream's ``_meta``/``notifications`` must stay frozen
-        for the version pin (#352 review finding 2) and only its
-        ``resourceSubscriptions`` is rebuilt per attempt, so there is one
-        snapshot and one advertised set, never two that can drift.
+        Both streams seed from the SAME call (#270 Phase 2 PR B) for the
+        ``_meta`` half, which must stay frozen for the version pin (#352
+        review finding 2) and identical on both. Their ``notifications``
+        FILTERS differ and always did: the resource stream replaces it
+        per attempt with a ``resourceSubscriptions``-only filter (Design
+        A9, ``_with_resource_subscriptions``). One snapshot and one
+        advertised set, so neither can drift.
         """
         if listen_stream.thread is not None:
             return
@@ -6775,10 +6850,10 @@ def run(
     def _resource_listen_body() -> tuple[dict[str, Any], int]:
         """This attempt's body plus the generation it was built from.
 
-        Design A8. The frozen ``_meta``/``notifications`` of the seeded
-        snapshot with the CURRENT URI set overlaid — see
-        ``_with_resource_subscriptions`` for why ``_meta`` must not be
-        re-derived here.
+        Design A8. The seeded snapshot's FROZEN ``_meta`` (see
+        ``_with_resource_subscriptions`` for why it must not be
+        re-derived here) plus a fresh ``resourceSubscriptions``-only
+        notification filter carrying the CURRENT URI set (Design A9).
         """
         uris, generation = subscriptions.snapshot()
         return _with_resource_subscriptions(res_stream.params or {}, uris), generation

@@ -13355,14 +13355,31 @@ class TestRunModernEra:
         res = [b for b in posted if b["id"].startswith(_LISTEN_RES_ID_PREFIX)]
         plain = [b for b in posted if b["id"].startswith(_LISTEN_ID_PREFIX)]
         assert len(res) == 1
-        assert res[0]["params"]["resourceSubscriptions"] == ["file:///b.txt"]
+        # Design A9, end-to-end wire-shape pin: the field belongs TO the
+        # `notifications` filter, never beside it. A top-level placement
+        # is not an error on a compliant server — it is silently ignored
+        # (the reference SDK models the filter with `extra="ignore"`), so
+        # only an assertion on the serialized body can catch a regression.
+        assert res[0]["params"]["notifications"] == {
+            "resourceSubscriptions": ["file:///b.txt"]
+        }
+        assert "resourceSubscriptions" not in res[0]["params"]
         # The two prefixes are DISTINCT and both derived, so the streams
         # can never mistake each other's graceful-end signals and the
         # #356 intake rejection covers both for free.
         assert _LISTEN_RES_ID_PREFIX.startswith(_RELAY_ID_NAMESPACE)
         assert _LISTEN_RES_ID_PREFIX != _LISTEN_ID_PREFIX
-        # PR A's stream is untouched by PR B (base change 1).
-        assert plain and all("resourceSubscriptions" not in b["params"] for b in plain)
+        # PR A's stream is untouched by PR B (base change 1): the three
+        # listChanged booleans, and no resourceSubscriptions at either
+        # level.
+        assert plain
+        for body in plain:
+            assert body["params"]["notifications"] == {
+                "toolsListChanged": True,
+                "promptsListChanged": True,
+                "resourcesListChanged": True,
+            }
+            assert "resourceSubscriptions" not in body["params"]
 
     def test_rapid_subscribes_coalesce_into_two_opens(self, httpx_mock):
         """Base change 6 (generation coalescing, no timers): five
@@ -13382,11 +13399,11 @@ class TestRunModernEra:
             if provider is None:  # the list_changed stream
                 assert kwargs["stop"].wait(timeout=5)
                 return
-            snapshots.append(provider()[0]["resourceSubscriptions"])
+            snapshots.append(provider()[0]["notifications"]["resourceSubscriptions"])
             opened.set()
             assert release.wait(timeout=5)
             kwargs["restart"].clear()
-            snapshots.append(provider()[0]["resourceSubscriptions"])
+            snapshots.append(provider()[0]["notifications"]["resourceSubscriptions"])
             done.set()
             assert kwargs["stop"].wait(timeout=5)
 
@@ -13479,7 +13496,7 @@ class TestRunModernEra:
         def stub_loop(**kwargs):
             provider = kwargs.get("body_provider")
             if provider is not None:
-                first["uris"] = provider()[0]["resourceSubscriptions"]
+                first["filter"] = provider()[0]["notifications"]
             assert kwargs["stop"].wait(timeout=5)
 
         with patch("mcp_stdio.relay._listen_stream_loop", stub_loop):
@@ -13492,7 +13509,7 @@ class TestRunModernEra:
                 ],
                 protocol_era="modern",
             )
-        assert first["uris"] == ["file:///early"]
+        assert first["filter"] == {"resourceSubscriptions": ["file:///early"]}
 
     def test_subscribe_with_a_reserved_id_falls_through_to_the_intake_guard(
         self, httpx_mock
@@ -16794,30 +16811,58 @@ class TestResourceSubscriptions:
 
 
 class TestWithResourceSubscriptions:
-    def test_overlays_sorted_uris_and_reuses_the_frozen_meta(self):
-        """Base changes 2/4: only `resourceSubscriptions` is rebuilt per
-        attempt. `_meta` is carried over from the FROZEN snapshot because
-        `_listen_stream_loop` pins every attempt's MCP-Protocol-Version
-        header to the version inside it (#352 review finding 2) — a
-        re-derived `_meta` could renegotiate the body version out from
-        under the pinned header and earn a terminal -32020."""
+    LIST_CHANGED_FILTER = {
+        "toolsListChanged": True,
+        "promptsListChanged": True,
+        "resourcesListChanged": True,
+    }
+
+    def _base(self):
         state = _ModernState()
         state.negotiated_version = "2026-07-28"
-        base = _build_listen_params(state)
-        overlaid = _with_resource_subscriptions(base, frozenset({"b", "a"}))
-        assert overlaid["resourceSubscriptions"] == ["a", "b"]
+        return _build_listen_params(state)
+
+    def test_subscriptions_are_nested_inside_the_notifications_filter(self):
+        """Design A9, the shape pin. The spec's Notification Filter table
+        lists `resourceSubscriptions: string[]` as a FIELD of the
+        `notifications` object — its own `subscriptions/listen` example
+        nests it there, and so does the acknowledgement example. A
+        top-level placement is not rejected by a compliant server, it is
+        silently IGNORED, which would leave the relay subscribed to
+        nothing while reading every URI back as unhonored: two silent
+        no-ops that cancel out into "no updates, no diagnosis"."""
+        overlaid = _with_resource_subscriptions(self._base(), frozenset({"b", "a"}))
+        assert overlaid["notifications"] == {"resourceSubscriptions": ["a", "b"]}
+        assert "resourceSubscriptions" not in overlaid
+
+    def test_the_filter_is_replaced_not_merged(self):
+        """Design A9's second half: this stream requests
+        `resourceSubscriptions` and NOTHING else. "The server MUST NOT
+        send notification types the client has not explicitly requested",
+        so asking for the list_changed kinds here would invite the server
+        to send — and this relay to have to drop — every one of them
+        twice, once per concurrent stream."""
+        base = self._base()
+        assert base["notifications"] == self.LIST_CHANGED_FILTER
+        overlaid = _with_resource_subscriptions(base, frozenset({"a"}))
+        assert set(overlaid["notifications"]) == {"resourceSubscriptions"}
+
+    def test_frozen_meta_is_reused_by_reference_and_the_base_untouched(self):
+        """Base changes 2/4: `_meta` is carried over from the FROZEN
+        snapshot because `_listen_stream_loop` pins every attempt's
+        MCP-Protocol-Version header to the version inside it (#352 review
+        finding 2) — a re-derived `_meta` could renegotiate the body
+        version out from under the pinned header and earn a terminal
+        -32020."""
+        base = self._base()
+        overlaid = _with_resource_subscriptions(base, frozenset({"a"}))
         assert overlaid["_meta"] is base["_meta"]
-        assert overlaid["notifications"] == base["notifications"]
         # The frozen snapshot itself is never mutated.
-        assert "resourceSubscriptions" not in base
+        assert base["notifications"] == self.LIST_CHANGED_FILTER
 
     def test_empty_set_produces_an_empty_list(self):
-        state = _ModernState()
-        state.negotiated_version = "2026-07-28"
-        overlaid = _with_resource_subscriptions(
-            _build_listen_params(state), frozenset()
-        )
-        assert overlaid["resourceSubscriptions"] == []
+        overlaid = _with_resource_subscriptions(self._base(), frozenset())
+        assert overlaid["notifications"] == {"resourceSubscriptions": []}
 
 
 class TestConsumeRestart:
@@ -17081,8 +17126,7 @@ class TestHandleListenResourceUpdated:
                 "jsonrpc": "2.0",
                 "method": "notifications/subscriptions/acknowledged",
                 "params": {
-                    "notifications": {},
-                    "resourceSubscriptions": [self.URI],
+                    "notifications": {"resourceSubscriptions": [self.URI]},
                 },
             }
         )
@@ -17194,13 +17238,17 @@ class TestResourceListenStreamLoop:
         )
 
     def _ack(self, honored=None, resources=None):
-        params = {"notifications": honored if honored is not None else {}}
+        """The acknowledgement, with the honored subscriptions nested
+        INSIDE the `notifications` filter exactly as the spec's own
+        example shows (`params.notifications.resourceSubscriptions`,
+        Design A9)."""
+        notifications = dict(honored) if honored is not None else {}
         if resources is not None:
-            params["resourceSubscriptions"] = resources
+            notifications["resourceSubscriptions"] = resources
         return {
             "jsonrpc": "2.0",
             "method": "notifications/subscriptions/acknowledged",
-            "params": params,
+            "params": {"notifications": notifications},
         }
 
     def _graceful(self, attempt=1):
@@ -17281,10 +17329,14 @@ class TestResourceListenStreamLoop:
         self._run_loop(uris=[["file:///b", "file:///a"]])
         body = json.loads(httpx_mock.get_requests()[0].content)
         assert body["id"] == f"{_LISTEN_RES_ID_PREFIX}1"
-        assert body["params"]["resourceSubscriptions"] == ["file:///a", "file:///b"]
-        assert body["params"]["notifications"] == _build_listen_params(
-            _ModernState()
-        ).get("notifications")
+        # Design A9 wire-shape pin: INSIDE the notifications filter, and
+        # the filter carries NOTHING ELSE — the list_changed kinds are the
+        # first stream's job ("The server MUST NOT send notification types
+        # the client has not explicitly requested").
+        assert body["params"]["notifications"] == {
+            "resourceSubscriptions": ["file:///a", "file:///b"]
+        }
+        assert "resourceSubscriptions" not in body["params"]
 
     def test_stale_generation_after_the_ack_reopens_without_a_backoff(self, httpx_mock):
         """Base change 6: the ack is the earliest proof the server has seen
@@ -17315,10 +17367,9 @@ class TestResourceListenStreamLoop:
         )
         requests = httpx_mock.get_requests()
         assert len(requests) == 2
-        assert json.loads(requests[1].content)["params"]["resourceSubscriptions"] == [
-            "file:///a",
-            "file:///b",
-        ]
+        assert json.loads(requests[1].content)["params"]["notifications"] == {
+            "resourceSubscriptions": ["file:///a", "file:///b"]
+        }
         assert stop.waits == []  # no reconnect backoff was ever taken
 
     def test_restart_on_a_dropped_attempt_reopens_even_before_establishment(
