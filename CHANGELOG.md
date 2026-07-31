@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.35.0](https://github.com/shigechika/mcp-stdio/compare/v0.34.1...v0.35.0) (2026-07-31)
+
+
+### Features
+
+* stdin handoff + true cancel abort on the modern era ([#270](https://github.com/shigechika/mcp-stdio/issues/270) Phase 2 PR D) ([#362](https://github.com/shigechika/mcp-stdio/issues/362)) ([203b9c2](https://github.com/shigechika/mcp-stdio/commit/203b9c273cff546b35a9a2109a9f838113f9a5ed))
+
 ## [0.34.1](https://github.com/shigechika/mcp-stdio/compare/v0.34.0...v0.34.1) (2026-07-31)
 
 
