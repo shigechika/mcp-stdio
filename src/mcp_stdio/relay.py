@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import binascii
 import copy
 import email.utils
 import json
@@ -676,7 +675,18 @@ def _decode_mcp_name(value: str | None) -> str | None:
     Three ways to be invalid, all folded into that one outcome:
 
     1. the payload is not valid Base64 (``validate=True``, so characters
-       outside the standard alphabet are rejected rather than discarded);
+       outside the standard alphabet are rejected rather than discarded).
+       Caught as ``ValueError``, NOT the narrower ``binascii.Error``:
+       HTTP headers decode as latin-1, so a header can legitimately hand
+       us a non-ASCII payload, and ``b64decode`` fails such a string at
+       its internal ``s.encode("ascii")`` step — BEFORE the base64
+       decoder runs — with a plain ``ValueError`` that ``binascii.Error``
+       does not cover. Missing that raised straight out of serve's
+       validation ladder and killed the handler thread, so a request with
+       ``Mcp-Name: =?base64?<0xFF>?=`` got NO response at all instead of
+       the ``-32020`` it had earned (#371 review R1F1). ``binascii.Error``
+       is itself a ``ValueError`` subclass, so the wider catch is a
+       superset, not a trade;
     2. the payload is not CANONICAL. ``validate=True`` still accepts
        encodings with non-zero trailing bits, which decode fine but are
        not what ``b64encode`` would produce — so a round-trip check
@@ -700,7 +710,7 @@ def _decode_mcp_name(value: str | None) -> str | None:
     payload = value[len(_BASE64_SENTINEL_PREFIX) : -len(_BASE64_SENTINEL_SUFFIX)]
     try:
         raw = base64.b64decode(payload, validate=True)
-    except binascii.Error:
+    except ValueError:
         return None
     if base64.b64encode(raw).decode("ascii") != payload:
         # Non-canonical encoding (see point 2 above).

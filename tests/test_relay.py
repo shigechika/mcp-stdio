@@ -9645,6 +9645,22 @@ class TestDecodeMcpName:
         payload = base64.b64encode(b"\xff").decode("ascii")
         assert _decode_mcp_name(f"=?base64?{payload}?=") is None
 
+    def test_non_ascii_payload_returns_none_instead_of_raising(self):
+        """#371 review R1F1 — the one invalid input that is NOT a
+        `binascii.Error`.
+
+        HTTP headers decode as latin-1, so a header can hand this
+        function a payload containing non-ASCII characters. `b64decode`
+        rejects such a string at its internal `s.encode("ascii")` step,
+        BEFORE the base64 decoder runs, with a plain `ValueError` that
+        `binascii.Error` does not cover — and that escaped serve's
+        validation ladder and killed the handler thread, so the request
+        got NO response at all rather than the `-32020` it had earned.
+        """
+        assert _decode_mcp_name("=?base64?\xff?=") is None
+        # Mixed ASCII and non-ASCII takes the same path.
+        assert _decode_mcp_name("=?base64?QUI\xff?=") is None
+
     def test_empty_payload_decodes_to_empty_string(self):
         assert _decode_mcp_name("=?base64??=") == ""
 

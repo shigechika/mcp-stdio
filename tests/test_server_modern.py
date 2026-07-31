@@ -31,6 +31,7 @@ import ast
 import base64
 import json
 import os
+import socket
 import sys
 import threading
 
@@ -288,6 +289,53 @@ class TestHeaderRungs:
         body = _modern_body("tools/call", params={"name": "echo"}, meta=_meta())
         headers = _modern_headers("tools/call", name="=?base64?not-base64!!?=")
         _assert_rejected(_post(gateway, body, headers), HEADER_MISMATCH)
+
+    def test_non_ascii_sentinel_payload_is_rejected_not_fatal(self, gateway):
+        """#371 review R1F1 — a regression test for a real crash.
+
+        HTTP headers decode as latin-1, so `Mcp-Name: =?base64?<0xFF>?=`
+        reaches the decoder as a str with a non-ASCII character.
+        `b64decode` rejects that at its internal `s.encode("ascii")` step
+        with a plain `ValueError`, which the original `binascii.Error`
+        catch did not cover: the exception escaped the ladder, killed the
+        handler thread, and the client got NO RESPONSE AT ALL — strictly
+        worse than the rejection it had earned, and remotely triggerable
+        by one header.
+
+        Driven over a raw socket because httpx will not send a non-ASCII
+        header value; only a byte-level client can express this.
+        """
+        body = json.dumps(
+            _modern_body("tools/call", params={"name": "echo"}, meta=_meta())
+        )
+        request = (
+            f"POST /mcp HTTP/1.1\r\n"
+            f"Host: 127.0.0.1\r\n"
+            f"Content-Type: application/json\r\n"
+            f"MCP-Protocol-Version: {MODERN_VERSION}\r\n"
+            f"Mcp-Method: tools/call\r\n"
+            f"Mcp-Name: =?base64?\xff?=\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n{body}"
+        ).encode("latin-1")
+
+        port = int(gateway.rsplit(":", 1)[1].split("/")[0])
+        sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        try:
+            sock.sendall(request)
+            sock.settimeout(10)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        finally:
+            sock.close()
+
+        text = data.decode("utf-8", "replace")
+        assert text, "the handler died and answered nothing"
+        assert text.startswith("HTTP/1.1 400 "), text[:200]
+        assert f'"code": {HEADER_MISMATCH}' in text, text[:400]
 
     def test_decoded_name_disagrees_with_body(self, gateway):
         body = _modern_body("tools/call", params={"name": "echo"}, meta=_meta())
