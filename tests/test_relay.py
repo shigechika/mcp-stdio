@@ -16258,31 +16258,76 @@ class TestRunModernStdinHandoff:
         With the abort set it is the flagged terminal outcome and nothing
         is written; with it unset the arm re-raises, so a genuine bug
         still surfaces loudly instead of dying as a silently dropped
-        request."""
+        request.
+
+        The abort is set INSIDE the stream, not before the call: setting
+        it up front is caught by the loop-top pre-attempt guard and no
+        POST is ever issued, which would leave the very arm this test is
+        named for completely unexercised. Setting it there also mirrors
+        what the reader thread does — set, THEN close the handle."""
+        abort = threading.Event()
 
         def gen():
+            yield b": open\n\n"
+            abort.set()
+            raise httpx.StreamClosed()
+
+        def plain_gen():
             yield b": open\n\n"
             raise httpx.StreamClosed()
 
         httpx_mock.add_response(
             stream=IteratorStream(gen()),
             headers={"content-type": "text/event-stream"},
-            is_reusable=True,
         )
         client = httpx.Client()
-        abort = threading.Event()
-        abort.set()
         stdout = StringIO()
         with patch("sys.stdout", stdout), patch("mcp_stdio.relay.time.sleep"):
             result = _post_and_stream(client, self.URL, '{"id":2}', {}, 2, abort=abort)
+        assert len(httpx_mock.get_requests()) == 1, "the POST must actually happen"
         assert result is not None and result.aborted
         assert stdout.getvalue() == ""
 
+        httpx_mock.add_response(
+            stream=IteratorStream(plain_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
         stdout = StringIO()
         with patch("sys.stdout", stdout), patch("mcp_stdio.relay.time.sleep"):
             with pytest.raises(httpx.StreamClosed):
                 _post_and_stream(client, self.URL, '{"id":2}', {}, 2)
         client.close()
+
+    def test_abort_on_a_stream_that_ends_without_raising(self, httpx_mock):
+        """The FALSE-NORMAL terminal: a close landing between chunks,
+        after the underlying stream already reached EOF, ends
+        `iter_text()` without raising anything at all.
+
+        Neither exception arm sees that, so without the gate on the
+        NORMAL 200 return `_post_and_stream` writes "empty response from
+        server" under the cancelled id and hands the caller a
+        healthy-looking 200 that the recovery ladder and
+        `_mrtr_run_retry` then act on."""
+        abort = threading.Event()
+
+        def gen():
+            # A comment frame only: no `message` event, so nothing is
+            # emitted and the stream simply ends — the empty-200 path.
+            yield b": open\n\n"
+            abort.set()
+
+        httpx_mock.add_response(
+            stream=IteratorStream(gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+        client = httpx.Client()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout), patch("mcp_stdio.relay.time.sleep"):
+            result = _post_and_stream(client, self.URL, '{"id":2}', {}, 2, abort=abort)
+        client.close()
+        assert result is not None and result.aborted
+        assert result.status_code != 200
+        assert stdout.getvalue() == ""
 
     # --- EOF and teardown (§3.8) ---
 
@@ -16399,7 +16444,10 @@ class TestRunModernStdinHandoff:
             # Still parked, still a daemon — so it cannot hold up process
             # exit — and the teardown did NOT wait for it.
             assert reader and reader[0].daemon
-            assert elapsed < 5
+            # Double the headroom for the slow Windows CI runner while
+            # still discriminating: replacing the bound with a plain
+            # join() parks here for the reader's full 20 s park.
+            assert elapsed < 10
         finally:
             never.set()
             for t in threading.enumerate():

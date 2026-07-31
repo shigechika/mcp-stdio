@@ -7900,6 +7900,21 @@ def run(
                         # That is correct because `initialize` is not in
                         # PAGINATED_LIST_METHODS, so an initialize request can never
                         # take this branch — keep that invariant if the table grows.
+                        #
+                        # It is also not abortable (#270 Phase 2 PR D, owner
+                        # question 2, recorded as a KNOWN GAP rather than
+                        # implemented). Continuations go through
+                        # `_post_parsed`, a sibling that buffers instead of
+                        # streaming and publishes no response handle, so
+                        # wiring the abort here would mean new machinery
+                        # rather than the free ride the shared path gives
+                        # every other request. The consequence is benign and
+                        # bounded: a cancel for a paginating id sets the
+                        # abort event, finds no handle to close, and the
+                        # merged list still goes out — exactly the pre-PR-D
+                        # behaviour — after which the per-line `finally`
+                        # clears the cell. These are list methods; they are
+                        # rarely the long calls a user reaches for escape on.
                         return _paginate_and_stream(
                             client,
                             url,
