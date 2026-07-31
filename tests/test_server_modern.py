@@ -31,6 +31,7 @@ import ast
 import base64
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -114,6 +115,36 @@ def _post(url: str, body: dict, headers: dict | None = None, **kwargs):
     return httpx.post(
         url, content=json.dumps(body), headers=headers or {}, timeout=10, **kwargs
     )
+
+
+def _read_http_response(sock: socket.socket, timeout: float = 10.0) -> bytes:
+    """Read ONE complete HTTP response — headers AND the declared body.
+
+    Stopping at the `\\r\\n\\r\\n` header terminator is the obvious loop
+    and it is wrong: TCP is free to deliver the headers and the body in
+    separate segments, so a body assertion then passes or fails by
+    scheduling luck. It did exactly that — green on one CI interpreter
+    and red on four, for a response the server had sent correctly all
+    along. Honour `Content-Length` instead.
+    """
+    sock.settimeout(timeout)
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(65536)
+        if not chunk:
+            return data
+        data += chunk
+    head, _, body = data.partition(b"\r\n\r\n")
+    match = re.search(rb"(?im)^content-length:\s*(\d+)\s*$", head)
+    if match is None:  # pragma: no cover — every serve response declares one
+        return data
+    expected = int(match.group(1))
+    while len(body) < expected:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        body += chunk
+    return head + b"\r\n\r\n" + body
 
 
 def _assert_rejected(resp: httpx.Response, code: int, req_id: object = 1) -> dict:
@@ -322,13 +353,7 @@ class TestHeaderRungs:
         sock = socket.create_connection(("127.0.0.1", port), timeout=10)
         try:
             sock.sendall(request)
-            sock.settimeout(10)
-            data = b""
-            while b"\r\n\r\n" not in data:
-                chunk = sock.recv(65536)
-                if not chunk:
-                    break
-                data += chunk
+            data = _read_http_response(sock)
         finally:
             sock.close()
 
