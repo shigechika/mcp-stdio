@@ -93,9 +93,7 @@ class Harness:
     the server runs in-process instead of as a second subprocess.
     """
 
-    app: Any
     port: int
-    server: Any
 
     # Set by the app builder; see `build_app`.
     bus: InMemorySubscriptionBus = None  # type: ignore[assignment]

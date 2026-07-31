@@ -204,11 +204,6 @@ def reference_peer_version() -> str:
     return resolved
 
 
-@pytest.fixture(scope="session")
-def poll_tick() -> float:
-    return _POLL_TICK
-
-
 def _serve(app, sock: socket.socket):
     """Boot uvicorn on an already-bound socket, in a daemon thread.
 
@@ -269,7 +264,7 @@ def harness_server(reference_peer_version):
     sock, port = free_port()
     server, thread = _serve(app, sock)
     try:
-        yield _reference_server.Harness(app=app, port=port, server=server, **extras)
+        yield _reference_server.Harness(port=port, **extras)
     finally:
         _shutdown(server, thread)
 
@@ -291,7 +286,7 @@ def dedicated_server(reference_peer_version):
         sock, port = free_port()
         server, thread = _serve(app, sock)
         made.append((server, thread))
-        return _reference_server.Harness(app=app, port=port, server=server, **extras)
+        return _reference_server.Harness(port=port, **extras)
 
     try:
         yield _make
