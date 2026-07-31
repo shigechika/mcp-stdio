@@ -6173,9 +6173,39 @@ def run(
         # their responses, and unlike `_MRTR_MAX_TXNS` there is no
         # two-responses-for-one-id hazard here to bound against.
         stdin_lines = queue.SimpleQueue()
+
+        def _reader_cancel(cancel_id: Any) -> None:
+            """Abort the in-flight POST a stdin cancel names (§3.1, step 2).
+
+            The ONLY out-of-band action the reader thread ever takes, and
+            the only thing on it that touches relay state at all: the
+            line itself is still enqueued afterwards, unchanged and in
+            order, so `tracker.add` and `_mrtr_handle_cancel` run on the
+            consumer exactly as before.
+
+            Closing the published response IS the cancellation on this
+            transport — "Closing the SSE response stream MUST be treated
+            by the server as cancellation of that request. … The server
+            SHOULD stop work on the cancelled request as soon as
+            practical and MUST NOT send any further messages for it."
+            Nothing is POSTed upstream: a `notifications/cancelled` is
+            neither "required or expected" here and a v2 server may
+            legally reject it (python-sdk answers 400). Note the spec
+            gives no rollback guarantee — abort means "stop waiting", not
+            "undo".
+
+            A miss is the common case (a cancel for a request that
+            already finished, or for one that never blocked) and is a
+            silent no-op: the queued line still reaches the tracker and
+            the MRTR bridge, which is where a late-response drop and a
+            transaction purge belong.
+            """
+            if in_flight is not None and in_flight.abort_if_matches(cancel_id):
+                log(f"cancelling id {cancel_id!r}: closing the in-flight upstream POST")
+
         stdin_reader = threading.Thread(
             target=_stdin_reader_loop,
-            kwargs={"lines": stdin_lines},
+            kwargs={"lines": stdin_lines, "on_cancel": _reader_cancel},
             name=_STDIN_READER_THREAD_NAME,
             daemon=True,
         )

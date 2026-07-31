@@ -28,6 +28,7 @@ from mcp_stdio.relay import (
     _RESOURCE_UPDATED_METHOD,
     _STDIN_READER_THREAD_NAME,
     _CancelTracker,
+    _InFlightPost,
     _ModernState,
     _ResourceSubscriptions,
     _SseState,
@@ -13389,13 +13390,32 @@ class TestRunModernEra:
         subscribes that land while one attempt is open produce ONE reopen,
         not five — `Event.set` is idempotent and the next attempt's
         snapshot sees every URI at once. Deterministic without sleeps: the
-        stub holds attempt 1 open until the stdin generator has fed all
-        five and released it."""
+        stub holds attempt 1 open until the relay has ANSWERED all five
+        and the generator releases it.
+
+        The release waits on the last subscribe's synthesized `{}` reply
+        rather than on the generator having yielded it (#270 Phase 2 PR
+        D): on the modern era the generator now runs on the stdin READER
+        thread, so a yield only means ENQUEUED. The subscription set is
+        updated before that reply is written, so seeing it is what proves
+        all five were processed."""
         self._register_discover_with_resources(httpx_mock)
         snapshots = []
         opened = threading.Event()
         release = threading.Event()
         done = threading.Event()
+        answered = threading.Event()
+
+        class _AnswerWatchingStdout(StringIO):
+            def write(self, data):
+                written = super().write(data)
+                for line in data.splitlines():
+                    try:
+                        if json.loads(line).get("id") == 14:
+                            answered.set()
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+                return written
 
         def stub_loop(**kwargs):
             provider = kwargs.get("body_provider")
@@ -13417,13 +13437,14 @@ class TestRunModernEra:
             assert opened.wait(timeout=5)
             for n in range(1, 5):
                 yield self._subscribe_line(10 + n, f"file:///r{n}") + "\n"
+            assert answered.wait(timeout=5)
             release.set()
             assert done.wait(timeout=5)
 
         with (
             patch("mcp_stdio.relay._listen_stream_loop", stub_loop),
             patch("sys.stdin", stdin_lines()),
-            patch("sys.stdout", StringIO()),
+            patch("sys.stdout", _AnswerWatchingStdout()),
         ):
             run(self.URL, {"Content-Type": "application/json"}, protocol_era="modern")
 
@@ -15749,6 +15770,517 @@ class TestRunModernStdinHandoff:
             )
         assert sampled, "the modern dispatch never ran"
         assert any(_STDIN_READER_THREAD_NAME in names for names in sampled)
+
+    # --- the core scenario ---
+
+    def _cancellable_tool_call(self, httpx_mock, *, before=(), after=()):
+        """Register discover + a tools/call whose stream parks mid-flight.
+
+        Returns ``(stream_holder, opened)``. The FIRST tools/call gets the
+        parked stream; every later one answers immediately, so a genuine
+        follow-up request is served without parking the suite a second
+        time, and a REPLAY of the cancelled id — which only a regression
+        can produce, because a deliberate abort must never be re-issued —
+        is labelled so the assertions can spot it.
+        """
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        opened = threading.Event()
+        holder: list = []
+
+        def tool_callback(request):
+            if holder:
+                req_id = json.loads(request.content)["id"]
+                return httpx.Response(
+                    200,
+                    json=self._result(req_id, "REPLAYED" if req_id == 2 else "served"),
+                    headers={"content-type": "application/json"},
+                )
+            stream = _AbortableStream(
+                before=[b": open\n\n", *before],
+                after=list(after),
+                opened=opened,
+            )
+            holder.append(stream)
+            return httpx.Response(
+                200, stream=stream, headers={"content-type": "text/event-stream"}
+            )
+
+        httpx_mock.add_callback(
+            tool_callback,
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            is_reusable=True,
+        )
+        return holder, opened
+
+    @pytest.mark.timeout(30)
+    def test_modern_cancel_aborts_inflight_post(self, httpx_mock):
+        """The core scenario: a cancel arriving while the POST is parked
+        inside `resp.iter_text()` ends that POST, and the request is NOT
+        re-issued.
+
+        Without the abort-terminal classification the cross-thread close
+        surfaces as an `httpx.HTTPError` with `emitted=False` and the
+        attempt loop replays the cancelled `tools/call` up to MAX_RETRIES
+        times — the recorded trap. Reverting the reader thread instead
+        deadlocks, which the timeout turns into a loud failure rather
+        than a stalled job."""
+        holder, opened = self._cancellable_tool_call(
+            httpx_mock, after=[self._sse(self._result(2, "too late"))]
+        )
+        stdout = StringIO()
+
+        def stdin_gen():
+            yield self._call() + "\n"
+            assert opened.wait(timeout=10)
+            yield self._cancel(2) + "\n"
+
+        with patch("sys.stdin", stdin_gen()), patch("sys.stdout", stdout):
+            run(self.URL, {"Content-Type": "application/json"}, protocol_era="modern")
+
+        assert holder and holder[0].closed.is_set()
+        # ONE POST, not MAX_RETRIES: a deliberate abort never re-issues.
+        # The changelog's "broken response stream … clients MUST re-issue
+        # with a new request ID" rule is for UNINTENTIONAL drops only.
+        assert len(self._tool_calls(httpx_mock)) == 1
+        assert MAX_RETRIES > 1
+        assert not [
+            line for line in self._out(stdout.getvalue()) if line.get("id") == 2
+        ]
+
+    @pytest.mark.timeout(30)
+    def test_aborted_id_writes_nothing(self, httpx_mock):
+        """Zero stdout lines under the cancelled id — the receiver SHOULD
+        the cancellation spec puts on us ("Not send a response for the
+        cancelled request").
+
+        Pins the write gates specifically: reverting them puts an
+        "upstream stream interrupted" error (or, on the empty-stream
+        path, "empty response from server") on the wire under an id the
+        client has already withdrawn. The cancel TRACKER cannot cover
+        this — `tracker.add` runs only when the CONSUMER dequeues the
+        cancel line, which is strictly after those writes."""
+        holder, opened = self._cancellable_tool_call(httpx_mock)
+        stdout = StringIO()
+
+        def stdin_gen():
+            yield self._call() + "\n"
+            assert opened.wait(timeout=10)
+            yield self._cancel(2) + "\n"
+
+        with patch("sys.stdin", stdin_gen()), patch("sys.stdout", stdout):
+            run(self.URL, {"Content-Type": "application/json"}, protocol_era="modern")
+
+        assert holder and holder[0].closed.is_set()
+        emitted = stdout.getvalue()
+        assert not [line for line in self._out(emitted) if line.get("id") == 2]
+        assert "interrupted" not in emitted
+        assert "empty response from server" not in emitted
+        assert "internal relay error" not in emitted
+
+    @pytest.mark.timeout(30)
+    def test_next_request_dispatches_after_abort(self, httpx_mock):
+        """A request queued BEHIND the cancel is served — the handoff
+        itself, end to end. Without the reader thread the cancel and
+        everything after it stay unread until the dispatch returns, so
+        this deadlocks (loudly, via the timeout) rather than failing."""
+        holder, opened = self._cancellable_tool_call(httpx_mock)
+        stdout = StringIO()
+
+        def stdin_gen():
+            yield self._call() + "\n"
+            assert opened.wait(timeout=10)
+            yield self._cancel(2) + "\n"
+            yield self._call(req_id=3, name="fast") + "\n"
+
+        with patch("sys.stdin", stdin_gen()), patch("sys.stdout", stdout):
+            run(self.URL, {"Content-Type": "application/json"}, protocol_era="modern")
+
+        lines = self._out(stdout.getvalue())
+        answers = [line for line in lines if line.get("id") == 3]
+        assert len(answers) == 1
+        assert answers[0]["result"]["content"][0]["text"] == "served"
+        assert not [line for line in lines if line.get("id") == 2]
+
+    @pytest.mark.timeout(30)
+    def test_cancel_races_completion(self, httpx_mock):
+        """A response already delivered to the client is never converted
+        into an error by a cancel that lands afterwards.
+
+        The payload is emitted BEFORE the stream parks, so the abort
+        arrives with `emitted=True` — the branch that would otherwise
+        write "upstream stream interrupted" under the same id the result
+        just went out under, i.e. two responses for one id."""
+        holder, opened = self._cancellable_tool_call(
+            httpx_mock, before=[self._sse(self._result(2, "delivered"))]
+        )
+        stdout = StringIO()
+
+        def stdin_gen():
+            yield self._call() + "\n"
+            assert opened.wait(timeout=10)
+            yield self._cancel(2) + "\n"
+
+        with patch("sys.stdin", stdin_gen()), patch("sys.stdout", stdout):
+            run(self.URL, {"Content-Type": "application/json"}, protocol_era="modern")
+
+        lines = self._out(stdout.getvalue())
+        answers = [line for line in lines if line.get("id") == 2]
+        assert len(answers) == 1
+        assert answers[0]["result"]["content"][0]["text"] == "delivered"
+        assert "error" not in answers[0]
+
+    @pytest.mark.timeout(30)
+    def test_stale_handle_never_closed(self, httpx_mock):
+        """An abort can only ever reach the request it names.
+
+        Two halves. The CELL half pins the `finally` un-publish directly:
+        a handle recorded for a request that has since been released must
+        not be closable, or a late cancel for N would end N+1's stream.
+        The END-TO-END half pins the id match: a cancel for a finished
+        request N, read while N+1 is parked mid-stream, leaves N+1
+        alone."""
+        released = _InFlightPost()
+        closed = []
+
+        class _Handle:
+            def close(self):
+                closed.append(True)
+
+        handle = _Handle()
+        released.publish(2)
+        released.publish_response(handle)
+        released.clear()
+        assert released.abort_if_matches(2) is False
+        assert closed == []
+        # A handle recorded AFTER the release is dropped rather than kept
+        # for whoever publishes next.
+        released.publish_response(handle)
+        released.publish(3)
+        assert released.abort_if_matches(2) is False
+        assert closed == []
+
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        opened = threading.Event()
+        holder: list = []
+
+        def tool_callback(request):
+            body = json.loads(request.content)
+            if body["id"] == 2:
+                return httpx.Response(
+                    200,
+                    json=self._result(2, "finished"),
+                    headers={"content-type": "application/json"},
+                )
+            stream = _AbortableStream(
+                before=[b": open\n\n"],
+                after=[self._sse(self._result(3, "survived"))],
+                opened=opened,
+            )
+            holder.append(stream)
+            return httpx.Response(
+                200, stream=stream, headers={"content-type": "text/event-stream"}
+            )
+
+        httpx_mock.add_callback(
+            tool_callback,
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            is_reusable=True,
+        )
+        stdout = StringIO()
+
+        def stdin_gen():
+            yield self._call(req_id=2) + "\n"
+            yield self._call(req_id=3) + "\n"
+            assert opened.wait(timeout=10)
+            # Names the FINISHED request while request 3 is parked
+            # mid-stream. The published id is 3, so this must not match.
+            yield self._cancel(2) + "\n"
+            holder[0].release()
+
+        with patch("sys.stdin", stdin_gen()), patch("sys.stdout", stdout):
+            run(self.URL, {"Content-Type": "application/json"}, protocol_era="modern")
+
+        lines = self._out(stdout.getvalue())
+        survivors = [line for line in lines if line.get("id") == 3]
+        assert len(survivors) == 1
+        assert survivors[0]["result"]["content"][0]["text"] == "survived"
+
+    # --- MRTR interaction (§3.5) ---
+
+    def _elicit_round(self, req_id, key="who"):
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "resultType": "input_required",
+                "inputRequests": {
+                    key: {
+                        "method": "elicitation/create",
+                        "params": {"message": "name?", "requestedSchema": {}},
+                    }
+                },
+                "requestState": "OPAQUE",
+            },
+        }
+
+    @pytest.mark.timeout(30)
+    def test_swallowed_then_abort_no_input_required_abort(self, httpx_mock):
+        """A cancel landing after an MRTR round was SWALLOWED must not
+        route through `input_required_abort`.
+
+        That funnel writes a JSON-RPC error under the client's id — the
+        right answer for a broken transport, the wrong one for a cancel
+        the client itself sent. The abort is silent; the QUEUED cancel
+        line is what drives `_mrtr_handle_cancel`'s purge and the
+        downstream cancels that retire the dialog nobody will collect."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        opened = threading.Event()
+        holder: list = []
+
+        def tool_callback(request):
+            stream = _AbortableStream(
+                before=[self._sse(self._elicit_round(2))], opened=opened
+            )
+            holder.append(stream)
+            return httpx.Response(
+                200, stream=stream, headers={"content-type": "text/event-stream"}
+            )
+
+        httpx_mock.add_callback(
+            tool_callback,
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            is_reusable=True,
+        )
+        stdout = StringIO()
+
+        def stdin_gen():
+            yield self._initialize({"elicitation": {}}) + "\n"
+            yield self._call() + "\n"
+            assert opened.wait(timeout=10)
+            yield self._cancel(2) + "\n"
+
+        with patch("sys.stdin", stdin_gen()), patch("sys.stdout", stdout):
+            run(self.URL, {"Content-Type": "application/json"}, protocol_era="modern")
+
+        lines = self._out(stdout.getvalue())
+        # The minted elicitation went out, and exactly one downstream
+        # cancel retires it — from the queued cancel line, not from the
+        # abort funnel.
+        minted = [line for line in lines if line.get("method") == "elicitation/create"]
+        assert len(minted) == 1
+        cancels = [
+            line
+            for line in lines
+            if line.get("method") == "notifications/cancelled"
+            and line["params"]["requestId"] == minted[0]["id"]
+        ]
+        assert len(cancels) == 1
+        # And NOTHING was answered under the client's own id.
+        assert not [line for line in lines if line.get("id") == 2]
+        assert "MRTR bridge" not in stdout.getvalue()
+
+    @pytest.mark.timeout(30)
+    def test_cancel_during_mrtr_retry(self, httpx_mock):
+        """A cancel landing while an MRTR RETRY POST is in flight
+        disconnects that POST — never a translated upstream
+        `notifications/cancelled`, which is neither required nor expected
+        on this transport, and which MRTR server requirement 8 ("Servers
+        MUST NOT assume that clients will fulfill the inputRequests or
+        retry") makes unnecessary.
+
+        `_mrtr_run_retry` must return WITHOUT purging or answering:
+        purging would make the queued cancel line's `_mrtr_handle_cancel`
+        a no-op and strand round 2's minted request as a dialog nobody
+        retires; answering would put an error under an id the client
+        withdrew. Exactly one set of downstream cancels, no second
+        response under N."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        opened = threading.Event()
+        holder: list = []
+
+        def tool_callback(request):
+            body = json.loads(request.content)
+            if not holder:
+                # Round 1: mint `who`, answered by the client below.
+                holder.append(None)
+                return httpx.Response(
+                    200,
+                    json=self._elicit_round(body["id"], "who"),
+                    headers={"content-type": "application/json"},
+                )
+            # The RETRY POST: open round 2 (a swallow, so `where` is
+            # outstanding), then park until the cancel closes it.
+            stream = _AbortableStream(
+                before=[self._sse(self._elicit_round(body["id"], "where"))],
+                opened=opened,
+            )
+            holder.append(stream)
+            return httpx.Response(
+                200, stream=stream, headers={"content-type": "text/event-stream"}
+            )
+
+        httpx_mock.add_callback(
+            tool_callback,
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            is_reusable=True,
+        )
+        stdout = StringIO()
+
+        def stdin_gen():
+            yield self._initialize({"elicitation": {}}) + "\n"
+            yield self._call() + "\n"
+            yield (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mcp-stdio/mrtr/1/who",
+                        "result": {"action": "accept", "content": {"name": "octocat"}},
+                    }
+                )
+                + "\n"
+            )
+            assert opened.wait(timeout=10)
+            yield self._cancel(2) + "\n"
+
+        with patch("sys.stdin", stdin_gen()), patch("sys.stdout", stdout):
+            run(self.URL, {"Content-Type": "application/json"}, protocol_era="modern")
+
+        assert holder[-1] is not None and holder[-1].closed.is_set()
+        lines = self._out(stdout.getvalue())
+        # No `notifications/cancelled` was POSTed UPSTREAM — the wire
+        # mechanism is the disconnect, and translating one would be a
+        # message this era's servers may legally reject.
+        assert not [
+            json.loads(r.content)
+            for r in httpx_mock.get_requests()
+            if json.loads(r.content).get("method") == "notifications/cancelled"
+        ]
+        # Round 2's minted id is retired exactly once, by the queued
+        # cancel line's `_mrtr_handle_cancel`.
+        where = [
+            line
+            for line in lines
+            if line.get("method") == "elicitation/create"
+            and line["id"].endswith("/where")
+        ]
+        assert len(where) == 1
+        cancels = [
+            line
+            for line in lines
+            if line.get("method") == "notifications/cancelled"
+            and line["params"]["requestId"] == where[0]["id"]
+        ]
+        assert len(cancels) == 1
+        # Nothing under the client's own id — not the retry's result, not
+        # an "HTTP 0" from the aborted terminal falling through.
+        assert not [line for line in lines if line.get("id") == 2]
+
+    # --- the retry-loop guards, at unit level ---
+
+    def test_abort_checked_before_retry_attempt_and_sleep(self, httpx_mock):
+        """A deliberate abort never re-issues the request and never burns
+        the backoff, whichever side of the inter-attempt sleep it lands
+        on.
+
+        (a) set DURING the sleep: the next attempt's loop-top check stops
+        it, so exactly one POST goes out. (b) set before the failure is
+        classified: no sleep happens at all. Reverting either check
+        restores the replay."""
+        attempts: list = []
+        slept: list = []
+        abort = threading.Event()
+
+        def cb(request):
+            attempts.append(request)
+            raise httpx.ConnectError("upstream unreachable")
+
+        httpx_mock.add_callback(cb, is_reusable=True)
+
+        def fake_sleep(secs):
+            slept.append(secs)
+            # The cancel lands while the relay is backing off.
+            abort.set()
+
+        client = httpx.Client()
+        stdout = StringIO()
+        with (
+            patch("sys.stdout", stdout),
+            patch("mcp_stdio.relay.time.sleep", fake_sleep),
+        ):
+            result = _post_and_stream(client, self.URL, '{"id":2}', {}, 2, abort=abort)
+        assert result is not None and result.aborted
+        assert len(attempts) == 1
+        assert len(slept) == 1
+        assert stdout.getvalue() == ""
+
+        attempts.clear()
+        slept.clear()
+        abort_early = threading.Event()
+
+        def cb_early(request):
+            attempts.append(request)
+            abort_early.set()
+            raise httpx.ConnectError("upstream unreachable")
+
+        httpx_mock.reset()
+        httpx_mock.add_callback(cb_early, is_reusable=True)
+        stdout = StringIO()
+        with (
+            patch("sys.stdout", stdout),
+            patch("mcp_stdio.relay.time.sleep", fake_sleep),
+        ):
+            result = _post_and_stream(
+                client, self.URL, '{"id":2}', {}, 2, abort=abort_early
+            )
+        assert result is not None and result.aborted
+        assert len(attempts) == 1
+        assert slept == []
+        assert stdout.getvalue() == ""
+        client.close()
+
+    def test_stream_closed_not_internal_error(self, httpx_mock):
+        """`httpx.StreamClosed` is a `StreamError`, which subclasses
+        RuntimeError and is a SIBLING of `HTTPError` — so without a
+        dedicated arm a mid-read close escapes `_post_and_stream`
+        entirely and run()'s never-crash net answers the CANCELLED id
+        with "internal relay error".
+
+        With the abort set it is the flagged terminal outcome and nothing
+        is written; with it unset the arm re-raises, so a genuine bug
+        still surfaces loudly instead of dying as a silently dropped
+        request."""
+
+        def gen():
+            yield b": open\n\n"
+            raise httpx.StreamClosed()
+
+        httpx_mock.add_response(
+            stream=IteratorStream(gen()),
+            headers={"content-type": "text/event-stream"},
+            is_reusable=True,
+        )
+        client = httpx.Client()
+        abort = threading.Event()
+        abort.set()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout), patch("mcp_stdio.relay.time.sleep"):
+            result = _post_and_stream(client, self.URL, '{"id":2}', {}, 2, abort=abort)
+        assert result is not None and result.aborted
+        assert stdout.getvalue() == ""
+
+        stdout = StringIO()
+        with patch("sys.stdout", stdout), patch("mcp_stdio.relay.time.sleep"):
+            with pytest.raises(httpx.StreamClosed):
+                _post_and_stream(client, self.URL, '{"id":2}', {}, 2)
+        client.close()
 
 
 # --- modern era: subscriptions/listen stream (#270 Phase 2 PR A) ---
