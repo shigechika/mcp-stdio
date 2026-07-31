@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.33.0](https://github.com/shigechika/mcp-stdio/compare/v0.32.0...v0.33.0) (2026-07-31)
+
+
+### Features
+
+* MRTR bridge on the modern era ([#270](https://github.com/shigechika/mcp-stdio/issues/270) Phase 2 PR C) ([#356](https://github.com/shigechika/mcp-stdio/issues/356)) ([3c1c5d7](https://github.com/shigechika/mcp-stdio/commit/3c1c5d76c8f2b001f3d4afdc07d9fa211728527f))
+
 ## [0.32.0](https://github.com/shigechika/mcp-stdio/compare/v0.31.0...v0.32.0) (2026-07-30)
 
 
