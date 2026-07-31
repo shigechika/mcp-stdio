@@ -154,7 +154,13 @@ _SERVE_IMPLEMENTED_MODERN_VERSIONS = frozenset({"2026-07-28"})
 # the other two are MCP's, from the -32020..-32099 range the spec reserves
 # for itself (which is also why serve mints no NEW -32002: that code is
 # grandfathered for relay's cold-start gate only, obligation O18).
+_JSONRPC_INVALID_REQUEST = -32600
+_JSONRPC_METHOD_NOT_FOUND = -32601
 _JSONRPC_INVALID_PARAMS = -32602
+# The modern path's failure code. NOT a fresh -32000 mint: O18 says "new
+# implementations SHOULD NOT use codes from this sub-range at all", and
+# -32603 Internal error is JSON-RPC's own name for "the gateway broke".
+_JSONRPC_INTERNAL_ERROR = -32603
 _MCP_HEADER_MISMATCH = -32020
 _MCP_UNSUPPORTED_PROTOCOL_VERSION = -32022
 
@@ -694,6 +700,26 @@ def _stamp_modern_result(
     return msg
 
 
+def _modern_response_status(msg: dict[str, Any]) -> int:
+    """The HTTP status a modern JSON-RPC response rides on.
+
+    200 for a result. For an error, the spec maps one code to its own
+    status and the v2 client's own table agrees: "If the server does not
+    implement the requested RPC method, it MUST respond with `404 Not
+    Found` and ... `-32601`". Everything else keeps 200 and lets the
+    JSON-RPC error speak — the client parses an error body at any status.
+
+    This is also the carve-out `subscriptions/listen` needs until 3.5-D
+    implements it: a legacy child answers it `-32601`, and that must
+    reach the client as 404 rather than as a 200 the client would treat
+    as a malformed success.
+    """
+    error = msg.get("error")
+    if isinstance(error, dict) and error.get("code") == _JSONRPC_METHOD_NOT_FOUND:
+        return 404
+    return 200
+
+
 def _synthesize_discover_result(
     init_result: dict[str, Any], *, cache_ttl_ms: int = _DEFAULT_CACHE_TTL_MS
 ) -> dict[str, Any]:
@@ -870,6 +896,41 @@ class BackendProcess:
             # No waiter (timed-out, or an id we never sent): expose on SSE
             # rather than lose it.
             self.server_initiated.put(line)
+        elif self._modern_owned:
+            # #270 Phase 3 P3-B. A gateway-owned child has NO SSE stream
+            # and no client that could ever drain `server_initiated`, so
+            # queueing here would grow without bound for the life of the
+            # process — the "unbounded is fine for one client" assumption
+            # stops holding the moment a child is pooled and long-lived.
+            if kind == "request":
+                # A child-initiated request (elicitation/sampling/roots
+                # from a misbehaving child; a well-behaved one never asks,
+                # because the gateway's handshake advertised `{}`). Answer
+                # it straight from the reader thread rather than leaving
+                # the child blocked forever on a reply nobody will send.
+                # Also discharges O15: "The server MUST NOT send
+                # independent JSON-RPC requests on this stream" — nothing
+                # of the kind ever reaches a stream, because there is none.
+                # `_write` is lock-guarded and its broken-pipe path is
+                # already reentrant-safe, so this is safe off-thread.
+                self._write(
+                    _error_body(
+                        "this gateway does not bridge server-initiated requests",
+                        msg.get("id"),
+                        code=_JSONRPC_METHOD_NOT_FOUND,
+                    )
+                )
+                return
+            # Notifications, noise and orphan responses: dropped, with one
+            # log line per child so an operator sees it happening without
+            # a flood.
+            self._discarded += 1
+            if self._discarded == 1:
+                log(
+                    "modern backend produced server-initiated traffic with no "
+                    "modern channel to carry it; discarding (3.5-D adds the "
+                    "listen stream)"
+                )
         else:
             # request / notification / invalid — all server-initiated toward
             # the client.
@@ -2715,6 +2776,120 @@ class _Handler(BaseHTTPRequestHandler):
             return None
         self._session_id = sid
         return backend
+
+    def _dispatch_modern(self, kind: str, msg: dict[str, Any], req_id: Any) -> None:
+        """Serve one validated modern request from a gateway-owned child.
+
+        #270 Phase 3 P3-B. Reached only after `_validate_modern` passed,
+        and it NEVER returns to the session path — which is the point.
+        Branching here fixes both of P3-A's recorded interims at once:
+
+        - a sessionless modern request no longer earns the legacy 400;
+        - a modern request carrying a valid legacy `Mcp-Session-Id` no
+          longer dispatches on that session. The header is IGNORED, per
+          the spec's instruction to a modern-era server to "ignore it,
+          and do not mint or echo session IDs" — and because this method
+          never sets `self._session_id`, `_send_json`'s auto-echo cannot
+          leak one back, which the tests assert on 200s as well as 4xxs.
+
+        The v2 client never sends that header on a modern flow anyway
+        (its session capture is gated on an `initialize` response, which
+        a modern negotiation never produces); the ignore rule is for the
+        mixed deployments D2 keeps legal.
+        """
+        method = msg.get("method")
+
+        # Intake reject for an id inside serve's own namespace (§3.3).
+        if kind == "request" and _is_reserved_client_id(req_id):
+            self._send_json(
+                400,
+                _error_body(
+                    f"request id must not start with {_SERVE_ID_NAMESPACE!r}: "
+                    "that namespace is reserved for gateway-minted requests",
+                    req_id,
+                    code=_JSONRPC_INVALID_REQUEST,
+                ),
+            )
+            return
+
+        try:
+            backend, init_result = self.modern_pool.get_or_create(self._current_user())
+        except RuntimeError as exc:
+            log(f"modern dispatch: backend unavailable: {exc}")
+            self._send_json(
+                503,
+                _error_body(
+                    "backend unavailable", req_id, code=_JSONRPC_INTERNAL_ERROR
+                ),
+            )
+            return
+
+        # Notifications: forward and acknowledge. The v2 client sends none
+        # in the discover flow (no `initialize` means no
+        # `notifications/initialized`), so this is consistency rather than
+        # liveness — but leaving modern-classified traffic to fall onto a
+        # legacy session error would be a worse answer than 202.
+        if kind == "notification":
+            backend.send_oneway(json.dumps(msg))
+            self._send_empty(202)
+            return
+
+        # `server/discover` is answered HERE, never forwarded: a legacy
+        # child has never heard of it and would answer -32601.
+        if method == _MODERN_DISCOVER_METHOD:
+            self._send_json(
+                200,
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": _synthesize_discover_result(
+                            init_result, cache_ttl_ms=self.cache_ttl_ms
+                        ),
+                    }
+                ),
+            )
+            return
+
+        upstream_id = _mint_modern_id()
+        outbound = dict(msg)
+        outbound["id"] = upstream_id
+        line = backend.send_request(
+            json.dumps(outbound), upstream_id, _BACKEND_RESPONSE_TIMEOUT_SECS
+        )
+        if line is None:
+            self._send_json(
+                504,
+                _error_body(
+                    "no response from backend", req_id, code=_JSONRPC_INTERNAL_ERROR
+                ),
+            )
+            return
+        try:
+            parsed = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            log("modern dispatch: backend returned unparseable JSON")
+            self._send_json(
+                502,
+                _error_body(
+                    "malformed response from backend",
+                    req_id,
+                    code=_JSONRPC_INTERNAL_ERROR,
+                ),
+            )
+            return
+
+        # Rekey minted -> client id. One parse total: the same dict is
+        # rekeyed and stamped, so relay's `_mrtr_rekey` (which re-parses a
+        # string) would be strictly more work for the same result here.
+        parsed["id"] = req_id
+        _stamp_modern_result(
+            parsed,
+            method,
+            server_info=init_result.get("serverInfo"),
+            cache_ttl_ms=self.cache_ttl_ms,
+        )
+        self._send_json(_modern_response_status(parsed), json.dumps(parsed))
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         # Reset the per-request session id (the handler instance is reused
