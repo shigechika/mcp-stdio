@@ -216,6 +216,15 @@ class StdioClient:
         The bounded quiescence check behind every "nothing arrived"
         assertion. Returns pending + newly-read messages; the caller asserts
         on the CONTENT, never on how long it waited.
+
+        Raises `RelayDied` on EOF, exactly like `_take` (#368 review R1F1):
+        a "nothing arrived" observation is only meaningful over a LIVE
+        relay. Treating EOF as successful quiescence let a relay that
+        CRASHED mid-drain pass every negative assertion built on this
+        method vacuously — the exact failure this harness exists to catch,
+        silently turned into a false green. The sentinel is re-enqueued
+        first, exactly like `_take`, so every LATER call (drain or `_take`)
+        fails just as fast instead of stalling until its own timeout.
         """
         deadline = time.monotonic() + window
         collected = list(self._pending)
@@ -230,7 +239,10 @@ class StdioClient:
                 return collected
             if msg is _EOF:
                 self._inbox.put(_EOF)
-                return collected
+                raise RelayDied(
+                    f"relay stdout closed during drain(window={window})\n"
+                    f"{self._diagnostics()}"
+                )
             collected.append(msg)
 
     # --- lifecycle --------------------------------------------------
