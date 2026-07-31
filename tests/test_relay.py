@@ -16325,13 +16325,15 @@ class TestRunModernStdinHandoff:
         healthy-looking 200 that the recovery ladder and
         `_mrtr_run_retry` then act on.
 
-        Two halves. The unit half isolates the classification; the
-        END-TO-END half is the real article — the reader THREAD closes
-        the published handle while the consumer is provably parked
+        Two halves, the real article FIRST: the reader THREAD closes the
+        published handle while the consumer is provably parked
         mid-stream, and the stream ends quietly rather than raising, so
         the non-raising path is driven by an actual cross-thread close
-        rather than simulated. Removing the pre-return check fails
-        both."""
+        rather than simulated. The unit half follows, isolating the
+        classification for a sharper message when the gate itself is what
+        regressed. Removing the pre-return check fails both — the E2E
+        half with the exact harm it prevents, an "empty response from
+        server" error under the id the client just cancelled."""
         self._register_listen_stream(httpx_mock)
         self._register_discover(httpx_mock)
         opened = threading.Event()
