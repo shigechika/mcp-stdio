@@ -282,6 +282,17 @@ class StdioClient:
 
         stdin EOF is the relay's own documented shutdown path (`_STDIN_EOF`),
         so the graceful case exercises production code rather than a signal.
+
+        The post-SIGKILL wait is bounded too (#368 review, /code-review
+        round): a process still alive after SIGKILL is not something this
+        method can escalate further — there is no signal stronger than
+        SIGKILL — so a timeout here means the kernel itself has it stuck
+        (uninterruptible I/O), which is unrecoverable from user space.
+        Swallowing that silently would turn "the relay died" into "the
+        SUITE hangs" — exactly what rule 6 exists to prevent — so the
+        `TimeoutExpired` is left to propagate, the same "surface it loudly"
+        choice every other bounded wait in this file makes (`_take` and
+        `drain` raise `RelayDied` on their own unbounded-wait risk).
         """
         try:
             if self.proc.stdin and not self.proc.stdin.closed:
@@ -296,7 +307,7 @@ class StdioClient:
                 self.proc.wait(timeout=2)
             except subprocess.TimeoutExpired:  # pragma: no cover
                 self.proc.kill()
-                self.proc.wait()
+                self.proc.wait(timeout=5.0)
         for stream in (self.proc.stdout, self.proc.stderr):
             try:
                 if stream is not None:
