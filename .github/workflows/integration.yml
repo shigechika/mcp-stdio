@@ -4,6 +4,26 @@ name: Integration
 # issue #367. Advisory: deliberately NOT in the required-checks gate
 # (branch protection + ruleset ci-gate-main list only the unit-test matrix)
 # until it proves stable. Promoting it later means editing BOTH definitions.
+#
+# TWO jobs since #270 Phase 3 P3-0, because the directory now holds two
+# kinds of suite:
+#   integration — everything, reference-peer scenarios included.
+#   serve       — the serve-mode suites ONLY, installed WITHOUT the peer.
+#
+# The second is not redundant with the first. It decouples serve signal
+# from peer resolution — today a bad `mcp>=2.0,<3` resolution fails the
+# version-smoke step and would take the serve suites down with it, though
+# they need nothing from the peer — and it is the ONLY thing that
+# exercises the conftest allow-list that keeps those suites collectable
+# when the peer is absent. If that guard regresses, this job collects zero
+# tests and pytest's exit code 5 fails it, instead of the serve suites
+# vanishing silently, which is the exact false green the allow-list exists
+# to prevent.
+#
+# ubuntu only, like #367: the harness ends subprocesses with SIGTERM
+# (serve's own documented shutdown path, which reaps its children in a
+# `finally`), and `Popen.terminate()` does not deliver a catchable signal
+# on Windows. The unit matrix already covers serve there.
 
 on:
   pull_request:
@@ -55,3 +75,31 @@ jobs:
         # never reaches the log and a slow drift toward the timeout would be
         # invisible until the day it goes red.
         run: pytest tests_integration/ -v -s
+
+  serve:
+    # #270 Phase 3 P3-0. The serve-mode suites — the AC2 legacy pin base
+    # and the gateway sandwich — run here with NO reference peer installed.
+    runs-on: ubuntu-latest
+    # Well under the sibling job's budget: these suites run in ~15 s
+    # locally and spawn only our own subprocesses.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install (no reference peer)
+        # `[dev]` ONLY, deliberately: installing `[integration]` here would
+        # defeat the job's purpose, which is to prove these suites stand up
+        # without the peer.
+        run: pip install -e ".[dev]"
+
+      - name: Serve-mode suites
+        # A directory-wide run, not a file list: with the peer absent the
+        # conftest allow-list collect-ignores the peer-dependent modules,
+        # so this collects exactly the serve suites — and exits 5 (failing
+        # the job) if that guard ever stops working.
+        run: pytest tests_integration/ -v

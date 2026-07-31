@@ -43,6 +43,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import pathlib
 import socket
@@ -55,14 +56,36 @@ from collections.abc import Callable, Iterator
 
 import pytest
 
+_HERE = pathlib.Path(__file__).parent
+
+# Test modules that need NOTHING from the reference peer. #270 Phase 3
+# P3-0's serve suites drive our own `mcp-stdio serve` against our own
+# scripted legacy child, so the peer's absence must not silence them —
+# "silently collected zero tests" is exactly the false green this
+# directory exists to prevent, and a suite whose job is to be a zero-diff
+# invariant is the worst possible place for it.
+#
+# An ALLOW-list, not a deny-list, and that direction is deliberate: a new
+# peer-dependent module added later is ignored by default (safe), while
+# only a module someone explicitly declares peer-independent survives.
+_PEER_INDEPENDENT_MODULES = frozenset(
+    {
+        "test_serve_legacy_pin.py",
+        "test_serve_modern_before.py",
+        "test_serve_sandwich.py",
+    }
+)
+
 # Collection guard: `pytest` with no arguments at the repository root walks
 # this directory too, and the reference peer is an OPTIONAL dependency
 # (`pip install -e ".[integration]"`). Skipping collection rather than
 # erroring keeps a plain `pip install -e ".[dev]"` checkout usable.
 if importlib.util.find_spec("mcp") is None:  # pragma: no cover — env-dependent
-    collect_ignore_glob = ["test_*.py"]
-
-_HERE = pathlib.Path(__file__).parent
+    collect_ignore = [
+        path.name
+        for path in sorted(_HERE.glob("test_*.py"))
+        if path.name not in _PEER_INDEPENDENT_MODULES
+    ]
 
 # Rule 3's default per-test budget. Generous against the ~15-25 s the whole
 # suite is expected to take, because its job is to turn a HANG into a loud
@@ -176,27 +199,38 @@ def free_port() -> tuple[socket.socket, int]:
     return sock, sock.getsockname()[1]
 
 
-def spawn_relay(port: int, *, extra_args: list[str] | None = None):
+def spawn_relay(
+    port: int,
+    *,
+    extra_args: list[str] | None = None,
+    protocol_era: str = "auto",
+    path: str = "/mcp",
+):
     """Start `mcp-stdio` as a subprocess against the harness server.
 
     `sys.executable -m mcp_stdio` rather than the console script: it pins
     the relay to the SAME interpreter running the tests, independent of
     PATH and of whether the venv is activated.
 
-    `--protocol-era auto` is deliberate — the era probe against a real v2
-    server is scenario 1's whole subject. The transport stays the default
-    streamable-http: `--protocol-era` is ignored (with a warning) under the
-    legacy `--transport sse`, which would defeat every scenario here. The
-    v2 server's SSE response framing is its own default (`json_response`
-    off) and needs no flag on either side.
+    `--protocol-era auto` is the DEFAULT here — the era probe against a
+    real v2 server is scenario 1's whole subject. The transport stays the
+    default streamable-http: `--protocol-era` is ignored (with a warning)
+    under the legacy `--transport sse`, which would defeat every scenario
+    here. The v2 server's SSE response framing is its own default
+    (`json_response` off) and needs no flag on either side.
+
+    `protocol_era` is a parameter rather than a constant since #270 Phase
+    3 P3-0: the gateway sandwich points a LEGACY-era relay at our own
+    serve, whose legacy face is the thing being pinned. Every existing
+    caller keeps the `auto` default, so #367's scenarios are unchanged.
     """
     args = [
         sys.executable,
         "-m",
         "mcp_stdio",
-        f"http://127.0.0.1:{port}/mcp",
+        f"http://127.0.0.1:{port}{path}",
         "--protocol-era",
-        "auto",
+        protocol_era,
     ]
     args += extra_args or []
     return subprocess.Popen(  # noqa: S603 — fixed argv, no shell
@@ -209,14 +243,22 @@ def spawn_relay(port: int, *, extra_args: list[str] | None = None):
 
 
 @pytest.fixture(scope="session", autouse=True)
-def reference_peer_version() -> str:
+def reference_peer_version() -> str | None:
     """Pin the reference peer to a 2.x wheel, loudly, once per session.
 
     Required change 6 of the #367 design: the extra is a RANGE, so the
     suite states which major it was written against rather than trusting
     whatever resolved. NOTE: `mcp.__version__` does not exist in v2.0.0 —
     the version lives only in distribution metadata.
+
+    Returns None when the peer is absent (#270 Phase 3 P3-0) instead of
+    erroring. It is `autouse`, so it runs for the serve suites too — and
+    those need nothing from the peer. The peer-dependent modules are
+    collect-ignored in exactly that case (see `_PEER_INDEPENDENT_MODULES`
+    above), so nothing that DOES need a 2.x wheel can reach this None.
     """
+    if importlib.util.find_spec("mcp") is None:  # pragma: no cover — env-dependent
+        return None
     from importlib.metadata import version
 
     resolved = version("mcp")
@@ -332,8 +374,11 @@ def relay_factory() -> Iterator[Callable]:
 
     clients: list[StdioClient] = []
 
-    def _spawn(port: int, *, extra_args: list[str] | None = None) -> StdioClient:
-        proc = spawn_relay(port, extra_args=extra_args)
+    def _spawn(port: int, **kwargs) -> StdioClient:
+        # kwargs pass straight through to `spawn_relay` (`extra_args`,
+        # `protocol_era`, `path`) rather than being enumerated here, so a
+        # new relay flag needs one signature change, not two.
+        proc = spawn_relay(port, **kwargs)
         client = StdioClient(proc, stderr=_StderrDrain(proc.stderr))
         clients.append(client)
         return client
@@ -343,3 +388,258 @@ def relay_factory() -> Iterator[Callable]:
     finally:
         for client in clients:
             client.close(timeout=_RELAY_STOP_TIMEOUT)
+
+
+# --- serve mode: the reverse gateway under test (#270 Phase 3 P3-0) -------
+
+# The scripted legacy child serve fronts. `sys.executable` pins it to the
+# interpreter running the tests, like `spawn_relay`.
+LEGACY_CHILD_COMMAND = [sys.executable, str(_HERE / "_legacy_child.py")]
+
+_SERVE_START_TIMEOUT = 20.0
+_SERVE_STOP_TIMEOUT = 5.0
+# Rule 5's bounded quiescence window, in one place.
+QUIESCENCE_WINDOW = 1.0
+
+
+def _reserve_port() -> int:
+    """An unused localhost port for a SUBPROCESS to bind.
+
+    UNLIKE `free_port()`, which hands uvicorn the already-bound socket and
+    therefore has no race at all, this one binds, reads the port and
+    RELEASES it — a subprocess cannot inherit our socket, and
+    `serve --port 0` is undiscoverable because `serve()` logs the
+    REQUESTED port (`server.py`'s "serving … at http://host:port"), not
+    `httpd.server_address`. The gap between release and the child's bind
+    is therefore real.
+
+    It is made self-detecting rather than merely unlikely: readiness is a
+    full `initialize` round-trip that must come back with a minted
+    `Mcp-Session-Id` (see `ServeHarness.wait_until_ready`). A foreign
+    listener that stole the port answers a bare TCP connect happily and
+    this probe not at all, so the race surfaces as an explicit readiness
+    failure naming the port instead of a mystery timeout later.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+    finally:
+        sock.close()
+
+
+class ServeHarness:
+    """One `mcp-stdio serve` subprocess, plus what a pin test needs to drive it.
+
+    A SUBPROCESS, deliberately, where the unit suite uses `build_server`
+    in-process: P3-0's job is to pin the deployed artifact — argv parsing,
+    the `--` command split, signal-driven teardown and all — because that
+    is what later Phase 3 PRs could break without any in-process test
+    noticing.
+    """
+
+    def __init__(self, proc: subprocess.Popen, port: int, stderr: _StderrDrain) -> None:
+        self.proc = proc
+        self.port = port
+        self.stderr = stderr
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/mcp"
+
+    def base(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def diagnose(self) -> str:
+        return f"serve stderr tail:\n{self.stderr.tail()}"
+
+    # --- requests -----------------------------------------------------
+
+    def post(
+        self,
+        message: dict,
+        *,
+        sid: str | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float = 10.0,
+    ):
+        import httpx
+
+        merged = dict(headers or {})
+        if sid is not None:
+            merged["Mcp-Session-Id"] = sid
+        return httpx.post(
+            self.url, content=json.dumps(message), headers=merged, timeout=timeout
+        )
+
+    def delete(
+        self,
+        *,
+        sid: str | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float = 10.0,
+    ):
+        import httpx
+
+        merged = dict(headers or {})
+        if sid is not None:
+            merged["Mcp-Session-Id"] = sid
+        return httpx.request("DELETE", self.url, headers=merged, timeout=timeout)
+
+    def open_session(self) -> str:
+        """`initialize` a fresh session and return its minted id."""
+        resp = self.post(
+            {
+                "jsonrpc": "2.0",
+                "id": "open",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "p3-0-pin-suite", "version": "0"},
+                },
+            }
+        )
+        assert resp.status_code == 200, (resp.status_code, resp.text, self.diagnose())
+        sid = resp.headers.get("mcp-session-id")
+        assert sid, f"serve minted no session id\n{self.diagnose()}"
+        return sid
+
+    # --- lifecycle ----------------------------------------------------
+
+    def wait_until_ready(self) -> None:
+        """Bounded poll for OUR serve, proved by a minted session id (rule 1)."""
+        import httpx
+
+        state: dict[str, object] = {"last": "no attempt completed"}
+
+        def _up() -> bool:
+            if self.proc.poll() is not None:
+                raise AssertionError(
+                    f"serve exited with {self.proc.returncode} before it was ready"
+                    f"\n{self.diagnose()}"
+                )
+            try:
+                resp = httpx.post(
+                    self.url,
+                    content=json.dumps(
+                        {"jsonrpc": "2.0", "id": "ready", "method": "initialize"}
+                    ),
+                    timeout=2.0,
+                )
+            except httpx.HTTPError as exc:
+                state["last"] = f"{type(exc).__name__}: {exc}"
+                return False
+            sid = resp.headers.get("mcp-session-id")
+            state["last"] = f"HTTP {resp.status_code}, Mcp-Session-Id={sid!r}"
+            if resp.status_code == 200 and sid:
+                # Leave no probe session behind: it would hold a child
+                # process for the whole module and skew any test that
+                # reasons about session count.
+                self.delete(sid=sid)
+                return True
+            return False
+
+        wait_until(
+            _up,
+            _SERVE_START_TIMEOUT,
+            f"mcp-stdio serve on port {self.port} to answer initialize",
+            diagnose=lambda: f"last probe: {state['last']}\n{self.diagnose()}",
+        )
+
+    def close(self) -> None:
+        """Rule 6 for the gateway: terminate -> wait -> kill, all bounded.
+
+        SIGTERM is serve's own documented shutdown path (`serve()` installs
+        it), so the graceful case exercises production code. Child
+        processes are reaped by serve's own `registry.shutdown_all()` in
+        its `finally`; a kill would orphan them, which is why the
+        terminate step gets the generous bound and the kill is the last
+        resort.
+        """
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=_SERVE_STOP_TIMEOUT)
+            except subprocess.TimeoutExpired:  # pragma: no cover — wedged serve
+                self.proc.kill()
+                self.proc.wait(timeout=_SERVE_STOP_TIMEOUT)
+        for stream in (self.proc.stdout, self.proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:  # pragma: no cover
+                pass
+
+
+def spawn_serve(
+    *,
+    command: list[str] | None = None,
+    extra_args: list[str] | None = None,
+) -> ServeHarness:
+    """Start `mcp-stdio serve` as a subprocess and wait for it to answer.
+
+    `sys.executable -m mcp_stdio serve` rather than the console script, for
+    the same reason `spawn_relay` does it: it pins the gateway to the
+    interpreter running the tests, independent of PATH and of whether the
+    venv is activated. The backend command follows the options after the
+    `--` separator serve documents.
+    """
+    port = _reserve_port()
+    args = [sys.executable, "-m", "mcp_stdio", "serve", "--host", "127.0.0.1"]
+    args += ["--port", str(port)]
+    args += extra_args or []
+    args += ["--", *(command or LEGACY_CHILD_COMMAND)]
+    proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
+        args,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_clean_env(),
+    )
+    harness = ServeHarness(proc, port, _StderrDrain(proc.stderr))
+    try:
+        harness.wait_until_ready()
+    except BaseException:
+        harness.close()
+        raise
+    return harness
+
+
+@pytest.fixture(scope="module")
+def serve_gateway() -> Iterator[ServeHarness]:
+    """The shared `mcp-stdio serve` under test (module-scoped).
+
+    Module-scoped for the same reason `harness_server` is: it holds no
+    per-test state worth isolating — every test opens its OWN session, and
+    a session is the unit of isolation serve actually provides — while a
+    subprocess boot plus a readiness round-trip costs real wall-clock.
+    Tests that need a gateway they may disrupt take `serve_factory`.
+    """
+    harness = spawn_serve()
+    try:
+        yield harness
+    finally:
+        harness.close()
+
+
+@pytest.fixture
+def serve_factory() -> Iterator[Callable[..., ServeHarness]]:
+    """Fresh `mcp-stdio serve` instances bound to one test (function-scoped).
+
+    For tests that stop the gateway, exhaust a cap, or need non-default
+    flags — doing any of that to the shared instance would break every
+    later test in the module.
+    """
+    made: list[ServeHarness] = []
+
+    def _make(**kwargs) -> ServeHarness:
+        harness = spawn_serve(**kwargs)
+        made.append(harness)
+        return harness
+
+    try:
+        yield _make
+    finally:
+        for harness in made:
+            harness.close()
