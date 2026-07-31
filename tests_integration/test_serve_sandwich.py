@@ -22,10 +22,12 @@ our own serve as modern and its fail-closed `ttlMs` merge cross-validates
 discover — that one needs modern dispatch to exist, so it is not here.
 
 Determinism: the relay is driven through the same `StdioClient` #367
-built, every wait is bounded, and teardown is relay-first (the relay
-holds an HTTP connection to serve) exactly as conftest rule 6 requires —
-`relay_factory` is requested AFTER `serve_gateway`, so pytest's
-reverse-order teardown closes the relay first.
+built, and every wait is bounded. Teardown is relay-first, as conftest
+rule 6 requires (the relay holds an HTTP connection to serve) — and it
+holds by SCOPE, not by argument order: `relay_factory` is
+function-scoped and `serve_gateway` module-scoped, so the relay is torn
+down at the end of each test while the gateway outlives the module.
+Argument order governs only same-scope fixtures and is irrelevant here.
 """
 
 from __future__ import annotations
@@ -45,9 +47,7 @@ def test_full_sandwich_completes_a_tools_flow(serve_gateway, relay_factory):
     about session round-tripping, not just about tools); and `tools/call`
     returns the child's own payload unaltered end to end.
     """
-    client = relay_factory(
-        serve_gateway.port, protocol_era="legacy", extra_args=["--no-cancel-filter"]
-    )
+    client = relay_factory(serve_gateway.port, protocol_era="legacy")
 
     init = client.initialize(protocol_version=LEGACY_PROTOCOL_VERSION)
     # The child's InitializeResult, not the relay's or serve's invention.
@@ -80,9 +80,7 @@ def test_sandwich_surfaces_a_child_error_under_the_clients_own_id(
     Under the id the CLIENT sent, which is the correlation both gateways
     are responsible for preserving.
     """
-    client = relay_factory(
-        serve_gateway.port, protocol_era="legacy", extra_args=["--no-cancel-filter"]
-    )
+    client = relay_factory(serve_gateway.port, protocol_era="legacy")
     client.initialize(protocol_version=LEGACY_PROTOCOL_VERSION)
 
     req_id = client.send_request("tools/call", {"name": "nope", "arguments": {}})

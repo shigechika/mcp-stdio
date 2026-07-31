@@ -13,6 +13,12 @@ the P3-0 scope note's label and the code disagree, the code wins and the
 divergence is called out in the test's own docstring (see
 `test_notification_post_needs_a_session_first`).
 
+The zero-diff claim above is LITERAL, with no exceptions carved into it.
+Tests that are expected to move — the before-picture of serve's modern
+face — live in `test_serve_modern_before.py` instead, precisely so that
+this file's invariant stays enforceable by a reviewer reading a diff
+rather than a docstring.
+
 Assertion style, tuned for a zero-diff invariant:
 - exact status codes and exact JSON-RPC error CODES (a widened error code
   is precisely what P3-A ships, and it must move a test here);
@@ -25,10 +31,11 @@ Assertion style, tuned for a zero-diff invariant:
 from __future__ import annotations
 
 import json
+import re
+import socket
 import threading
 
 import httpx
-import pytest
 
 from ._legacy_child import (
     LEGACY_PROTOCOL_VERSION,
@@ -409,47 +416,73 @@ def test_get_mirrors_the_post_session_statuses(serve_gateway):
     assert unknown.status_code == 404
 
 
-# --- what serve must NOT do yet ------------------------------------------
+# --- transport-level invariants ------------------------------------------
 
 
-@pytest.mark.timeout(45)
-def test_modern_markers_are_not_answered_yet(serve_factory):
-    """A modern-shaped request gets today's legacy treatment, not a modern one.
+def test_a_4xx_drains_the_request_body_so_keep_alive_survives(serve_gateway):
+    """An early-returning 4xx must consume the request body first.
 
-    The before-picture for P3-A and P3-B in one assertion: a request
-    carrying modern per-request `_meta` — the exact positive evidence D5
-    makes the era predicate look for — is NOT special-cased today. It
-    falls into the sessionless-POST path and gets 400, and
-    `server/discover` gets the same. When P3-A lands, `_meta` presence
-    starts routing to validation; when P3-B lands, discover is answered.
-    Both are visible here as an intentional diff.
+    `do_POST` reads the body BEFORE any early return, and says why: on
+    HTTP/1.1 keep-alive, leftover body bytes in the socket are parsed as
+    the NEXT request line ("Bad request syntax"). P3-A adds several new
+    4xx early returns, and the Phase 3 re-scope's risk table lists this
+    contract as "pinned" — it was not, until here.
 
-    A dedicated gateway (not the shared one) because this is the test most
-    likely to change shape in a later PR, and it must not leave the module
-    fixture in a state a rewrite could disturb.
+    Driven over a RAW SOCKET with two pipelined requests rather than
+    through httpx: a connection pool is free to open a second connection,
+    which would make the test pass vacuously without ever exercising
+    reuse. Two requests written back to back on one socket cannot.
     """
-    gateway = serve_factory()
-
-    modern = gateway.post(
+    sid = serve_gateway.open_session()
+    # A sessionless POST -> 400, and a BODY big enough that leftovers
+    # could not be mistaken for anything but corruption.
+    rejected = json.dumps(
         {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/list",
-            "params": {
-                "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                    "io.modelcontextprotocol/clientCapabilities": {},
-                }
-            },
-        },
-        headers={"MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "tools/list"},
+            "params": {"pad": "x" * 400},
+        }
     )
-    assert modern.status_code == 400
-    assert _error_of(modern)["code"] == LEGACY_ERROR_CODE
+    accepted = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
 
-    discover = gateway.post({"jsonrpc": "2.0", "id": 2, "method": "server/discover"})
-    assert discover.status_code == 400
-    assert _error_of(discover)["code"] == LEGACY_ERROR_CODE
+    def _frame(body: str, extra: str = "") -> bytes:
+        return (
+            f"POST /mcp HTTP/1.1\r\n"
+            f"Host: 127.0.0.1\r\n"
+            f"Content-Type: application/json\r\n"
+            f"{extra}"
+            f"Content-Length: {len(body)}\r\n\r\n{body}"
+        ).encode("utf-8")
+
+    sock = socket.create_connection(("127.0.0.1", serve_gateway.port), timeout=10)
+    try:
+        sock.sendall(_frame(rejected))
+        sock.sendall(_frame(accepted, extra=f"Mcp-Session-Id: {sid}\r\n"))
+        sock.settimeout(10)
+        data = b""
+        # Bounded by the socket timeout (rule 1); stop as soon as both
+        # status lines are on the wire.
+        while data.count(b"HTTP/1.1 ") < 2:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        sock.close()
+        serve_gateway.delete(sid=sid)
+
+    text = data.decode("utf-8", "replace")
+    # Scanned with a regex, not `splitlines()`: the second response's
+    # status line begins immediately after the first response's body, with
+    # no newline between them, so it is not a "line" at all.
+    statuses = re.findall(r"HTTP/1\.1 (\d{3})", text)
+    assert statuses[:2] == ["400", "200"], text[:800]
+    # The specific corruption an undrained body produces.
+    assert "Bad request syntax" not in text
+
+
+# --- what serve must NOT do yet ------------------------------------------
 
 
 def test_a_quiet_session_receives_nothing_unsolicited(serve_gateway):

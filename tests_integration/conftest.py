@@ -71,6 +71,7 @@ _HERE = pathlib.Path(__file__).parent
 _PEER_INDEPENDENT_MODULES = frozenset(
     {
         "test_serve_legacy_pin.py",
+        "test_serve_modern_before.py",
         "test_serve_sandwich.py",
     }
 )
