@@ -582,13 +582,17 @@ jobs:
             | map(. as $f
                   | if ($droppedids | index($f.id)) and $f.status == "open"
                     then $f + {status: "dismissed"}
-                  # A verifier KEEP outranks the model dismissing its own
+                  # A verifier KEEP outranks the model settling its own
                   # finding in the same response: without this the entry the
-                  # reader sees posted is stored as dismissed and suppressed
-                  # from every later round. Restricted to ids absent from the
-                  # previous ledger, so a genuinely settled finding from an
-                  # earlier round is never resurrected.
-                  elif ($keptids | index($f.id)) and $f.status == "dismissed"
+                  # reader sees posted is stored as settled and suppressed
+                  # from every later round. Covers `fixed` as well as
+                  # `dismissed` — a model claiming its own fresh finding is
+                  # already fixed suppresses it exactly the same way.
+                  # Restricted to ids absent from the previous ledger, so a
+                  # genuinely settled finding from an earlier round is never
+                  # resurrected.
+                  elif ($keptids | index($f.id))
+                       and ($f.status | IN("dismissed", "fixed"))
                        and (($oldids | index($f.id)) | not)
                     then $f + {status: "open"}
                   else $f end)
@@ -600,9 +604,19 @@ jobs:
             # ledger exists to prevent. Three findings across seventeen
             # rounds was enough to reach the old flat cap of 50. An entry is
             # ~100 bytes, so 200 stays far inside the comment size limit.
+            #
+            # Settled entries take the cap first and open ones fill what is
+            # left, rather than each getting a fixed sub-cap: with 151
+            # settled and 50 open, sub-caps of 150/50 would drop a decision
+            # even though dropping one open entry meets the cap. `$room > 0`
+            # is load-bearing — jq's `.[-0:]` is `.[0:]`, which would return
+            # the whole open list precisely when there is no room for it.
             | if length > 200
-              then (map(select(.status != "open")) | .[-150:])
-                   + (map(select(.status == "open")) | .[-50:])
+              then (map(select(.status != "open")) | .[-200:]) as $s
+                   | (200 - ($s | length)) as $room
+                   | $s + (if $room > 0
+                           then (map(select(.status == "open")) | .[-$room:])
+                           else [] end)
               else . end
           ' 2>/dev/null || true)
           if [ -z "$FINAL_FINDINGS" ]; then FINAL_FINDINGS="$merged"; fi
