@@ -757,6 +757,47 @@ def _modern_response_status(msg: dict[str, Any]) -> int:
     return 200
 
 
+# The four notification-dependent capability flags discover cannot honor
+# YET (#373 review, /code-review score 85): each one promises a
+# notification kind that a gateway-owned child's real traffic never
+# reaches the client for. `_queue_server_initiated`'s modern_owned branch
+# silently discards every notification a pooled child emits — no SSE
+# stream, no consumer — until 3.5-D ships `subscriptions/listen`. This is
+# the relay's C8 principle (relay.py: "advertise exactly what is
+# forwarded") applied in reverse: C8 forwards a notification kind only for
+# a family the relay advertised; here the matching rule is to advertise a
+# family's notification flag only for a kind serve can actually forward.
+# Keyed by family -> the KEYS to strip, never the whole family object:
+# spec capability semantics are presence-based, and the REQUEST surfaces
+# in every one of these families (tools/list, resources/read,
+# prompts/get) are served today — only the notification promise is
+# undeliverable. `logging` is deliberately NOT in this table: whether its
+# `notifications/message` promise belongs in the same boat is 3.5-D
+# territory, not this fix's scope.
+_UNDELIVERABLE_NOTIFICATION_FLAGS: dict[str, tuple[str, ...]] = {
+    "tools": ("listChanged",),
+    "resources": ("subscribe", "listChanged"),
+    "prompts": ("listChanged",),
+}
+
+
+def _strip_undeliverable_capability_flags(
+    capabilities: dict[str, Any],
+) -> dict[str, Any]:
+    """Drop the notification flags discover cannot honor yet (see above).
+
+    Non-dict family values pass through untouched (defensive: a
+    malformed child answer is not this function's concern to validate).
+    """
+    stripped: dict[str, Any] = {}
+    for family, value in capabilities.items():
+        flags = _UNDELIVERABLE_NOTIFICATION_FLAGS.get(family)
+        if flags and isinstance(value, dict):
+            value = {k: v for k, v in value.items() if k not in flags}
+        stripped[family] = value
+    return stripped
+
+
 def _synthesize_discover_result(
     init_result: dict[str, Any], *, cache_ttl_ms: int = _DEFAULT_CACHE_TTL_MS
 ) -> dict[str, Any]:
@@ -769,7 +810,12 @@ def _synthesize_discover_result(
     `supportedVersions` is SERVE's own implemented set, never the
     child's: the child speaks 2025-06-18 and the question being asked is
     what the ENDPOINT supports. `capabilities` is the child's, echoed
-    verbatim, because that is what the endpoint can actually do.
+    almost verbatim — `_strip_undeliverable_capability_flags` removes the
+    four notification-dependent flags first (`tools.listChanged`,
+    `resources.subscribe`, `resources.listChanged`,
+    `prompts.listChanged`; see that function's comment), because those
+    are not what the endpoint can actually do until 3.5-D. Every other
+    flag, and the family objects themselves, pass through untouched.
 
     BOTH FIELDS ARE LOAD-BEARING FOR INTEROP, not decoration. The v2
     client validates this result as a `DiscoverResult` whose required
@@ -787,7 +833,9 @@ def _synthesize_discover_result(
         # `.get(...) or {}` deliberately: a child that answers with no
         # capabilities key, or a null one, still yields the OBJECT the
         # client's validation requires.
-        "capabilities": init_result.get("capabilities") or {},
+        "capabilities": _strip_undeliverable_capability_flags(
+            init_result.get("capabilities") or {}
+        ),
         "ttlMs": cache_ttl_ms,
         "cacheScope": _CACHE_SCOPE,
     }

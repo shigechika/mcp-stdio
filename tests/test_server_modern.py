@@ -1028,6 +1028,50 @@ class TestSynthesizeDiscover:
             server._SERVE_IMPLEMENTED_MODERN_VERSIONS
         )
 
+    def test_notification_dependent_flags_are_stripped(self):
+        """#373 review, /code-review score 85: discover cannot honor
+        `tools.listChanged`, `resources.subscribe`, `resources.listChanged`
+        or `prompts.listChanged` until 3.5-D ships `subscriptions/listen` —
+        `_queue_server_initiated`'s modern_owned branch silently discards
+        every notification a pooled child sends today. Echoing these flags
+        verbatim would advertise a promise this endpoint cannot keep.
+        """
+        result = server._synthesize_discover_result(
+            {
+                "capabilities": {
+                    "tools": {"listChanged": True},
+                    "resources": {"subscribe": True, "listChanged": True},
+                    "prompts": {"listChanged": True},
+                    "completions": {},
+                }
+            }
+        )
+        caps = result["capabilities"]
+        assert "listChanged" not in caps["tools"]
+        assert "subscribe" not in caps["resources"]
+        assert "listChanged" not in caps["resources"]
+        assert "listChanged" not in caps["prompts"]
+        # The family objects survive — the REQUEST surfaces (tools/list,
+        # resources/read, prompts/get) are served today — just emptied of
+        # the stripped keys, never removed wholesale.
+        assert "tools" in caps
+        assert "resources" in caps
+        assert "prompts" in caps
+        # Control: a non-notification-dependent capability passes through
+        # untouched, proving the filter is scoped to the four flags rather
+        # than over-stripping.
+        assert caps["completions"] == {}
+
+    def test_a_non_stripped_key_survives_within_a_stripped_family(self):
+        """The filter removes specific KEYS, never the whole family
+        object: a hypothetical `resources.other` flag must survive
+        alongside `subscribe` being stripped from the SAME family — spec
+        capability semantics are presence-based per key, not per family."""
+        result = server._synthesize_discover_result(
+            {"capabilities": {"resources": {"subscribe": True, "other": "x"}}}
+        )
+        assert result["capabilities"]["resources"] == {"other": "x"}
+
 
 class TestModernIdMinting:
     def test_minted_ids_are_unique_across_threads(self):
