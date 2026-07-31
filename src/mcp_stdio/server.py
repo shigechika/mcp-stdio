@@ -53,6 +53,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from .relay import (
     _META_CLIENT_CAPABILITIES,
     _META_PROTOCOL_VERSION,
+    _META_SERVER_INFO,
     _NAME_BEARING_METHODS,
     _decode_mcp_name,
     log,
@@ -599,6 +600,141 @@ class ModernBackendPool:
     def count(self) -> int:
         with self._lock:
             return len(self._entries)
+
+
+# --- modern dispatch: id remap and the result-rewrite seam ---
+
+_MODERN_ID_LOCK = threading.Lock()
+_MODERN_ID_SEQ = 0
+
+
+def _mint_modern_id() -> str:
+    """A globally unique upstream id for one modern request.
+
+    PROCESS-global and monotonic, not per-child: two concurrent modern
+    clients may share one pooled child, and their own ids are whatever
+    they chose — very possibly the same integer. Minting our own removes
+    the collision by construction, which is also why
+    `_DuplicateInFlightId` and the same-payload piggyback are unreachable
+    on this path. Both stay for the legacy one, where the client's id IS
+    the routing key.
+
+    Namespaced like relay's `_RELAY_ID_NAMESPACE`, so a child that echoes
+    ids into logs shows where they came from.
+    """
+    global _MODERN_ID_SEQ
+    with _MODERN_ID_LOCK:
+        _MODERN_ID_SEQ += 1
+        return f"{_SERVE_ID_NAMESPACE}{_MODERN_ID_SEQ}"
+
+
+def _is_reserved_client_id(req_id: Any) -> bool:
+    """True when a client's own id trespasses on serve's namespace.
+
+    Closes by construction the gap relay's PR C had to close by rule: a
+    client whose id is literally `mcp-stdio/serve/7` would be
+    indistinguishable from serve's own bookkeeping the moment a response
+    came back, so the id is rejected where it ENTERS rather than
+    disambiguated at every later consumer.
+    """
+    return isinstance(req_id, str) and req_id.startswith(_SERVE_ID_NAMESPACE)
+
+
+def _stamp_modern_result(
+    msg: dict[str, Any],
+    method: str | None,
+    *,
+    server_info: Any = None,
+    cache_ttl_ms: int = _DEFAULT_CACHE_TTL_MS,
+) -> dict[str, Any]:
+    """Add the fields a 2026-07-28 server owes, to a legacy child's result.
+
+    #270 Phase 3 P3-B, the rewrite seam. A legacy child emits none of
+    these, and serve — answering as a modern server — gets no waiver:
+    "The `result` MUST include a `resultType` field", and the
+    absent-means-complete leniency is explicitly a CLIENT obligation for
+    EARLIER-protocol servers, which serve is not claiming to be.
+
+    Everything is stamped IFF ABSENT, never overwritten: a child that
+    already speaks the modern dialect keeps its own values, and the seam
+    stays a widening rather than a rewrite.
+
+    - `resultType: "complete"` on EVERY modern success result. Broader
+      than the six cacheable ops, because O3's MUST is about every
+      result — and the v2 client enforces it on the cacheable ones.
+    - `ttlMs`/`cacheScope` on the SIX cacheable operations only, as
+      top-level result keys (siblings of `resultType`, not `_meta`).
+      NEVER on `tools/call`: `CallToolResult` is not a CacheableResult
+      and the v2 client's model has no such fields at all, so stamping
+      them would be inventing wire data.
+    - `_meta["io.modelcontextprotocol/serverInfo"]` on every result —
+      "Servers SHOULD include the following ... field in every result's
+      `_meta`" — echoed verbatim from the cached child InitializeResult.
+      Identity fields are "self-reported by the sender and ... not
+      verified", so echoing the child's is legal and honest; inventing
+      one would not be.
+
+    ERRORS ARE NEVER STAMPED, and that is structural rather than
+    policy: `resultType` is a field OF `result`, and a JSON-RPC error
+    response has no `result` member to put it in.
+    """
+    result = msg.get("result")
+    if not isinstance(result, dict):
+        return msg
+    result.setdefault("resultType", "complete")
+    if method in _CACHEABLE_METHODS:
+        result.setdefault("ttlMs", cache_ttl_ms)
+        result.setdefault("cacheScope", _CACHE_SCOPE)
+    if server_info is not None:
+        meta = result.get("_meta")
+        if not isinstance(meta, dict):
+            meta = {}
+            result["_meta"] = meta
+        meta.setdefault(_META_SERVER_INFO, server_info)
+    return msg
+
+
+def _synthesize_discover_result(
+    init_result: dict[str, Any], *, cache_ttl_ms: int = _DEFAULT_CACHE_TTL_MS
+) -> dict[str, Any]:
+    """Build the DiscoverResult serve answers `server/discover` with.
+
+    Never forwarded to the child — a legacy child has never heard of
+    `server/discover` and would answer `-32601`. Serve owns the answer,
+    sourced from the handshake it performed on the client's behalf.
+
+    `supportedVersions` is SERVE's own implemented set, never the
+    child's: the child speaks 2025-06-18 and the question being asked is
+    what the ENDPOINT supports. `capabilities` is the child's, echoed
+    verbatim, because that is what the endpoint can actually do.
+
+    BOTH FIELDS ARE LOAD-BEARING FOR INTEROP, not decoration. The v2
+    client validates this result as a `DiscoverResult` whose required
+    fields are exactly `supportedVersions` and `capabilities`; a
+    ValidationError makes it SILENTLY FALL BACK to `initialize` — verified
+    against the real client, which on a capabilities-less result emitted
+    `initialize` + `notifications/initialized` and left
+    `discover_result` None. Discovery would "succeed" while the modern
+    path quietly never engaged, which is why the AC1 test asserts
+    `discover_result is not None` rather than that the calls worked.
+    """
+    result: dict[str, Any] = {
+        "resultType": "complete",
+        "supportedVersions": sorted(_SERVE_IMPLEMENTED_MODERN_VERSIONS),
+        # `.get(...) or {}` deliberately: a child that answers with no
+        # capabilities key, or a null one, still yields the OBJECT the
+        # client's validation requires.
+        "capabilities": init_result.get("capabilities") or {},
+        "ttlMs": cache_ttl_ms,
+        "cacheScope": _CACHE_SCOPE,
+    }
+    server_info = init_result.get("serverInfo")
+    if server_info is not None:
+        result["_meta"] = {_META_SERVER_INFO: server_info}
+    instructions = init_result.get("instructions")
+    if isinstance(instructions, str):
+        result["instructions"] = instructions
+    return result
 
 
 class _DuplicateInFlightId(Exception):

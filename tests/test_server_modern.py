@@ -696,3 +696,141 @@ class TestModernBackendPool:
             assert pool.count() == 0
         finally:
             pool.shutdown_all()
+
+
+# --- the rewrite seam and discover synthesis (#270 Phase 3 P3-B) ---------
+
+
+class TestStampModernResult:
+    """What a 2026-07-28 server owes on top of a legacy child's result."""
+
+    def test_result_type_is_stamped_on_every_result(self):
+        """O3 is a MUST on EVERY result, not just the cacheable six.
+
+        The absent-means-complete leniency is explicitly a CLIENT
+        obligation toward EARLIER-protocol servers; serve, answering as a
+        2026-07-28 server, gets no waiver.
+        """
+        for method in ("tools/list", "tools/call", "resources/read", "prompts/get"):
+            msg = server._stamp_modern_result({"result": {}}, method)
+            assert msg["result"]["resultType"] == "complete", method
+
+    def test_caching_hints_land_on_the_six_and_nowhere_else(self):
+        for method in sorted(server._CACHEABLE_METHODS):
+            result = server._stamp_modern_result({"result": {}}, method)["result"]
+            assert result["ttlMs"] == server._DEFAULT_CACHE_TTL_MS, method
+            assert result["cacheScope"] == "private", method
+
+    def test_tools_call_never_gets_caching_hints(self):
+        """`CallToolResult` is not a CacheableResult, and the v2 client's
+        model has no `ttlMs`/`cacheScope` fields at all — stamping them
+        would be inventing wire data."""
+        assert "tools/call" not in server._CACHEABLE_METHODS
+        result = server._stamp_modern_result({"result": {"content": []}}, "tools/call")
+        assert "ttlMs" not in result["result"]
+        assert "cacheScope" not in result["result"]
+
+    def test_errors_are_never_stamped(self):
+        """Structural, not policy: `resultType` is a field OF `result`,
+        and an error response has no `result` member to put it in."""
+        msg = {"error": {"code": -32601, "message": "nope"}}
+        assert server._stamp_modern_result(dict(msg), "tools/list") == msg
+
+    def test_stamps_are_iff_absent(self):
+        """A child that already speaks the modern dialect keeps its own
+        values — the seam is a widening, not a rewrite."""
+        msg = server._stamp_modern_result(
+            {
+                "result": {
+                    "resultType": "input_required",
+                    "ttlMs": 5,
+                    "cacheScope": "public",
+                }
+            },
+            "tools/list",
+            server_info={"name": "ours", "version": "9"},
+        )
+        assert msg["result"]["resultType"] == "input_required"
+        assert msg["result"]["ttlMs"] == 5
+        assert msg["result"]["cacheScope"] == "public"
+
+    def test_server_info_is_echoed_into_meta_on_every_result(self):
+        info = {"name": "child", "version": "1.2.3"}
+        for method in ("tools/list", "tools/call"):
+            result = server._stamp_modern_result(
+                {"result": {}}, method, server_info=info
+            )["result"]
+            assert result["_meta"]["io.modelcontextprotocol/serverInfo"] == info, method
+
+    def test_a_custom_ttl_threads_through(self):
+        result = server._stamp_modern_result(
+            {"result": {}}, "tools/list", cache_ttl_ms=0
+        )["result"]
+        assert result["ttlMs"] == 0
+
+
+class TestSynthesizeDiscover:
+    def test_carries_the_two_fields_the_client_requires(self):
+        """Both are load-bearing for interop, not decoration: the v2
+        client validates `DiscoverResult` with exactly `supportedVersions`
+        and `capabilities` required, and a ValidationError makes it
+        SILENTLY fall back to `initialize`."""
+        result = server._synthesize_discover_result(
+            {"capabilities": {"tools": {}}, "serverInfo": {"name": "f", "version": "0"}}
+        )
+        assert result["supportedVersions"] == ["2026-07-28"]
+        assert result["capabilities"] == {"tools": {}}
+        assert result["resultType"] == "complete"
+        assert result["ttlMs"] == server._DEFAULT_CACHE_TTL_MS
+        assert result["cacheScope"] == "private"
+        assert result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "f"
+
+    def test_a_capability_less_child_still_yields_an_object(self):
+        """The silent-fallback trap: a child answering with no
+        capabilities (or a null one) must still produce the OBJECT the
+        client's validation requires, or discovery "succeeds" while the
+        modern path quietly never engages."""
+        for init in ({}, {"capabilities": None}):
+            result = server._synthesize_discover_result(init)
+            assert result["capabilities"] == {}
+            assert isinstance(result["capabilities"], dict)
+
+    def test_supported_versions_are_serves_own_not_the_childs(self):
+        """The child speaks 2025-06-18; the question is what the ENDPOINT
+        supports."""
+        result = server._synthesize_discover_result(
+            {"protocolVersion": "2025-06-18", "capabilities": {}}
+        )
+        assert "2025-06-18" not in result["supportedVersions"]
+        assert result["supportedVersions"] == sorted(
+            server._SERVE_IMPLEMENTED_MODERN_VERSIONS
+        )
+
+
+class TestModernIdMinting:
+    def test_minted_ids_are_unique_across_threads(self):
+        """Two concurrent modern clients may share one pooled child and
+        may well have chosen the same integer id; minting our own removes
+        the collision by construction."""
+        seen: list[str] = []
+        lock = threading.Lock()
+
+        def _mint():
+            local = [server._mint_modern_id() for _ in range(50)]
+            with lock:
+                seen.extend(local)
+
+        threads = [threading.Thread(target=_mint) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert len(seen) == 200
+        assert len(set(seen)) == 200
+        assert all(i.startswith("mcp-stdio/serve/") for i in seen)
+
+    def test_reserved_client_ids_are_recognised(self):
+        assert server._is_reserved_client_id("mcp-stdio/serve/1") is True
+        assert server._is_reserved_client_id("mcp-stdio/serve") is False
+        assert server._is_reserved_client_id(1) is False
+        assert server._is_reserved_client_id(None) is False
