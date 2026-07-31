@@ -21,6 +21,13 @@ pytest tests/ -v
 pytest tests/test_relay.py -v
 pytest tests/test_relay.py::TestWriteLine -v
 
+# Integration harness against python-sdk v2, the 2026-07-28 reference peer
+# (#367). Real localhost HTTP and a real relay subprocess, so it is a
+# SEPARATE directory the unit gate never walks. Needs the extra; without it
+# a conftest guard skips collection.
+pip install -e ".[dev,integration]"
+pytest tests_integration/ -v
+
 # Build package
 pip install build && python -m build
 ```
