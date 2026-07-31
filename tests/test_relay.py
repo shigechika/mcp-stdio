@@ -18,11 +18,20 @@ from mcp_stdio.relay import (
     MAX_LIST_PAGES,
     MAX_RETRIES,
     PAGINATED_LIST_METHODS,
+    _COLD_START_LIST_CHANGED,
+    _LISTEN_FORWARDED_NOTIFICATIONS,
+    _LISTEN_ID_PREFIX,
+    _LISTEN_MAX_SUBSCRIPTIONS,
+    _LISTEN_RES_ID_PREFIX,
+    _RELAY_ID_NAMESPACE,
+    _RESOURCE_UPDATED_METHOD,
     _CancelTracker,
     _ModernState,
+    _ResourceSubscriptions,
     _SseState,
     _build_discover_probe_request,
     _build_listen_params,
+    _consume_restart,
     _detect_paginated_list,
     _drain_pending,
     _emit,
@@ -42,6 +51,7 @@ from mcp_stdio.relay import (
     _handle_rate_limit,
     _inject_modern_meta,
     _listen_stream_loop,
+    _log_unhonored_subscriptions,
     _is_initialize_request,
     _is_pure_response_for,
     _is_recognized_modern_error,
@@ -69,6 +79,7 @@ from mcp_stdio.relay import (
     _start_proactive_refresh,
     _stop_proactive_refresh,
     _strip_listen_subscription_id,
+    _with_resource_subscriptions,
     _same_origin,
     _split_sse_text,
     _sse_reader_loop,
@@ -10373,7 +10384,12 @@ def _with_list_changed(caps):
     empty seed the union adds nothing (and the relay-side gate then
     swallows every listen notification — the documented degraded mode).
     Every other seeded key (and every other field of a unioned family) must
-    survive untouched."""
+    survive untouched.
+
+    #270 Phase 2 PR B unions ``subscribe: true`` onto ``resources`` under
+    exactly the same rule — the RELAY implements ``resources/subscribe``
+    now, backed by the dedicated resource listen stream — so an absent
+    ``resources`` family still gets nothing at all."""
     expected = copy.deepcopy(caps)
     for key in ("tools", "resources", "prompts"):
         if key not in expected:
@@ -10382,6 +10398,8 @@ def _with_list_changed(caps):
         if not isinstance(entry, dict):
             entry = {}
         entry["listChanged"] = True
+        if key == "resources":
+            entry["subscribe"] = True
         expected[key] = entry
     return expected
 
@@ -13162,6 +13180,583 @@ class TestRunModernEra:
         assert captured["timeout"].read == 42.0
         assert captured["timeout"].connect == 7.0
 
+    # --- resource subscriptions (#270 Phase 2 PR B) ---
+
+    def _init_line(self, req_id=1, capabilities=None):
+        return json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": capabilities if capabilities is not None else {},
+                },
+            }
+        )
+
+    def _initialized_line(self):
+        return json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def _subscribe_line(self, req_id, uri, method="resources/subscribe"):
+        return json.dumps(
+            {"jsonrpc": "2.0", "id": req_id, "method": method, "params": {"uri": uri}}
+        )
+
+    def _register_discover_with_resources(self, httpx_mock):
+        """Seed a discover response that advertises the resources family.
+
+        Pinned to its OWN ``Mcp-Method``, unlike the matcher-less
+        registrations elsewhere in this class. With TWO background listen
+        streams (#270 Phase 2 PR B) a matcher-less response is no longer
+        safe: pytest_httpx falls back to "the LAST registered matcher, if
+        it is reusable" once every matcher has been called, so the second
+        listen POST resolves to the (non-reusable) discover matcher and
+        fails to match at all. Pinning keeps each response bound to the
+        request it actually answers.
+        """
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "server/discover"},
+            text=self._discover_response(capabilities={"tools": {}, "resources": {}}),
+            headers={"content-type": "application/json"},
+        )
+
+    def test_modern_subscribe_answered_locally_and_never_forwarded(self, httpx_mock):
+        """#270 Phase 2 PR B, implementation spec 1 + base change 3. Spec
+        rev 2026-07-28 has no `resources/subscribe` on the wire, so
+        forwarding one could only earn a -32601 the 2025-era client never
+        expected from a server that advertised `resources.subscribe`. The
+        relay answers the legacy EmptyResult itself, immediately, and
+        POSTs nothing for it — the only upstream traffic here is the
+        discover probe and the two listen streams."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover_with_resources(httpx_mock)
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._init_line(),
+                self._initialized_line(),
+                self._subscribe_line(7, "file:///a.txt"),
+                self._subscribe_line(8, "file:///a.txt", "resources/unsubscribe"),
+            ],
+            protocol_era="modern",
+        )
+        lines = [json.loads(line) for line in output.strip().split("\n") if line]
+        # [0] the synthesized InitializeResult, then one EmptyResult each.
+        assert lines[1] == {"jsonrpc": "2.0", "id": 7, "result": {}}
+        assert lines[2] == {"jsonrpc": "2.0", "id": 8, "result": {}}
+        # The synthesized handshake advertised the capability the relay
+        # itself now implements.
+        assert lines[0]["result"]["capabilities"]["resources"] == {
+            "listChanged": True,
+            "subscribe": True,
+        }
+        # Nothing but the discover probe left this process on the ordinary
+        # dispatch path — no subscribe/unsubscribe was forwarded.
+        forwarded = [
+            json.loads(r.content).get("method")
+            for r in self._non_listen_requests(httpx_mock)
+        ]
+        assert forwarded == ["server/discover"]
+
+    def test_duplicate_subscribe_and_unknown_unsubscribe_still_answer_empty(
+        self, httpx_mock
+    ):
+        """Base change 7 (idempotent semantics): a repeat subscribe and an
+        unsubscribe for a URI that was never subscribed both succeed with
+        `{}`. The legacy methods define no error for either, so inventing
+        one would be a wire behavior no 2025-era client is prepared for."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover_with_resources(httpx_mock)
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._init_line(),
+                self._initialized_line(),
+                self._subscribe_line(2, "file:///a.txt"),
+                self._subscribe_line(3, "file:///a.txt"),
+                self._subscribe_line(4, "file:///never", "resources/unsubscribe"),
+            ],
+            protocol_era="modern",
+        )
+        lines = [json.loads(line) for line in output.strip().split("\n") if line]
+        assert [line.get("id") for line in lines] == [1, 2, 3, 4]
+        assert all(line["result"] == {} for line in lines[1:])
+
+    def test_subscribe_cap_refuses_new_uris_but_still_answers_empty(
+        self, httpx_mock, capsys
+    ):
+        """Design A6: the 256-URI cap has `_MRTR_MAX_TXNS` semantics —
+        cap, never TTL; at the cap the NEW subscription is refused and
+        logged while every existing one keeps working, and the client
+        still gets its EmptyResult (base change 3)."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover_with_resources(httpx_mock)
+        stdin = [self._init_line(), self._initialized_line()]
+        stdin += [
+            self._subscribe_line(100 + n, f"file:///r{n}")
+            for n in range(_LISTEN_MAX_SUBSCRIPTIONS + 1)
+        ]
+        output = self._run_with_stdin(httpx_mock, stdin, protocol_era="modern")
+        lines = [json.loads(line) for line in output.strip().split("\n") if line]
+        # Every subscribe, over-cap one included, answered {}.
+        assert len(lines) == _LISTEN_MAX_SUBSCRIPTIONS + 2
+        assert lines[-1] == {
+            "jsonrpc": "2.0",
+            "id": 100 + _LISTEN_MAX_SUBSCRIPTIONS,
+            "result": {},
+        }
+        err = capsys.readouterr().err
+        assert f"{_LISTEN_MAX_SUBSCRIPTIONS}-subscription cap" in err
+
+    def test_resource_stream_posts_current_uris_under_its_own_id_prefix(
+        self, httpx_mock
+    ):
+        """Design A2 + base changes 2/4, end to end: the SECOND stream
+        carries `resourceSubscriptions` with the live URI set under ids
+        derived from the relay's reserved namespace, while the
+        list_changed stream's body stays byte-frozen (no
+        `resourceSubscriptions` key at all — the PR A invariant)."""
+        posted = []
+        res_posted = threading.Event()
+
+        def listen_callback(request):
+            body = json.loads(request.content)
+            posted.append(body)
+            if body["id"].startswith(_LISTEN_RES_ID_PREFIX):
+                res_posted.set()
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {"resultType": "complete"},
+                },
+            )
+
+        httpx_mock.add_callback(
+            listen_callback,
+            url=self.URL,
+            match_headers={"Mcp-Method": "subscriptions/listen"},
+            is_optional=True,
+            is_reusable=True,
+        )
+        self._register_discover_with_resources(httpx_mock)
+
+        def stdin_lines():
+            yield self._init_line() + "\n"
+            yield self._initialized_line() + "\n"
+            yield self._subscribe_line(2, "file:///b.txt") + "\n"
+            assert res_posted.wait(timeout=5)
+
+        with patch("sys.stdin", stdin_lines()), patch("sys.stdout", StringIO()):
+            run(self.URL, {"Content-Type": "application/json"}, protocol_era="modern")
+
+        res = [b for b in posted if b["id"].startswith(_LISTEN_RES_ID_PREFIX)]
+        plain = [b for b in posted if b["id"].startswith(_LISTEN_ID_PREFIX)]
+        assert len(res) == 1
+        # Design A9, end-to-end wire-shape pin: the field belongs TO the
+        # `notifications` filter, never beside it. A top-level placement
+        # is not an error on a compliant server — it is silently ignored
+        # (the reference SDK models the filter with `extra="ignore"`), so
+        # only an assertion on the serialized body can catch a regression.
+        assert res[0]["params"]["notifications"] == {
+            "resourceSubscriptions": ["file:///b.txt"]
+        }
+        assert "resourceSubscriptions" not in res[0]["params"]
+        # The two prefixes are DISTINCT and both derived, so the streams
+        # can never mistake each other's graceful-end signals and the
+        # #356 intake rejection covers both for free.
+        assert _LISTEN_RES_ID_PREFIX.startswith(_RELAY_ID_NAMESPACE)
+        assert _LISTEN_RES_ID_PREFIX != _LISTEN_ID_PREFIX
+        # PR A's stream is untouched by PR B (base change 1): the three
+        # listChanged booleans, and no resourceSubscriptions at either
+        # level.
+        assert plain
+        for body in plain:
+            assert body["params"]["notifications"] == {
+                "toolsListChanged": True,
+                "promptsListChanged": True,
+                "resourcesListChanged": True,
+            }
+            assert "resourceSubscriptions" not in body["params"]
+
+    def test_rapid_subscribes_coalesce_into_two_opens(self, httpx_mock):
+        """Base change 6 (generation coalescing, no timers): five
+        subscribes that land while one attempt is open produce ONE reopen,
+        not five — `Event.set` is idempotent and the next attempt's
+        snapshot sees every URI at once. Deterministic without sleeps: the
+        stub holds attempt 1 open until the stdin generator has fed all
+        five and released it."""
+        self._register_discover_with_resources(httpx_mock)
+        snapshots = []
+        opened = threading.Event()
+        release = threading.Event()
+        done = threading.Event()
+
+        def stub_loop(**kwargs):
+            provider = kwargs.get("body_provider")
+            if provider is None:  # the list_changed stream
+                assert kwargs["stop"].wait(timeout=5)
+                return
+            snapshots.append(provider()[0]["notifications"]["resourceSubscriptions"])
+            opened.set()
+            assert release.wait(timeout=5)
+            kwargs["restart"].clear()
+            snapshots.append(provider()[0]["notifications"]["resourceSubscriptions"])
+            done.set()
+            assert kwargs["stop"].wait(timeout=5)
+
+        def stdin_lines():
+            yield self._init_line() + "\n"
+            yield self._initialized_line() + "\n"
+            yield self._subscribe_line(10, "file:///r0") + "\n"
+            assert opened.wait(timeout=5)
+            for n in range(1, 5):
+                yield self._subscribe_line(10 + n, f"file:///r{n}") + "\n"
+            release.set()
+            assert done.wait(timeout=5)
+
+        with (
+            patch("mcp_stdio.relay._listen_stream_loop", stub_loop),
+            patch("sys.stdin", stdin_lines()),
+            patch("sys.stdout", StringIO()),
+        ):
+            run(self.URL, {"Content-Type": "application/json"}, protocol_era="modern")
+
+        assert len(snapshots) == 2
+        assert snapshots[0] == ["file:///r0"]
+        assert snapshots[1] == [f"file:///r{n}" for n in range(5)]
+
+    def test_teardown_wakes_a_parked_resource_stream(self, httpx_mock):
+        """Design A4 through run()'s finally: an unsubscribe that empties
+        the URI set parks the resource thread on `restart.wait()`, and an
+        `Event.wait()` is deaf to BOTH the stop event and the dedicated
+        client's close — the two things that unblock every other arm. So
+        the teardown sets the restart event as well, after the stop. The
+        stub parks exactly the way the real loop does (see
+        `TestResourceListenStreamLoop.test_empty_uri_set_parks_and_teardown_wakes_it`
+        for that being a plain `restart.wait()`); without the teardown's
+        set it would outlive the bounded join."""
+        self._register_discover_with_resources(httpx_mock)
+        parked = threading.Event()
+        exited = threading.Event()
+
+        def stub_loop(**kwargs):
+            if kwargs.get("body_provider") is None:
+                assert kwargs["stop"].wait(timeout=5)
+                return
+            parked.set()
+            kwargs["restart"].wait()
+            exited.set()
+
+        def stdin_lines():
+            yield self._init_line() + "\n"
+            yield self._initialized_line() + "\n"
+            yield self._subscribe_line(2, "file:///a") + "\n"
+            assert parked.wait(timeout=5)
+
+        with (
+            patch("mcp_stdio.relay._listen_stream_loop", stub_loop),
+            patch("sys.stdin", stdin_lines()),
+            patch("sys.stdout", StringIO()),
+        ):
+            run(self.URL, {"Content-Type": "application/json"}, protocol_era="modern")
+
+        # run() has already joined it; a still-parked thread means the
+        # teardown never woke it.
+        assert exited.is_set()
+
+    def test_no_resource_stream_without_a_subscription(self, httpx_mock):
+        """The second stream is LAZY: a client that never subscribes must
+        not pay for a second upstream connection, so only the
+        list_changed stream (no `body_provider`) is ever started."""
+        self._register_discover_with_resources(httpx_mock)
+        started = []
+
+        def stub_loop(**kwargs):
+            started.append(kwargs.get("body_provider") is not None)
+            assert kwargs["stop"].wait(timeout=5)
+
+        with patch("mcp_stdio.relay._listen_stream_loop", stub_loop):
+            self._run_with_stdin(
+                httpx_mock,
+                [self._init_line(), self._initialized_line()],
+                protocol_era="modern",
+            )
+        assert started == [False]
+
+    def test_subscribe_before_initialized_rides_the_first_open(self, httpx_mock):
+        """Base change 3: subscribes that arrive before the listen phase
+        accumulate and ride the FIRST open — there is nothing to reopen
+        yet, so the URI set is simply what the first attempt requests."""
+        self._register_discover_with_resources(httpx_mock)
+        first = {}
+
+        def stub_loop(**kwargs):
+            provider = kwargs.get("body_provider")
+            if provider is not None:
+                first["filter"] = provider()[0]["notifications"]
+            assert kwargs["stop"].wait(timeout=5)
+
+        with patch("mcp_stdio.relay._listen_stream_loop", stub_loop):
+            self._run_with_stdin(
+                httpx_mock,
+                [
+                    self._init_line(),
+                    self._subscribe_line(2, "file:///early"),
+                    self._initialized_line(),
+                ],
+                protocol_era="modern",
+            )
+        assert first["filter"] == {"resourceSubscriptions": ["file:///early"]}
+
+    def test_resource_stream_does_not_start_before_notifications_initialized(
+        self, httpx_mock
+    ):
+        """#358 review R1F1: `initialize` seeds BOTH streams' body snapshot
+        (`_seed_listen_snapshot`), so a `resources/subscribe` landing in the
+        initialize -> initialized window used to start the resource stream
+        immediately — opening the upstream connection before the
+        downstream handshake had even completed, while the list_changed
+        stream correctly waits for `initialized` (#352 review finding 1).
+        The subscribe still answers `{}` and accumulates the URI, but the
+        resource stream itself must not start until `_start_listen_stream`
+        runs, then rides that start with the accumulated URI in its first
+        body — same outcome as
+        `test_subscribe_before_initialized_rides_the_first_open`, but this
+        test also pins WHEN the thread is allowed to start.
+
+        Absence is proven with a bounded wait rather than a race: the
+        resource stream's stub signals an event the instant it runs, and
+        starting a thread plus running one statement takes microseconds —
+        nowhere near the bound below — so a premature start would show up
+        reliably."""
+        self._register_discover_with_resources(httpx_mock)
+        resource_stream_started = threading.Event()
+        first_resource_notifications = {}
+
+        def stub_loop(**kwargs):
+            provider = kwargs.get("body_provider")
+            if provider is None:
+                assert kwargs["stop"].wait(timeout=5)
+                return
+            first_resource_notifications.update(provider()[0]["notifications"])
+            resource_stream_started.set()
+            assert kwargs["stop"].wait(timeout=5)
+
+        def stdin_lines():
+            yield self._init_line() + "\n"
+            yield self._subscribe_line(2, "file:///early") + "\n"
+            assert not resource_stream_started.wait(timeout=0.5)
+            yield self._initialized_line() + "\n"
+            assert resource_stream_started.wait(timeout=5)
+
+        stdout = StringIO()
+        with (
+            patch("mcp_stdio.relay._listen_stream_loop", stub_loop),
+            patch("sys.stdin", stdin_lines()),
+            patch("sys.stdout", stdout),
+        ):
+            run(self.URL, {"Content-Type": "application/json"}, protocol_era="modern")
+
+        lines = [json.loads(line) for line in stdout.getvalue().strip().split("\n")]
+        assert lines[1] == {"jsonrpc": "2.0", "id": 2, "result": {}}
+        assert first_resource_notifications == {
+            "resourceSubscriptions": ["file:///early"]
+        }
+
+    def test_subscribe_with_a_reserved_id_falls_through_to_the_intake_guard(
+        self, httpx_mock
+    ):
+        """Design A1, revert-check. The PR B interception runs BEFORE
+        #356's reserved-namespace intake rejection, so answering `{}` here
+        would put a SECOND response on the wire for one id. The hook
+        declines instead and the guard emits the single -32600 — and
+        nothing is subscribed, which is what a response-only assertion
+        would miss."""
+        self._register_discover_with_resources(httpx_mock)
+        started = []
+
+        def stub_loop(**kwargs):
+            started.append(kwargs.get("body_provider") is not None)
+            assert kwargs["stop"].wait(timeout=5)
+
+        with patch("mcp_stdio.relay._listen_stream_loop", stub_loop):
+            output = self._run_with_stdin(
+                httpx_mock,
+                [
+                    self._init_line(),
+                    self._initialized_line(),
+                    self._subscribe_line("mcp-stdio/listen-res/1", "file:///x"),
+                ],
+                protocol_era="modern",
+            )
+        lines = [json.loads(line) for line in output.strip().split("\n") if line]
+        # EXACTLY one response for the subscribe, and it is the rejection.
+        assert len(lines) == 2
+        assert lines[1]["id"] == "mcp-stdio/listen-res/1"
+        assert lines[1]["error"]["code"] == -32600
+        assert _RELAY_ID_NAMESPACE in lines[1]["error"]["message"]
+        # No subscription was recorded, so no resource stream was started.
+        assert started == [False]
+
+    def test_subscribe_reusing_a_pending_mrtr_id_falls_through_to_that_guard(
+        self, httpx_mock
+    ):
+        """Design A1, the second guard: an id that still owns a pending
+        MRTR transaction must get ONE -32600 from the reuse check, never a
+        synthesized `{}` from the subscribe interception on top of it."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover_with_resources(httpx_mock)
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "result": {
+                        "resultType": "input_required",
+                        "inputRequests": {
+                            "who": {
+                                "method": "elicitation/create",
+                                "params": {"message": "name?", "requestedSchema": {}},
+                            }
+                        },
+                    },
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._init_line(capabilities={"elicitation": {}}),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 5,
+                        "method": "tools/call",
+                        "params": {"name": "greet", "arguments": {}},
+                    }
+                ),
+                # id 5 still owns the transaction the minted elicitation
+                # is waiting on.
+                self._subscribe_line(5, "file:///x"),
+            ],
+            protocol_era="modern",
+        )
+        lines = [json.loads(line) for line in output.strip().split("\n") if line]
+        # [0] InitializeResult, [1] the minted elicitation/create, [2] the
+        # single rejection — no `{}` for id 5 anywhere.
+        assert len(lines) == 3
+        assert lines[1]["method"] == "elicitation/create"
+        assert lines[2]["id"] == 5
+        assert lines[2]["error"]["code"] == -32600
+        assert "MRTR transaction pending" in lines[2]["error"]["message"]
+        assert not any(line.get("result") == {} for line in lines)
+
+    def test_subscribe_is_not_swallowed_by_the_mrtr_response_interception(
+        self, httpx_mock
+    ):
+        """The MRTR response interception consumes RESPONSE-shaped lines
+        (id + result/error, NO method). A subscribe carries a method, so
+        `_is_pure_response` rejects it by construction — this pins that,
+        because a subscribe swallowed there would vanish without a
+        reply."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover_with_resources(httpx_mock)
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._init_line(),
+                self._initialized_line(),
+                self._subscribe_line(6, "file:///c.txt"),
+            ],
+            protocol_era="modern",
+        )
+        lines = [json.loads(line) for line in output.strip().split("\n") if line]
+        assert lines[-1] == {"jsonrpc": "2.0", "id": 6, "result": {}}
+
+    def test_input_required_on_a_listen_response_mints_nothing(self, httpx_mock):
+        """Design A3: `subscriptions/listen` is NOT MRTR-eligible (only
+        prompts/get, resources/read and tools/call are), so an
+        `input_required` result on a listen response is a spec violation —
+        never an invitation to mint an elicitation onto stdout. The listen
+        loops deliberately do not go through `_post_and_stream`, so no
+        bridge hook exists on that path; this pins the consequence."""
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "subscriptions/listen"},
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "mcp-stdio/listen/1",
+                    "result": {
+                        "resultType": "input_required",
+                        "inputRequests": {
+                            "who": {
+                                "method": "elicitation/create",
+                                "params": {"message": "name?"},
+                            }
+                        },
+                    },
+                }
+            ),
+            headers={"content-type": "application/json"},
+            is_optional=True,
+            is_reusable=True,
+        )
+        self._register_discover_with_resources(httpx_mock)
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._init_line(capabilities={"elicitation": {}}),
+                self._initialized_line(),
+            ],
+            protocol_era="modern",
+        )
+        assert "elicitation/create" not in output
+
+    def test_legacy_era_forwards_subscribe_verbatim_and_touches_no_state(
+        self, httpx_mock
+    ):
+        """AC 3 (#270): the legacy era has NO PR B call site. A
+        `resources/subscribe` is POSTed verbatim — no Mcp-Method header,
+        no local `{}` — and the URI-set holder is never touched, so no
+        resource stream can exist to reopen."""
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}',
+            headers={"content-type": "application/json"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            text='{"jsonrpc":"2.0","id":2,"result":{}}',
+            headers={"content-type": "application/json"},
+        )
+        recorded = []
+
+        class SpySubscriptions(_ResourceSubscriptions):
+            def add(self, uri):
+                recorded.append(uri)
+                return super().add(uri)
+
+        subscribe = self._subscribe_line(2, "file:///legacy.txt")
+        with patch("mcp_stdio.relay._ResourceSubscriptions", SpySubscriptions):
+            self._run_with_stdin(
+                httpx_mock,
+                [self._init_line(), subscribe],
+                protocol_era="legacy",
+            )
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 2  # forwarded initialize + forwarded subscribe
+        assert requests[1].content.decode() == subscribe
+        assert "mcp-method" not in requests[1].headers
+        assert recorded == []
+
 
 # --- modern era: MRTR bridge (#270 Phase 2 PR C) ---
 
@@ -15739,6 +16334,55 @@ class TestListenStreamLoop:
         assert err.count("before the stream was ever established") == 1
         assert "disabled for this session" in err
 
+    def test_input_required_result_fails_fast_pre_establishment_no_reconnect(
+        self, httpx_mock, capsys
+    ):
+        """#358 review R1F2 pin, the BEHAVIOR half (not just the comment
+        wording it guards): `subscriptions/listen` is not MRTR-eligible,
+        so a FIRST-attempt result with `resultType: "input_required"` is a
+        server-side spec violation. `_handle_listen_message` swallows it
+        (returns None — neither "ack" nor terminal), and the stream then
+        ends with neither graceful signal — PRE-establishment, that is
+        C7's ordinary no-ack fail-fast (`established` is still False
+        here): exactly one POST, the thread exits, no reconnect.
+        Reconnecting forever instead would be exactly the 1 Hz hammering
+        of a server that will answer input_required on every attempt that
+        C7 exists to prevent. This pins the BEHAVIOR so a future fix to
+        the misleading in-branch comment above this case (which used to
+        claim "the ordinary reconnect path") can never accidentally
+        become a fix to the reconnect behavior it describes."""
+        httpx_mock.add_response(
+            stream=self._sse(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "mcp-stdio/listen/1",
+                    "result": {"resultType": "input_required", "requestState": "X"},
+                }
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+        self._add_regression_escape_hatch(httpx_mock)
+        state = {}
+        with (
+            patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            patch("sys.stdout", StringIO()),
+        ):
+            self._run_loop(state=state)
+        assert len(httpx_mock.get_requests()) == 1
+        err = capsys.readouterr().err
+        assert err.count("input_required result") == 1
+        # The log line itself must state the truthful, establishment-split
+        # consequence — not a flat "reconnecting" claim, which used to
+        # mislead an operator at the exact moment they are diagnosing a
+        # permanently-disabled stream.
+        assert "fails fast here on a first attempt" in err
+        assert "ignoring and reconnecting" not in err
+        # No MRTR transaction state was touched: this loop is never even
+        # given an `mrtr_txns` handle (the listen loops deliberately do
+        # not go through `_post_and_stream`), and the only thing this
+        # branch writes to `state` is the once-per-stream log latch.
+        assert state == {"input_required_logged": True}
+
     def test_established_then_ackless_junk_reconnect_keeps_retrying(
         self, httpx_mock, capsys
     ):
@@ -16188,3 +16832,873 @@ class TestListenStreamLoop:
                 state=None,
             )
         assert len(httpx_mock.get_requests()) == 0
+
+
+# --- modern era: resource subscriptions (#270 Phase 2 PR B) ---
+
+
+class TestResourceSubscriptions:
+    """The URI-set holder the stdin loop writes and the resource listen
+    thread reads (base change 3)."""
+
+    def test_add_bumps_the_generation_once_per_new_uri(self):
+        subs = _ResourceSubscriptions()
+        assert subs.generation == 0
+        assert subs.add("file:///a") == "added"
+        assert subs.snapshot() == (frozenset({"file:///a"}), 1)
+
+    def test_duplicate_add_neither_changes_the_set_nor_the_generation(self):
+        """The coalescing guarantee depends on this: a duplicate subscribe
+        must not look like a change, or every repeat would reopen the
+        stream for nothing."""
+        subs = _ResourceSubscriptions()
+        subs.add("file:///a")
+        assert subs.add("file:///a") == "duplicate"
+        assert subs.snapshot() == (frozenset({"file:///a"}), 1)
+
+    def test_cap_refuses_new_uris_and_keeps_the_old_ones(self):
+        """Design A6 — `_MRTR_MAX_TXNS` semantics: cap, not TTL; at the cap
+        the NEW subscription fails and the older ones survive."""
+        subs = _ResourceSubscriptions()
+        for n in range(_LISTEN_MAX_SUBSCRIPTIONS):
+            assert subs.add(f"file:///r{n}") == "added"
+        assert subs.add("file:///over") == "refused"
+        uris, generation = subs.snapshot()
+        assert len(uris) == _LISTEN_MAX_SUBSCRIPTIONS
+        assert "file:///over" not in uris
+        assert generation == _LISTEN_MAX_SUBSCRIPTIONS  # the refusal bumped nothing
+
+    def test_discard_reports_whether_anything_changed(self):
+        subs = _ResourceSubscriptions()
+        subs.add("file:///a")
+        assert subs.discard("file:///never") is False
+        assert subs.snapshot()[1] == 1
+        assert subs.discard("file:///a") is True
+        assert subs.snapshot() == (frozenset(), 2)
+
+    def test_snapshot_is_immutable_and_wholesale(self):
+        """Published as a frozenset so a racing reader sees the old set or
+        the new one, never a half-mutated one (the `_SseState.endpoint_url`
+        GIL-atomic-publish precedent)."""
+        subs = _ResourceSubscriptions()
+        subs.add("file:///a")
+        first = subs.snapshot()[0]
+        subs.add("file:///b")
+        assert first == frozenset({"file:///a"})
+        assert isinstance(first, frozenset)
+
+    def test_close_response_closes_and_forgets_the_published_handle(self):
+        closed = []
+
+        class FakeResponse:
+            def close(self):
+                closed.append(True)
+
+        subs = _ResourceSubscriptions()
+        subs.publish_response(FakeResponse())
+        subs.close_response()
+        subs.close_response()  # nothing published any more: no second close
+        assert closed == [True]
+
+    def test_close_response_never_raises_into_the_stdin_loop(self, capsys):
+        """The stdin loop must never break because a response the reader
+        already finished with refused to close — the reopen still happens
+        through the restart event."""
+
+        class ExplodingResponse:
+            def close(self):
+                raise RuntimeError("already closed")
+
+        subs = _ResourceSubscriptions()
+        subs.publish_response(ExplodingResponse())
+        subs.close_response()
+        assert "already closed" in capsys.readouterr().err
+
+
+class TestWithResourceSubscriptions:
+    LIST_CHANGED_FILTER = {
+        "toolsListChanged": True,
+        "promptsListChanged": True,
+        "resourcesListChanged": True,
+    }
+
+    def _base(self):
+        state = _ModernState()
+        state.negotiated_version = "2026-07-28"
+        return _build_listen_params(state)
+
+    def test_subscriptions_are_nested_inside_the_notifications_filter(self):
+        """Design A9, the shape pin. The spec's Notification Filter table
+        lists `resourceSubscriptions: string[]` as a FIELD of the
+        `notifications` object — its own `subscriptions/listen` example
+        nests it there, and so does the acknowledgement example. A
+        top-level placement is not rejected by a compliant server, it is
+        silently IGNORED, which would leave the relay subscribed to
+        nothing while reading every URI back as unhonored: two silent
+        no-ops that cancel out into "no updates, no diagnosis"."""
+        overlaid = _with_resource_subscriptions(self._base(), frozenset({"b", "a"}))
+        assert overlaid["notifications"] == {"resourceSubscriptions": ["a", "b"]}
+        assert "resourceSubscriptions" not in overlaid
+
+    def test_the_filter_is_replaced_not_merged(self):
+        """Design A9's second half: this stream requests
+        `resourceSubscriptions` and NOTHING else. "The server MUST NOT
+        send notification types the client has not explicitly requested",
+        so asking for the list_changed kinds here would invite the server
+        to send — and this relay to have to drop — every one of them
+        twice, once per concurrent stream."""
+        base = self._base()
+        assert base["notifications"] == self.LIST_CHANGED_FILTER
+        overlaid = _with_resource_subscriptions(base, frozenset({"a"}))
+        assert set(overlaid["notifications"]) == {"resourceSubscriptions"}
+
+    def test_frozen_meta_is_reused_by_reference_and_the_base_untouched(self):
+        """Base changes 2/4: `_meta` is carried over from the FROZEN
+        snapshot because `_listen_stream_loop` pins every attempt's
+        MCP-Protocol-Version header to the version inside it (#352 review
+        finding 2) — a re-derived `_meta` could renegotiate the body
+        version out from under the pinned header and earn a terminal
+        -32020."""
+        base = self._base()
+        overlaid = _with_resource_subscriptions(base, frozenset({"a"}))
+        assert overlaid["_meta"] is base["_meta"]
+        # The frozen snapshot itself is never mutated.
+        assert base["notifications"] == self.LIST_CHANGED_FILTER
+
+    def test_empty_set_produces_an_empty_list(self):
+        overlaid = _with_resource_subscriptions(self._base(), frozenset())
+        assert overlaid["notifications"] == {"resourceSubscriptions": []}
+
+
+class TestConsumeRestart:
+    """Design A4: stop ALWAYS wins over a pending reopen."""
+
+    def test_consumes_and_clears_a_pending_restart(self):
+        stop, restart = threading.Event(), threading.Event()
+        restart.set()
+        assert _consume_restart(stop, restart) is True
+        assert not restart.is_set()
+
+    def test_stop_wins_and_leaves_the_restart_untouched(self):
+        """Revert-check for A4: without the stop check, run()'s teardown
+        (stop, then the client close, then the restart that wakes a parked
+        thread) reads as a subscription change and the dying thread
+        reopens against a closed client."""
+        stop, restart = threading.Event(), threading.Event()
+        stop.set()
+        restart.set()
+        assert _consume_restart(stop, restart) is False
+        assert restart.is_set()
+
+    def test_no_restart_event_is_never_a_reopen(self):
+        assert _consume_restart(threading.Event(), None) is False
+
+
+class TestResourceSubscriptionInterception:
+    """`_handle_modern_special_method`'s PR B branches."""
+
+    URI = "file:///a.txt"
+
+    def _line(self, method="resources/subscribe", req_id=1, params=None):
+        msg = {"jsonrpc": "2.0", "method": method}
+        if req_id is not None:
+            msg["id"] = req_id
+        msg["params"] = {"uri": self.URI} if params is None else params
+        return json.dumps(msg)
+
+    def test_subscribe_is_answered_with_the_legacy_empty_result(self):
+        calls = []
+        handled, reply = _handle_modern_special_method(
+            self._line(),
+            1,
+            _ModernState(),
+            resource_subscription=lambda m, u, i: calls.append((m, u, i)) or True,
+        )
+        assert handled is True
+        assert json.loads(reply) == {"jsonrpc": "2.0", "id": 1, "result": {}}
+        assert calls == [("resources/subscribe", self.URI, 1)]
+
+    def test_unsubscribe_is_answered_the_same_way(self):
+        handled, reply = _handle_modern_special_method(
+            self._line(method="resources/unsubscribe", req_id=4),
+            4,
+            _ModernState(),
+            resource_subscription=lambda m, u, i: True,
+        )
+        assert handled is True
+        assert json.loads(reply)["result"] == {}
+
+    def test_no_hook_keeps_the_pre_pr_b_forward_behavior(self):
+        """The legacy era passes no hook, so its wire bytes are untouched
+        (AC 3) — and so is any direct caller written before PR B."""
+        assert _handle_modern_special_method(self._line(), 1, _ModernState()) == (
+            False,
+            None,
+        )
+
+    def test_a_declining_hook_falls_through_to_the_caller(self):
+        """Design A1: the hook declines for an id the stdin loop's intake
+        guards are about to reject, and the line must then take the
+        ordinary path so exactly ONE response reaches the client."""
+        assert _handle_modern_special_method(
+            self._line(req_id="mcp-stdio/mrtr/1/a"),
+            "mcp-stdio/mrtr/1/a",
+            _ModernState(),
+            resource_subscription=lambda m, u, i: False,
+        ) == (False, None)
+
+    @pytest.mark.parametrize(
+        "params", [None, {}, {"uri": ""}, {"uri": 42}, "not-an-object"]
+    )
+    def test_malformed_uri_is_not_answered_locally(self, params):
+        """A synthesized success must never stand in for a request the
+        relay could not actually carry out; such a line falls through."""
+        line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "resources/subscribe",
+                "params": params,
+            }
+        )
+        assert _handle_modern_special_method(
+            line,
+            1,
+            _ModernState(),
+            resource_subscription=lambda m, u, i: True,
+        ) == (False, None)
+
+    def test_a_notification_shaped_subscribe_is_not_answered(self):
+        """No id means no response may be written at all (JSON-RPC), so
+        there is nothing to synthesize — the line falls through."""
+        assert _handle_modern_special_method(
+            self._line(req_id=None),
+            None,
+            _ModernState(),
+            resource_subscription=lambda m, u, i: True,
+        ) == (False, None)
+
+    def test_subscribe_capability_unioned_only_onto_a_seeded_resources_family(self):
+        """Implementation spec 2 under the C8 narrowing: `subscribe: true`
+        joins `listChanged: true` on a `resources` family the discover
+        seed already contained — and an absent family is still never
+        fabricated, because a capabilities object's mere presence
+        advertises the whole feature family."""
+        seeded = _ModernState()
+        seeded.capabilities = {"tools": {}, "resources": {}}
+        line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2026-07-28", "capabilities": {}},
+            }
+        )
+        caps = json.loads(_handle_modern_special_method(line, 1, seeded)[1])["result"][
+            "capabilities"
+        ]
+        assert caps["resources"] == {"listChanged": True, "subscribe": True}
+        assert caps["tools"] == {"listChanged": True}  # never on other families
+
+        unseeded = _ModernState()
+        unseeded.capabilities = {"tools": {}}
+        caps = json.loads(_handle_modern_special_method(line, 1, unseeded)[1])[
+            "result"
+        ]["capabilities"]
+        assert "resources" not in caps
+
+
+class TestHandleListenResourceUpdated:
+    """`notifications/resources/updated`'s own forwarding branch (base
+    changes 4 and 6)."""
+
+    LISTEN_ID = "mcp-stdio/listen-res/1"
+    URI = "file:///a.txt"
+
+    def _state(self, **overrides):
+        state = {
+            "resource_stream": True,
+            "advertised": frozenset({"resources"}),
+            "honored_resources": [self.URI],
+            "uris": frozenset({self.URI}),
+        }
+        state.update(overrides)
+        return state
+
+    def _updated(self, uri=None, **extra):
+        msg = {
+            "jsonrpc": "2.0",
+            "method": _RESOURCE_UPDATED_METHOD,
+            "params": {"uri": uri if uri is not None else self.URI},
+        }
+        msg.update(extra)
+        return json.dumps(msg)
+
+    def _run(self, payload, state, acked=True):
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            outcome = _handle_listen_message(
+                payload, self.LISTEN_ID, None, state, acked=acked
+            )
+        return outcome, stdout.getvalue()
+
+    def test_forwarded_with_the_subscription_id_stripped(self):
+        payload = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": _RESOURCE_UPDATED_METHOD,
+                "params": {
+                    "uri": self.URI,
+                    "_meta": {
+                        "io.modelcontextprotocol/subscriptionId": "s-1",
+                        "keep": 1,
+                    },
+                },
+            }
+        )
+        outcome, out = self._run(payload, self._state())
+        assert outcome is None
+        emitted = json.loads(out)
+        assert emitted["params"]["uri"] == self.URI
+        assert emitted["params"]["_meta"] == {"keep": 1}
+
+    def test_pre_ack_notification_is_swallowed(self):
+        """The acknowledgement is the spec-mandated FIRST stream message,
+        so anything before it is a protocol violation — the same
+        per-attempt rule the list_changed branch applies."""
+        assert self._run(self._updated(), self._state(), acked=False)[1] == ""
+
+    def test_id_bearing_message_is_swallowed(self):
+        """An id makes it a JSON-RPC request the legacy client may answer,
+        leaking a relay-internal interaction into the request path."""
+        assert self._run(self._updated(id=9), self._state())[1] == ""
+
+    def test_unadvertised_resources_family_is_swallowed(self):
+        """The client only ever saw `subscribe: true` under a family the
+        discover seed reported (the C8 narrowing) — forwarding without it
+        would be exactly the un-negotiated-capability notification C8
+        exists to prevent."""
+        assert self._run(self._updated(), self._state(advertised=frozenset()))[1] == ""
+
+    def test_absent_ack_echo_reads_as_unsupported(self):
+        """Base change 5, defensive: the spec only defines type-level
+        omission of the honored subset, so an absent `resourceSubscriptions`
+        echo means the feature is unsupported and nothing is forwarded.
+        This is also what makes the branch inert on the list_changed
+        stream, which never records the key."""
+        assert self._run(self._updated(), self._state(honored_resources=None))[1] == ""
+
+    def test_narrowed_ack_echo_suppresses_the_unhonored_uri(self):
+        state = self._state(
+            honored_resources=["file:///other"],
+            uris=frozenset({self.URI, "file:///other"}),
+        )
+        assert self._run(self._updated(), state)[1] == ""
+
+    def test_already_unsubscribed_uri_is_swallowed(self):
+        """An `updated` racing an unsubscribe must not reach a client that
+        already forgot the resource."""
+        assert self._run(self._updated(), self._state(uris=frozenset()))[1] == ""
+
+    def test_unseeded_carrier_forwards_nothing(self):
+        assert self._run(self._updated(), None)[1] == ""
+
+    def test_resource_stream_never_forwards_list_changed(self):
+        """With TWO streams up both request all three list_changed kinds,
+        so the role flag is what keeps a server that honors them on both
+        from putting every list_changed on stdout twice — and the resource
+        stream reopens on every subscribe, which would multiply it."""
+        payload = json.dumps(
+            {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
+        )
+        state = self._state(advertised=frozenset({"tools", "resources"}), honored=None)
+        assert self._run(payload, state)[1] == ""
+        # The SAME message on the list_changed stream is forwarded.
+        state["resource_stream"] = False
+        assert json.loads(self._run(payload, state)[1])["method"].endswith(
+            "list_changed"
+        )
+
+    def test_ack_records_the_resource_echo_and_stays_quiet_on_the_subset_log(
+        self, capsys
+    ):
+        """The resource stream over-requests all three list_changed kinds
+        (it reuses the frozen body) but forwards none, so a compliant
+        server honoring none is not news — and it would otherwise be
+        logged on every reopen, which happens on every subscribe."""
+        ack = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/subscriptions/acknowledged",
+                "params": {
+                    "notifications": {"resourceSubscriptions": [self.URI]},
+                },
+            }
+        )
+        state = self._state()
+        assert self._run(ack, state)[0] == "ack"
+        assert state["honored_resources"] == [self.URI]
+        assert "honored a subset" not in capsys.readouterr().err
+
+    def test_malformed_ack_echo_sanitizes_non_string_elements(self, capsys):
+        """#358 review R2F1: an ack echo containing a non-string element —
+        e.g. a nested list — used to be stored verbatim, and
+        `_log_unhonored_subscriptions`'s `set(honored)` then raised
+        `TypeError: unhashable type: 'list'`, killing the daemon thread (no
+        except arm in `_listen_stream_loop` catches a `TypeError`). The
+        store site now keeps only the `str` elements, order preserved, so a
+        broken/hostile server can only narrow what is treated as honored —
+        never crash the stream."""
+        ack = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/subscriptions/acknowledged",
+                "params": {
+                    "notifications": {
+                        "resourceSubscriptions": [["file:///a"], self.URI, 42]
+                    },
+                },
+            }
+        )
+        state = self._state()
+        assert self._run(ack, state)[0] == "ack"
+        # The consumer that used to crash on the raw, unsanitized list —
+        # exercised BEFORE the storage assertion below, so a revert of the
+        # sanitize surfaces here as the TypeError this fix prevents, not
+        # merely as a value mismatch on the next line.
+        attempt_params = {"notifications": {"resourceSubscriptions": [self.URI]}}
+        _log_unhonored_subscriptions(state, attempt_params, "resource listen stream")
+        assert capsys.readouterr().err == ""
+        assert state["honored_resources"] == [self.URI]
+
+    def test_malformed_ack_echo_non_list_reads_as_unsupported(self):
+        """A non-list echo — e.g. a server sending
+        `resourceSubscriptions: "file:///a.txt,other"` (a bare string
+        instead of an array) — must not let `uri in honored` fall back to
+        SUBSTRING matching against that string. It stores `None`, the same
+        "feature unsupported" reading an absent field gets, so the
+        forwarding gate correctly refuses to treat any URI as honored."""
+        ack = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/subscriptions/acknowledged",
+                "params": {
+                    "notifications": {"resourceSubscriptions": f"{self.URI},other"},
+                },
+            }
+        )
+        state = self._state()
+        assert self._run(ack, state)[0] == "ack"
+        assert state["honored_resources"] is None
+        # Would have substring-matched `self.URI` out of the raw string.
+        assert self._run(self._updated(), state)[1] == ""
+
+    def test_list_changed_stream_still_logs_the_subset_divergence(self, capsys):
+        ack = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/subscriptions/acknowledged",
+                "params": {"notifications": {"toolsListChanged": True}},
+            }
+        )
+        state = {"honored": None, "advertised": None}
+        assert self._run(ack, state)[0] == "ack"
+        assert state["honored_resources"] is None
+        assert "honored a subset" in capsys.readouterr().err
+
+    def test_updated_is_not_a_cold_start_or_whitelist_member(self):
+        """Base change 4: `_LISTEN_FORWARDED_NOTIFICATIONS` is SHARED with
+        the cold-start gate, which both advertises and emits its members —
+        an `updated` synthesized there would name no resource the client
+        ever subscribed to."""
+        assert _RESOURCE_UPDATED_METHOD not in _LISTEN_FORWARDED_NOTIFICATIONS
+        assert _RESOURCE_UPDATED_METHOD not in _COLD_START_LIST_CHANGED
+
+    def test_input_required_listen_result_is_not_a_graceful_end(self, capsys):
+        """Design A3: `subscriptions/listen` is NOT MRTR-eligible, so an
+        InputRequiredResult here is a server-side spec violation. It must
+        not ALSO be misread as the graceful end, which would silently stop
+        listening for the rest of the session — swallowed instead, so the
+        stream takes the ordinary reconnect path. Logged once per stream."""
+        payload = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": self.LISTEN_ID,
+                "result": {"resultType": "input_required", "requestState": "X"},
+            }
+        )
+        state = self._state()
+        assert self._run(payload, state)[0] is None
+        assert self._run(payload, state)[0] is None
+        assert capsys.readouterr().err.count("input_required result") == 1
+
+    def test_on_stream_terminal_rejection_names_the_resource_stream(self, capsys):
+        """The C6 terminal arm is reachable on BOTH streams, so its stderr
+        line must name what actually stopped working — telling an operator
+        that list_changed forwarding died when the RESOURCE stream gave up
+        would send them after the wrong thing. Mirrors the loop's own
+        label/disabled split."""
+        payload = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": self.LISTEN_ID,
+                "error": {"code": -32601, "message": "Method not found"},
+            }
+        )
+        assert self._run(payload, self._state())[0] == "terminal"
+        err = capsys.readouterr().err
+        assert "resource listen stream: server rejected" in err
+        assert "resources/updated forwarding disabled" in err
+        # The list_changed stream keeps PR A's wording byte-for-byte.
+        assert (
+            self._run(payload, {"honored": None, "advertised": None})[0] == "terminal"
+        )
+        err = capsys.readouterr().err
+        assert "listen stream: server rejected" in err
+        assert "list_changed forwarding disabled" in err
+
+    def test_an_ordinary_listen_result_is_still_the_graceful_end(self):
+        payload = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": self.LISTEN_ID,
+                "result": {"resultType": "complete"},
+            }
+        )
+        assert self._run(payload, self._state())[0] == "graceful"
+
+
+class _RecordingStop(threading.Event):
+    """A stop event that records every backoff wait without blocking.
+
+    The reopen path must never take `RETRY_DELAY` — a subscription change
+    is the relay's own doing, not a drop — and an empty `waits` list is
+    the only way to assert that without a wall-clock measurement.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.waits = []
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        return super().wait(0)
+
+
+class TestResourceListenStreamLoop:
+    """The second stream's own mechanics (base changes 1, 2, 4 and 5)."""
+
+    URL = "https://example.com/mcp"
+
+    def _sse(self, *messages):
+        return IteratorStream(
+            [f"event: message\ndata: {json.dumps(m)}\n\n".encode() for m in messages]
+        )
+
+    def _ack(self, honored=None, resources=None):
+        """The acknowledgement, with the honored subscriptions nested
+        INSIDE the `notifications` filter exactly as the spec's own
+        example shows (`params.notifications.resourceSubscriptions`,
+        Design A9)."""
+        notifications = dict(honored) if honored is not None else {}
+        if resources is not None:
+            notifications["resourceSubscriptions"] = resources
+        return {
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": {"notifications": notifications},
+        }
+
+    def _graceful(self, attempt=1):
+        return {
+            "jsonrpc": "2.0",
+            "id": f"{_LISTEN_RES_ID_PREFIX}{attempt}",
+            "result": {"resultType": "complete"},
+        }
+
+    def _base_params(self):
+        state = _ModernState()
+        state.negotiated_version = "2026-07-28"
+        return _build_listen_params(state)
+
+    def _run_loop(
+        self,
+        *,
+        uris,
+        snapshot_gens=None,
+        live_generation=0,
+        stop=None,
+        restart=None,
+        state=None,
+    ):
+        """Drive the loop with a scripted per-attempt filter snapshot.
+
+        ``uris`` and ``snapshot_gens`` are consumed one entry per ATTEMPT
+        (the last entry repeats, so a single-entry list means "unchanged
+        from here on"); ``live_generation`` is what the stdin thread's
+        counter would read back at the post-ack staleness check.
+        """
+        base = self._base_params()
+        uri_seq = list(uris)
+        gen_seq = list(snapshot_gens if snapshot_gens is not None else [0])
+        attempts = {"n": 0}
+
+        def _at(seq, index):
+            return seq[index] if index < len(seq) else seq[-1]
+
+        def body_provider():
+            index = attempts["n"]
+            attempts["n"] += 1
+            return (
+                _with_resource_subscriptions(base, frozenset(_at(uri_seq, index))),
+                _at(gen_seq, index),
+            )
+
+        def generation_reader():
+            return live_generation
+
+        client = httpx.Client()
+        try:
+            _listen_stream_loop(
+                client=client,
+                url=self.URL,
+                params=base,
+                prepare_headers=lambda body: {"Content-Type": "application/json"},
+                tracker=None,
+                stop=stop or threading.Event(),
+                timeout=httpx.Timeout(connect=10, read=300, write=30, pool=10),
+                state=state,
+                id_prefix=_LISTEN_RES_ID_PREFIX,
+                body_provider=body_provider,
+                generation_reader=generation_reader,
+                publish_response=None,
+                restart=restart,
+                label="resource listen stream",
+            )
+        finally:
+            client.close()
+
+    def test_attempt_body_carries_sorted_uris_under_the_res_prefix(self, httpx_mock):
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(self._graceful()),
+            headers={"content-type": "application/json"},
+        )
+        self._run_loop(uris=[["file:///b", "file:///a"]])
+        body = json.loads(httpx_mock.get_requests()[0].content)
+        assert body["id"] == f"{_LISTEN_RES_ID_PREFIX}1"
+        # Design A9 wire-shape pin: INSIDE the notifications filter, and
+        # the filter carries NOTHING ELSE — the list_changed kinds are the
+        # first stream's job ("The server MUST NOT send notification types
+        # the client has not explicitly requested").
+        assert body["params"]["notifications"] == {
+            "resourceSubscriptions": ["file:///a", "file:///b"]
+        }
+        assert "resourceSubscriptions" not in body["params"]
+
+    def test_stale_generation_after_the_ack_reopens_without_a_backoff(self, httpx_mock):
+        """Base change 6: the ack is the earliest proof the server has seen
+        THIS attempt's filter, so a change that landed after the snapshot
+        is caught there — immediately, with no `RETRY_DELAY` (an empty
+        `waits` list is the revert-check) and without counting a drop."""
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=self._sse(self._ack()),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=self._sse(self._ack(), self._graceful(attempt=2)),
+            headers={"content-type": "text/event-stream"},
+        )
+        stop = _RecordingStop()
+        self._run_loop(
+            uris=[["file:///a"], ["file:///a", "file:///b"]],
+            # Attempt 1 snapshots generation 0 while the live counter is
+            # already at 1 (a subscribe landed after the snapshot); attempt
+            # 2 snapshots 1 and is therefore current.
+            snapshot_gens=[0, 1],
+            live_generation=1,
+            stop=stop,
+            restart=threading.Event(),
+            state={"advertised": frozenset({"resources"}), "resource_stream": True},
+        )
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 2
+        assert json.loads(requests[1].content)["params"]["notifications"] == {
+            "resourceSubscriptions": ["file:///a", "file:///b"]
+        }
+        assert stop.waits == []  # no reconnect backoff was ever taken
+
+    def test_restart_on_a_dropped_attempt_reopens_even_before_establishment(
+        self, httpx_mock, capsys
+    ):
+        """Base change 5: the stdin thread ends an attempt by closing the
+        PUBLISHED RESPONSE, which surfaces as a transport error. That is
+        the relay's own doing, so it must bypass C7's pre-establishment
+        fail-fast instead of disabling the stream for the session."""
+        httpx_mock.add_exception(httpx.ReadError("closed by the relay"))
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=self._sse(self._ack(), self._graceful(attempt=2)),
+            headers={"content-type": "text/event-stream"},
+        )
+        restart = threading.Event()
+        restart.set()
+        stop = _RecordingStop()
+        self._run_loop(uris=[["file:///a"]], stop=stop, restart=restart)
+        assert len(httpx_mock.get_requests()) == 2
+        err = capsys.readouterr().err
+        assert "subscription filter changed; reopening" in err
+        assert "before it was ever established" not in err
+        assert stop.waits == []
+
+    def test_stream_closed_mid_read_reopens_instead_of_re_raising(self, httpx_mock):
+        """httpx raises `StreamClosed` — a RuntimeError subclass — when the
+        stdin thread's `resp.close()` lands mid-read. With stop unset the
+        RuntimeError arm re-raises by default (#352 round-5 finding 1); a
+        pending restart is the one legitimate producer PR B adds."""
+        httpx_mock.add_exception(httpx.StreamClosed())
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=self._sse(self._ack(), self._graceful(attempt=2)),
+            headers={"content-type": "text/event-stream"},
+        )
+        restart = threading.Event()
+        restart.set()
+        self._run_loop(uris=[["file:///a"]], restart=restart)
+        assert len(httpx_mock.get_requests()) == 2
+
+    def test_teardown_mid_attempt_never_consumes_the_restart(self, httpx_mock):
+        """Design A4, revert-check. Teardown sets stop, then closes the
+        dedicated client, then sets restart to wake a parked thread — a
+        thread that read `restart` without checking `stop` first would take
+        that for a subscription change and reopen against a closed
+        client."""
+        stop = threading.Event()
+        restart = threading.Event()
+        restart.set()
+
+        class TeardownRacingClient:
+            def stream(self, *args, **kwargs):
+                stop.set()
+                raise RuntimeError(
+                    "Cannot send a request, as the client has been closed."
+                )
+
+        _listen_stream_loop(
+            client=TeardownRacingClient(),
+            url=self.URL,
+            params=self._base_params(),
+            prepare_headers=lambda body: {"Content-Type": "application/json"},
+            tracker=None,
+            stop=stop,
+            timeout=httpx.Timeout(connect=10, read=300, write=30, pool=10),
+            state=None,
+            id_prefix=_LISTEN_RES_ID_PREFIX,
+            body_provider=lambda: (
+                _with_resource_subscriptions(self._base_params(), frozenset({"a"})),
+                0,
+            ),
+            restart=restart,
+            label="resource listen stream",
+        )
+        assert restart.is_set()  # never consumed by the dying thread
+        assert len(httpx_mock.get_requests()) == 0
+
+    def test_empty_uri_set_parks_and_teardown_wakes_it(self, httpx_mock):
+        """An `Event.wait()` is deaf to both `stop.set()` and the client
+        close that unblocks a parked READ, which is why run()'s teardown
+        sets the restart event too (Design A4). Without that, this thread
+        would outlive the bounded join."""
+        stop = threading.Event()
+        restart = threading.Event()
+        parked = threading.Event()
+
+        def body_provider():
+            parked.set()
+            return (
+                _with_resource_subscriptions(self._base_params(), frozenset()),
+                0,
+            )
+
+        thread = threading.Thread(
+            target=_listen_stream_loop,
+            kwargs={
+                "client": httpx.Client(),
+                "url": self.URL,
+                "params": self._base_params(),
+                "prepare_headers": lambda body: {},
+                "tracker": None,
+                "stop": stop,
+                "timeout": httpx.Timeout(connect=10, read=300, write=30, pool=10),
+                "id_prefix": _LISTEN_RES_ID_PREFIX,
+                "body_provider": body_provider,
+                "restart": restart,
+                "label": "resource listen stream",
+            },
+            daemon=True,
+        )
+        thread.start()
+        assert parked.wait(timeout=5)
+        stop.set()
+        restart.set()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert len(httpx_mock.get_requests()) == 0
+
+    def test_unhonored_uris_are_logged_once_across_reopens(self, httpx_mock, capsys):
+        """Base change 7: the degraded mode is loud ONCE PER URI, not once
+        per reconnect — the resource stream re-opens on every subscribe, so
+        a per-attempt log would turn one unsupported server into a
+        flood."""
+        for attempt in (1, 2):
+            httpx_mock.add_response(
+                url=self.URL,
+                stream=self._sse(
+                    self._ack(resources=[]),
+                    *([self._graceful(attempt=2)] if attempt == 2 else []),
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
+        state = {"advertised": frozenset({"resources"}), "resource_stream": True}
+        with patch("mcp_stdio.relay.RETRY_DELAY", 0):
+            self._run_loop(uris=[["file:///a"]], state=state)
+        err = capsys.readouterr().err
+        assert err.count("did not honor") == 1
+        assert "file:///a" in err
+
+    def test_updated_reaches_stdout_through_the_real_loop(self, httpx_mock):
+        """The whole PR B path in one test: ack echoes the honored URI, the
+        `updated` notification is forwarded with its subscriptionId
+        stripped, and the terminal result ends the stream silently."""
+        updated = {
+            "jsonrpc": "2.0",
+            "method": _RESOURCE_UPDATED_METHOD,
+            "params": {
+                "uri": "file:///a",
+                "_meta": {"io.modelcontextprotocol/subscriptionId": "s-1"},
+            },
+        }
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=self._sse(
+                self._ack(resources=["file:///a"]),
+                updated,
+                self._graceful(),
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+        state = {
+            "advertised": frozenset({"resources"}),
+            "resource_stream": True,
+            "uris": frozenset({"file:///a"}),
+        }
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            self._run_loop(uris=[["file:///a"]], state=state)
+        emitted = [json.loads(line) for line in stdout.getvalue().strip().split("\n")]
+        assert len(emitted) == 1
+        assert emitted[0]["method"] == _RESOURCE_UPDATED_METHOD
+        assert "_meta" not in emitted[0]["params"]
+        assert len(httpx_mock.get_requests()) == 1

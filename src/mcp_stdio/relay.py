@@ -1370,6 +1370,7 @@ def _handle_modern_special_method(
     discover_retry: Callable[[], None] | None = None,
     listen_seed: Callable[[], None] | None = None,
     listen_start: Callable[[], None] | None = None,
+    resource_subscription: Callable[[str, str, Any], bool] | None = None,
 ) -> tuple[bool, str | None]:
     """Intercept ``initialize`` / ``notifications/initialized`` /
     ``notifications/cancelled`` on the modern path, where none of the three
@@ -1483,7 +1484,9 @@ def _handle_modern_special_method(
     with no prior ``initialize`` finds no seeded snapshot and starts
     nothing), so a client-driven re-``initialize`` or a repeated
     ``initialized`` can never spawn a second thread. The
-    synthesized ``InitializeResult`` unions ``listChanged: true`` into
+    synthesized ``InitializeResult`` unions ``listChanged: true`` (and,
+    on ``resources``, ``subscribe: true`` — #270 Phase 2 PR B, since the
+    RELAY implements that method now) into
     the capability families ALREADY PRESENT in the discover-seeded
     ``modern_state.capabilities`` — never creating an absent
     ``tools``/``resources``/``prompts`` family (C8, narrowed by #352
@@ -1502,6 +1505,40 @@ def _handle_modern_special_method(
     (precedent for advertising exactly what is forwarded:
     ``_COLD_START_LIST_CHANGED``, which advertises the union it later
     emits while the cold-start gate is closed).
+
+    ``resource_subscription`` (#270 Phase 2 PR B, implementation spec 1):
+    intercepts ``resources/subscribe`` / ``resources/unsubscribe``, which
+    spec rev 2026-07-28 removed from the wire — the subscriptions pattern
+    replaced them with the ``resourceSubscriptions`` filter on
+    ``subscriptions/listen``, so forwarding one upstream can only earn a
+    ``-32601`` a 2025-era client never expected from a server that
+    advertised ``resources.subscribe``. The hook records the URI and
+    (re)opens the dedicated resource listen stream; the reply is
+    synthesized HERE and IMMEDIATELY — the legacy ``EmptyResult`` ``{}``,
+    the exact shape 2025-06-18 defines for both methods (base change 3:
+    reply-then-degrade). It is deliberately NOT held until the upstream
+    acknowledgement: the stdin loop is single-threaded, so waiting would
+    stall every other request behind a network round-trip, and the
+    subscription is best-effort by nature. A duplicate subscribe and an
+    unsubscribe for a URI that was never subscribed both answer ``{}``
+    too — idempotent, because erroring would invent wire behavior the
+    legacy methods never had (base change 7).
+
+    The hook returns ``False`` to DECLINE, which falls the line through
+    to the ordinary dispatch path — the one case that matters is Design
+    A1: the id-intake guards this interception runs BEFORE (the reserved
+    ``mcp-stdio/`` namespace, #356 review R2F1, and a pending MRTR
+    transaction) must be the only responders for such an id, or the
+    client gets TWO responses for one id. The guards are not duplicated
+    here; the caller's hook simply declines and lets them fire. A hook
+    that is absent entirely (legacy era, direct callers) also declines,
+    keeping the pre-PR-B forward behavior byte-identical.
+
+    Only a well-formed request is intercepted: an ``id`` member (a
+    notification could not be answered at all) and a non-empty string
+    ``params.uri``. Anything else falls through rather than being
+    answered with a synthesized success for a request the relay could not
+    actually carry out.
 
     Returns ``(False, None)`` for every other line, which the caller
     dispatches normally (through ``_inject_modern_meta`` first).
@@ -1653,6 +1690,21 @@ def _handle_modern_special_method(
                 # advertised, so coerce to an object we can flag.
                 entry = {}
             entry["listChanged"] = True
+            if key == "resources":
+                # #270 Phase 2 PR B, implementation spec 2. The relay —
+                # not the remote — now implements `resources/subscribe`
+                # (intercepted above, served by the dedicated resource
+                # listen stream), so it is the relay that advertises it.
+                # Unioned under exactly the same C8 rule as `listChanged`:
+                # only onto a `resources` family the discover seed ALREADY
+                # contained, never creating one. With an empty seed
+                # nothing is advertised and a capability-gated client
+                # never subscribes — the same documented degraded mode
+                # `_listen_advertised_families` describes, and the same
+                # one the forwarding gate for
+                # `notifications/resources/updated` enforces from the
+                # other side.
+                entry["subscribe"] = True
             capabilities[key] = entry
         result = {
             # Downstream ack: what the LOCAL client asked for (falling back
@@ -1681,6 +1733,20 @@ def _handle_modern_special_method(
         return True, None
     if method == "notifications/cancelled":
         return True, None
+    if method in (_SUBSCRIBE_METHOD, _UNSUBSCRIBE_METHOD):
+        # #270 Phase 2 PR B — see this function's docstring for the
+        # decline rules (Design A1) and for why the reply is synthesized
+        # rather than held for the upstream acknowledgement.
+        if resource_subscription is None or "id" not in msg:
+            return False, None
+        params = msg.get("params")
+        uri = params.get("uri") if isinstance(params, dict) else None
+        if not isinstance(uri, str) or not uri:
+            return False, None
+        if not resource_subscription(method, uri, req_id):
+            return False, None
+        # The legacy EmptyResult both methods are defined to return.
+        return True, json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {}})
     return False, None
 
 
@@ -3374,10 +3440,27 @@ def _cold_start_loop(
 # and forwards ONLY the three ``list_changed`` notification kinds
 # downstream — and only for capability families the synthesized
 # InitializeResult actually advertised (the C8 narrowing, #352 round-3
-# finding 2; see ``_listen_advertised_families``). Resource
-# subscriptions (``resourceSubscriptions`` +
-# ``resources/subscribe`` interception) are PR B; the MRTR bridge is PR C
-# (#270 Phase 2 phasing).
+# finding 2; see ``_listen_advertised_families``). The MRTR bridge is PR
+# C (#270 Phase 2 phasing).
+#
+# PR B adds a SECOND, dedicated listen stream for resource subscriptions
+# (base change 1): "Clients MAY have multiple concurrent listen requests"
+# and every notification is demultiplexed by its
+# ``io.modelcontextprotocol/subscriptionId``, so the churn a changing URI
+# set forces (a stdio reconnect MUST resend the CURRENT
+# ``resourceSubscriptions`` — there is no in-band filter mutation) is
+# confined to its own stream. The list_changed stream above therefore
+# keeps PR A's C1/established/terminal invariants VERBATIM and never has
+# a reopen gap. The two streams share ``_listen_stream_loop`` and
+# ``_handle_listen_message``, parameterized rather than forked, so the
+# hard-won reconnect/terminal/ack arms cannot drift apart; the resource
+# stream's extras are its own id prefix (``_LISTEN_RES_ID_PREFIX``), a
+# per-attempt body provider (whose notification filter asks for
+# ``resourceSubscriptions`` and nothing else — Design A9), a ``restart``
+# event, and the
+# ``state["resource_stream"]`` role flag that keeps the two streams from
+# both forwarding the same ``list_changed`` (see
+# ``_handle_listen_message``).
 _LISTEN_METHOD = "subscriptions/listen"
 _LISTEN_ACK_METHOD = "notifications/subscriptions/acknowledged"
 # Relay-minted JSON-RPC id prefix for the listen request (C10), under the
@@ -3391,20 +3474,53 @@ _LISTEN_ACK_METHOD = "notifications/subscriptions/acknowledged"
 # for uniformity, which is cheaper to reason about than a per-prefix
 # argument.
 _LISTEN_ID_PREFIX = f"{_RELAY_ID_NAMESPACE}listen/"
-# The notification kinds requested on every listen POST: all three
-# list_changed booleans, no ``resourceSubscriptions`` until PR B. Also the
+# The resource-subscription stream's own attempt-id prefix (#270 Phase 2
+# PR B, Design A2). DERIVED from ``_RELAY_ID_NAMESPACE`` rather than
+# hardcoded, exactly like its sibling above: the modern era's intake
+# rejection (#356 review R2F1) refuses any CLIENT request whose id falls
+# inside that namespace, so deriving the prefix buys collision immunity
+# for free and no per-stream defensive id check is needed. A DISTINCT
+# prefix from ``_LISTEN_ID_PREFIX`` so the two concurrent streams can
+# never mistake each other's graceful-end signals for their own
+# (``_handle_listen_message`` compares the attempt id by exact value).
+_LISTEN_RES_ID_PREFIX = f"{_RELAY_ID_NAMESPACE}listen-res/"
+# The notification filter of the LIST_CHANGED stream's listen POST: all
+# three list_changed booleans. Also the
 # reference set the ack's honored subset is compared against.
 # DELIBERATELY broader than what may be forwarded (#352 round-3 finding
-# 2): over-requesting is spec-safe (the server merely sends kinds the
-# relay may then drop), and three distinct layers do three distinct jobs
+# 2): over-requesting these three is spec-safe (the server merely sends
+# kinds the relay may then drop), and three distinct layers do three
+# distinct jobs
 # — this REQUEST filter over-asks, the server's ack narrows what ARRIVES,
 # and the advertised-family set frozen at seed time
 # (``_listen_advertised_families``) gates what the relay FORWARDS.
+#
+# The RESOURCE stream (#270 Phase 2 PR B) does NOT reuse this filter: it
+# requests ``resourceSubscriptions`` and nothing else (Design A9, see
+# ``_with_resource_subscriptions``). "The server MUST NOT send
+# notification types the client has not explicitly requested", so asking
+# each stream for exactly what it consumes is both the narrowest reading
+# and the only way two concurrent streams cannot be sent — and forward —
+# the same ``list_changed`` twice.
 _LISTEN_REQUESTED_NOTIFICATIONS = {
     "toolsListChanged": True,
     "promptsListChanged": True,
     "resourcesListChanged": True,
 }
+# Field name of the resource-subscription filter, INSIDE the
+# ``notifications`` object of both the request and the acknowledgement
+# (Design A9). The spec's Notification Filter table lists
+# ``resourceSubscriptions: string[]`` as the fourth field of that filter,
+# beside the three listChanged booleans, and its verbatim
+# ``subscriptions/listen`` example nests it there — as does the
+# acknowledgement example (``params.notifications.resourceSubscriptions``).
+# Named once so the request builder and both echo readers cannot drift:
+# a top-level placement is not an ERROR on a compliant server, it is
+# silently IGNORED (the reference SDK models the filter with
+# ``extra="ignore"``), which would leave the relay subscribed to nothing
+# while every URI read back as unhonored — two silent no-ops that cancel
+# out into "no updates, no diagnosis".
+_LISTEN_RESOURCE_SUBSCRIPTIONS_KEY = "resourceSubscriptions"
 # The only methods a listen stream may forward downstream (whitelist
 # semantics — everything else, including the ack, the terminal result and
 # ``notifications/cancelled``, is relay-internal and swallowed). Same
@@ -3414,6 +3530,29 @@ _LISTEN_FORWARDED_NOTIFICATIONS = frozenset(_COLD_START_LIST_CHANGED)
 # stream can carry — the family is the middle segment of each
 # _LISTEN_FORWARDED_NOTIFICATIONS method name.
 _LISTEN_FAMILIES = ("tools", "resources", "prompts")
+# The resource-subscription notification (#270 Phase 2 PR B, base change
+# 4). DELIBERATELY NOT added to ``_LISTEN_FORWARDED_NOTIFICATIONS``: that
+# set is SHARED with the cold-start gate (``_COLD_START_LIST_CHANGED``,
+# which the gate both advertises and emits), and a
+# ``notifications/resources/updated`` synthesized there would name no
+# resource the client ever subscribed to. It gets its own branch in
+# ``_handle_listen_message`` with its own gates instead.
+_RESOURCE_UPDATED_METHOD = "notifications/resources/updated"
+# The two client methods PR B intercepts and answers locally. Neither
+# exists on the wire to a modern remote — spec rev 2026-07-28 replaced
+# them with the ``resourceSubscriptions`` filter on
+# ``subscriptions/listen`` — so forwarding them upstream can only earn a
+# -32601 the legacy stdio client was never prepared for.
+_SUBSCRIBE_METHOD = "resources/subscribe"
+_UNSUBSCRIBE_METHOD = "resources/unsubscribe"
+# Hard cap on subscribed resource URIs (base change 3; owner call: 256).
+# Same semantics as ``_MRTR_MAX_TXNS`` and for the same reason — a cap,
+# never a TTL: at the cap the NEW URI is refused (logged once) while
+# every already-subscribed URI keeps working, and the client still gets
+# its ``EmptyResult`` because erroring here would invent wire behavior
+# the legacy ``resources/subscribe`` never had. Bounds both the
+# per-attempt request body and the state a hostile client can pin.
+_LISTEN_MAX_SUBSCRIPTIONS = 256
 
 
 def _listen_advertised_families(capabilities: dict[str, Any]) -> frozenset[str]:
@@ -3484,7 +3623,17 @@ def _build_listen_params(modern_state: "_ModernState") -> dict[str, Any]:
     ``{}`` (presence-based, like every modern request); ``clientInfo`` only
     when the client supplied one (SHOULD, never fabricated). Nested values
     are deep-copied so later mutations of ``modern_state`` can never reach
-    the frozen snapshot. No ``resourceSubscriptions`` until PR B.
+    the frozen snapshot.
+
+    The ``notifications`` filter built here is the LIST_CHANGED stream's
+    (#270 Phase 2 PR B): three booleans and no
+    ``resourceSubscriptions``. The resource stream shares this function
+    for ``_meta`` — its version must be pinned identically (base change
+    4: "version pinned as PR A") — and then REPLACES the filter per
+    attempt in ``_with_resource_subscriptions``, because its URI list
+    must be CURRENT on every attempt ("To modify the subscription
+    filter, the client MUST send a new subscriptions/listen request")
+    while everything else here must stay FROZEN. One call cannot be both.
     """
     meta: dict[str, Any] = {
         _META_PROTOCOL_VERSION: (
@@ -3499,6 +3648,76 @@ def _build_listen_params(modern_state: "_ModernState") -> dict[str, Any]:
         "_meta": meta,
         "notifications": dict(_LISTEN_REQUESTED_NOTIFICATIONS),
     }
+
+
+def _with_resource_subscriptions(
+    params: dict[str, Any], uris: frozenset[str]
+) -> dict[str, Any]:
+    """The resource stream's per-attempt body: frozen ``_meta``, live URIs.
+
+    #270 Phase 2 PR B, base changes 2 and 4 ("snapshot-per-open body, not
+    frozen ... C1 stays frozen only on the listChanged stream"). Spec rev
+    2026-07-28 defines no in-band way to mutate a live subscription
+    filter — "To modify the subscription filter, the client MUST send a
+    new subscriptions/listen request" and, on stdio, a reconnect re-sends
+    the CURRENT filter — so the resource stream rebuilds its body per
+    attempt.
+
+    PLACEMENT (Design A9, spec-verified): ``resourceSubscriptions`` is a
+    field of the ``notifications`` FILTER OBJECT, not a sibling of it.
+    The Notification Filter table lists it as that object's fourth field
+    (``resourceSubscriptions: string[]``) beside the three listChanged
+    booleans, and the spec's own ``subscriptions/listen`` example nests
+    it there. Getting this wrong is not a visible failure: a compliant
+    server ignores unknown top-level params keys, so the relay would
+    subscribe to nothing, receive nothing, and read every URI back as
+    unhonored — a silent no-op that only a wire-shape assertion catches.
+
+    The filter is REPLACED, not merged: this stream requests
+    ``resourceSubscriptions`` and NOTHING else. "The server MUST NOT
+    send notification types the client has not explicitly requested", so
+    each of the two concurrent streams asks for exactly what it
+    consumes — the list_changed kinds are the first stream's job, and
+    requesting them here would invite the server to send (and this relay
+    to have to drop) every one of them twice.
+
+    ``_meta`` is carried over from the frozen ``_build_listen_params``
+    snapshot BY REFERENCE (never mutated: every level of the return
+    value is a fresh dict), because ``_listen_stream_loop`` pins every
+    attempt's ``MCP-Protocol-Version`` header to the version inside that
+    frozen ``_meta`` (#352 review finding 2). Re-deriving ``_meta``
+    from the live ``modern_state`` would let a client-driven
+    re-``initialize`` renegotiate the body version out from under the
+    pinned header — a HeaderMismatch (-32020) on a compliant server,
+    which is in ``_LISTEN_TERMINAL_ERROR_CODES`` and would permanently
+    disable the stream over a mere renegotiation.
+
+    ``sorted()``, not the set's iteration order: a stable body makes the
+    generation counter the only thing that decides whether a reopen is
+    needed, and makes the wire bytes reproducible in tests.
+    """
+    return {
+        **params,
+        "notifications": {_LISTEN_RESOURCE_SUBSCRIPTIONS_KEY: sorted(uris)},
+    }
+
+
+def _listen_resource_subscriptions(params: Any) -> Any:
+    """``params.notifications.resourceSubscriptions``, or ``None``.
+
+    ONE reader for both directions (Design A9), because the field sits at
+    the same nested path in a ``subscriptions/listen`` REQUEST and in the
+    ``notifications/subscriptions/acknowledged`` echo — so what the relay
+    asked for and what the server honored can never be read from
+    different places. Returned RAW: base change 5's defensive reading
+    ("an absent field means the feature is unsupported, not everything
+    honored") belongs to the caller, and a non-object ``notifications``
+    reads the same way as an absent one.
+    """
+    notifications = params.get("notifications") if isinstance(params, dict) else None
+    if not isinstance(notifications, dict):
+        return None
+    return notifications.get(_LISTEN_RESOURCE_SUBSCRIPTIONS_KEY)
 
 
 def _strip_listen_subscription_id(msg: dict[str, Any]) -> dict[str, Any]:
@@ -3572,8 +3791,18 @@ def _handle_listen_message(
     only the MUST would otherwise look like an abrupt drop and be
     reconnect-looped forever. Everything else is swallowed. Id compares
     are type-aware by construction: the listen id is a namespaced STRING
-    (``_LISTEN_ID_PREFIX``), and ``==`` between an int and a str is always
+    (``_LISTEN_ID_PREFIX`` / ``_LISTEN_RES_ID_PREFIX``), and ``==``
+    between an int and a str is always
     False, so a client-style numeric id can never alias it.
+
+    Shared by BOTH listen streams (#270 Phase 2 PR B, base change 1),
+    told apart by ``state["resource_stream"]``: the list_changed stream
+    forwards the three ``list_changed`` kinds, and the resource stream
+    forwards ``notifications/resources/updated`` (its own branch, base
+    change 4) and no ``list_changed`` at all. One handler, so the
+    graceful / terminal / ack classification can never drift between the
+    two — and so a duplicate ``list_changed`` cannot reach stdout from
+    the stream that reopens on every subscribe.
 
     ``_emit`` may raise ``OSError``/``BrokenPipeError`` (stdout closed);
     that propagates to ``_listen_stream_loop``'s terminal handler (C12).
@@ -3613,14 +3842,102 @@ def _handle_listen_message(
         honored = params.get("notifications") if isinstance(params, dict) else None
         if "id" in msg or not isinstance(honored, dict):
             return None
+        resource_stream = bool(state.get("resource_stream")) if state else False
         if state is not None:
             state["honored"] = honored
-        if honored != _LISTEN_REQUESTED_NOTIFICATIONS:
+            # The honored-subset echo for resource subscriptions (#270
+            # Phase 2 PR B, base change 5): "the server MUST include the
+            # subscriptions it has honored". Read from INSIDE the
+            # ``notifications`` filter — the same nested path the REQUEST
+            # uses (Design A9) — through the one shared reader, so what
+            # was asked and what was honored cannot be read from
+            # different places. SANITIZED here, not stored raw (#358
+            # review R2F1): a malformed echo — e.g.
+            # ``resourceSubscriptions: [["file:///a"]]`` (a non-string
+            # element) — used to be stored verbatim, and
+            # ``_log_unhonored_subscriptions``'s ``set(honored)`` then
+            # raised ``TypeError: unhashable type: 'list'`` on the nested
+            # list, killing this daemon thread (none of
+            # ``_listen_stream_loop``'s except arms catches a
+            # ``TypeError``). ``_listen_resource_subscriptions`` itself
+            # still returns the field RAW — its docstring deliberately
+            # leaves defensive reading to the caller — so the sanitizing
+            # belongs HERE, the one place both consumers
+            # (``_log_unhonored_subscriptions``'s ``set(honored)`` and the
+            # forwarding gate's ``uri in honored_uris``) read from.
+            # Invariant enforced from here on: ``state["honored_resources"]``
+            # is always ``list[str] | None``. A list keeps only its
+            # ``str`` elements, order preserved (a malformed element
+            # narrows the honored set instead of poisoning the whole
+            # read); anything that is not a list — including a bare
+            # string, which would otherwise let ``uri in honored`` do
+            # substring matching instead of membership — stores ``None``
+            # and reads as "nothing honored" (feature unsupported) by the
+            # forwarding gate below, the defensive reading base change 5
+            # mandates: the spec only defines type-level omission, so a
+            # per-URI narrowing is not something the relay may assume
+            # away. A malformed echo must degrade exactly like an absent
+            # field, never crash the thread. Overwritten by every
+            # reconnect's fresh ack, exactly like ``honored``.
+            raw_honored_resources = _listen_resource_subscriptions(params)
+            state["honored_resources"] = (
+                [uri for uri in raw_honored_resources if isinstance(uri, str)]
+                if isinstance(raw_honored_resources, list)
+                else None
+            )
+        # The resource stream requests ONLY resourceSubscriptions (Design
+        # A9), so its ack legitimately honors none of the three
+        # list_changed booleans this compares against — not news worth a
+        # stderr line on every reopen, and reopens happen on every
+        # subscribe.
+        if honored != _LISTEN_REQUESTED_NOTIFICATIONS and not resource_stream:
             log(
                 "listen stream: server honored a subset of the requested "
                 f"notifications: {honored}"
             )
         return "ack"
+    if method == _RESOURCE_UPDATED_METHOD:
+        # #270 Phase 2 PR B, base change 6 — its OWN branch, deliberately
+        # not a member of ``_LISTEN_FORWARDED_NOTIFICATIONS`` (base change
+        # 4: that set is shared with the cold-start gate). Five gates, all
+        # of which must hold:
+        #
+        # - ``acked``: the acknowledgement is the spec-mandated FIRST
+        #   stream message, so a pre-ack notification is a protocol
+        #   violation (the same per-ATTEMPT rule the list_changed branch
+        #   applies, #352 round-7 finding).
+        # - ``"id" not in msg``: an id makes it a JSON-RPC request, which
+        #   the legacy client may answer — #352 round-2 finding 3.
+        # - the ``resources`` family was advertised in the synthesized
+        #   InitializeResult (the C8 narrowing, #352 round-3 finding 2):
+        #   the client only ever saw ``subscribe: true`` under a family
+        #   the discover seed actually reported.
+        # - the URI appears in the ack's echoed ``resourceSubscriptions``
+        #   (base change 5). An ABSENT echo means the feature is
+        #   unsupported, so nothing is forwarded — which is also what
+        #   makes this branch inert on the list_changed stream, where the
+        #   key is never recorded.
+        # - the URI is STILL in the client's live subscription set
+        #   (``state["uris"]``, republished by the stdin thread on every
+        #   subscribe/unsubscribe): an ``updated`` racing an unsubscribe
+        #   must not reach a client that already forgot the resource.
+        advertised = state.get("advertised") if state is not None else None
+        honored_uris = state.get("honored_resources") if state is not None else None
+        subscribed = state.get("uris") if state is not None else None
+        params = msg.get("params")
+        uri = params.get("uri") if isinstance(params, dict) else None
+        if (
+            acked
+            and "id" not in msg
+            and isinstance(uri, str)
+            and (advertised is None or "resources" in advertised)
+            and isinstance(honored_uris, list)
+            and uri in honored_uris
+            and subscribed is not None
+            and uri in subscribed
+        ):
+            _emit(json.dumps(_strip_listen_subscription_id(msg)), tracker)
+        return None
     if method in _LISTEN_FORWARDED_NOTIFICATIONS:
         # #352 round-2 finding 3: JSON-RPC 2.0 defines any message that
         # CARRIES an "id" member as a request — the sender expects a
@@ -3652,12 +3969,27 @@ def _handle_listen_message(
         # subset rides ``state["honored"]`` (recorded by the ack branch
         # above, overwritten by each reconnect's fresh ack); an unseeded
         # carrier keeps the permissive behavior like the advertised gate.
+        #
+        # #270 Phase 2 PR B: with TWO concurrent listen streams up, only
+        # the list_changed stream may forward these. The primary defense
+        # is on the REQUEST side — the resource stream's filter asks for
+        # ``resourceSubscriptions`` and nothing else (Design A9), and
+        # "the server MUST NOT send notification types the client has not
+        # explicitly requested" — so a compliant server never sends a
+        # list_changed on that stream at all. This gate is the second
+        # layer, for the server that sends one anyway: forwarding it would
+        # put every list_changed on stdout TWICE, and the resource stream
+        # reopens on every subscribe, which would multiply it further. An
+        # unseeded carrier (``state`` is None, direct callers in tests)
+        # keeps the permissive pre-PR-B behavior.
         advertised = state.get("advertised") if state is not None else None
         honored = state.get("honored") if state is not None else None
+        resource_stream = bool(state.get("resource_stream")) if state else False
         family = method.split("/")[1]
         if (
             acked
             and "id" not in msg
+            and not resource_stream
             and (advertised is None or family in advertised)
             and (
                 not isinstance(honored, dict)
@@ -3680,18 +4012,252 @@ def _handle_listen_message(
             # Any error for our id, or a deterministic-rejection code under
             # ANY id (a server may reject an unknown method with id null).
             if msg.get("id") == listen_id or code in _LISTEN_TERMINAL_ERROR_CODES:
+                # Name what actually stops working (#270 Phase 2 PR B):
+                # this branch is reachable on BOTH streams, and telling an
+                # operator that list_changed forwarding died when the
+                # resource stream is the one that gave up would send them
+                # after the wrong thing. Mirrors the loop's own `label` /
+                # `disabled` split.
+                resource_stream = bool(state.get("resource_stream")) if state else False
                 log(
-                    "listen stream: server rejected subscriptions/listen "
-                    f"({error}); list_changed forwarding disabled for this "
-                    "session"
+                    f"{'resource listen' if resource_stream else 'listen'} "
+                    f"stream: server rejected subscriptions/listen "
+                    f"({error}); "
+                    f"{'resources/updated' if resource_stream else 'list_changed'} "
+                    "forwarding disabled for this session"
                 )
                 return "terminal"
             return None
         if msg.get("id") == listen_id:
+            result = msg.get("result")
+            result_type = result.get("resultType") if isinstance(result, dict) else None
+            if result_type == "input_required":
+                # Design A3 (#270 Phase 2 PR B). ``subscriptions/listen``
+                # is NOT one of the three MRTR-eligible methods (the spec
+                # lists prompts/get, resources/read and tools/call), so an
+                # ``InputRequiredResult`` here is a server-side spec
+                # violation — never an invitation to open an MRTR
+                # transaction. The listen loops deliberately do not go
+                # through ``_post_and_stream``, so no bridge hook exists
+                # on this path and none may be added; this branch only
+                # makes sure the violation is not ALSO misread as the
+                # graceful end below, which would silently stop listening
+                # for the rest of the session. Swallowed instead: the
+                # stream then ends without a signal, and what happens next
+                # is NOT uniformly "the ordinary reconnect path" (#358
+                # review R1F2) — it depends on C7's ``established`` split,
+                # exactly like every other signal-less stream end.
+                # PRE-establishment (this is the very first attempt's
+                # answer) the no-ack fail-fast below finds ``established``
+                # still ``False`` and returns, permanently disabling the
+                # thread with no reconnect — correctly: a server that
+                # violates this spec rule on attempt 1 will violate it on
+                # every attempt, exactly the 1 Hz hammering C7 exists to
+                # stop. POST-establishment it is an ordinary
+                # end-without-signal and does take the usual reconnect
+                # path. Logged once per stream, because a server that does
+                # this once will do it on every attempt.
+                if not (state is not None and state.get("input_required_logged")):
+                    if state is not None:
+                        state["input_required_logged"] = True
+                    log(
+                        "listen stream: server answered subscriptions/listen "
+                        "with an input_required result (spec violation); "
+                        "ignoring it — fails fast here on a first attempt "
+                        "(no prior acknowledgement), otherwise reconnects "
+                        "as usual"
+                    )
+                return None
             log("listen stream: closed gracefully (result for the listen request)")
             return "graceful"
         return None
     return None
+
+
+class _ListenStream:
+    """One background ``subscriptions/listen`` stream owned by run().
+
+    Design A5, partially adopted: the two loose dict holders become two
+    instances of one holder, but ``state`` stays a plain ``dict`` because
+    that is ``_handle_listen_message``'s published contract (its unit
+    tests pass ``{}`` / ``{"advertised": ...}`` directly, and an unseeded
+    carrier is a documented permissive mode). ``__slots__`` rather than a
+    dataclass follows ``_SseState``'s idiom in this file. MRTR
+    transaction state is deliberately NOT folded in — different owner,
+    different lifecycle (Design A5).
+
+    ``thread`` doubles as the one-shot never-respawn latch (Design A6):
+    a client-driven re-``initialize``, a repeated ``initialized`` or a
+    subscribe arriving after the stream terminated must never spawn a
+    second thread. ``params`` is the frozen C1 body snapshot, seeded at
+    ``initialize`` interception; ``None`` means no ``initialize`` was
+    intercepted, so an orphan ``initialized`` starts nothing.
+    ``restart`` is the resource stream's reopen signal and stays ``None``
+    on the list_changed stream, which never reopens on demand.
+    """
+
+    __slots__ = ("stop", "restart", "thread", "client", "params", "state")
+
+    def __init__(self, *, restart: threading.Event | None = None) -> None:
+        self.stop = threading.Event()
+        self.restart = restart
+        self.thread: threading.Thread | None = None
+        self.client: httpx.Client | None = None
+        self.params: dict[str, Any] | None = None
+        # "honored" records the server-acknowledged notification subset;
+        # "advertised" the capability families the synthesized
+        # InitializeResult flagged (#352 round-3 finding 2); PR B adds
+        # "resource_stream" (the role flag that keeps the two streams
+        # from both forwarding list_changed), "honored_resources" (the
+        # ack's resourceSubscriptions echo) and "uris" (the live
+        # subscription set, republished by the stdin thread).
+        self.state: dict[str, Any] = {"honored": None, "advertised": None}
+
+
+class _ResourceSubscriptions:
+    """The client's live ``resources/subscribe`` URI set (base change 3).
+
+    Written by the stdin thread, read by the resource listen thread. The
+    set itself is published WHOLESALE as an immutable ``frozenset`` under
+    ``lock`` and republished into the stream's state dict, where the
+    reader picks it up with a single GIL-atomic attribute read — the
+    ``_SseState.endpoint_url`` precedent, and the reason the reader never
+    contends with the stdin loop. ``generation`` is bumped only by a real
+    change, which is what makes a subscribe storm collapse into one
+    reopen: N sets of the same event coalesce, and the next attempt's
+    snapshot sees every URI at once.
+
+    ``response`` is the in-flight ``httpx.Response`` of the current
+    attempt, published by the reader and closed by the stdin thread to
+    end that attempt (base change 5 — the DEDICATED CLIENT is never
+    closed here: run()'s teardown owns that, and a closed client makes
+    every later attempt raise). Closing a response the reader has already
+    finished with is harmless; ``httpx`` makes it idempotent.
+    """
+
+    __slots__ = ("_lock", "_uris", "generation", "_response")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._uris: frozenset[str] = frozenset()
+        # Read lock-free by the listen thread (GIL-atomic single read).
+        self.generation = 0
+        self._response: httpx.Response | None = None
+
+    def snapshot(self) -> tuple[frozenset[str], int]:
+        with self._lock:
+            return self._uris, self.generation
+
+    def add(self, uri: str) -> str:
+        """``"added"`` / ``"duplicate"`` / ``"refused"`` (at the cap).
+
+        Three outcomes, not two: only ``"added"`` bumps the generation
+        and earns a reopen — a duplicate subscribe must not restart the
+        stream (it would break the coalescing guarantee for nothing) and
+        a cap refusal must be logged rather than silently swallowed. All
+        three still answer the client ``{}`` (base change 7).
+        """
+        with self._lock:
+            if uri in self._uris:
+                return "duplicate"
+            if len(self._uris) >= _LISTEN_MAX_SUBSCRIPTIONS:
+                return "refused"
+            self._uris = self._uris | {uri}
+            self.generation += 1
+            return "added"
+
+    def discard(self, uri: str) -> bool:
+        """True when the URI was actually removed (and the gen bumped)."""
+        with self._lock:
+            if uri not in self._uris:
+                return False
+            self._uris = self._uris - {uri}
+            self.generation += 1
+            return True
+
+    def publish_response(self, resp: "httpx.Response | None") -> None:
+        with self._lock:
+            self._response = resp
+
+    def close_response(self) -> None:
+        """End the in-flight attempt, if any, without closing the client."""
+        with self._lock:
+            resp = self._response
+            self._response = None
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception as e:  # noqa: BLE001 — best-effort wake-up
+                # The reader may have finished with it concurrently; the
+                # reopen still happens through the restart event, so a
+                # failure here must never reach the stdin loop's request
+                # handling.
+                log(f"resource listen stream: closing the in-flight response: {e}")
+
+
+def _log_unhonored_subscriptions(
+    state: dict[str, Any] | None, attempt_params: dict[str, Any], label: str
+) -> None:
+    """Log every resource URI this attempt's ack did not honor, ONCE.
+
+    #270 Phase 2 PR B, base changes 5 and 7. "The server MUST include the
+    subscriptions it has honored" in the acknowledgement, and the spec
+    only defines type-level omission — so the relay reads the echo
+    DEFENSIVELY: any requested URI missing from it is unhonored, and an
+    absent field means the feature is unsupported outright. Either way
+    the client keeps getting its ``EmptyResult`` (base change 7:
+    reply-then-degrade) and the stream keeps running, so the operator's
+    only signal that a subscription is silently dead is this line.
+
+    Once per URI for the LIFE of the stream, not once per attempt: the
+    resource stream re-opens on every subscribe, and a per-attempt log
+    would turn one unsupported server into a stderr flood. The
+    already-reported set lives in ``state`` and is touched only by this
+    thread. A no-op on the list_changed stream, which never requests
+    subscriptions.
+    """
+    if state is None:
+        return
+    # Same nested reader as the ack echo (Design A9): comparing a request
+    # read one way against an echo read another is how a placement bug
+    # hides as "the server honored nothing".
+    requested = _listen_resource_subscriptions(attempt_params)
+    if not requested:
+        return
+    honored = state.get("honored_resources")
+    honored_set = set(honored) if isinstance(honored, list) else set()
+    reported = state.setdefault("unhonored_logged", set())
+    missing = [
+        uri for uri in requested if uri not in honored_set and uri not in reported
+    ]
+    if not missing:
+        return
+    reported.update(missing)
+    log(
+        f"{label}: server did not honor {len(missing)} resource "
+        f"subscription(s); no updates will arrive for them: {missing}"
+    )
+
+
+def _consume_restart(stop: threading.Event, restart: threading.Event | None) -> bool:
+    """True when a pending reopen may be consumed — STOP ALWAYS WINS.
+
+    Design A4, the rule every reopen-continue arm in
+    ``_listen_stream_loop`` funnels through: run()'s teardown sets the
+    stop event, then closes the thread's dedicated client, then sets the
+    restart event to wake a PARKED thread. A thread that read ``restart``
+    without checking ``stop`` first would take a mid-teardown client
+    close for a subscription change and reopen against a closed client,
+    raising in a dying daemon thread. Clearing the event here (and only
+    here) also makes the coalescing rule single-sourced: N subscribes
+    that arrive while one attempt is open collapse into ONE reopen,
+    because ``Event.set`` is idempotent and the next attempt's snapshot
+    sees all of them.
+    """
+    if stop.is_set() or restart is None or not restart.is_set():
+        return False
+    restart.clear()
+    return True
 
 
 def _listen_stream_loop(
@@ -3704,6 +4270,12 @@ def _listen_stream_loop(
     stop: threading.Event,
     timeout: httpx.Timeout,
     state: dict[str, Any] | None = None,
+    id_prefix: str = _LISTEN_ID_PREFIX,
+    body_provider: Callable[[], tuple[dict[str, Any], int]] | None = None,
+    generation_reader: Callable[[], int] | None = None,
+    publish_response: Callable[[httpx.Response | None], None] | None = None,
+    restart: threading.Event | None = None,
+    label: str = "listen stream",
 ) -> None:
     """Reader thread: maintain the modern ``subscriptions/listen`` stream.
 
@@ -3782,6 +4354,58 @@ def _listen_stream_loop(
       closed, but this thread had already passed the loop-top stop check)
       exits silently iff stop is set; with stop UNSET it re-raises — see
       the handler's comment.
+
+    RESOURCE-SUBSCRIPTION MODE (#270 Phase 2 PR B, base changes 1-2 and
+    4-5) — every default below leaves the list_changed stream's behavior
+    BYTE-IDENTICAL to PR A; the second instance run() starts passes:
+
+    - ``id_prefix=_LISTEN_RES_ID_PREFIX`` (Design A2), so two concurrent
+      streams never see each other's graceful-end signals.
+    - ``body_provider``: rebuilds the body per ATTEMPT (Design A8) and
+      returns ``(params, generation)``. There is no in-band way to change
+      a live subscription filter, so a changed URI set means a new
+      request — the loop simply re-opens with what the provider now
+      returns. The body it returns carries a
+      ``resourceSubscriptions``-ONLY notification filter (Design A9), so
+      a compliant server sends this stream no ``list_changed`` at all.
+      ``None`` keeps the frozen ``params`` of PR A (C1).
+      ``params`` is still required either way: the ``MCP-Protocol-Version``
+      pin below reads its frozen ``_meta``, which the provider's overlay
+      preserves (``_with_resource_subscriptions``).
+    - ``generation_reader``: the live counter, read WITHOUT rebuilding a
+      body (the ``_SseState.endpoint_url`` GIL-atomic-publish precedent).
+    - ``publish_response``: hands the in-flight ``httpx.Response`` to the
+      stdin thread — stored under the URI-set lock — so a subscribe can
+      close THIS stream without touching the dedicated client, which the
+      teardown owns and whose close would make every later attempt raise
+      (base change 5). Always re-published as ``None`` when the attempt
+      ends, so a stale handle is never closed.
+    - ``restart``: set by the stdin thread after a subscribe/unsubscribe,
+      together with a ``close()`` on the in-flight response handle the
+      loop publishes under the URI-set lock. The close makes the parked
+      read raise (or end), and every arm that could otherwise treat that
+      as a drop consumes the restart and re-opens IMMEDIATELY — no
+      ``RETRY_DELAY``, no drop counted, and C7's pre-establishment
+      fail-fast bypassed, because this close is the relay's OWN doing.
+      Design A4: every one of those arms goes through
+      ``_consume_restart``, which lets ``stop`` win. An EMPTY URI set
+      parks the thread on the same event instead of POSTing a
+      subscription-less request; teardown sets ``restart`` after ``stop``
+      to wake it.
+    - ``label``: stderr prefix, so two streams' logs are tellable apart.
+
+    Reopen races are settled by the generation counter: the attempt
+    snapshots ``(body, generation)`` at the top and re-checks the live
+    generation right after the ack. A change that landed between the
+    snapshot and the response handle being published would otherwise be
+    lost until the next unrelated reopen — the ack is the earliest point
+    at which the server has definitely seen this attempt's filter.
+
+    Documented gap (base change 7): while the resource stream re-opens,
+    ``resources/updated`` notifications are not being received. The
+    list_changed stream is untouched by that churn, which is exactly why
+    PR B uses a second stream (base change 1) instead of reopening the
+    only one.
     """
     # C1 x C2 interaction guard (#352 review finding 2): the body is
     # FROZEN (C1) but prepare_headers (the modern _prepare_headers) reads
@@ -3795,17 +4419,48 @@ def _listen_stream_loop(
     # inside the snapshot; everything ELSE in the fresh snapshot — the
     # credentials above all — stays fresh, which is C2's actual point.
     frozen_version = params["_meta"][_META_PROTOCOL_VERSION]
+    # What stops working when this stream gives up for good — the two
+    # streams carry different payloads (#270 Phase 2 PR B). The default
+    # keeps PR A's wording byte-identical.
+    disabled = (
+        "resources/updated forwarding disabled for this session"
+        if body_provider is not None
+        else "list_changed forwarding disabled for this session"
+    )
     attempt = 0
     established = False
     while not stop.is_set():
+        # Per-attempt body (Design A8). Without a provider this is PR A's
+        # frozen snapshot verbatim, re-serialized exactly as before.
+        generation = 0
+        attempt_params = params
+        if body_provider is not None:
+            attempt_params, generation = body_provider()
+            if not _listen_resource_subscriptions(attempt_params):
+                # Nothing subscribed: park rather than POST a listen whose
+                # filter requests nothing at all (Design A9 — this stream
+                # asks for `resourceSubscriptions` and nothing else, so an
+                # empty set leaves it with no reason to exist). Woken by
+                # the stdin thread's next subscribe — or
+                # by teardown, which sets `restart` AFTER `stop` precisely
+                # so this wait cannot outlive run() (Design A4); an
+                # `Event.wait()` is deaf to both `stop.set()` and the
+                # client close that unblocks a parked READ.
+                if restart is None:
+                    return
+                log(f"{label}: no resource subscriptions; parking")
+                restart.wait()
+                if not _consume_restart(stop, restart):
+                    return
+                continue
         attempt += 1
-        listen_id = f"{_LISTEN_ID_PREFIX}{attempt}"
+        listen_id = f"{id_prefix}{attempt}"
         body = json.dumps(
             {
                 "jsonrpc": "2.0",
                 "id": listen_id,
                 "method": _LISTEN_METHOD,
-                "params": params,
+                "params": attempt_params,
             }
         )
         req_headers = prepare_headers(body)
@@ -3823,10 +4478,20 @@ def _listen_stream_loop(
             k: v for k, v in req_headers.items() if k.lower() != "mcp-protocol-version"
         }
         req_headers["MCP-Protocol-Version"] = frozen_version
+        # Set when THIS attempt must be re-opened at once rather than
+        # counted as a drop (#270 Phase 2 PR B): the subscription filter
+        # moved on while the attempt was in flight.
+        reopen = False
         try:
             with client.stream(
                 "POST", url, content=body, headers=req_headers, timeout=timeout
             ) as resp:
+                # Publish the in-flight handle so a subscribe/unsubscribe
+                # on the stdin thread can end THIS attempt without closing
+                # the dedicated client (base change 5). Un-published in
+                # the finally below, on every arm including the returns.
+                if publish_response is not None:
+                    publish_response(resp)
                 if resp.status_code != 200:
                     resp.read()
                     # #352 round-3 finding 1: classify the BODY before the
@@ -3849,10 +4514,9 @@ def _listen_stream_loop(
                     code = _listen_error_code(resp)
                     if code in _LISTEN_TERMINAL_ERROR_CODES:
                         log(
-                            "listen stream: server rejected "
+                            f"{label}: server rejected "
                             f"subscriptions/listen (HTTP {resp.status_code}, "
-                            f"JSON-RPC {code}); list_changed forwarding "
-                            "disabled for this session"
+                            f"JSON-RPC {code}); {disabled}"
                         )
                         return
                     # Three-way split (#352 round-2 finding 1): terminal
@@ -3873,18 +4537,17 @@ def _listen_stream_loop(
                     # generally but NOT auth challenges).
                     if resp.status_code in (401, 403):
                         log(
-                            f"listen stream: HTTP {resp.status_code}; "
+                            f"{label}: HTTP {resp.status_code}; "
                             "reconnecting with a fresh header snapshot"
                         )
                     elif not established:
                         log(
-                            f"listen stream: HTTP {resp.status_code} before the "
-                            "stream was ever established; list_changed "
-                            "forwarding disabled for this session"
+                            f"{label}: HTTP {resp.status_code} before the "
+                            f"stream was ever established; {disabled}"
                         )
                         return
                     else:
-                        log(f"listen stream: HTTP {resp.status_code}; reconnecting")
+                        log(f"{label}: HTTP {resp.status_code}; reconnecting")
                 else:
                     # #352 round-5 finding 2: an HTTP 200 alone is NOT
                     # establishment. Establishment is recorded only on the
@@ -3922,18 +4585,34 @@ def _listen_stream_loop(
                             if outcome == "ack":
                                 established = True
                                 acked = True
+                                _log_unhonored_subscriptions(
+                                    state, attempt_params, label
+                                )
+                                # Stale-filter check (#270 Phase 2 PR B):
+                                # the ack is the earliest proof the server
+                                # has seen THIS attempt's filter, so it is
+                                # where a change that landed after the
+                                # snapshot must force a re-open — the
+                                # stdin thread's restart/close may have
+                                # raced the publish above and been lost.
+                                if (
+                                    generation_reader is not None
+                                    and generation_reader() != generation
+                                ):
+                                    reopen = True
+                                    break
                             elif outcome is not None:
                                 return
-                        # Stream ended with neither graceful signal.
-                        if not established:
-                            log(
-                                "listen stream: 200 stream ended without the "
-                                "acknowledgement before the stream was ever "
-                                "established; list_changed forwarding "
-                                "disabled for this session"
-                            )
-                            return
-                        log("listen stream ended without a signal; reconnecting")
+                        if not reopen:
+                            # Stream ended with neither graceful signal.
+                            if not established:
+                                log(
+                                    f"{label}: 200 stream ended without the "
+                                    "acknowledgement before the stream was "
+                                    f"ever established; {disabled}"
+                                )
+                                return
+                            log(f"{label} ended without a signal; reconnecting")
                     else:
                         resp.read()
                         text = resp.text.strip()
@@ -3951,30 +4630,34 @@ def _listen_stream_loop(
                         )
                         if outcome == "ack":
                             established = True
+                            _log_unhonored_subscriptions(state, attempt_params, label)
                         elif outcome is not None:
                             return
                         if not established:
                             log(
-                                "listen stream: 200 response carried no "
+                                f"{label}: 200 response carried no "
                                 "acknowledgement before the stream was ever "
-                                "established; list_changed forwarding "
-                                "disabled for this session"
+                                f"established; {disabled}"
                             )
                             return
                         log(
-                            "listen stream: JSON 200 carried no terminal "
-                            "signal; reconnecting"
+                            f"{label}: JSON 200 carried no terminal signal; reconnecting"
                         )
         except httpx.HTTPError as e:
             if stop.is_set():
                 return
+            if _consume_restart(stop, restart):
+                # The stdin thread closed the published handle for a
+                # subscription change — the relay's OWN doing, so this is
+                # not a drop: no delay, no drop count, and C7's
+                # pre-establishment fail-fast below is bypassed (base
+                # change 5).
+                log(f"{label}: subscription filter changed; reopening")
+                continue
             if not established:
-                log(
-                    f"listen stream failed before it was ever established "
-                    f"({e}); list_changed forwarding disabled for this session"
-                )
+                log(f"{label} failed before it was ever established ({e}); {disabled}")
                 return
-            log(f"listen stream dropped ({e}); reconnecting")
+            log(f"{label} dropped ({e}); reconnecting")
         except OSError as e:
             if stop.is_set():
                 # Shutdown teardown (#352 round-2 finding 2): run()'s
@@ -3986,7 +4669,7 @@ def _listen_stream_loop(
             # C12: _emit's stdout write failed (BrokenPipeError is an
             # OSError) — the downstream reader is gone; reconnecting the
             # upstream stream would spin against a dead stdout.
-            log(f"listen stream: stdout write failed ({e}); stopping")
+            log(f"{label}: stdout write failed ({e}); stopping")
             return
         except RuntimeError:
             # Shutdown race (#352 round-5 finding 1): run()'s finally sets
@@ -4007,9 +4690,31 @@ def _listen_stream_loop(
             # is the ONLY closer of the dedicated client, and it sets stop
             # first), so re-raise loudly: swallowing would mask a real
             # logic bug as a quiet thread death.
+            #
+            # #270 Phase 2 PR B adds a SECOND legitimate producer on the
+            # resource stream: the stdin thread closes the published
+            # RESPONSE (never the client) on a subscription change, and
+            # httpx raises StreamClosed — a RuntimeError subclass — when
+            # that lands mid-read. Consuming the pending restart tells the
+            # two apart without weakening the re-raise for anything else;
+            # stop still wins (Design A4).
             if stop.is_set():
                 return
+            if _consume_restart(stop, restart):
+                log(f"{label}: subscription filter changed; reopening")
+                continue
             raise
+        finally:
+            # Never leave a finished attempt's handle published: closing a
+            # stale response would be a no-op at best and would consume a
+            # restart meant for the NEXT attempt at worst.
+            if publish_response is not None:
+                publish_response(None)
+        if reopen or _consume_restart(stop, restart):
+            if stop.is_set():
+                return
+            log(f"{label}: subscription filter changed; reopening")
+            continue
         if stop.wait(RETRY_DELAY):
             return
 
@@ -6048,28 +6753,34 @@ def run(
     # new call site (acceptance criterion #3): the only caller of either
     # hook is the era == "modern" branch in the stdin loop below, so
     # legacy wire bytes are untouched structurally.
-    listen_stop = threading.Event()
-    # Mutable holder shared with the thread. "thread" doubles as the
-    # one-shot latch — a client-driven re-`initialize`/repeat
-    # `initialized` invokes the hooks again but must never spawn a second
-    # thread. "params" is the frozen C1 snapshot, seeded at initialize
-    # time; None means no initialize was ever intercepted, so an orphan
-    # `initialized` starts nothing. "honored" records the
-    # server-acknowledged notification subset from the ack (logged on
-    # divergence; consumed for real by PR B). "advertised" is the frozen
-    # set of capability families the synthesized InitializeResult
-    # advertised listChanged on (#352 round-3 finding 2) — the forwarding
-    # gate _handle_listen_message applies. "client" is the thread's
-    # DEDICATED httpx client (#352 round-2 finding 2), created alongside
-    # the thread and closed by the finally below — from the main thread —
-    # to actively unblock a parked read at shutdown.
-    listen_state: dict[str, Any] = {
-        "thread": None,
-        "params": None,
-        "honored": None,
-        "advertised": None,
-        "client": None,
-    }
+    #
+    # #270 Phase 2 PR B adds a SECOND stream (base change 1) for resource
+    # subscriptions, arranged the same way: `res_stream` shares the
+    # list_changed stream's seeded body but keeps its own thread,
+    # dedicated client, stop event, restart event and state carrier, so
+    # the churn a changing URI set forces never touches the list_changed
+    # stream's C1/established/terminal invariants. It is started LAZILY —
+    # on the first `resources/subscribe`, or alongside the list_changed
+    # stream when subscribes arrived before the handshake completed —
+    # because a client that never subscribes must not pay for a second
+    # upstream connection.
+    listen_stream = _ListenStream()
+    subscriptions = _ResourceSubscriptions()
+    res_stream = _ListenStream(restart=threading.Event())
+    res_stream.state["resource_stream"] = True
+    res_stream.state["honored_resources"] = None
+    res_stream.state["uris"] = frozenset()
+
+    def _publish_subscribed_uris() -> None:
+        """Republish the live URI set for the resource reader's gate.
+
+        Wholesale immutable publish, read by the reader with one
+        GIL-atomic dict lookup — the ``_SseState.endpoint_url`` precedent.
+        A racing read sees either the old or the new frozenset, never a
+        half-mutated one, and a stale read only delays a forwarding
+        decision by one notification.
+        """
+        res_stream.state["uris"] = subscriptions.snapshot()[0]
 
     def _seed_listen_snapshot() -> None:
         """Freeze the listen body snapshot (C1) at initialize time.
@@ -6086,32 +6797,38 @@ def run(
         over-advertised family merely gets no notifications (which
         ``listChanged`` never guarantees), never a forwarded notification
         for an unadvertised one.
+
+        Both streams seed from the SAME call (#270 Phase 2 PR B) for the
+        ``_meta`` half, which must stay frozen for the version pin (#352
+        review finding 2) and identical on both. Their ``notifications``
+        FILTERS differ and always did: the resource stream replaces it
+        per attempt with a ``resourceSubscriptions``-only filter (Design
+        A9, ``_with_resource_subscriptions``). One snapshot and one
+        advertised set, so neither can drift.
         """
-        if listen_state["thread"] is not None:
+        if listen_stream.thread is not None:
             return
-        listen_state["params"] = _build_listen_params(modern_state)
-        listen_state["advertised"] = _listen_advertised_families(
+        listen_stream.params = _build_listen_params(modern_state)
+        listen_stream.state["advertised"] = _listen_advertised_families(
             modern_state.capabilities
         )
+        if res_stream.thread is None:
+            res_stream.params = listen_stream.params
+            res_stream.state["advertised"] = listen_stream.state["advertised"]
 
-    def _start_listen_stream() -> None:
-        """Open the background subscriptions/listen stream, at most once.
+    def _new_listen_client() -> httpx.Client:
+        """A DEDICATED httpx client for one listen thread.
 
-        Invoked on ``notifications/initialized`` (#352 review finding 1).
-        No seeded snapshot — an ``initialized`` with no prior
-        ``initialize`` — starts nothing: the snapshot would carry an
-        un-negotiated version and no captured client identity.
+        #352 round-2 finding 2, mirroring the shared client's
+        construction above. A listen thread must never touch the shared
+        client: shutdown interrupts a read parked for up to
+        --listen-read-timeout by closing THIS client from the main thread
+        (run()'s finally), which a bounded join alone cannot do — and a
+        long-parked stream no longer holds one of the shared client's
+        pool=10 connections either. One per stream (#270 Phase 2 PR B),
+        so closing one at teardown cannot disturb the other.
         """
-        if listen_state["thread"] is not None or listen_state["params"] is None:
-            return
-        # DEDICATED client for the listen thread (#352 round-2 finding 2),
-        # mirroring the shared client's construction above. The thread must
-        # never touch the shared client: shutdown interrupts a read parked
-        # for up to --listen-read-timeout by closing THIS client from the
-        # main thread (run()'s finally), which a bounded join alone cannot
-        # do — and a long-parked stream no longer holds one of the shared
-        # client's pool=10 connections either.
-        listen_client = httpx.Client(
+        return httpx.Client(
             transport=_make_httpx_transport(tcp_keepalive=tcp_keepalive),
             timeout=httpx.Timeout(
                 connect=timeout_connect,
@@ -6120,34 +6837,190 @@ def run(
                 pool=10,
             ),
         )
-        listen_state["client"] = listen_client
+
+    # Per-request timeout override, built like run_sse's post_timeout:
+    # same connect/write/pool, but the READ timeout is the dedicated
+    # --listen-read-timeout (C9). Shared by both streams.
+    listen_timeout = httpx.Timeout(
+        connect=timeout_connect,
+        read=listen_read_timeout,
+        write=timeout_write,
+        pool=10,
+    )
+
+    def _start_listen_stream() -> None:
+        """Open the background subscriptions/listen stream, at most once.
+
+        Invoked on ``notifications/initialized`` (#352 review finding 1).
+        No seeded snapshot — an ``initialized`` with no prior
+        ``initialize`` — starts nothing: the snapshot would carry an
+        un-negotiated version and no captured client identity.
+
+        Also the point where subscribes that arrived BEFORE the handshake
+        completed ride their first open (#270 Phase 2 PR B, base change
+        3): they accumulated in the URI set with nothing to open yet.
+        """
+        if listen_stream.thread is not None or listen_stream.params is None:
+            return
+        listen_client = _new_listen_client()
+        listen_stream.client = listen_client
         listen_thread = threading.Thread(
             target=_listen_stream_loop,
             kwargs={
                 "client": listen_client,
                 "url": url,
                 # Frozen body snapshot (C1) — seeded at initialize time.
-                "params": listen_state["params"],
+                "params": listen_stream.params,
                 # Fresh header snapshot per attempt (C2) — _prepare_headers
                 # locks internally, so refreshed tokens reach reconnects.
                 "prepare_headers": _prepare_headers,
                 "tracker": tracker,
-                "stop": listen_stop,
-                # Per-request timeout override, built like run_sse's
-                # post_timeout: same connect/write/pool, but the READ
-                # timeout is the dedicated --listen-read-timeout (C9).
-                "timeout": httpx.Timeout(
-                    connect=timeout_connect,
-                    read=listen_read_timeout,
-                    write=timeout_write,
-                    pool=10,
-                ),
-                "state": listen_state,
+                "stop": listen_stream.stop,
+                "timeout": listen_timeout,
+                "state": listen_stream.state,
             },
             daemon=True,
         )
-        listen_state["thread"] = listen_thread
+        listen_stream.thread = listen_thread
         listen_thread.start()
+        _start_resource_listen_stream()
+
+    def _resource_listen_body() -> tuple[dict[str, Any], int]:
+        """This attempt's body plus the generation it was built from.
+
+        Design A8. The seeded snapshot's FROZEN ``_meta`` (see
+        ``_with_resource_subscriptions`` for why it must not be
+        re-derived here) plus a fresh ``resourceSubscriptions``-only
+        notification filter carrying the CURRENT URI set (Design A9).
+        """
+        uris, generation = subscriptions.snapshot()
+        return _with_resource_subscriptions(res_stream.params or {}, uris), generation
+
+    def _start_resource_listen_stream() -> None:
+        """Open the dedicated resource listen stream, at most once.
+
+        The never-respawn latch is ``thread`` (Design A6), exactly like
+        the list_changed stream's: once this thread has exited — a
+        graceful end, or the C6 terminal arm on a server that rejects
+        ``subscriptions/listen`` — later subscribes still answer ``{}``
+        but no updates arrive, which is the documented degraded mode.
+        Nothing starts before ``_start_listen_stream`` has actually run
+        (``listen_stream.thread is None`` in the guard below, #358 review
+        R1F1) — covering the WHOLE pre-``initialized`` window, not merely
+        pre-``initialize``. The body snapshot alone
+        (``res_stream.params``) is seeded by ``initialize``, well before
+        ``initialized`` — so gating on the snapshot alone let a
+        ``resources/subscribe`` that arrived in exactly that window start
+        THIS thread immediately, opening the upstream connection before
+        the downstream handshake had even completed, while the
+        list_changed stream correctly waited (``_start_listen_stream``
+        itself only starts on ``notifications/initialized``, #352 review
+        finding 1). A subscribe that beats the handshake now simply
+        accumulates and rides ``_start_listen_stream``, which calls this
+        function again at its own end, once the thread it gates on
+        exists.
+
+        And nothing starts on an EMPTY set: a client that never
+        subscribes must not pay for a second upstream connection, which
+        is the whole point of the lazy start. (Once running, an
+        unsubscribe that empties the set PARKS the thread rather than
+        ending it — re-opening is cheap, but the never-respawn latch is
+        deliberately not re-armable.)
+        """
+        if (
+            res_stream.thread is not None
+            or res_stream.params is None
+            or listen_stream.thread is None
+        ):
+            return
+        if not subscriptions.snapshot()[0]:
+            return
+        res_client = _new_listen_client()
+        res_stream.client = res_client
+        res_thread = threading.Thread(
+            target=_listen_stream_loop,
+            kwargs={
+                "client": res_client,
+                # Seed body: the version pin reads its frozen _meta.
+                "params": res_stream.params,
+                "url": url,
+                "prepare_headers": _prepare_headers,
+                "tracker": tracker,
+                "stop": res_stream.stop,
+                "timeout": listen_timeout,
+                "state": res_stream.state,
+                "id_prefix": _LISTEN_RES_ID_PREFIX,
+                "body_provider": _resource_listen_body,
+                "generation_reader": lambda: subscriptions.generation,
+                "publish_response": subscriptions.publish_response,
+                "restart": res_stream.restart,
+                "label": "resource listen stream",
+            },
+            daemon=True,
+        )
+        res_stream.thread = res_thread
+        res_thread.start()
+
+    def _wake_resource_listen_stream() -> None:
+        """Make the resource stream pick up a changed URI set.
+
+        Start it if this is the first subscribe; otherwise signal the
+        reopen and end the in-flight attempt by closing the PUBLISHED
+        RESPONSE — never the dedicated client, which run()'s teardown
+        owns and whose close would make every later attempt raise (base
+        change 5). Order matters: set the event first, so a reader that
+        wakes from the close finds the restart already pending and takes
+        the reopen arm instead of counting a drop.
+        """
+        if res_stream.thread is None:
+            _start_resource_listen_stream()
+            return
+        if res_stream.restart is not None:
+            res_stream.restart.set()
+        subscriptions.close_response()
+
+    def _handle_resource_subscription(method: str, uri: str, req_id: Any) -> bool:
+        """Record a subscribe/unsubscribe; False declines the intercept.
+
+        Design A1 — the ONLY reason this declines a well-formed request:
+        the interception in ``_handle_modern_special_method`` runs BEFORE
+        the stdin loop's id-intake guards (the relay's reserved
+        ``mcp-stdio/`` namespace, #356 review R2F1, and an id that still
+        owns a pending MRTR transaction). Answering ``{}`` here would put
+        a SECOND response on the wire for an id those guards are about to
+        reject. Declining lets the line fall through to them, so exactly
+        one rejection goes out and no subscription state is touched — the
+        checks are deliberately first, before any mutation.
+
+        Everything else answers ``{}`` (base change 7): a duplicate
+        subscribe, an unsubscribe for a URI that was never subscribed,
+        and a subscribe refused by the ``_LISTEN_MAX_SUBSCRIPTIONS`` cap
+        all succeed from the client's point of view, because the legacy
+        methods define no error for them and inventing one would be a
+        wire behavior no 2025-era client is prepared for.
+        """
+        if isinstance(req_id, str) and req_id.startswith(_RELAY_ID_NAMESPACE):
+            return False
+        if _is_scalar_id(req_id) and req_id in mrtr_txns:
+            return False
+        if method == _SUBSCRIBE_METHOD:
+            outcome = subscriptions.add(uri)
+            if outcome == "refused":
+                log(
+                    f"resources/subscribe: refusing {uri!r}; already at the "
+                    f"{_LISTEN_MAX_SUBSCRIPTIONS}-subscription cap (existing "
+                    "subscriptions keep working)"
+                )
+        else:
+            outcome = "added" if subscriptions.discard(uri) else "duplicate"
+        if outcome != "added":
+            # No state change, so no reopen: a duplicate must not restart
+            # the stream, which would break the coalescing guarantee for
+            # nothing.
+            return True
+        _publish_subscribed_uris()
+        _wake_resource_listen_stream()
+        return True
 
     refresh_timer, refresh_stop = _start_proactive_refresh(
         refresher=token_refresher,
@@ -6269,6 +7142,7 @@ def run(
                         discover_retry=_discover_reseed,
                         listen_seed=_seed_listen_snapshot,
                         listen_start=_start_listen_stream,
+                        resource_subscription=_handle_resource_subscription,
                     )
                     if handled:
                         if modern_reply is not None:
@@ -6848,13 +7722,28 @@ def run(
         # touches. Closing here unconditionally also covers the thread's
         # natural exits (graceful/terminal arms) so the dedicated client
         # never leaks until process exit; httpx.Client.close is idempotent.
-        listen_stop.set()
-        listen_client = listen_state["client"]
-        if listen_client is not None:
-            listen_client.close()
-        listen_thread = listen_state["thread"]
-        if listen_thread is not None:
-            listen_thread.join(timeout=1.0)
+        #
+        # Design A4, with TWO threads: BOTH stop events first, then both
+        # dedicated clients, then both joins (~2 s additive worst case,
+        # which is the price of the second stream and is bounded), and
+        # only then the shared client. Setting both stops before either
+        # close is what makes the loops' stop-set arms unambiguous — a
+        # thread must never see a peer's teardown as a live restart. The
+        # restart events are set LAST of the signals, because a resource
+        # thread PARKED on `restart.wait()` (empty URI set) is deaf to
+        # both the stop event and the client close; `_consume_restart`
+        # then sees stop already set and the thread exits at once.
+        for stream in (listen_stream, res_stream):
+            stream.stop.set()
+        for stream in (listen_stream, res_stream):
+            if stream.restart is not None:
+                stream.restart.set()
+        for stream in (listen_stream, res_stream):
+            if stream.client is not None:
+                stream.client.close()
+        for stream in (listen_stream, res_stream):
+            if stream.thread is not None:
+                stream.thread.join(timeout=1.0)
         # The cold-start daemon self-exits after one OAuth attempt; briefly join
         # it so a clean shutdown does not race its final emit. daemon=True keeps
         # process exit unblocked if it is still parked in the interactive flow.
