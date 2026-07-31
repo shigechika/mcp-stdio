@@ -2656,6 +2656,38 @@ class _InFlightPost:
     session-wide event that would need clearing: there is no later
     request to hand a stale set() to, so "consuming" the abort is a
     read (see ``_abort_requested``) and no clear-vs-set race exists.
+
+    THE WINDOW THIS COVERS, and the three it does not. A cancel is
+    honored from the moment the consumer publishes the request until the
+    per-line ``finally`` releases it, and it can actually END the POST
+    only while a response handle is published. Outside that, a cancel is
+    still enqueued and still reaches the tracker and the MRTR bridge on
+    the consumer — it simply cannot cut the request short. None of the
+    three is a regression: before this PR the modern era honored no
+    cancel at all.
+
+    1. BEFORE PUBLICATION. The reader can enqueue a request and read its
+       cancel before the consumer has picked the request up (the window
+       is the handful of parses between dequeue and publish, so this
+       needs a client that cancels essentially simultaneously). The
+       cancel then matches nothing and is not re-tried when the consumer
+       later dequeues it, so the call runs to completion. Re-arming it
+       from a "seen before publication" set is NOT obviously correct:
+       JSON-RPC lets a client reuse an id once the prior call is done —
+       which is exactly what the tracker's ``discard``-on-reuse encodes —
+       so a naive set would abort an unrelated LATER request under the
+       same id.
+    2. BEFORE RESPONSE HEADERS. ``client.stream()`` does not return until
+       the server sends headers, so a server that does its long work
+       first and only then responds leaves ``_response`` None for the
+       whole of it: the abort event is set, nothing is closed, and the
+       relay waits out the server or the read timeout. Closing that
+       window means a dedicated ``httpx.Client`` per abortable request
+       (the listen threads' pattern) so the teardown has something to
+       close — a real cost per request, deliberately not paid here.
+    3. PAGINATION. See the ``_paginate_and_stream`` branch in run()'s
+       ``_dispatch`` — continuations go through ``_post_parsed``, which
+       publishes no handle (#270 PR D owner question 2, a recorded gap).
     """
 
     __slots__ = ("_lock", "_req_id", "_live", "_abort", "_response")
