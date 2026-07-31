@@ -5213,9 +5213,10 @@ def _listen_stream_loop(
         # attempt gets consumed. With `reopen` on the left, a stale-filter
         # reopen short-circuits and leaves the event SET, so an unrelated
         # `RuntimeError` on the next attempt (stop unset — the "nothing
-        # legitimate produces this" case) finds a pending restart at the
-        # 5188 arm, takes it for a subscription change and continues
-        # quietly instead of re-raising as #352 R5F1 intends. Consuming
+        # legitimate produces this" case) finds a pending restart in the
+        # `except RuntimeError` arm above, takes it for a subscription
+        # change and continues quietly instead of re-raising as #352 R5F1
+        # intends. Consuming
         # first costs nothing else: coalescing still holds (the next
         # attempt's `body_provider` snapshot sees the newest URI set, and
         # the ack-time generation check covers the race), and stop still
