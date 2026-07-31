@@ -282,9 +282,10 @@ class TestErrorResponse:
 
     def test_code_defaults_to_server_error_and_can_be_overridden(self):
         """#270 PR C: the MRTR bridge needs -32600 Invalid Request for the
-        two cases where the fault is in the MESSAGE (an unbridgeable
+        cases where the fault is in the MESSAGE (an unbridgeable
         input_required result; a client id already owning a pending
-        transaction) rather than in the relay's attempt to deliver it.
+        transaction; a client request id intruding on the relay's reserved
+        namespace) rather than in the relay's attempt to deliver it.
         Every pre-existing caller must keep the -32000 default."""
         assert json.loads(_error_response("e", 1))["error"]["code"] == -32000
         assert (
@@ -13283,7 +13284,7 @@ class TestRunModernMrtrBridge:
         """The whole bridge in one test: the server answers tools/call with
         an InputRequiredResult, the relay mints a legacy elicitation/create
         onto stdout, the client answers it, and the relay re-POSTs the
-        ORIGINAL request with `inputResponses` + the byte-exact
+        ORIGINAL request with `inputResponses` + the value-exact
         `requestState` echo under a DIFFERENT id ("The JSON-RPC id MUST be
         different between the initial request and the retry"), then hands
         the final result back under the id the client is waiting on."""

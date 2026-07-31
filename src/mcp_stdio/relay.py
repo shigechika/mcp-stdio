@@ -1900,11 +1900,12 @@ def _error_response(
     ``code`` defaults to -32000 (the implementation-defined server-error
     range JSON-RPC 2.0 §5.1 reserves for exactly this kind of gateway-
     synthesized failure), which every pre-existing caller relies on. The
-    MRTR bridge (#270 PR C) overrides it with -32600 Invalid Request for
-    the two cases where the fault is in the MESSAGE rather than in the
-    relay's attempt to deliver it: an unbridgeable ``input_required``
-    result, and a client reusing an id that still has a transaction
-    pending.
+    MRTR bridge (#270 PR C, #356 review R2F1) overrides it with -32600
+    Invalid Request for the cases where the fault is in the MESSAGE rather
+    than in the relay's attempt to deliver it: an unbridgeable
+    ``input_required`` result, a client reusing an id that still has a
+    transaction pending, and a client request whose id intrudes on the
+    relay's reserved minted-id namespace.
     """
     error: dict[str, Any] = {"code": code, "message": message}
     if data is not None:
@@ -4879,7 +4880,7 @@ def run(
     ordinary server-initiated requests on stdout under
     ``mcp-stdio/mrtr/<seq>/<key>`` ids, the client's answers are
     collected, and the ORIGINAL request is re-POSTed with
-    ``inputResponses`` plus a byte-exact ``requestState`` echo under a
+    ``inputResponses`` plus a value-exact ``requestState`` echo under a
     fresh id (the spec requires the retry id to differ). The final result
     is re-keyed to the client's own id on the way out. Multi-round works;
     a ``requestState``-only result re-POSTs immediately.
@@ -5183,9 +5184,12 @@ def run(
 
         One place so no path can leak a half-purged transaction or a
         differently-shaped error: an undeclared capability, an unknown
-        request kind, a malformed ``inputRequests``, ``mode: "url"``, a
-        sampling request carrying ``tools``, a client JSON-RPC error on a
-        minted id, and both caps all land here.
+        request kind, a malformed ``inputRequests`` (missing entirely, or
+        with neither ``inputRequests`` nor ``requestState`` present),
+        ``mode: "url"``, a sampling request carrying ``tools``, both caps
+        (transaction and round), a client JSON-RPC error on a minted id, a
+        client cancelling a minted id, and an upstream stream interrupted
+        after a swallow (via ``_make_input_required_abort``) all land here.
 
         Outstanding minted requests are cancelled downstream before the
         error goes out. The relay issued them and they ARE still in
@@ -5195,8 +5199,11 @@ def run(
         to still be in-progress"), and without it the client sits on an
         elicitation dialog nobody will ever collect. ``-32600`` Invalid
         Request is the default because the usual fault is the shape of the
-        server's MRTR message; callers pass ``-32000`` for the failures
-        that are the relay's own resource limits instead.
+        server's MRTR message; callers pass ``-32000`` for every other
+        reason the exchange could not be completed — not only the relay's
+        own resource limits (the two caps), but also a client answer that
+        cannot be used (a JSON-RPC error or a cancel on a minted id) and an
+        interrupted upstream transport after a round was already opened.
         """
         txn = _mrtr_purge(client_id)
         if txn is not None:
@@ -5466,7 +5473,7 @@ def run(
         capability set than the round the server is holding state for.
 
         ``inputResponses`` carries the client's results verbatim under the
-        server's own keys. ``requestState`` is echoed byte-exactly and ONLY
+        server's own keys. ``requestState`` is echoed value-exactly and ONLY
         when the latest result carried one: "If an InputRequiredResult
         contains the requestState field, the client MUST echo back the
         exact value of that field when retrying the original request.
