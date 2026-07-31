@@ -8,6 +8,7 @@ import email.utils
 import json
 import math
 import os
+import queue
 import re
 import signal
 import socket
@@ -2510,6 +2511,97 @@ def _iter_sse_events(lines: Iterable[str]) -> Iterator[tuple[str, str]]:
     data = "\n".join(data_lines)
     if data:
         yield event_type, data
+
+
+# Name of the modern era's stdin reader thread. Named rather than
+# anonymous so an operator reading a traceback or a `faulthandler` dump
+# can tell the gateway's own reader apart from the two listen threads,
+# and so the AC3 guard test can assert on `threading.enumerate()` by name
+# instead of on a thread COUNT the refresh timer and listen threads make
+# unstable.
+_STDIN_READER_THREAD_NAME = "mcp-stdio-stdin-reader"
+
+# End-of-input marker enqueued by the reader thread. A unique sentinel
+# object rather than None or "": both are legal queue payloads in
+# principle, and confusing one for EOF would silently truncate a session.
+_STDIN_EOF = object()
+
+
+def _stdin_reader_loop(
+    lines: "queue.SimpleQueue[Any]",
+    on_cancel: "Callable[[Any], None] | None" = None,
+) -> None:
+    """Read stdin on a dedicated thread and hand every line to the queue.
+
+    #270 Phase 2 PR D, §3.1 — the permanent stdin handoff, started ONCE
+    at era resolution and ONLY on the modern era. Its whole reason to
+    exist is that on that era cancellation does not exist at all today:
+    the cancel notification sits unread in the pipe while run() blocks
+    inside a dispatch, and the v2 wire offers no other signal —
+    "**Streamable HTTP**: Closing the SSE response stream is the
+    cancellation signal. The server **MUST** treat a client disconnect as
+    cancellation of that request. No ``notifications/cancelled`` message
+    is required or expected." So the only way to honor a cancel is to be
+    reading stdin while the dispatch blocks.
+
+    A blocking read on a daemon thread is the ONLY portable mechanism
+    (§3.6): `select()` does not work on pipes on Windows, a blocked
+    `ReadFile` cannot be cancelled from Python, and the between-chunks
+    `os.read` variants fail structurally anyway — during a long call the
+    consumer is parked INSIDE `resp.iter_text()`, which is precisely when
+    the cancel arrives. It follows that any second thread that ever
+    touches stdin must own it forever, which is why the handoff is
+    permanent rather than scoped to a dispatch.
+
+    It iterates ``sys.stdin`` itself — the same text-mode object
+    ``_enforce_lf_stdio`` reconfigures on win32 — and never mixes in
+    ``os.read(0)`` or ``sys.stdin.buffer``, which would strand data
+    already sitting in Python's own buffer.
+
+    THE READER MUTATES NO RELAY STATE (required change 7). Per line it
+    does exactly two things: run the cheap pure-function cancel check and,
+    on a match against the published in-flight request, invoke
+    ``on_cancel``; then enqueue the line UNCHANGED, in order, including
+    the cancel lines it acted on. ``tracker.add``, ``_mrtr_handle_cancel``,
+    ``protocol_version``, ``session_id``, the recovery ladder and every
+    MRTR dict stay on the consumer thread, so each single-dispatch
+    invariant survives the handoff untouched. It writes nothing to stdout.
+
+    Because exactly one thread ever reads stdin, nothing is reordered, no
+    double-dispatch is possible, and a partial-line split cannot occur.
+    """
+    try:
+        for line in sys.stdin:
+            if on_cancel is not None:
+                cancel_id = _extract_cancel_id(line)
+                if cancel_id is not None:
+                    on_cancel(cancel_id)
+            lines.put(line)
+    except Exception as e:  # noqa: BLE001 — never crash the gateway
+        # Mirrors run()'s own never-crash net (#11) one thread over: a
+        # read failure must end THIS thread quietly, with the sentinel
+        # still enqueued below so the consumer drains and shuts down
+        # cleanly instead of blocking on a queue nobody will feed again.
+        log(f"stdin reader stopped: {e}")
+    finally:
+        lines.put(_STDIN_EOF)
+
+
+def _iter_queued_stdin(lines: "queue.SimpleQueue[Any]") -> Iterator[str]:
+    """Yield the reader thread's lines in order, ending at the sentinel.
+
+    #270 Phase 2 PR D, §3.1/§3.8. The FIFO ordering is what makes the
+    drain automatic (required change 9): the sentinel is enqueued last,
+    so every request that arrived before EOF is already ahead of it in
+    the queue and gets served before the consumer honors the end of
+    input. Dropping them instead would silently lose work a client
+    legitimately pipelined.
+    """
+    while True:
+        item = lines.get()
+        if item is _STDIN_EOF:
+            return
+        yield item
 
 
 class _InFlightPost:
@@ -6058,6 +6150,37 @@ def run(
     # spec-compliant with the 2025-06-18 SHOULDs and deliberately unchanged.
     in_flight = _InFlightPost() if era == "modern" else None
 
+    # The stdin handoff itself (§3.1/§3.2), started HERE — at era
+    # resolution, before the loop's first iteration — and only on the
+    # modern era. Early and once, so the whole session has ONE input
+    # regime: a cancel of the FIRST request must already be observable,
+    # and a direct-read -> queued transition state would multiply cases
+    # for no benefit. Straight-line code executed once is the one-shot
+    # spawn latch (PR A's `_ListenStream.thread` idiom, degenerate here).
+    #
+    # The era gate is not cosmetic. On legacy the loop below keeps the
+    # literal synchronous `for line in sys.stdin:` — zero threads, zero
+    # new per-line calls — so acceptance criterion #3 holds by
+    # construction including TIMING: an eager legacy-side `tracker.add`
+    # would make a cancel that today lands after a completed response
+    # start dropping that response mid-stream, a real observable change.
+    stdin_lines: "queue.SimpleQueue[Any] | None" = None
+    stdin_reader: threading.Thread | None = None
+    if era == "modern":
+        # Unbounded by construction — `SimpleQueue` has no `maxsize`
+        # parameter at all (§3.7). A cap that blocked the reader would
+        # reinstate the exact deafness this PR removes; real clients await
+        # their responses, and unlike `_MRTR_MAX_TXNS` there is no
+        # two-responses-for-one-id hazard here to bound against.
+        stdin_lines = queue.SimpleQueue()
+        stdin_reader = threading.Thread(
+            target=_stdin_reader_loop,
+            kwargs={"lines": stdin_lines},
+            name=_STDIN_READER_THREAD_NAME,
+            daemon=True,
+        )
+        stdin_reader.start()
+
     if era == "modern" and cold_start_login is not None:
         # _cold_start_loop's _reinitialize sends a legacy `initialize`
         # handshake to establish a session — meaningless on a path with no
@@ -7409,8 +7532,20 @@ def run(
         )
         cold_timer.start()
 
+    # #270 Phase 2 PR D, §3.2 — the ONE line that switches input regimes,
+    # and the reason acceptance criterion #3 survives the handoff. On the
+    # legacy era `stdin_source` IS `sys.stdin`, so the loop below is the
+    # literal synchronous `for line in sys.stdin:` it has always been: the
+    # same object, the same iteration protocol, zero threads and zero new
+    # calls per line. On the modern era it is the reader thread's queue
+    # drain instead. Duplicating the six-hundred-line loop body to keep
+    # the legacy STATEMENT byte-identical would trade a real guarantee for
+    # a cosmetic one and put the whole dispatch ladder in two places.
+    stdin_source: Iterable[str] = (
+        sys.stdin if stdin_lines is None else _iter_queued_stdin(stdin_lines)
+    )
     try:
-        for line in sys.stdin:
+        for line in stdin_source:
             line = line.strip()
             if not line:
                 continue
@@ -8176,6 +8311,20 @@ def run(
         # process exit unblocked if it is still parked in the interactive flow.
         if cold_timer is not None:
             cold_timer.join(timeout=1.0)
+        # #270 Phase 2 PR D, §3.8. The stdin reader is the one thread here
+        # that CANNOT be woken: a read parked in the C-level `readline()`
+        # is not portably interruptible (the same Windows constraint that
+        # forced a blocking reader in the first place — a blocked
+        # `ReadFile` cannot be cancelled from Python), and there is no
+        # dedicated client to close out from under it the way the listen
+        # threads get. So the contract is `daemon=True` plus a TINY bounded
+        # join: it reaps a reader that already saw EOF and costs a tenth of
+        # a second at most for one that has not, after which process exit
+        # takes it. Reaching this point at all means the consumer already
+        # drained the queue to the sentinel or is unwinding on an
+        # exception, so nothing is lost by not waiting longer.
+        if stdin_reader is not None:
+            stdin_reader.join(timeout=0.1)
         client.close()
 
 

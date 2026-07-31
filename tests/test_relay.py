@@ -3,6 +3,7 @@
 import copy
 import email.utils
 import json
+import queue
 import socket
 import threading
 import time
@@ -25,6 +26,7 @@ from mcp_stdio.relay import (
     _LISTEN_RES_ID_PREFIX,
     _RELAY_ID_NAMESPACE,
     _RESOURCE_UPDATED_METHOD,
+    _STDIN_READER_THREAD_NAME,
     _CancelTracker,
     _ModernState,
     _ResourceSubscriptions,
@@ -15510,6 +15512,243 @@ class TestRunModernMrtrBridge:
         answers = [line for line in lines if line.get("id") == 2]
         assert len(answers) == 1
         assert answers[0]["result"]["content"][0]["text"] == "the real answer"
+
+
+# --- modern era: stdin handoff + true cancel abort (#270 Phase 2 PR D) ---
+
+
+class _AbortableStream(httpx.SyncByteStream):
+    """A response body the relay's cancel path can actually interrupt.
+
+    ``pytest_httpx`` has no socket, so a cross-thread ``resp.close()``
+    cannot make a read fail the way a real one does — ``iter_raw`` only
+    checks ``is_closed`` BEFORE it starts iterating, and a plain iterator
+    parked between chunks never notices. This stream restores that half
+    of reality: it yields its opening chunks, parks, and then does
+    whichever of the two things the wire would have done.
+
+    - the relay closes the handle (``close()``, which
+      ``httpx.Response.close`` calls) -> raise ``httpx.ReadError``,
+      standing in for the socket teardown httpcore reports when a
+      partially-read connection cannot be returned to the pool;
+    - the test releases it -> deliver ``after`` and end normally.
+
+    Both signals ride ONE queue, so the choice is made by arrival order
+    with no polling, no timers and no sleeps. ``opened`` fires once the
+    POST is genuinely streaming, which is what lets a test send its
+    cancel at a point where the consumer is provably parked inside
+    ``resp.iter_text()`` — the exact state that makes the cancel
+    unobservable without the reader thread.
+    """
+
+    _CLOSED = "closed"
+    _RELEASED = "released"
+
+    def __init__(self, before=(), after=(), *, opened=None):
+        self.before = list(before)
+        self.after = list(after)
+        self.opened = opened or threading.Event()
+        self.closed = threading.Event()
+        self._wake: queue.SimpleQueue = queue.SimpleQueue()
+        self._done = False
+
+    def release(self) -> None:
+        self._wake.put(self._RELEASED)
+
+    def close(self) -> None:
+        # httpx calls this on the normal path too (end of `iter_raw`, and
+        # the `client.stream()` context manager's exit), so the flag says
+        # "closed", not "cancelled" — only a close arriving while the
+        # iterator is still parked below can decide the outcome.
+        self.closed.set()
+        if not self._done:
+            self._wake.put(self._CLOSED)
+
+    def __iter__(self):
+        yield from self.before
+        self.opened.set()
+        signal = self._wake.get(timeout=10)
+        if signal == self._CLOSED:
+            raise httpx.ReadError("connection closed while the response was streaming")
+        self._done = True
+        yield from self.after
+
+
+class TestRunModernStdinHandoff:
+    """The permanent stdin handoff and true cancellation (#270 PR D).
+
+    On the modern era a ``notifications/cancelled`` has no wire form at
+    all — "Closing the SSE response stream is the cancellation signal.
+    The server MUST treat a client disconnect as cancellation of that
+    request. No notifications/cancelled message is required or expected."
+    — so honoring one requires reading stdin WHILE a dispatch blocks.
+    These drive that reader thread end to end through run().
+
+    Every schedule point is an event or a queue, never a sleep: the stdin
+    generator (which runs ON the reader thread) waits for the POST to be
+    provably streaming before it yields the cancel, and the response body
+    waits for either the relay's close or the test's release.
+    """
+
+    URL = "https://example.com/mcp"
+
+    def _register_listen_stream(self, httpx_mock):
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "subscriptions/listen"},
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "mcp-stdio/listen/1",
+                    "result": {"resultType": "complete"},
+                }
+            ),
+            headers={"content-type": "application/json"},
+            is_optional=True,
+            is_reusable=True,
+        )
+
+    def _register_discover(self, httpx_mock):
+        httpx_mock.add_response(
+            url=self.URL,
+            text=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "result": {
+                        "resultType": "discover",
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"tools": {}},
+                    },
+                }
+            ),
+            headers={"content-type": "application/json"},
+        )
+
+    def _initialize(self, capabilities=None):
+        return json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": capabilities if capabilities is not None else {},
+                },
+            }
+        )
+
+    def _call(self, req_id=2, name="slow"):
+        return json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": {}},
+            }
+        )
+
+    def _cancel(self, req_id):
+        return json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": req_id, "reason": "user pressed escape"},
+            }
+        )
+
+    def _sse(self, payload):
+        return f"event: message\ndata: {json.dumps(payload)}\n\n".encode()
+
+    def _result(self, req_id, text):
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"content": [{"type": "text", "text": text}]},
+        }
+
+    def _out(self, output):
+        return [json.loads(line) for line in output.strip().split("\n") if line]
+
+    def _tool_calls(self, httpx_mock):
+        return [
+            json.loads(r.content)
+            for r in httpx_mock.get_requests()
+            if r.headers.get("mcp-method") == "tools/call"
+        ]
+
+    # --- AC3: the era gate ---
+
+    def test_legacy_spawns_no_reader(self, httpx_mock):
+        """Acceptance criterion #3, the structural half: the legacy era
+        runs the literal synchronous `for line in sys.stdin:` and spawns
+        NO reader thread, while the modern era does. Asserted on thread
+        NAMES sampled from inside a dispatch — the only window in which
+        the reader is alive — rather than on a count the proactive-refresh
+        timer and the two listen threads would make unstable. Reverting
+        the `era == "modern"` gate flips the legacy half."""
+        sampled = []
+        sampled_once = threading.Event()
+
+        def sample(request):
+            body = json.loads(request.content)
+            method = body.get("method")
+            if method == "server/discover":
+                # The era probe runs BEFORE the reader is spawned, so it
+                # must not be sampled (nor allowed to release the park
+                # below) or the modern half would only ever see the
+                # pre-reader world.
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": body.get("id"),
+                        "result": {
+                            "resultType": "discover",
+                            "supportedVersions": ["2026-07-28"],
+                            "capabilities": {"tools": {}},
+                        },
+                    },
+                    headers={"content-type": "application/json"},
+                )
+            sampled.append({t.name for t in threading.enumerate()})
+            sampled_once.set()
+            return httpx.Response(
+                200,
+                json=self._result(2, "ok"),
+                headers={"content-type": "application/json"},
+            )
+
+        def stdin_gen():
+            # The request, then a park. On the modern era this holds the
+            # READER thread inside stdin for the whole dispatch, which is
+            # the only window in which it can be observed at all: with a
+            # plain StringIO it reaches EOF and exits before the POST even
+            # opens, and the probe would report "no reader" on both eras.
+            yield self._call() + "\n"
+            sampled_once.wait(timeout=10)
+
+        httpx_mock.add_callback(
+            sample, url=self.URL, is_reusable=True, is_optional=True
+        )
+        with patch("sys.stdin", stdin_gen()), patch("sys.stdout", StringIO()):
+            run(self.URL, {"Content-Type": "application/json"})
+        assert sampled, "the legacy dispatch never ran"
+        assert all(_STDIN_READER_THREAD_NAME not in names for names in sampled)
+
+        # The same probe on the modern era must SEE it — otherwise this
+        # test would keep passing if the reader stopped being spawned at
+        # all, which is the regression it exists to catch.
+        sampled.clear()
+        sampled_once.clear()
+        with patch("sys.stdin", stdin_gen()), patch("sys.stdout", StringIO()):
+            run(
+                self.URL,
+                {"Content-Type": "application/json"},
+                protocol_era="modern",
+            )
+        assert sampled, "the modern dispatch never ran"
+        assert any(_STDIN_READER_THREAD_NAME in names for names in sampled)
 
 
 # --- modern era: subscriptions/listen stream (#270 Phase 2 PR A) ---
