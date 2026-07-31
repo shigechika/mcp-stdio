@@ -3921,10 +3921,19 @@ def _handle_listen_message(
             # Any error for our id, or a deterministic-rejection code under
             # ANY id (a server may reject an unknown method with id null).
             if msg.get("id") == listen_id or code in _LISTEN_TERMINAL_ERROR_CODES:
+                # Name what actually stops working (#270 Phase 2 PR B):
+                # this branch is reachable on BOTH streams, and telling an
+                # operator that list_changed forwarding died when the
+                # resource stream is the one that gave up would send them
+                # after the wrong thing. Mirrors the loop's own `label` /
+                # `disabled` split.
+                resource_stream = bool(state.get("resource_stream")) if state else False
                 log(
-                    "listen stream: server rejected subscriptions/listen "
-                    f"({error}); list_changed forwarding disabled for this "
-                    "session"
+                    f"{'resource listen' if resource_stream else 'listen'} "
+                    f"stream: server rejected subscriptions/listen "
+                    f"({error}); "
+                    f"{'resources/updated' if resource_stream else 'list_changed'} "
+                    "forwarding disabled for this session"
                 )
                 return "terminal"
             return None

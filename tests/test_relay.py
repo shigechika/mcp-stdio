@@ -17130,6 +17130,31 @@ class TestHandleListenResourceUpdated:
         assert self._run(payload, state)[0] is None
         assert capsys.readouterr().err.count("input_required result") == 1
 
+    def test_on_stream_terminal_rejection_names_the_resource_stream(self, capsys):
+        """The C6 terminal arm is reachable on BOTH streams, so its stderr
+        line must name what actually stopped working — telling an operator
+        that list_changed forwarding died when the RESOURCE stream gave up
+        would send them after the wrong thing. Mirrors the loop's own
+        label/disabled split."""
+        payload = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": self.LISTEN_ID,
+                "error": {"code": -32601, "message": "Method not found"},
+            }
+        )
+        assert self._run(payload, self._state())[0] == "terminal"
+        err = capsys.readouterr().err
+        assert "resource listen stream: server rejected" in err
+        assert "resources/updated forwarding disabled" in err
+        # The list_changed stream keeps PR A's wording byte-for-byte.
+        assert (
+            self._run(payload, {"honored": None, "advertised": None})[0] == "terminal"
+        )
+        err = capsys.readouterr().err
+        assert "listen stream: server rejected" in err
+        assert "list_changed forwarding disabled" in err
+
     def test_an_ordinary_listen_result_is_still_the_graceful_end(self):
         payload = json.dumps(
             {
