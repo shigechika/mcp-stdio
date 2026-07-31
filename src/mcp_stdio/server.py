@@ -550,9 +550,21 @@ class ModernBackendPool:
                         entry["used"] = time.monotonic()
                         return backend, entry["init_result"]
                     if backend is not None:
-                        # Child died. Drop it and loop to respawn — the
-                        # mirror of the legacy path's drop-then-reinit.
+                        # Child died. Reap it, then drop the entry and loop
+                        # to respawn — the mirror of the legacy path's
+                        # drop-then-reinit AND its stale.shutdown() reap.
+                        # Every other cleanup path here already calls
+                        # shutdown() on a leaving child (eviction, a failed
+                        # spawn, shutdown_all); skipping it here leaked a
+                        # zombie process on every pooled-child crash (#373
+                        # review, /code-review score 100). Direct call, not
+                        # the eviction daemon-thread: that pattern exists to
+                        # keep a LIVE child's terminate/kill wait off the
+                        # lock, but this child already exited, so
+                        # shutdown()'s poll() sees it dead and returns at
+                        # once.
                         self._entries.pop(principal, None)
+                        backend.shutdown()
                         continue
             if not mine:
                 # Another thread is spawning: wait for its outcome rather

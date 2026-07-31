@@ -792,6 +792,42 @@ class TestModernBackendPool:
         finally:
             pool.shutdown_all()
 
+    def test_a_dead_child_is_reaped_when_get_or_create_drops_it(self):
+        """#373 review, /code-review score 100: the child-died branch used
+        to pop the dead entry and loop to respawn WITHOUT ever reaping the
+        popped backend — every OTHER cleanup path here (eviction, a failed
+        spawn, `shutdown_all`) already calls `shutdown()` on a leaving
+        child, and the legacy dead-session mirror's own comment says why:
+        "shutdown() reaps the already-exited child". Skipping it here
+        leaked a zombie process on every pooled-child crash.
+
+        The child exits ON ITS OWN (`exit`, no reply expected) rather than
+        via `first.shutdown()` — calling `shutdown()` directly would reap
+        it itself and prove nothing about `get_or_create()`.
+        """
+        pool = server.ModernBackendPool(_BACKEND)
+        try:
+            first, _ = pool.get_or_create(None)
+            first.send_oneway(json.dumps({"jsonrpc": "2.0", "method": "exit"}))
+            deadline = time.monotonic() + 10
+            while not first.closed and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert first.closed, "the child never closed"
+            # Not yet reaped: nothing but shutdown()/poll()/wait() collects
+            # the exit status, and nothing has called any of them yet.
+            assert first._proc.returncode is None, (
+                "the child was reaped before get_or_create() ever ran"
+            )
+
+            second, _ = pool.get_or_create(None)
+
+            assert second is not first
+            assert first._proc.returncode is not None, (
+                "get_or_create() dropped the dead child without reaping it"
+            )
+        finally:
+            pool.shutdown_all()
+
     def test_at_cap_the_idlest_child_is_evicted(self):
         """§4 Q3: evict, don't refuse.
 
