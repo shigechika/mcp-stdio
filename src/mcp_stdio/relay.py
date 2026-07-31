@@ -2585,18 +2585,41 @@ def _stdin_reader_loop(
     the sentinel and exits. So EOF buys latency at best, and a regression
     at worst.
     """
+    cancel_check_failed = False
     try:
         for line in sys.stdin:
             if on_cancel is not None:
-                cancel_id = _extract_cancel_id(line)
-                if cancel_id is not None:
-                    on_cancel(cancel_id)
+                try:
+                    cancel_id = _extract_cancel_id(line)
+                    if cancel_id is not None:
+                        on_cancel(cancel_id)
+                except Exception as e:  # noqa: BLE001 — per-line resilience boundary (#362 review finding 2)
+                    # The per-line half of run()'s never-crash net (#11),
+                    # one thread over: a poison line must cost only its own
+                    # cancel DETECTION, never the reader. Before this wrap,
+                    # e.g. a cancel whose ``params`` nests deep enough to
+                    # raise ``RecursionError`` through ``json.loads`` (past
+                    # ``_extract_cancel_id``'s narrow catch) ended the loop,
+                    # and the ``finally`` sentinel made a live session read
+                    # as a clean client disconnect — every later request
+                    # silently vanished. The line is still enqueued below:
+                    # the consumer's own per-line net owns rejecting it.
+                    # Logged once per reader lifetime, not per line
+                    # (the ``input_required_logged`` precedent) — a client
+                    # streaming poison must not flood stderr.
+                    if not cancel_check_failed:
+                        cancel_check_failed = True
+                        log(
+                            f"stdin reader: cancel detection failed, line still forwarded: {e}"
+                        )
             lines.put(line)
     except Exception as e:  # noqa: BLE001 — never crash the gateway
-        # Mirrors run()'s own never-crash net (#11) one thread over: a
-        # read failure must end THIS thread quietly, with the sentinel
-        # still enqueued below so the consumer drains and shuts down
-        # cleanly instead of blocking on a queue nobody will feed again.
+        # The TRANSPORT half of the net: only a failure of stdin iteration
+        # itself lands here now (the cancel-detect step recovers per line
+        # above), and a dead stdin must end THIS thread quietly, with the
+        # sentinel still enqueued below so the consumer drains and shuts
+        # down cleanly instead of blocking on a queue nobody will feed
+        # again.
         log(f"stdin reader stopped: {e}")
     finally:
         lines.put(_STDIN_EOF)
@@ -2942,9 +2965,11 @@ def _post_and_stream(
     for attempt in range(1, MAX_RETRIES + 1):
         if _abort_requested(abort):
             # Required change 8, the pre-ATTEMPT half: a cancel landing in
-            # the inter-attempt gap — or during the rate-limit sleep, which
-            # `continue`s back to here — must never be answered with one
-            # more POST of a request the client has withdrawn.
+            # the inter-attempt gap must never be answered with one more
+            # POST of a request the client has withdrawn. The rate-limit
+            # branch checks the event itself after draining the body (#362
+            # review finding 1), so this loop-top check is the backstop for
+            # a cancel that lands DURING that sleep and `continue`s here.
             log(f"request {req_id!r} cancelled by the client before attempt {attempt}")
             return _aborted_result()
         # Tracks whether any payload has been committed to stdout on this
@@ -2974,6 +2999,25 @@ def _post_and_stream(
 
                 if resp.status_code in _RETRYABLE_RATE_LIMIT_STATUSES:
                     resp.read()
+                    if _abort_requested(abort):
+                        # The NON-200 half of the false-normal arm below
+                        # (#362 review finding 1): a cancel that lands while
+                        # ``client.stream()`` is still awaiting headers (the
+                        # documented pre-headers window — event set, nothing
+                        # to close) arrives here once the server answers, and
+                        # ``resp.read()`` drains the small buffered body
+                        # without raising. One check after the drain covers
+                        # BOTH exits of this branch: the exhausted return
+                        # (whose ``aborted=False`` result would skip
+                        # ``_mrtr_run_retry``'s aborted-guard and reach the
+                        # recovery ladder) and the rate-limit sleep (the
+                        # client stops waiting NOW — the same pre-sleep rule
+                        # as the ``RETRY_DELAY`` sleep below).
+                        log(
+                            f"request {req_id!r} cancelled by the client "
+                            f"(rate-limited HTTP {resp.status_code})"
+                        )
+                        return _aborted_result()
                     sleep_secs = _handle_rate_limit(resp.headers, attempt)
                     if sleep_secs is None:
                         return _StreamResult(
@@ -2993,6 +3037,20 @@ def _post_and_stream(
 
                 if resp.status_code != 200:
                     resp.read()
+                    if _abort_requested(abort):
+                        # Same non-200 half of the false-normal arm (#362
+                        # review finding 1): without this check a cancelled
+                        # request answered with e.g. a plain 500 — or a 401
+                        # that the recovery ladder would then re-POST — comes
+                        # back ``aborted=False``, and run() writes an error
+                        # under the id the client just withdrew while
+                        # ``_mrtr_run_retry`` purges the transaction and
+                        # strands its outstanding minted dialogs.
+                        log(
+                            f"request {req_id!r} cancelled by the client "
+                            f"(HTTP {resp.status_code})"
+                        )
+                        return _aborted_result()
                     return _StreamResult(session, resp.status_code, www_auth)
 
                 pv: str | None = None

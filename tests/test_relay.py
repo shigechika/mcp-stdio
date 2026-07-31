@@ -15947,6 +15947,193 @@ class TestRunModernStdinHandoff:
         assert answers[0]["result"]["content"][0]["text"] == "delivered"
         assert "error" not in answers[0]
 
+    # --- #362 review finding 1: the NON-200 half of the false-normal arm ---
+
+    def _preheaders_cancel_transport(self, response_factory):
+        """A transport that simulates the documented pre-headers window.
+
+        The abort event is set INSIDE ``handle_request`` — i.e. while
+        ``client.stream()`` has not yet returned, exactly when a cancel
+        can only set the event because there is no handle to close — and
+        the server then answers with whatever ``response_factory`` builds.
+        Deterministic: no race, no threads, the event is provably set for
+        the entire tail of the call.
+        """
+        abort = threading.Event()
+
+        class _PreHeadersCancelTransport(httpx.BaseTransport):
+            def handle_request(self, request):
+                abort.set()
+                return response_factory()
+
+        return abort, httpx.Client(transport=_PreHeadersCancelTransport())
+
+    def test_non_200_after_preheaders_cancel_is_aborted(self):
+        """A cancelled request answered with a plain 500 must classify as
+        the abort it is, not as a normal error result (#362 review
+        finding 1).
+
+        With the check reverted the result comes back ``aborted=False``
+        with ``status_code=500``: run() then writes an error under the id
+        the client just withdrew, and ``_mrtr_run_retry``'s aborted-guard
+        is skipped — the transaction is purged and its outstanding minted
+        dialogs are stranded."""
+        abort, client = self._preheaders_cancel_transport(
+            lambda: httpx.Response(500, text="server error")
+        )
+        result = _post_and_stream(client, self.URL, '{"id": 7}', {}, 7, abort=abort)
+        assert result is not None and result.aborted
+
+    def test_rate_limit_after_preheaders_cancel_is_aborted(self):
+        """The 429 branch has its own terminal return and its own sleep;
+        both must honor a cancel that landed pre-headers (#362 review
+        finding 1 + the pre-sleep advisory).
+
+        ``time.sleep`` is patched to fail loudly: the whole point of a
+        true abort is that the client stops waiting NOW, so a cancelled
+        request must not serve out a server-driven Retry-After backoff
+        first."""
+        abort, client = self._preheaders_cancel_transport(
+            lambda: httpx.Response(429, text="slow down", headers={"retry-after": "30"})
+        )
+
+        def _no_sleep(_secs):
+            raise AssertionError(
+                "a cancelled request must not sleep out the rate limit"
+            )
+
+        with patch("mcp_stdio.relay.time.sleep", _no_sleep):
+            result = _post_and_stream(client, self.URL, '{"id": 7}', {}, 7, abort=abort)
+        assert result is not None and result.aborted
+
+    @pytest.mark.timeout(30)
+    def test_cancel_then_non_200_writes_nothing(self, httpx_mock):
+        """End to end through run(): the pre-headers cancel followed by a
+        non-200 answer produces ZERO stdout lines under the cancelled id,
+        and the session keeps serving (#362 review finding 1).
+
+        The tools/call callback parks until the reader thread has
+        provably processed the cancel (the in-flight cell's abort event
+        is set), then answers 500 — the deterministic ordering the
+        pre-headers window defines, driven end to end instead of via the
+        transport shim above."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        post_started = threading.Event()
+        cancel_seen = threading.Event()
+
+        def tool_callback(request):
+            req_id = json.loads(request.content)["id"]
+            if req_id == 2:
+                # Entering here means the consumer already ran
+                # `in_flight.publish(2)` (it precedes the POST), so a
+                # cancel released NOW lands in the pre-headers window
+                # proper — after publication, before any response exists.
+                post_started.set()
+                assert cancel_seen.wait(timeout=10)
+                return httpx.Response(500, text="server error")
+            return httpx.Response(
+                200,
+                json=self._result(req_id, "served"),
+                headers={"content-type": "application/json"},
+            )
+
+        httpx_mock.add_callback(
+            tool_callback,
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            is_reusable=True,
+        )
+
+        real_abort_if_matches = _InFlightPost.abort_if_matches
+
+        def spying_abort_if_matches(self_cell, req_id):
+            hit = real_abort_if_matches(self_cell, req_id)
+            if hit:
+                cancel_seen.set()
+            return hit
+
+        stdout = StringIO()
+
+        def stdin_gen():
+            yield self._call() + "\n"
+            # Gate on the POST being provably in flight: yielding the
+            # cancel any earlier can land it in the documented
+            # before-publication window, where it matches nothing.
+            assert post_started.wait(timeout=10)
+            yield self._cancel(2) + "\n"
+            yield self._call(req_id=3, name="fast") + "\n"
+
+        with (
+            patch.object(_InFlightPost, "abort_if_matches", spying_abort_if_matches),
+            patch("sys.stdin", stdin_gen()),
+            patch("sys.stdout", stdout),
+        ):
+            run(self.URL, {"Content-Type": "application/json"}, protocol_era="modern")
+
+        lines = self._out(stdout.getvalue())
+        assert not [line for line in lines if line.get("id") == 2]
+        answers = [line for line in lines if line.get("id") == 3]
+        assert len(answers) == 1
+        assert answers[0]["result"]["content"][0]["text"] == "served"
+
+    # --- #362 review finding 2: the reader's per-line resilience net ---
+
+    def _poison_cancel_line(self):
+        """A well-formed cancel whose ``params`` nests deep enough that
+        ``json.loads`` raises ``RecursionError`` — which escapes
+        ``_extract_cancel_id``'s narrow ``(JSONDecodeError, TypeError)``
+        catch and, before the per-line net, killed the reader outright."""
+        depth = 100_000
+        return (
+            '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+            '"params":{"requestId":' + "[" * depth + "]" * depth + "}\n"
+        )
+
+    def test_poison_cancel_line_does_not_kill_the_reader(self):
+        """One poison line costs only its own cancel detection — every
+        line, the poison one included, is still delivered in order, and
+        the reader keeps reading (#362 review finding 2).
+
+        With the per-line net reverted the executed reproduction stands:
+        the reader dies on the poison line, the sentinel fakes a clean
+        client disconnect, and BOTH legitimate requests silently vanish."""
+        poison = self._poison_cancel_line()
+        good = '{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n'
+        lines: queue.SimpleQueue = queue.SimpleQueue()
+        with patch("sys.stdin", StringIO(poison + good + good)):
+            _stdin_reader_loop(lines=lines, on_cancel=lambda cid: None)
+        assert list(_iter_queued_stdin(lines)) == [poison, good, good]
+
+    def test_on_cancel_raising_still_forwards_the_line(self):
+        """A failing ``on_cancel`` callback is the reader's problem for
+        one line only: the line is still enqueued and the next line is
+        still read (#362 review finding 2)."""
+        cancel = (
+            '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+            '"params":{"requestId":2}}\n'
+        )
+        good = '{"jsonrpc":"2.0","id":3,"method":"tools/list"}\n'
+
+        def exploding(_cid):
+            raise RuntimeError("boom")
+
+        lines: queue.SimpleQueue = queue.SimpleQueue()
+        with patch("sys.stdin", StringIO(cancel + good)):
+            _stdin_reader_loop(lines=lines, on_cancel=exploding)
+        assert list(_iter_queued_stdin(lines)) == [cancel, good]
+
+    def test_poison_cancel_lines_log_once(self, capsys):
+        """A client streaming poison must not flood stderr: the
+        cancel-detect failure class logs once per reader lifetime (the
+        ``input_required_logged`` precedent)."""
+        poison = self._poison_cancel_line()
+        lines: queue.SimpleQueue = queue.SimpleQueue()
+        with patch("sys.stdin", StringIO(poison + poison + poison)):
+            _stdin_reader_loop(lines=lines, on_cancel=lambda cid: None)
+        err = capsys.readouterr().err
+        assert err.count("cancel detection failed") == 1
+
     @pytest.mark.timeout(30)
     def test_stale_handle_never_closed(self, httpx_mock):
         """An abort can only ever reach the request it names.
