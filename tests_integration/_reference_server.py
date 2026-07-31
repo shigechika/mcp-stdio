@@ -101,12 +101,7 @@ class Harness:
     bus: InMemorySubscriptionBus = None  # type: ignore[assignment]
     listen_handler: ListenHandler = None  # type: ignore[assignment]
     cancelled: threading.Event = None  # type: ignore[assignment]
-    release: Any = None
     loop_holder: Any = None
-
-    @property
-    def url(self) -> str:
-        return f"http://127.0.0.1:{self.port}/mcp"
 
     def publish_resource_updated(self, uri: str = RESOURCE_URI, timeout: float = 5.0):
         """Publish a `ResourceUpdated` from the TEST thread, safely.
@@ -134,11 +129,6 @@ class Harness:
         the signal #352 PR A's graceful-end arm exists to recognize.
         """
         self.listen_handler.close()
-
-    def release_waiter(self, timeout: float = 5.0) -> None:
-        """Let a parked `wait_for_release` finish normally (cleanup path)."""
-        loop = self.loop_holder.get(timeout=timeout)
-        loop.call_soon_threadsafe(self.release.set)
 
 
 class _LoopHolder:
@@ -185,7 +175,12 @@ def build_app() -> tuple[Any, dict[str, Any]]:
     bus = InMemorySubscriptionBus()
     mcp = MCPServer(SERVER_NAME, subscriptions=bus)
 
+    # The cancellation side-channel, read by scenario 6 from the test thread.
     cancelled = threading.Event()
+    # Deliberately never set: `release` is the gate that makes the tool park
+    # indefinitely, and cancellation is the ONLY way out of it. Its existence
+    # is what makes the park an awaitable checkpoint (so the cancel scope can
+    # interrupt it) rather than a busy loop.
     release = anyio.Event()
 
     @mcp.tool()
@@ -266,6 +261,5 @@ def build_app() -> tuple[Any, dict[str, Any]]:
         "bus": bus,
         "listen_handler": listen_handler,
         "cancelled": cancelled,
-        "release": release,
         "loop_holder": holder,
     }
