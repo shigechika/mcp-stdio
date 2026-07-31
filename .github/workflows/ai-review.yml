@@ -364,10 +364,24 @@ jobs:
           commits resolve them) but do not repeat their argument. Finding
           blocks are for NEW findings only.
 
+          Severity, on its own line in every finding block, exactly one of:
+          severity: blocking
+          severity: advisory
+          Blocking means the diff introduces behavior that is wrong in normal
+          operation: an incorrect result, data loss, a crash on a realistic
+          input, a security hole reachable by an ordinary caller, or a
+          violation of the repository guidance quoted in the prompt.
+          Advisory is everything else that still clears the bar: hardening,
+          limits reached only after implausible accumulation, edge cases that
+          need a malformed or adversarial peer, and defects in paths the diff
+          does not make reachable. When torn, choose advisory — a reviewer
+          who marks everything blocking gives the reader no signal at all.
+
           Output format, exactly and with no code fences (write in English —
           this is a public repository). For each new finding:
           ===FINDING R<round>F<n>===
           <file>:<line> - <one-line summary>
+          severity: <blocking|advisory>
           <2-4 sentences: the concrete failing input or state and the wrong
           behavior>
           ===END FINDING===
@@ -495,6 +509,9 @@ jobs:
             awk '
               /^===FINDING / { id = $2; sub(/=+$/, "", id); printf "**%s** — ", id; next }
               /^===END FINDING===/ { print ""; next }
+              # The severity line drives the verdict below; showing it inside
+              # the prose as well is just noise.
+              /^[[:space:]]*severity:[[:space:]]*/ { next }
               { print }
             ' kept.txt > rendered.md || true
           elif [ -n "$ids" ]; then
@@ -579,14 +596,21 @@ jobs:
           if [ -z "$dropped_json" ]; then dropped_json='[]'; fi
 
           FINAL_FINDINGS=$(jq -n -c --argjson base "$merged" --argjson old "$OLD_FINDINGS" \
-              --argjson kept "$kept_json" --argjson dropped "$dropped_json" '
+              --argjson kept "$kept_json" --argjson dropped "$dropped_json" --arg round "$ROUND" '
             ($base | map(.id)) as $ids
             | ($old | map(.id?)) as $oldids
             | [$dropped[].id] as $droppedids
             | [$kept[].id] as $keptids
+            # The supplements are built from the emitted finding blocks, so
+            # they carry model-chosen ids and need the same round check the
+            # merge applies. Without it the merge rejects a future-round id
+            # and these lines put it straight back, because rejecting it is
+            # exactly what keeps it out of $ids.
             | ($base
-               + [$kept[] | select(.id as $i | $ids | index($i) | not)]
-               + [$dropped[] | select(.id as $i | $ids | index($i) | not)])
+               + [$kept[] | select((.id as $i | $ids | index($i) | not)
+                                   and (.id | test("^R" + $round + "F[0-9]+$")))]
+               + [$dropped[] | select((.id as $i | $ids | index($i) | not)
+                                      and (.id | test("^R" + $round + "F[0-9]+$")))])
             | map(. as $f
                   | if ($droppedids | index($f.id)) and $f.status == "open"
                     then $f + {status: "dismissed"}
@@ -610,20 +634,27 @@ jobs:
             # correct; a dropped fixed/dismissed entry loses a decision and
             # lets a settled point be re-litigated — the exact failure this
             # ledger exists to prevent. Three findings across seventeen
-            # rounds was enough to reach the old flat cap of 50. An entry is
-            # ~100 bytes, so 200 stays far inside the comment size limit.
+            # rounds was enough to reach the old flat cap of 50.
+            #
+            # 80 is the measured ceiling, not a guess. A summary is capped at
+            # 200 characters just above, so an entry serialises to ~248
+            # bytes. The ledger is paid for twice in one comment: base64 in
+            # the marker, and again as the rendered <details> list. At 80
+            # entries that is ~26.7 KB plus ~19.2 KB, about 45.9 KB of the
+            # 65,536-character comment limit, leaving room for the review
+            # body. 200 entries would need ~114 KB and the PATCH would fail.
             #
             # Settled entries take the cap first and open ones fill what is
             # left, rather than each getting a fixed sub-cap: with 151
-            # settled and 50 open, sub-caps of 150/50 would drop a decision
-            # even though dropping one open entry meets the cap. `$room > 0`
-            # is load-bearing: in jq, `.[-0:]` means `.[0:]`, which would
-            # return the whole open list precisely when there is no room for
-            # any of it. (No apostrophes in these comments — the surrounding
-            # shell single-quote would end the jq program right here.)
-            | if length > 200
-              then (map(select(.status != "open")) | .[-200:]) as $s
-                   | (200 - ($s | length)) as $room
+            # settled and 50 open, sub-caps would drop a decision even though
+            # dropping one open entry meets the cap. `$room > 0` is
+            # load-bearing: in jq, `.[-0:]` means `.[0:]`, which would return
+            # the whole open list precisely when there is no room for any of
+            # it. (No apostrophes in these comments — the surrounding shell
+            # single-quote would end the jq program right here.)
+            | if length > 80
+              then (map(select(.status != "open")) | .[-80:]) as $s
+                   | (80 - ($s | length)) as $room
                    | $s + (if $room > 0
                            then (map(select(.status == "open")) | .[-$room:])
                            else [] end)
@@ -631,13 +662,49 @@ jobs:
           ' 2>/dev/null || true)
           if [ -z "$FINAL_FINDINGS" ]; then FINAL_FINDINGS="$merged"; fi
 
+          # Say so when the cap bites. Shedding open entries is the intended
+          # trade-off — they come back next round — but a cap that silently
+          # drops history reads as "the ledger has everything" when it does
+          # not, and the reader has no way to tell.
+          kept_n=$(printf '%s' "$FINAL_FINDINGS" | jq -r 'length' 2>/dev/null || true)
+          case "$kept_n" in ''|*[!0-9]*) kept_n=0 ;; esac
+          if [ "$kept_n" -eq 80 ]; then
+            echo "::notice::findings ledger is at its 80-entry cap — the oldest open entries were shed (settled ones are kept first)"
+          fi
+
           LEDGER_B64=$(jq -n -c --argjson f "$FINAL_FINDINGS" --argjson r "$ROUND" --arg sha "$HEAD_SHA" \
             '{schema: 1, rounds: $r, last_sha: $sha, findings: $f}' 2>/dev/null | base64 -w0 || true)
+
+          # ---------- Verdict ----------
+          # An advisory reviewer that only ever emits a list of findings gives
+          # the reader no stopping rule, so every surviving nitpick reads like
+          # a merge blocker and the PR churns. Counting the severities into a
+          # one-line verdict makes the threshold explicit: blocking findings
+          # are the ones worth another round, advisory ones are worth an
+          # issue. Severity is model-supplied, so an unparseable or missing
+          # line counts as advisory rather than inventing a blocker.
+          # Counted from kept.txt (post-verifier, pre-render): rendered.md has
+          # already rewritten the block markers and dropped the severity line.
+          blocking_n=$(grep -ciE '^[[:space:]]*severity:[[:space:]]*blocking' kept.txt 2>/dev/null || true)
+          case "$blocking_n" in ''|*[!0-9]*) blocking_n=0 ;; esac
+          finding_n=$(grep -c '^===FINDING ' kept.txt 2>/dev/null || true)
+          case "$finding_n" in ''|*[!0-9]*) finding_n=0 ;; esac
+          advisory_n=$((finding_n - blocking_n))
+          [ "$advisory_n" -lt 0 ] && advisory_n=0
+          if [ "$blocking_n" -gt 0 ]; then
+            VERDICT="**Verdict: changes requested** — ${blocking_n} blocking, ${advisory_n} advisory."
+          elif [ "$finding_n" -gt 0 ]; then
+            VERDICT="**Verdict: no blocking findings** — ${advisory_n} advisory. Advisory findings do not need to be resolved before merge; open an issue for the ones worth keeping."
+          else
+            VERDICT="**Verdict: no blocking findings.**"
+          fi
 
           # ---------- Compose and post the sticky comment ----------
           {
             echo "<!-- ai-review-sticky -->"
             echo "### AI review (${MODEL})"
+            echo
+            echo "$VERDICT"
             echo
             if [ "$DELTA_MODE" = "1" ]; then
               echo "_Scope: new commits since \`${LAST_SHA:0:7}\` (full PR diff supplied to the model as context)._"
