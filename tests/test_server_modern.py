@@ -35,6 +35,7 @@ import re
 import socket
 import sys
 import threading
+import time
 
 from unittest.mock import patch
 
@@ -810,6 +811,65 @@ class TestModernBackendPool:
         finally:
             pool.shutdown_all()
 
+    def test_eviction_never_takes_a_pending_or_busy_child(self):
+        """#373 review R1F1 — the cap must bound processes, not leak them.
+
+        Two ways the naive "evict the smallest `used`" loses:
+
+        - a PENDING entry has no backend yet and no `used`, so it sorted
+          FIRST. Evicting it detaches the entry the spawning thread is
+          about to fill, and that child then belongs to nobody —
+          `shutdown_all()` cannot reach it, so the cap would leak
+          processes rather than bound them;
+        - `used` is last-ACQUIRED time, not in-flight work, so the
+          "idlest" child can still have a request on the wire. Shutting
+          it down fails an ordinary concurrent request to make room.
+
+        When nothing qualifies the cap is EXCEEDED rather than enforced —
+        the right way to fail for a soft resource policy whose only
+        alternative is breaking work already in flight.
+        """
+        pool = server.ModernBackendPool(_BACKEND, max_children=1)
+        try:
+            busy, _ = pool.get_or_create("busy")
+            # Park a request on the child so it is provably not idle.
+            started = threading.Event()
+            done = threading.Event()
+
+            def _occupy():
+                started.set()
+                busy.send_request(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": "slow",
+                            "method": "slow_echo",
+                            "params": {"delay": 2.0},
+                        }
+                    ),
+                    "slow",
+                    30.0,
+                )
+                done.set()
+
+            worker = threading.Thread(target=_occupy, daemon=True)
+            worker.start()
+            assert started.wait(timeout=10)
+            deadline = time.monotonic() + 10
+            while not busy.has_pending and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert busy.has_pending, "the request never reached the child"
+
+            # At cap, with the only child busy: the newcomer is served and
+            # the busy child is NOT killed.
+            other, _ = pool.get_or_create("other")
+            assert other is not busy
+            assert not busy.closed, "eviction killed a child mid-request"
+            assert pool.count() == 2, "the cap was enforced by breaking live work"
+            assert done.wait(timeout=30)
+        finally:
+            pool.shutdown_all()
+
     def test_a_child_that_never_answers_initialize_raises(self):
         """A failed handshake leaves no entry behind to poison retries."""
         pool = server.ModernBackendPool(
@@ -960,3 +1020,43 @@ class TestModernIdMinting:
         assert server._is_reserved_client_id("mcp-stdio/serve") is False
         assert server._is_reserved_client_id(1) is False
         assert server._is_reserved_client_id(None) is False
+
+
+def test_a_pooled_child_never_fills_the_unread_sse_queue():
+    """#373 review R1F2 — every server-initiated path sheds, not just two.
+
+    A gateway-owned child has no SSE stream and no consumer, so anything
+    put on `server_initiated` is retained for the life of the process.
+    The child-request and notification arms were gated; the
+    `kind == "response"` arm has its OWN put for a response whose waiter
+    is gone, and repeated backend timeouts would grow that without bound.
+
+    Driven through the real reader thread by feeding it lines directly:
+    an orphan RESPONSE (no waiter), a notification, and unparseable
+    noise — the three sources — must all leave the queue empty.
+    """
+    pool = server.ModernBackendPool(_BACKEND)
+    try:
+        backend, _ = pool.get_or_create(None)
+        assert backend.server_initiated.qsize() == 0
+        backend._route('{"jsonrpc":"2.0","id":"nobody-waits","result":{}}')
+        backend._route('{"jsonrpc":"2.0","method":"notifications/message"}')
+        backend._route("this is not json at all")
+        assert backend.server_initiated.qsize() == 0, "a pooled child filled the queue"
+    finally:
+        pool.shutdown_all()
+
+
+def test_a_legacy_child_still_queues_server_initiated_traffic():
+    """The other half of R1F2's gate: legacy behavior is byte-identical.
+
+    The SSE stream is a real consumer there, so shedding would be a
+    regression — `test_server.py`'s push test depends on it.
+    """
+    backend = server.BackendProcess(_BACKEND)
+    try:
+        backend._route('{"jsonrpc":"2.0","method":"notifications/message"}')
+        backend._route('{"jsonrpc":"2.0","id":"nobody-waits","result":{}}')
+        assert backend.server_initiated.qsize() == 2
+    finally:
+        backend.shutdown()

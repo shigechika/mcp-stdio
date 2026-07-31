@@ -494,14 +494,39 @@ class ModernBackendPool:
         if self._max_children <= 0:
             return
         while len(self._entries) >= self._max_children:
-            key, entry = min(
-                self._entries.items(), key=lambda kv: kv[1].get("used", 0.0)
-            )
+            # ONLY a ready, quiet child may be evicted (review R1F1):
+            #
+            # - a PENDING entry (another thread mid-spawn) has no backend
+            #   yet. Evicting it detaches the entry the spawner is about
+            #   to fill, and that child then belongs to nobody —
+            #   `shutdown_all` cannot reach it, so the "cap" would leak
+            #   processes rather than bound them.
+            # - a BUSY child is answering someone right now. `used` is
+            #   last-ACQUIRED time, not in-flight work, so the idlest by
+            #   that measure can still have a request on the wire;
+            #   shutting it down would fail an ordinary concurrent request
+            #   to make room for a new one.
+            #
+            # If nothing qualifies, the cap is exceeded rather than
+            # enforced. That is the right way to fail: the cap is a
+            # soft resource policy for a pool with no reaper until
+            # 3.5-C′, and every alternative here breaks a request that
+            # was already in flight.
+            evictable = [
+                (key, entry)
+                for key, entry in self._entries.items()
+                if entry.get("backend") is not None and not entry["backend"].has_pending
+            ]
+            if not evictable:
+                log(
+                    "modern pool at cap but every child is pending or busy; "
+                    "exceeding the cap rather than disturbing live work"
+                )
+                return
+            key, entry = min(evictable, key=lambda kv: kv[1].get("used", 0.0))
             self._entries.pop(key, None)
-            backend = entry.get("backend")
-            if backend is not None:
-                log(f"modern pool at cap; evicting the idlest child for {key!r}")
-                threading.Thread(target=backend.shutdown, daemon=True).start()
+            log(f"modern pool at cap; evicting the idlest child for {key!r}")
+            threading.Thread(target=entry["backend"].shutdown, daemon=True).start()
 
     def get_or_create(self, principal: Any) -> tuple[BackendProcess, dict[str, Any]]:
         """The child for ``principal``, plus its cached InitializeResult.
@@ -874,6 +899,29 @@ class BackendProcess:
         finally:
             self._fail_all("backend process exited")
 
+    def _queue_server_initiated(self, line: str) -> None:
+        """Hand a server-initiated line to the SSE stream, or shed it.
+
+        #270 Phase 3 P3-B, review R1F2. Every path that used to call
+        ``server_initiated.put`` directly comes through here, because a
+        GATEWAY-OWNED child has no SSE stream and no consumer that could
+        ever drain the queue — so anything put there is retained for the
+        life of the process. The obvious sources (child requests and
+        notifications) were gated in the reader's else-arm, but the
+        `kind == "response"` arm has its OWN put for a response whose
+        waiter is gone, and repeated backend timeouts would grow that
+        without bound. One gate, so a future arm cannot reintroduce it.
+        """
+        if not self._modern_owned:
+            self.server_initiated.put(line)
+            return
+        self._discarded += 1
+        if self._discarded == 1:
+            log(
+                "modern backend produced traffic with no modern channel to "
+                "carry it; discarding (3.5-D adds the listen stream)"
+            )
+
     def _route(self, line: str) -> None:
         try:
             msg = json.loads(line)
@@ -882,7 +930,7 @@ class BackendProcess:
             # stream rather than dropping silently, so a debugging operator can
             # see it. It cannot be a response (unparseable), so it never
             # correlates to a pending id.
-            self.server_initiated.put(line)
+            self._queue_server_initiated(line)
             return
         kind = _classify(msg)
         if kind == "response":
@@ -894,8 +942,8 @@ class BackendProcess:
                     slot["event"].set()
                     return
             # No waiter (timed-out, or an id we never sent): expose on SSE
-            # rather than lose it.
-            self.server_initiated.put(line)
+            # rather than lose it — unless nothing can ever read it (R1F2).
+            self._queue_server_initiated(line)
         elif self._modern_owned:
             # #270 Phase 3 P3-B. A gateway-owned child has NO SSE stream
             # and no client that could ever drain `server_initiated`, so
@@ -921,20 +969,12 @@ class BackendProcess:
                     )
                 )
                 return
-            # Notifications, noise and orphan responses: dropped, with one
-            # log line per child so an operator sees it happening without
-            # a flood.
-            self._discarded += 1
-            if self._discarded == 1:
-                log(
-                    "modern backend produced server-initiated traffic with no "
-                    "modern channel to carry it; discarding (3.5-D adds the "
-                    "listen stream)"
-                )
+            # Notifications and noise: shed through the same gate.
+            self._queue_server_initiated(line)
         else:
             # request / notification / invalid — all server-initiated toward
             # the client.
-            self.server_initiated.put(line)
+            self._queue_server_initiated(line)
 
     @staticmethod
     def _same_request(a: str, b: str) -> bool:
