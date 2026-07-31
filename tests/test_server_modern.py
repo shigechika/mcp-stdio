@@ -1072,6 +1072,34 @@ class TestSynthesizeDiscover:
         )
         assert result["capabilities"]["resources"] == {"other": "x"}
 
+    def test_malformed_capabilities_degrades_instead_of_crashing(self):
+        """#373 review R3F1: a misbehaving child answering `initialize`
+        with a truthy NON-dict `capabilities` (e.g. `"capabilities":
+        "tools"`) used to crash `_strip_undeliverable_capability_flags`'s
+        `.items()` call with an uncaught `AttributeError` — aborting the
+        whole discover HTTP request instead of degrading, where the RAW
+        echo (before this fix's stripping existed) degraded gracefully on
+        the client side (a spec-tolerable `ValidationError` -> silent
+        fallback to `initialize`). `capabilities` stays present — still
+        the DiscoverResult's REQUIRED object — but empty: a malformed
+        child forfeits capability advertisement, never the request."""
+        result = server._synthesize_discover_result({"capabilities": "tools"})
+        assert result["capabilities"] == {}
+        assert result["resultType"] == "complete"
+
+    def test_a_non_dict_family_value_passes_through_unstripped(self):
+        """A well-formed top-level dict whose FAMILY value is itself
+        malformed (e.g. `"tools": true`, spec-invalid) must not crash
+        either — only a dict family has keys to strip from, so it passes
+        through as-is, while a sibling well-formed family is still
+        stripped normally."""
+        result = server._synthesize_discover_result(
+            {"capabilities": {"tools": True, "resources": {"subscribe": True}}}
+        )
+        caps = result["capabilities"]
+        assert caps["tools"] is True
+        assert caps["resources"] == {}
+
 
 class TestModernIdMinting:
     def test_minted_ids_are_unique_across_threads(self):

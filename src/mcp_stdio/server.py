@@ -781,14 +781,29 @@ _UNDELIVERABLE_NOTIFICATION_FLAGS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _strip_undeliverable_capability_flags(
-    capabilities: dict[str, Any],
-) -> dict[str, Any]:
+def _strip_undeliverable_capability_flags(capabilities: Any) -> dict[str, Any]:
     """Drop the notification flags discover cannot honor yet (see above).
 
-    Non-dict family values pass through untouched (defensive: a
-    malformed child answer is not this function's concern to validate).
+    A non-dict `capabilities` value degrades to `{}` rather than raising
+    (#373 review R3F1): `.items()` on it would otherwise crash with an
+    uncaught `AttributeError` that aborts the whole HTTP request — a
+    misbehaving child's protocol violation must never crash the gateway's
+    request handler. Before this function existed the raw echo degraded
+    the same way on the CLIENT side instead (a `DiscoverResult`
+    `ValidationError` falling silently back to `initialize`, spec-tolerable
+    per `_synthesize_discover_result`'s own docstring); this must degrade
+    at least that gracefully. A malformed child forfeits capability
+    advertisement, never the request — `capabilities` stays the REQUIRED
+    object either way, so the v2 client still proceeds modern and the
+    request surfaces (tools/list, resources/read, prompts/get) keep
+    working regardless of what this returns.
+
+    Non-dict FAMILY values (inside an otherwise well-formed top-level
+    dict) likewise pass through un-stripped rather than crash — e.g.
+    `"tools": true` — since only a dict family has keys to strip from.
     """
+    if not isinstance(capabilities, dict):
+        return {}
     stripped: dict[str, Any] = {}
     for family, value in capabilities.items():
         flags = _UNDELIVERABLE_NOTIFICATION_FLAGS.get(family)
