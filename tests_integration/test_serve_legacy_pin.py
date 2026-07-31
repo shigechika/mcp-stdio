@@ -504,9 +504,25 @@ def test_a_quiet_session_receives_nothing_unsolicited(serve_gateway):
     result-rewrite seam and a pooled modern child. Neither may start
     pushing traffic at a LEGACY session. Bounded window, assertion on the
     collected content — never on how long it waited.
+
+    The negative observation is only meaningful over a PROVEN-open SSE
+    stream (#370 review): `httpx.stream` does not raise on a 4xx/5xx, so
+    if the session-valid GET path ever regressed to an error response, the
+    stream would still "open" (`opened.set()` fired unconditionally,
+    before this fix), nothing would arrive (an error body is not an SSE
+    message the parser yields), and this assertion would pass VACUOUSLY —
+    the exact regression this test exists to catch, silently masked as a
+    pass. The reader below now checks the same open contract the sibling
+    pin (`test_get_opens_an_sse_stream_carrying_server_initiated_messages`)
+    checks, so the two can never drift apart on what "open" means. A bare
+    `assert` inside this daemon thread would be swallowed by Python's
+    default thread exception hook and never reach pytest — its own
+    vacuity hazard — so a mismatch is recorded into `failures` instead,
+    which the main thread asserts empty after `join`.
     """
     sid = serve_gateway.open_session()
     seen: list[dict] = []
+    failures: list[str] = []
     opened = threading.Event()
 
     def _read() -> None:
@@ -517,7 +533,23 @@ def test_a_quiet_session_receives_nothing_unsolicited(serve_gateway):
                 headers={"Mcp-Session-Id": sid},
                 timeout=QUIESCENCE_WINDOW + 5.0,
             ) as resp:
+                if resp.status_code != 200:
+                    failures.append(f"status_code={resp.status_code}, want 200")
+                if resp.headers.get("content-type") != "text/event-stream":
+                    failures.append(
+                        f"content-type={resp.headers.get('content-type')!r}, "
+                        "want 'text/event-stream'"
+                    )
+                if resp.headers.get("mcp-session-id") != sid:
+                    failures.append(
+                        "Mcp-Session-Id echo="
+                        f"{resp.headers.get('mcp-session-id')!r}, want {sid!r}"
+                    )
                 opened.set()
+                if failures:
+                    # Not a proven-open SSE stream — nothing below is a
+                    # meaningful "nothing arrived" observation.
+                    return
                 for line in resp.iter_lines():
                     if line.startswith("data: "):
                         seen.append(json.loads(line[len("data: ") :]))
@@ -534,4 +566,5 @@ def test_a_quiet_session_receives_nothing_unsolicited(serve_gateway):
         serve_gateway.delete(sid=sid)
         reader.join(timeout=10)
 
+    assert not failures, "; ".join(failures)
     assert seen == [], f"unsolicited traffic on a quiet legacy session: {seen}"
