@@ -609,8 +609,10 @@ jobs:
             # left, rather than each getting a fixed sub-cap: with 151
             # settled and 50 open, sub-caps of 150/50 would drop a decision
             # even though dropping one open entry meets the cap. `$room > 0`
-            # is load-bearing — jq's `.[-0:]` is `.[0:]`, which would return
-            # the whole open list precisely when there is no room for it.
+            # is load-bearing: in jq, `.[-0:]` means `.[0:]`, which would
+            # return the whole open list precisely when there is no room for
+            # any of it. (No apostrophes in these comments — the surrounding
+            # shell single-quote would end the jq program right here.)
             | if length > 200
               then (map(select(.status != "open")) | .[-200:]) as $s
                    | (200 - ($s | length)) as $room
