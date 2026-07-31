@@ -532,11 +532,18 @@ jobs:
           # prompt both tells the model to number its first new finding R2F1
           # and not to re-report dismissed ids, so a real finding is
           # suppressed before the verifier ever sees it.
+          # Corroboration alone is not enough: the emitted ids are model
+          # output too, so a round-1 response that emits a block labelled
+          # R2F1 and ledgers R2F1 as dismissed passes the $emitted test and
+          # still books an id belonging to a future round. New entries must
+          # therefore also carry THIS round number, which the workflow
+          # controls. Ids that fail the pattern simply do not join the
+          # ledger, so nothing is suppressed on their behalf later.
           emitted_json=$(printf '%s\n' "$ids" \
             | jq -R -s 'split("\n") | map(select(length > 0))' 2>/dev/null || true)
           if [ -z "$emitted_json" ]; then emitted_json='[]'; fi
           merged=$(jq -n -c --argjson old "$OLD_FINDINGS" --argjson model "$MODEL_FINDINGS" \
-                      --argjson emitted "$emitted_json" '
+                      --argjson emitted "$emitted_json" --arg round "$ROUND" '
             def valid: map(select(type == "object"
               and ((.id? | type) == "string") and (.id != "")
               and ((.summary? | type) == "string")
@@ -549,7 +556,8 @@ jobs:
                 | if $u == null or ($f.status | IN("fixed", "dismissed")) then $f
                   else $f + {status: $u.status} end))
               + [$m[] | select((.id as $i | $known | index($i) | not)
-                               and (.id as $i | $emitted | index($i)))]
+                               and (.id as $i | $emitted | index($i))
+                               and (.id | test("^R" + $round + "F[0-9]+$")))]
           ' 2>/dev/null || true)
           if [ -z "$merged" ]; then merged="$OLD_FINDINGS"; fi
 
