@@ -1,0 +1,50 @@
+name: Integration
+
+# End-to-end harness against python-sdk v2 (the 2026-07-28 reference peer),
+# issue #367. Advisory: deliberately NOT in the required-checks gate
+# (branch protection + ruleset ci-gate-main list only the unit-test matrix)
+# until it proves stable. Promoting it later means editing BOTH definitions.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+# Private repository: without this, checkout fails.
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    # Outermost safety valve. The suite runs in ~17 s locally; the layers
+    # below it are the per-step expect timeout (5 s) and pytest-timeout
+    # (30 s/test, injected by tests_integration/conftest.py).
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          # One version, not a matrix: the point is interop with the
+          # reference peer, and the unit matrix already covers 3.10-3.14.
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install -e ".[dev,integration]"
+
+      - name: Reference-peer version smoke
+        # `mcp.__version__` does not exist in v2.0.0 — the version lives
+        # only in distribution metadata. The suite asserts the same thing
+        # once per session; this fails the job before any test runs when the
+        # `mcp>=2.0,<3` range resolves somewhere unexpected.
+        run: |
+          python -c "
+          from importlib.metadata import version
+          v = version('mcp')
+          print('mcp', v)
+          assert v.split('.')[0] == '2', v
+          "
+
+      - name: Integration tests
+        run: pytest tests_integration/ -v
