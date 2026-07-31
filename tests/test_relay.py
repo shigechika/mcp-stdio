@@ -58,6 +58,7 @@ from mcp_stdio.relay import (
     _is_initialize_request,
     _is_pure_response_for,
     _is_recognized_modern_error,
+    _iter_queued_stdin,
     _iter_sse_events,
     _iter_sse_lines,
     _looks_like_initialize,
@@ -86,6 +87,7 @@ from mcp_stdio.relay import (
     _same_origin,
     _split_sse_text,
     _sse_reader_loop,
+    _stdin_reader_loop,
     _tcp_keepalive_socket_options,
     _write_line,
     check_connection,
@@ -16281,6 +16283,128 @@ class TestRunModernStdinHandoff:
             with pytest.raises(httpx.StreamClosed):
                 _post_and_stream(client, self.URL, '{"id":2}', {}, 2)
         client.close()
+
+    # --- EOF and teardown (§3.8) ---
+
+    @pytest.mark.timeout(30)
+    def test_eof_sentinel_drains_queue(self, httpx_mock):
+        """Requests that arrived before EOF are served, not dropped.
+
+        The reader enqueues its sentinel LAST, so FIFO order alone makes
+        the drain complete: honoring EOF the moment it is seen — or
+        enqueuing the sentinel ahead of the backlog — would silently lose
+        work a client legitimately pipelined ahead of a slow call.
+
+        Two halves: the reader/drain pair in isolation, then end to end
+        with the consumer provably BEHIND (parked mid-stream on request 2
+        while 3 and 4 are queued and stdin has already ended)."""
+        lines: queue.SimpleQueue = queue.SimpleQueue()
+        fed = "a\nb\nc\n"
+        with patch("sys.stdin", StringIO(fed)):
+            _stdin_reader_loop(lines=lines)
+        assert list(_iter_queued_stdin(lines)) == ["a\n", "b\n", "c\n"]
+        assert lines.empty(), "the sentinel must be consumed by the drain"
+
+        holder, opened = self._cancellable_tool_call(httpx_mock)
+        stdout = StringIO()
+
+        def stdin_gen():
+            yield self._call(req_id=2) + "\n"
+            assert opened.wait(timeout=10)
+            yield self._call(req_id=3) + "\n"
+            yield self._call(req_id=4) + "\n"
+            # Release only once 3 and 4 are queued; the generator then
+            # ends, which is EOF, which enqueues the sentinel BEHIND them.
+            holder[0].release()
+
+        with patch("sys.stdin", stdin_gen()), patch("sys.stdout", stdout):
+            run(self.URL, {"Content-Type": "application/json"}, protocol_era="modern")
+
+        answered = {line.get("id") for line in self._out(stdout.getvalue())}
+        assert {2, 3, 4} <= answered
+
+    @pytest.mark.timeout(30)
+    def test_teardown_with_parked_reader(self, httpx_mock):
+        """Shutdown completes while the reader is blocked in stdin.
+
+        A read parked in the C-level `readline()` is not portably
+        interruptible — the same constraint that forced a blocking reader
+        in the first place — so there is nothing to close out from under
+        it the way the listen threads get their dedicated client closed.
+        The contract is therefore `daemon=True` plus a TINY bounded join.
+        An unbounded join here would hang every shutdown that happens
+        while a client is idle, which is most of them.
+
+        SystemExit is exactly what run()'s own SIGTERM/SIGINT handler
+        raises, and it is a BaseException, so it walks straight past the
+        loop's never-crash net into the `finally` — the real teardown
+        path, not a stand-in for one."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        parked = threading.Event()
+        never = threading.Event()
+
+        class _ParkedStdin:
+            """One line, then blocked in `readline()` for good."""
+
+            def __init__(self):
+                self._sent = False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if not self._sent:
+                    self._sent = True
+                    return (
+                        json.dumps(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": 2,
+                                "method": "tools/call",
+                                "params": {"name": "slow", "arguments": {}},
+                            }
+                        )
+                        + "\n"
+                    )
+                parked.set()
+                never.wait(timeout=20)
+                raise StopIteration
+
+        def tool_callback(request):
+            assert parked.wait(timeout=10)
+            raise SystemExit(0)
+
+        httpx_mock.add_callback(
+            tool_callback,
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            is_reusable=True,
+        )
+        started = time.monotonic()
+        try:
+            with patch("sys.stdin", _ParkedStdin()), patch("sys.stdout", StringIO()):
+                with pytest.raises(SystemExit):
+                    run(
+                        self.URL,
+                        {"Content-Type": "application/json"},
+                        protocol_era="modern",
+                    )
+            elapsed = time.monotonic() - started
+            reader = [
+                t
+                for t in threading.enumerate()
+                if t.name == _STDIN_READER_THREAD_NAME and t.is_alive()
+            ]
+            # Still parked, still a daemon — so it cannot hold up process
+            # exit — and the teardown did NOT wait for it.
+            assert reader and reader[0].daemon
+            assert elapsed < 5
+        finally:
+            never.set()
+            for t in threading.enumerate():
+                if t.name == _STDIN_READER_THREAD_NAME:
+                    t.join(timeout=5)
 
 
 # --- modern era: subscriptions/listen stream (#270 Phase 2 PR A) ---

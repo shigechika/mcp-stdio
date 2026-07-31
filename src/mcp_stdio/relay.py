@@ -2569,6 +2569,18 @@ def _stdin_reader_loop(
 
     Because exactly one thread ever reads stdin, nothing is reordered, no
     double-dispatch is possible, and a partial-line split cannot occur.
+
+    EOF enqueues the sentinel and NOTHING ELSE — deliberately, and
+    contrary to the first reading of the design (#270 PR D, owner
+    question 1). Aborting the in-flight POST at EOF is not implementable:
+    "the client crashed after sending A" and "``echo A | mcp-stdio``" are
+    byte-identical at this layer, both leave the consumer mid-dispatch
+    when EOF arrives, and cutting the second one off means a piped
+    request never gets its answer. It is also unnecessary — a genuinely
+    dead client makes ``_write_line`` raise ``BrokenPipeError``, which
+    run()'s never-crash net already absorbs before the consumer drains to
+    the sentinel and exits. So EOF buys latency at best, and a regression
+    at worst.
     """
     try:
         for line in sys.stdin:
