@@ -6892,9 +6892,21 @@ def run(
         graceful end, or the C6 terminal arm on a server that rejects
         ``subscriptions/listen`` — later subscribes still answer ``{}``
         but no updates arrive, which is the documented degraded mode.
-        Nothing starts before the body snapshot exists (an ``initialize``
-        must have been intercepted) — a subscribe that beats the
-        handshake simply accumulates and rides ``_start_listen_stream``.
+        Nothing starts before ``_start_listen_stream`` has actually run
+        (``listen_stream.thread is None`` in the guard below, #358 review
+        R1F1) — covering the WHOLE pre-``initialized`` window, not merely
+        pre-``initialize``. The body snapshot alone
+        (``res_stream.params``) is seeded by ``initialize``, well before
+        ``initialized`` — so gating on the snapshot alone let a
+        ``resources/subscribe`` that arrived in exactly that window start
+        THIS thread immediately, opening the upstream connection before
+        the downstream handshake had even completed, while the
+        list_changed stream correctly waited (``_start_listen_stream``
+        itself only starts on ``notifications/initialized``, #352 review
+        finding 1). A subscribe that beats the handshake now simply
+        accumulates and rides ``_start_listen_stream``, which calls this
+        function again at its own end, once the thread it gates on
+        exists.
 
         And nothing starts on an EMPTY set: a client that never
         subscribes must not pay for a second upstream connection, which
@@ -6903,7 +6915,11 @@ def run(
         ending it — re-opening is cheap, but the never-respawn latch is
         deliberately not re-armable.)
         """
-        if res_stream.thread is not None or res_stream.params is None:
+        if (
+            res_stream.thread is not None
+            or res_stream.params is None
+            or listen_stream.thread is None
+        ):
             return
         if not subscriptions.snapshot()[0]:
             return

@@ -13512,6 +13512,61 @@ class TestRunModernEra:
             )
         assert first["filter"] == {"resourceSubscriptions": ["file:///early"]}
 
+    def test_resource_stream_does_not_start_before_notifications_initialized(
+        self, httpx_mock
+    ):
+        """#358 review R1F1: `initialize` seeds BOTH streams' body snapshot
+        (`_seed_listen_snapshot`), so a `resources/subscribe` landing in the
+        initialize -> initialized window used to start the resource stream
+        immediately — opening the upstream connection before the
+        downstream handshake had even completed, while the list_changed
+        stream correctly waits for `initialized` (#352 review finding 1).
+        The subscribe still answers `{}` and accumulates the URI, but the
+        resource stream itself must not start until `_start_listen_stream`
+        runs, then rides that start with the accumulated URI in its first
+        body — same outcome as
+        `test_subscribe_before_initialized_rides_the_first_open`, but this
+        test also pins WHEN the thread is allowed to start.
+
+        Absence is proven with a bounded wait rather than a race: the
+        resource stream's stub signals an event the instant it runs, and
+        starting a thread plus running one statement takes microseconds —
+        nowhere near the bound below — so a premature start would show up
+        reliably."""
+        self._register_discover_with_resources(httpx_mock)
+        resource_stream_started = threading.Event()
+        first_resource_notifications = {}
+
+        def stub_loop(**kwargs):
+            provider = kwargs.get("body_provider")
+            if provider is None:
+                assert kwargs["stop"].wait(timeout=5)
+                return
+            first_resource_notifications.update(provider()[0]["notifications"])
+            resource_stream_started.set()
+            assert kwargs["stop"].wait(timeout=5)
+
+        def stdin_lines():
+            yield self._init_line() + "\n"
+            yield self._subscribe_line(2, "file:///early") + "\n"
+            assert not resource_stream_started.wait(timeout=0.5)
+            yield self._initialized_line() + "\n"
+            assert resource_stream_started.wait(timeout=5)
+
+        stdout = StringIO()
+        with (
+            patch("mcp_stdio.relay._listen_stream_loop", stub_loop),
+            patch("sys.stdin", stdin_lines()),
+            patch("sys.stdout", stdout),
+        ):
+            run(self.URL, {"Content-Type": "application/json"}, protocol_era="modern")
+
+        lines = [json.loads(line) for line in stdout.getvalue().strip().split("\n")]
+        assert lines[1] == {"jsonrpc": "2.0", "id": 2, "result": {}}
+        assert first_resource_notifications == {
+            "resourceSubscriptions": ["file:///early"]
+        }
+
     def test_subscribe_with_a_reserved_id_falls_through_to_the_intake_guard(
         self, httpx_mock
     ):
