@@ -43,6 +43,7 @@ from mcp_stdio.relay import (
     _inject_modern_meta,
     _listen_stream_loop,
     _is_initialize_request,
+    _is_pure_response_for,
     _is_recognized_modern_error,
     _iter_sse_events,
     _iter_sse_lines,
@@ -369,6 +370,48 @@ class TestExtractInputRequired:
         assert _extract_input_required("not json", 5) is None
         assert _extract_input_required(self._payload(result="scalar"), 5) is None
         assert _extract_input_required(json.dumps([1, 2]), 5) is None
+
+
+# --- _is_pure_response_for (MRTR hook latch, #356 deep-review finding) ---
+
+
+class TestIsPureResponseFor:
+    """The id-match check the per-POST hook latch uses, independent of
+    ``_extract_input_required``'s ``resultType`` gate and of
+    ``_mrtr_rekey``'s ``upstream_id == client_id`` short-circuit (neither of
+    which can tell the hook "did this payload carry the id I'm watching")."""
+
+    def test_matching_response_is_true(self):
+        payload = json.dumps({"jsonrpc": "2.0", "id": 5, "result": {"x": 1}})
+        assert _is_pure_response_for(payload, 5) is True
+
+    def test_matching_error_response_is_true(self):
+        """Unlike ``_extract_input_required``, an ``error`` response still
+        counts as a match — a duplicate frame under an already-matched id is
+        the violation, regardless of whether it is shaped as a result or an
+        error."""
+        payload = json.dumps(
+            {"jsonrpc": "2.0", "id": 5, "error": {"code": -1, "message": "x"}}
+        )
+        assert _is_pure_response_for(payload, 5) is True
+
+    def test_id_mismatch_is_false(self):
+        payload = json.dumps({"jsonrpc": "2.0", "id": 6, "result": {}})
+        assert _is_pure_response_for(payload, 5) is False
+
+    def test_id_compare_is_type_aware(self):
+        payload = json.dumps({"jsonrpc": "2.0", "id": "5", "result": {}})
+        assert _is_pure_response_for(payload, 5) is False
+
+    def test_notification_and_server_request_are_false(self):
+        note = json.dumps({"jsonrpc": "2.0", "method": "notifications/progress"})
+        assert _is_pure_response_for(note, 5) is False
+        req = json.dumps({"jsonrpc": "2.0", "id": 5, "method": "ping", "result": {}})
+        assert _is_pure_response_for(req, 5) is False
+
+    def test_malformed_payload_is_false(self):
+        assert _is_pure_response_for("not json", 5) is False
+        assert _is_pure_response_for(json.dumps([1, 2]), 5) is False
 
 
 # --- _post_and_stream ---
@@ -14521,6 +14564,255 @@ class TestRunModernMrtrBridge:
         # The cancelled request is answered with nothing at all ("Not send a
         # response for the cancelled request").
         assert [line for line in lines if line.get("id") == 2] == []
+
+    # --- #356 deep-review finding (minted-orphan): the per-POST latch ---
+
+    def test_two_input_required_in_one_post_are_latched_no_orphan(self, httpx_mock):
+        """A non-compliant server streams a SECOND `input_required` under
+        the SAME upstream id before the client answered the first — the
+        exact JSON-RPC violation `_SSE_PENDING_MAX` documents this file
+        absorbing elsewhere. Without the per-POST latch this re-enters
+        `_mrtr_open_round` for a still-live round, replacing it and leaving
+        the first round's minted id a PERMANENT orphan in `mrtr_minted`
+        (`_mrtr_purge` only ever walks the CURRENT `txn["minted"]`). With
+        the latch, only the first `input_required` is minted — the second
+        is dropped outright, so nothing is ever orphaned. Proven here by
+        cancelling the id the orphan WOULD have used after the transaction
+        completes: with no orphan, that cancel is indistinguishable from
+        cancelling something that never existed — dropped silently, no
+        output at all."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+
+        def gen():
+            first = json.dumps(
+                self._input_required(2, {"a": self._elicit()}, state="S1")
+            )
+            second = json.dumps(
+                self._input_required(2, {"b": self._elicit()}, state="S2")
+            )
+            yield f"event: message\ndata: {first}\n\n".encode()
+            yield f"event: message\ndata: {second}\n\n".encode()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            stream=IteratorStream(gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+        self._register_json(
+            httpx_mock,
+            {
+                "jsonrpc": "2.0",
+                "id": "mcp-stdio/mrtr-retry/1/1",
+                "result": {"content": [{"type": "text", "text": "done"}]},
+            },
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"elicitation": {}}),
+                self._call(),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mcp-stdio/mrtr/1/a",
+                        "result": {"action": "accept", "content": {}},
+                    }
+                ),
+                # The client never saw "b" — nothing minted it — but replay
+                # a cancel naming where it WOULD have landed anyway.
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/cancelled",
+                        "params": {"requestId": "mcp-stdio/mrtr/1/b"},
+                    }
+                ),
+            ],
+            protocol_era="modern",
+        )
+        lines = self._out(output)
+        elicitations = [
+            line for line in lines if line.get("method") == "elicitation/create"
+        ]
+        # Only "a" ever reached stdout; "b" was never minted at all.
+        assert [line["id"] for line in elicitations] == ["mcp-stdio/mrtr/1/a"]
+        # The transaction completed normally on "a" alone, and the stray
+        # cancel for the never-minted "b" produced no output whatsoever —
+        # no error, no downstream cancel notification, nothing beyond the
+        # InitializeResult, the "a" mint, and the final answer.
+        assert len(lines) == 3
+        answers = [line for line in lines if line.get("id") == 2]
+        assert len(answers) == 1
+        assert answers[0]["result"]["content"][0]["text"] == "done"
+
+    def test_stale_minted_id_cancel_after_reuse_touches_nothing(self, httpx_mock):
+        """The full failing sequence (#356 deep-review finding,
+        minted-orphan): two `input_required` results under one id in one
+        POST, the transaction completes on the first key alone, and the
+        client legally reuses the same id N for a brand new, UNRELATED
+        transaction that is still pending when a stale
+        `notifications/cancelled` arrives naming the id the never-opened
+        second round would have minted. Pre-fix, that id would still be a
+        live entry in `mrtr_minted` (owned by N, since `mrtr_minted` keys on
+        `client_id` — not on which transaction incarnation minted it), so
+        the cancel would resolve to N's CURRENT (unrelated) transaction and
+        `_mrtr_abort` would kill it — or, if N's second call had already
+        been answered too, write a spurious error under an id that already
+        has its answer. Post-fix there is no orphan to resolve: the cancel
+        is dropped, and the second transaction survives to answer
+        normally."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+
+        def gen():
+            first = json.dumps(self._input_required(2, {"a": self._elicit()}))
+            second = json.dumps(self._input_required(2, {"b": self._elicit()}))
+            yield f"event: message\ndata: {first}\n\n".encode()
+            yield f"event: message\ndata: {second}\n\n".encode()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            stream=IteratorStream(gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+        self._register_json(
+            httpx_mock,
+            {
+                "jsonrpc": "2.0",
+                "id": "mcp-stdio/mrtr-retry/1/1",
+                "result": {"content": [{"type": "text", "text": "first done"}]},
+            },
+        )
+        # The client reuses id 2 for a second, unrelated call once the first
+        # transaction is purged — a fresh MRTR transaction (seq 2) opens.
+        self._register_json(httpx_mock, self._input_required(2, {"x": self._elicit()}))
+        self._register_json(
+            httpx_mock,
+            {
+                "jsonrpc": "2.0",
+                "id": "mcp-stdio/mrtr-retry/2/1",
+                "result": {"content": [{"type": "text", "text": "second done"}]},
+            },
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"elicitation": {}}),
+                self._call(),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mcp-stdio/mrtr/1/a",
+                        "result": {"action": "accept", "content": {}},
+                    }
+                ),
+                self._call(req_id=2),
+                # The stale cancel arrives while the SECOND, unrelated
+                # transaction under the reused id 2 is still live.
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/cancelled",
+                        "params": {"requestId": "mcp-stdio/mrtr/1/b"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mcp-stdio/mrtr/2/x",
+                        "result": {"action": "accept", "content": {}},
+                    }
+                ),
+            ],
+            protocol_era="modern",
+        )
+        lines = self._out(output)
+        elicitations = [
+            line for line in lines if line.get("method") == "elicitation/create"
+        ]
+        # "b" is never minted; only "a" (txn 1) and "x" (txn 2) are.
+        assert [line["id"] for line in elicitations] == [
+            "mcp-stdio/mrtr/1/a",
+            "mcp-stdio/mrtr/2/x",
+        ]
+        # The stale cancel produced no downstream cancel notification — it
+        # named an id that never existed.
+        cancels = [
+            line for line in lines if line.get("method") == "notifications/cancelled"
+        ]
+        assert cancels == []
+        # Both id-2 answers arrived, in order, neither replaced by an error:
+        # the reused id's own transaction was never touched by the cancel
+        # meant for a different (never-opened) round of the FIRST one.
+        answers = [line for line in lines if line.get("id") == 2]
+        assert len(answers) == 2
+        assert "error" not in answers[0]
+        assert answers[0]["result"]["content"][0]["text"] == "first done"
+        assert "error" not in answers[1]
+        assert answers[1]["result"]["content"][0]["text"] == "second done"
+
+    def test_input_required_then_premature_result_emits_once(self, httpx_mock):
+        """Sequence 2 (#356 deep-review finding, minted-orphan): a
+        non-compliant server streams an `input_required` and, in the SAME
+        POST, a normal RESULT under the SAME id — as if it answered before
+        the client ever replied. On the INITIAL POST `upstream_id ==
+        client_id`, so `_mrtr_rekey` short-circuits before even parsing and
+        the premature result would reach stdout untouched, immediately.
+        Then the client's real answer fires the retry and its genuine
+        result reaches stdout again under the SAME id: two responses for
+        one id. The latch drops the premature frame instead, so exactly one
+        response — the genuine one — is ever emitted under N."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+
+        def gen():
+            required = json.dumps(self._input_required(2, {"who": self._elicit()}))
+            premature = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {"content": [{"type": "text", "text": "too early"}]},
+                }
+            )
+            yield f"event: message\ndata: {required}\n\n".encode()
+            yield f"event: message\ndata: {premature}\n\n".encode()
+
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            stream=IteratorStream(gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+        self._register_json(
+            httpx_mock,
+            {
+                "jsonrpc": "2.0",
+                "id": "mcp-stdio/mrtr-retry/1/1",
+                "result": {"content": [{"type": "text", "text": "the real answer"}]},
+            },
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"elicitation": {}}),
+                self._call(),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mcp-stdio/mrtr/1/who",
+                        "result": {"action": "accept", "content": {}},
+                    }
+                ),
+            ],
+            protocol_era="modern",
+        )
+        lines = self._out(output)
+        answers = [line for line in lines if line.get("id") == 2]
+        assert len(answers) == 1
+        assert answers[0]["result"]["content"][0]["text"] == "the real answer"
 
 
 # --- modern era: subscriptions/listen stream (#270 Phase 2 PR A) ---

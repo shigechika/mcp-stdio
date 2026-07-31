@@ -2182,6 +2182,29 @@ def _mrtr_rekey(payload: str, upstream_id: Any, client_id: Any) -> str:
     return json.dumps(msg)
 
 
+def _is_pure_response_for(payload: str, target_id: Any) -> bool:
+    """True when ``payload`` is a pure JSON-RPC response carrying ``target_id``.
+
+    The per-POST MRTR hook (``_make_input_required_hook``) needs this as a
+    standalone check, independent of ``_extract_input_required``'s
+    ``resultType`` gate and of ``_mrtr_rekey``'s ``upstream_id == client_id``
+    short-circuit (which — on the INITIAL POST, where the two ids are equal
+    by construction — returns the payload untouched without ever looking at
+    whether it carries ``target_id`` at all). The hook's latch (#356
+    deep-review finding, minted-orphan) has to know "did THIS payload match
+    the id I'm listening for", regardless of which of those two downstream
+    functions would go on to treat it specially.
+
+    Parse-lenient like its siblings: a malformed payload is simply "not a
+    match", not an error to raise here.
+    """
+    try:
+        msg = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return _is_pure_response(msg) and msg["id"] == target_id
+
+
 def _mrtr_pinned_version(line: str) -> str | None:
     """The ``_meta`` protocol version of a stored MRTR request line.
 
@@ -2452,9 +2475,12 @@ def _post_and_stream(
     must be re-keyed to the id the client is waiting on) or ``None`` to
     swallow it. A swallow suppresses the empty-response synthesis below:
     the hook has taken responsibility for answering this request (it either
-    put minted requests on stdout and is now waiting for the client, or it
-    already wrote a JSON-RPC error), so synthesizing "empty response from
-    server" on top would put a SECOND response on the wire for one id.
+    put minted requests on stdout and is now waiting for the client, it
+    already wrote a JSON-RPC error, or — the hook's own per-POST latch,
+    #356 deep-review finding, minted-orphan — this id was already matched
+    earlier in this same POST and the payload is a non-compliant server's
+    extra frame), so synthesizing "empty response from server" on top would
+    put a SECOND response on the wire for one id.
     A swallow also disables the mid-stream retry for the same reason
     ``emitted`` does: minted requests are already on the client's stdin and
     the tool call may already have run server-side, so replaying the POST
@@ -5385,6 +5411,24 @@ def run(
         # one), and the latest requestState replaces the old one.
         txn["expected_keys"] = {key for _, key, _ in minted}
         txn["responses"] = {}
+        # #356 deep-review finding (minted-orphan): retire the OLD round's
+        # ids from the global `mrtr_minted` index here, before dropping
+        # `txn["minted"]` — not just from the transaction's own dict below.
+        # `_mrtr_purge` only ever walks the CURRENT `txn["minted"]`, and the
+        # 256-txn cap bounds `mrtr_txns`, not this map, so an id left behind
+        # here would live in `mrtr_minted` forever: a PERMANENT orphan that
+        # a later, UNRELATED reuse of `client_id` could resolve a stale
+        # cancel or answer into. In the normal cross-POST multi-round flow
+        # this is a no-op (a retry only fires once every prior key has been
+        # answered, which already pops it from both maps) — it only bites
+        # when a non-compliant server streams a second `input_required`
+        # under one upstream id within a single POST, a class of violation
+        # this file elsewhere absorbs rather than trusts (cf.
+        # `_SSE_PENDING_MAX`). The per-POST hook latch below normally keeps
+        # that second frame from ever reaching this function at all; this
+        # stays as defense in depth for `_mrtr_open_round` itself.
+        for old_minted_id in txn["minted"]:
+            mrtr_minted.pop(old_minted_id, None)
         txn["minted"] = {}
         txn["has_request_state"] = has_state
         txn["request_state"] = result.get("requestState") if has_state else None
@@ -5811,8 +5855,26 @@ def run(
             # in-progress".
             mrtr_minted.pop(cancel_id, None)
             owner = mrtr_txns.get(owner_id)
-            if owner is not None:
-                owner["minted"].pop(cancel_id, None)
+            if owner is None:
+                # Defense in depth (#356 deep-review finding, minted-orphan):
+                # the pop-before-reset fix in `_mrtr_open_round` and the
+                # per-POST latch in the hook now keep `mrtr_minted` from
+                # ever outliving the round that minted an id, so a resolved
+                # `owner_id` with no live transaction here should no longer
+                # be reachable. If it ever is — a future orphan source, or
+                # this guard outliving whatever introduced it — `owner_id`
+                # is either a live id doing something unrelated or an
+                # already-answered one: either way the client already has
+                # its answer, there is no transaction left to purge, and no
+                # dialog left to cancel, so writing an error under it here
+                # would be a stale or simply WRONG response under someone
+                # else's id. Do nothing.
+                log(
+                    f"MRTR: dropping stale cancel for minted id {cancel_id!r}: "
+                    f"owner {owner_id!r} has no live transaction"
+                )
+                return
+            owner["minted"].pop(cancel_id, None)
             _mrtr_abort(
                 owner_id,
                 f"client cancelled input request {key!r}",
@@ -5839,14 +5901,44 @@ def run(
         upstream id and is RE-KEYED to ``client_id`` before it goes out:
         the client correlates on the id it sent, and the spec MUST above
         guarantees those two differ.
+
+        LATCHED per POST (#356 deep-review finding, minted-orphan): once a
+        payload carrying ``upstream_id`` has been matched once — whether it
+        opened/replaced a round (a swallow) or was the terminal answer
+        (rekeyed and emitted) — every later payload in the SAME stream that
+        still carries ``upstream_id`` is dropped instead of processed again.
+        A compliant server sends exactly one response per request id; a
+        server that streams a second one under an id already answered is
+        the same class of hostile/non-compliant peer this file elsewhere
+        absorbs rather than trusts (cf. ``_SSE_PENDING_MAX``). Without the
+        latch, a second ``input_required`` would re-enter
+        ``_mrtr_open_round`` for a still-live round — orphaning the first
+        round's minted ids in ``mrtr_minted`` — and a second terminal result
+        would double-emit under ``client_id``. The check is independent of
+        ``_mrtr_rekey``'s own id comparison, which short-circuits on the
+        INITIAL POST (``upstream_id == client_id``) before ever looking at
+        the payload — see ``_is_pure_response_for``.
         """
+        matched = False
 
         def hook(payload: str) -> str | None:
+            nonlocal matched
             result = _extract_input_required(payload, upstream_id)
-            if result is None:
-                return _mrtr_rekey(payload, upstream_id, client_id)
-            _mrtr_open_round(client_id, stored_line, result)
-            return None
+            is_match = result is not None or _is_pure_response_for(payload, upstream_id)
+            if is_match:
+                if matched:
+                    log(
+                        f"MRTR: dropping extra response for id {upstream_id!r} "
+                        "already matched earlier in this POST (non-compliant "
+                        "server streaming more than one response under one "
+                        "id; #356 deep-review finding, minted-orphan)"
+                    )
+                    return None
+                matched = True
+            if result is not None:
+                _mrtr_open_round(client_id, stored_line, result)
+                return None
+            return _mrtr_rekey(payload, upstream_id, client_id)
 
         return hook
 
