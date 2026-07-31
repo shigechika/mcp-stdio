@@ -2308,6 +2308,7 @@ class _StreamResult:
         "www_authenticate",
         "protocol_version",
         "retry_after",
+        "aborted",
     )
 
     def __init__(
@@ -2317,6 +2318,8 @@ class _StreamResult:
         www_authenticate: str | None = None,
         protocol_version: str | None = None,
         retry_after: float | None = None,
+        *,
+        aborted: bool = False,
     ):
         self.session_id = session_id
         self.status_code = status_code
@@ -2328,6 +2331,17 @@ class _StreamResult:
         # whose wait exceeded the cap — surfaced in the synthesized error's
         # ``data.retryAfter`` so a client can back off. See #8.
         self.retry_after = retry_after
+        # #270 Phase 2 PR D, required change 2: this POST was deliberately
+        # aborted by a ``notifications/cancelled`` the stdin reader thread
+        # matched against the in-flight request, NOT by a transport failure.
+        # A DISTINCT TERMINAL OUTCOME, never an exception: every consumer
+        # must short-circuit on it before reading ``status_code`` — the
+        # request has already been answered by not answering it, per the
+        # cancellation spec's receiver SHOULD ("Not send a response for the
+        # cancelled request"). It is what keeps the attempt loop from
+        # re-POSTing a cancelled ``tools/call`` MAX_RETRIES times and the
+        # 401/403/404 recovery ladder from re-dispatching it.
+        self.aborted = aborted
 
 
 def _parse_auth_params(header: str | None) -> dict[str, str]:
@@ -2498,6 +2512,38 @@ def _iter_sse_events(lines: Iterable[str]) -> Iterator[tuple[str, str]]:
         yield event_type, data
 
 
+def _abort_requested(abort: "threading.Event | None") -> bool:
+    """True when a stdin cancel has claimed the POST this event guards.
+
+    #270 Phase 2 PR D, required change 2 — the read half of the abort
+    protocol, factored out so every consultation site reads identically
+    (the ``_consume_restart`` template at the listen loop, minus the
+    clear: the event is created PER PUBLISHED REQUEST, so there is
+    nothing to hand back to a later one and "consuming" it is a read).
+
+    ``None`` — the legacy era in its entirety, and every modern line that
+    cannot be cancelled (a notification, a non-scalar id) — is always
+    False, which is what restores each guarded site to its pre-PR-D
+    behaviour byte for byte (acceptance criterion #3).
+    """
+    return abort is not None and abort.is_set()
+
+
+def _aborted_result() -> _StreamResult:
+    """The flagged terminal ``_StreamResult`` for a cancelled POST.
+
+    #270 Phase 2 PR D. ``status_code`` is 0 — deliberately NOT 200 — so
+    that a consumer which somehow reaches a status comparison before the
+    ``aborted`` check still falls on the silent side of every one of
+    them: ``>= 400`` (the fall-through error write), ``== 202`` (the
+    non-compliant-202 error write) and ``== 401/403/404`` (the recovery
+    ladder) are all False, and ``session_id`` is None so no rotation is
+    adopted. Silence is the correct outcome: the cancellation spec's
+    receiver SHOULD is "Not send a response for the cancelled request".
+    """
+    return _StreamResult(None, 0, aborted=True)
+
+
 def _post_and_stream(
     client: httpx.Client,
     url: str,
@@ -2510,6 +2556,7 @@ def _post_and_stream(
     has_id: bool = True,
     input_required_hook: Callable[[str], str | None] | None = None,
     input_required_abort: Callable[[str], None] | None = None,
+    abort: "threading.Event | None" = None,
 ) -> _StreamResult | None:
     """Send a POST and stream the response to stdout with retry.
 
@@ -2586,9 +2633,49 @@ def _post_and_stream(
     same stream can reach here — so ``input_required_abort``'s membership
     check (R1F1) finds nothing registered and no-ops instead of writing a
     second response.
+
+    ``abort`` is the true-cancellation event (#270 Phase 2 PR D, required
+    changes 2/4/6/8), set by run()'s stdin reader thread when a
+    ``notifications/cancelled`` names the request this POST is serving. It
+    is passed ONLY on the modern era, and only for a request whose id a
+    cancel can name; ``None`` — the whole legacy era, every notification,
+    ``_paginate_and_stream``'s sibling ``_post_parsed``, ``_reinitialize``,
+    run_sse and cold-start — restores this function byte for byte
+    (acceptance criterion #3).
+
+    Abort is a DISTINCT TERMINAL OUTCOME, never an exception. The
+    cancellation signal on this transport is the reader closing the
+    published response handle, so it surfaces here as an
+    ``httpx.HTTPError`` (a read-side ``TransportError``) or an
+    ``httpx.StreamClosed`` (a ``RuntimeError`` subclass) — and left
+    unclassified, ``emitted=False`` sends the attempt loop back around to
+    **re-POST a cancelled ``tools/call`` up to MAX_RETRIES times**, the
+    recorded trap this parameter exists to close. Every terminal exit
+    therefore consults the event FIRST (stop-wins, the ``_consume_restart``
+    template) and returns ``_aborted_result()`` instead — including the two
+    NORMAL returns, because a close landing between chunks can end
+    ``iter_text()`` without raising at all, which would otherwise leak a
+    false-normal 200 that the caller's recovery ladder and
+    ``_mrtr_run_retry`` would act on. Nothing is written to stdout under an
+    aborted id: the empty-response synthesis, the MRTR
+    ``input_required_abort`` funnel and the "stream interrupted" error are
+    each gated, and the cancel TRACKER cannot substitute for those gates
+    because ``tracker.add`` runs only when the CONSUMER dequeues the cancel
+    line — i.e. after every one of those writes. A deliberate abort also
+    never re-issues the request: the changelog's "broken response stream …
+    clients MUST re-issue with a new request ID" rule covers UNINTENTIONAL
+    drops only (required change 6), so the event is consulted before each
+    attempt and before the inter-attempt sleep as well.
     """
     last_error: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
+        if _abort_requested(abort):
+            # Required change 8, the pre-ATTEMPT half: a cancel landing in
+            # the inter-attempt gap — or during the rate-limit sleep, which
+            # `continue`s back to here — must never be answered with one
+            # more POST of a request the client has withdrawn.
+            log(f"request {req_id!r} cancelled by the client before attempt {attempt}")
+            return _aborted_result()
         # Tracks whether any payload has been committed to stdout on this
         # attempt. Once a byte is written to the client the non-idempotent
         # POST can no longer be safely replayed, so a mid-stream transient
@@ -2676,6 +2763,19 @@ def _post_and_stream(
                             _emit(text, tracker)
                             emitted = True
 
+                if _abort_requested(abort):
+                    # Required changes 2 and 4, the FALSE-NORMAL arm. A
+                    # cross-thread close does not always raise: landing
+                    # between chunks, after the underlying stream already
+                    # reached EOF, it simply ends ``iter_text()`` and control
+                    # arrives here with ``emitted=False``. Falling through
+                    # would write "empty response from server" under the id
+                    # the client just cancelled AND hand the caller a
+                    # normal-looking 200 that the recovery ladder and
+                    # ``_mrtr_run_retry`` would act on. Classify it as the
+                    # abort it is, before either can happen.
+                    log(f"request {req_id!r} cancelled by the client mid-stream")
+                    return _aborted_result()
                 if not emitted and has_id and not swallowed:
                     # A 200 that delivered NO JSON-RPC payload (empty body, or
                     # only non-message SSE events) would leave a request-with-id
@@ -2703,6 +2803,20 @@ def _post_and_stream(
             # for-line loop and crash the whole gateway mid-session, violating
             # the #11 "never crash the stdio connection" contract. Non-HTTP
             # (programming) errors still propagate.
+            if _abort_requested(abort):
+                # #270 Phase 2 PR D, required change 2. Consulted BEFORE
+                # anything else in this arm (stop-wins, the
+                # ``_consume_restart`` template): the reader thread closed
+                # the published handle, so httpcore could not return the
+                # partially-read connection to the pool and the read failed
+                # — but that is the relay's own cancellation, not a
+                # transport fault. Without this the ``emitted=False`` path
+                # below falls straight into ``if attempt < MAX_RETRIES`` and
+                # re-POSTs a cancelled ``tools/call``. Nothing is written:
+                # not the generic interrupted error, not the MRTR abort
+                # funnel — required changes 4 and 10.
+                log(f"request {req_id!r} cancelled by the client: {e}")
+                return _aborted_result()
             last_error = e
             log(f"attempt {attempt}/{MAX_RETRIES} failed: {e}")
             if emitted or swallowed:
@@ -2739,7 +2853,34 @@ def _post_and_stream(
                 # loop ran past their assignment.)
                 return _StreamResult(session, 200, protocol_version=pv)
             if attempt < MAX_RETRIES:
+                if _abort_requested(abort):
+                    # Required change 8, the pre-SLEEP half. The loop-top
+                    # check alone would still burn RETRY_DELAY * attempt
+                    # seconds sleeping before noticing, and the whole point
+                    # of a true abort is that the client stops waiting NOW.
+                    log(f"request {req_id!r} cancelled by the client; not retrying")
+                    return _aborted_result()
                 time.sleep(RETRY_DELAY * attempt)
+        except RuntimeError as e:
+            # #270 Phase 2 PR D, required change 3. The cancellation
+            # mechanism on this transport is the reader thread closing the
+            # published response handle, and httpx raises ``StreamClosed``
+            # for a close that lands mid-read — part of the ``StreamError``
+            # family, which subclasses RuntimeError and is a SIBLING of
+            # ``HTTPError``, not a subclass, so the arm above cannot see it.
+            # Left unhandled it escapes to run()'s never-crash net, which
+            # writes "internal relay error" under the very id the client
+            # just cancelled: the loudest possible wrong answer. Shaped like
+            # the listen loop's own RuntimeError arm, which absorbs the same
+            # family for the same reason — abort set → this close is the
+            # relay's OWN doing, return the flagged terminal result
+            # silently; abort NOT set → nothing legitimate raises a
+            # RuntimeError from a POST here, so re-raise loudly rather than
+            # mask a real logic bug as a silently dropped request.
+            if _abort_requested(abort):
+                log(f"request {req_id!r} cancelled by the client: {e}")
+                return _aborted_result()
+            raise
 
     log(f"request failed after retries: {last_error}")
     if has_id:
