@@ -186,14 +186,34 @@ jobs:
               if [ -z "$files_json" ]; then files_json='[]'; fi
               nfiles=$(printf '%s' "$files_json" | jq -r 'length' 2>/dev/null || true)
               case "$nfiles" in ''|*[!0-9]*) nfiles=0 ;; esac
-              if [ "$nfiles" -eq 0 ]; then
+              # An empty three-dot compare is ambiguous: either nothing was
+              # pushed, or the branch was force-pushed back to an ancestor of
+              # the reviewed head — that ancestor is then also the merge base,
+              # so the diff is legitimately empty while the PR content DID
+              # change. Only `identical` is safe to skip. Anything else falls
+              # through to a full-diff round, because code from the discarded
+              # commit would otherwise merge unreviewed under a ledger
+              # claiming the newer head had been seen.
+              cstatus=$(printf '%s' "$compare" | jq -r '.status // ""' 2>/dev/null || true)
+              if [ "$nfiles" -eq 0 ] && [ "$cstatus" = "identical" ]; then
                 echo "::notice::no file changes since last reviewed commit $LAST_SHA — skipping this round"
                 exit 0
               fi
-              # Docs-only skip: only when EVERY changed file in the delta is
-              # *.md. The compare API caps .files at 300 entries, so never
-              # conclude docs-only from a possibly-truncated list.
-              docs_only=$(printf '%s' "$files_json" | jq -r 'all(endswith(".md"))' 2>/dev/null || true)
+              if [ "$nfiles" -eq 0 ]; then
+                echo "::notice::empty delta since $LAST_SHA (compare status '$cstatus' — force-push to an ancestor?) — degrading to a full-diff review"
+              fi
+              # Docs-only skip: only when EVERY path in the delta is *.md.
+              # A rename reports only its destination in .filename, so
+              # previous_filename has to be tested too — otherwise a push
+              # renaming code to *.md reads as docs-only and the removal of
+              # that code goes unreviewed. nfiles stays the .files count so
+              # the 300-entry truncation guard below keeps its meaning, and
+              # the `length > 0` term stops an empty delta from satisfying
+              # all/1 vacuously.
+              paths_json=$(printf '%s' "$compare" \
+                | jq -c '[.files[]? | .filename, (.previous_filename // empty)]' 2>/dev/null || true)
+              if [ -z "$paths_json" ]; then paths_json='[]'; fi
+              docs_only=$(printf '%s' "$paths_json" | jq -r 'length > 0 and all(endswith(".md"))' 2>/dev/null || true)
               if [ "$docs_only" = "true" ] && [ "$nfiles" -lt 300 ]; then
                 echo "::notice::docs-only delta since $LAST_SHA (all *.md) — skipping this review round"
                 exit 0
@@ -500,8 +520,23 @@ jobs:
           # ---------- Merge the ledger (model output is untrusted) ----------
           # Start from the old ledger; take the model status only for known
           # ids and only with a valid value; a finding once fixed/dismissed
-          # is never resurrected; unknown-but-valid model entries append.
-          merged=$(jq -n -c --argjson old "$OLD_FINDINGS" --argjson model "$MODEL_FINDINGS" '
+          # is never resurrected; unknown model entries append ONLY when a
+          # finding block with that id was actually emitted this round.
+          #
+          # That corroboration requirement is the point: `valid` checks the
+          # shape of an entry, never its provenance, and the ledger is
+          # model-influenced data by design. Without it, a round-1 response
+          # carrying no findings but a ledger of
+          #   [{"id":"R2F1","summary":"x","status":"dismissed"}]
+          # pre-registers an id belonging to a future round. In round 2 the
+          # prompt both tells the model to number its first new finding R2F1
+          # and not to re-report dismissed ids, so a real finding is
+          # suppressed before the verifier ever sees it.
+          emitted_json=$(printf '%s\n' "$ids" \
+            | jq -R -s 'split("\n") | map(select(length > 0))' 2>/dev/null || true)
+          if [ -z "$emitted_json" ]; then emitted_json='[]'; fi
+          merged=$(jq -n -c --argjson old "$OLD_FINDINGS" --argjson model "$MODEL_FINDINGS" \
+                      --argjson emitted "$emitted_json" '
             def valid: map(select(type == "object"
               and ((.id? | type) == "string") and (.id != "")
               and ((.summary? | type) == "string")
@@ -513,7 +548,8 @@ jobs:
                 | ([$m[] | select(.id == $f.id)] | first) as $u
                 | if $u == null or ($f.status | IN("fixed", "dismissed")) then $f
                   else $f + {status: $u.status} end))
-              + [$m[] | select(.id as $i | $known | index($i) | not)]
+              + [$m[] | select((.id as $i | $known | index($i) | not)
+                               and (.id as $i | $emitted | index($i)))]
           ' 2>/dev/null || true)
           if [ -z "$merged" ]; then merged="$OLD_FINDINGS"; fi
 
@@ -534,18 +570,40 @@ jobs:
                         | {id: .[0], summary: ((.[1:] | join(" "))[0:200]), status: "dismissed"})' 2>/dev/null || true)
           if [ -z "$dropped_json" ]; then dropped_json='[]'; fi
 
-          FINAL_FINDINGS=$(jq -n -c --argjson base "$merged" \
+          FINAL_FINDINGS=$(jq -n -c --argjson base "$merged" --argjson old "$OLD_FINDINGS" \
               --argjson kept "$kept_json" --argjson dropped "$dropped_json" '
             ($base | map(.id)) as $ids
+            | ($old | map(.id?)) as $oldids
             | [$dropped[].id] as $droppedids
+            | [$kept[].id] as $keptids
             | ($base
                + [$kept[] | select(.id as $i | $ids | index($i) | not)]
                + [$dropped[] | select(.id as $i | $ids | index($i) | not)])
             | map(. as $f
                   | if ($droppedids | index($f.id)) and $f.status == "open"
-                    then $f + {status: "dismissed"} else $f end)
+                    then $f + {status: "dismissed"}
+                  # A verifier KEEP outranks the model dismissing its own
+                  # finding in the same response: without this the entry the
+                  # reader sees posted is stored as dismissed and suppressed
+                  # from every later round. Restricted to ids absent from the
+                  # previous ledger, so a genuinely settled finding from an
+                  # earlier round is never resurrected.
+                  elif ($keptids | index($f.id)) and $f.status == "dismissed"
+                       and (($oldids | index($f.id)) | not)
+                    then $f + {status: "open"}
+                  else $f end)
             | map(.summary |= (tostring | .[0:200]))
-            | .[-50:]
+            # Cap the ledger, but shed OPEN entries first. An open finding
+            # that falls out is simply re-reported next round, which is
+            # correct; a dropped fixed/dismissed entry loses a decision and
+            # lets a settled point be re-litigated — the exact failure this
+            # ledger exists to prevent. Three findings across seventeen
+            # rounds was enough to reach the old flat cap of 50. An entry is
+            # ~100 bytes, so 200 stays far inside the comment size limit.
+            | if length > 200
+              then (map(select(.status != "open")) | .[-150:])
+                   + (map(select(.status == "open")) | .[-50:])
+              else . end
           ' 2>/dev/null || true)
           if [ -z "$FINAL_FINDINGS" ]; then FINAL_FINDINGS="$merged"; fi
 
