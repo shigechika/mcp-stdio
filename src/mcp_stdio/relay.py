@@ -4062,8 +4062,10 @@ def _handle_listen_message(
                         state["input_required_logged"] = True
                     log(
                         "listen stream: server answered subscriptions/listen "
-                        "with an input_required result, which the spec does "
-                        "not allow for this method; ignoring and reconnecting"
+                        "with an input_required result (spec violation); "
+                        "ignoring it — fails fast here on a first attempt "
+                        "(no prior acknowledgement), otherwise reconnects "
+                        "as usual"
                     )
                 return None
             log("listen stream: closed gracefully (result for the listen request)")

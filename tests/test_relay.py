@@ -16371,6 +16371,12 @@ class TestListenStreamLoop:
         assert len(httpx_mock.get_requests()) == 1
         err = capsys.readouterr().err
         assert err.count("input_required result") == 1
+        # The log line itself must state the truthful, establishment-split
+        # consequence — not a flat "reconnecting" claim, which used to
+        # mislead an operator at the exact moment they are diagnosing a
+        # permanently-disabled stream.
+        assert "fails fast here on a first attempt" in err
+        assert "ignoring and reconnecting" not in err
         # No MRTR transaction state was touched: this loop is never even
         # given an `mrtr_txns` handle (the listen loops deliberately do
         # not go through `_post_and_stream`), and the only thing this
