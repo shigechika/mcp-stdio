@@ -13411,6 +13411,45 @@ class TestRunModernEra:
         assert snapshots[0] == ["file:///r0"]
         assert snapshots[1] == [f"file:///r{n}" for n in range(5)]
 
+    def test_teardown_wakes_a_parked_resource_stream(self, httpx_mock):
+        """Design A4 through run()'s finally: an unsubscribe that empties
+        the URI set parks the resource thread on `restart.wait()`, and an
+        `Event.wait()` is deaf to BOTH the stop event and the dedicated
+        client's close — the two things that unblock every other arm. So
+        the teardown sets the restart event as well, after the stop. The
+        stub parks exactly the way the real loop does (see
+        `TestResourceListenStreamLoop.test_empty_uri_set_parks_and_teardown_wakes_it`
+        for that being a plain `restart.wait()`); without the teardown's
+        set it would outlive the bounded join."""
+        self._register_discover_with_resources(httpx_mock)
+        parked = threading.Event()
+        exited = threading.Event()
+
+        def stub_loop(**kwargs):
+            if kwargs.get("body_provider") is None:
+                assert kwargs["stop"].wait(timeout=5)
+                return
+            parked.set()
+            kwargs["restart"].wait()
+            exited.set()
+
+        def stdin_lines():
+            yield self._init_line() + "\n"
+            yield self._initialized_line() + "\n"
+            yield self._subscribe_line(2, "file:///a") + "\n"
+            assert parked.wait(timeout=5)
+
+        with (
+            patch("mcp_stdio.relay._listen_stream_loop", stub_loop),
+            patch("sys.stdin", stdin_lines()),
+            patch("sys.stdout", StringIO()),
+        ):
+            run(self.URL, {"Content-Type": "application/json"}, protocol_era="modern")
+
+        # run() has already joined it; a still-parked thread means the
+        # teardown never woke it.
+        assert exited.is_set()
+
     def test_no_resource_stream_without_a_subscription(self, httpx_mock):
         """The second stream is LAZY: a client that never subscribes must
         not pay for a second upstream connection, so only the
