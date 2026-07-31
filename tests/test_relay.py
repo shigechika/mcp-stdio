@@ -14406,10 +14406,9 @@ class TestRunModernMrtrBridge:
         # call's answer. No error line anywhere.
         assert len(lines) == 4
         assert not [line for line in lines if "error" in line]
-        assert (
-            [line for line in lines if line.get("method") == "notifications/cancelled"]
-            == []
-        )
+        assert [
+            line for line in lines if line.get("method") == "notifications/cancelled"
+        ] == []
         # The literal R5F1 claim, checked BEFORE the reuse tail is even
         # possible (id 2 is only free to reuse once the transaction is
         # purged): exactly one message under id 2 out of the R5F1 sequence
