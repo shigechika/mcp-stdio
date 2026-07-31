@@ -23,6 +23,15 @@ import sys
 import time
 
 
+FAKE_TOOLS = [
+    {
+        "name": "echo_tool",
+        "description": "Echo the arguments back.",
+        "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}},
+    }
+]
+
+
 def _send(obj: dict) -> None:
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
@@ -80,6 +89,45 @@ def main() -> None:
                     },
                 }
             )
+        elif method == "tools/list" and "id" in msg:
+            # #270 Phase 3 P3-B: the modern dispatch path stamps caching
+            # hints onto `tools/list`, so the unit suite needs a child
+            # that actually answers it. Shape mirrors
+            # tests_integration/_legacy_child.py's TOOLS.
+            _send({"jsonrpc": "2.0", "id": mid, "result": {"tools": FAKE_TOOLS}})
+        elif method == "tools/call" and "id" in msg:
+            params = msg.get("params") or {}
+            if params.get("name") != "echo_tool":
+                _send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": mid,
+                        "error": {"code": -32602, "message": "unknown tool"},
+                    }
+                )
+            else:
+                _send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": mid,
+                        "result": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": json.dumps(
+                                        params.get("arguments") or {}, sort_keys=True
+                                    ),
+                                }
+                            ],
+                            "isError": False,
+                        },
+                    }
+                )
+        elif method == "ask_client" and "id" in msg:
+            # Emits a child-INITIATED request, which a gateway-owned child
+            # must never be able to hang on (P3-B reject arm).
+            _send({"jsonrpc": "2.0", "id": "child-1", "method": "elicitation/create"})
+            _send({"jsonrpc": "2.0", "id": mid, "result": {"asked": True}})
         elif method == "noreply" and "id" in msg:
             pass  # intentionally silent -> exercises the gateway timeout path
         elif method == "trigger_push":  # a notification (no id)
@@ -92,6 +140,20 @@ def main() -> None:
             )
         elif method == "exit":
             sys.exit(0)
+        elif "id" in msg:
+            # #270 Phase 3 P3-B: any OTHER request gets method-not-found
+            # rather than silence. Once serve dispatches modern requests
+            # here, a silent child means the handler blocks for the full
+            # 120 s backend timeout — a hang indistinguishable from a
+            # gateway bug. (`noreply` above stays silent on purpose: that
+            # IS the timeout path, and it is opt-in by name.)
+            _send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": mid,
+                    "error": {"code": -32601, "message": f"method not found: {method}"},
+                }
+            )
         # any other notification: ignore
 
 

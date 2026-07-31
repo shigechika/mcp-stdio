@@ -53,6 +53,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from .relay import (
     _META_CLIENT_CAPABILITIES,
     _META_PROTOCOL_VERSION,
+    _META_SERVER_INFO,
     _NAME_BEARING_METHODS,
     _decode_mcp_name,
     log,
@@ -153,7 +154,13 @@ _SERVE_IMPLEMENTED_MODERN_VERSIONS = frozenset({"2026-07-28"})
 # the other two are MCP's, from the -32020..-32099 range the spec reserves
 # for itself (which is also why serve mints no NEW -32002: that code is
 # grandfathered for relay's cold-start gate only, obligation O18).
+_JSONRPC_INVALID_REQUEST = -32600
+_JSONRPC_METHOD_NOT_FOUND = -32601
 _JSONRPC_INVALID_PARAMS = -32602
+# The modern path's failure code. NOT a fresh -32000 mint: O18 says "new
+# implementations SHOULD NOT use codes from this sub-range at all", and
+# -32603 Internal error is JSON-RPC's own name for "the gateway broke".
+_JSONRPC_INTERNAL_ERROR = -32603
 _MCP_HEADER_MISMATCH = -32020
 _MCP_UNSUPPORTED_PROTOCOL_VERSION = -32022
 
@@ -316,10 +323,21 @@ def _validate_modern(handler: Any, kind: str, msg: dict[str, Any], req_id: Any) 
 
     body_version = meta.get(_META_PROTOCOL_VERSION)
 
-    # Rung 2a — header/body version agreement (O7, and this PR's AC4).
-    # ABSENCE IS A MISMATCH: the header is REQUIRED, and `None` never
-    # equals the body value, so the one comparison covers both faults.
-    if handler.headers.get("MCP-Protocol-Version") != body_version:
+    # Rung 2a — header/body version agreement (O7, and P3-A's AC4).
+    # ABSENCE IS A MISMATCH: the header is REQUIRED, so a missing one is a
+    # HeaderMismatch condition in its own right.
+    #
+    # The presence test is EXPLICIT rather than folded into the equality,
+    # and that is #270 P3-B commit 0 closing a P3-A advisory: `None !=
+    # None` is False, so an absent header paired with a body carrying
+    # `"protocolVersion": null` slipped rung 2a entirely and fell through
+    # to the "unreachable" rung 3, answering -32602 for what is plainly a
+    # header fault. python-sdk v2 guards it the same way, for the same
+    # stated reason (`mcp/shared/inbound.py`): "Presence is checked
+    # explicitly: a null body version would otherwise slip the equality
+    # check (None == None) and mask the absent header."
+    version_header = handler.headers.get("MCP-Protocol-Version")
+    if version_header is None or version_header != body_version:
         return _reject(
             "MCP-Protocol-Version header does not match the protocol version "
             "in the request body's _meta",
@@ -372,6 +390,479 @@ def _validate_modern(handler: Any, kind: str, msg: dict[str, Any], req_id: Any) 
     return True
 
 
+# --- modern dispatch: gateway-owned children (#270 Phase 3 P3-B) ---
+
+# The id namespace serve mints into, mirroring relay's `_RELAY_ID_NAMESPACE`
+# precedent. Process-global and monotonic, so two concurrent modern clients
+# sharing one child can never collide on an id — which is also what makes
+# `_DuplicateInFlightId` and the same-payload piggyback unreachable on this
+# path. They stay, harmlessly, for the legacy one.
+_SERVE_ID_NAMESPACE = "mcp-stdio/serve/"
+
+# The revision the gateway speaks to its OWN pooled children. They are
+# ordinary legacy stdio servers — the modern wire stops at serve — so the
+# handshake is a 2025-06-18 one, which any unmodified child understands.
+_MODERN_CHILD_HANDSHAKE_VERSION = "2025-06-18"
+
+# Caching hints serve stamps on the six cacheable operations (§4 Q2).
+# `ttlMs` is operator-tunable via --cache-ttl-ms; the spec's only hard
+# constraint is ">= 0". `cacheScope` is hardcoded "private" and should
+# stay that way: "public" asserts the response contains no user-specific
+# data, which a gateway cannot know about an arbitrary child.
+_DEFAULT_CACHE_TTL_MS = 60000
+_CACHE_SCOPE = "private"
+
+# The six operations spec rev 2026-07-28 requires caching hints on.
+# `tools/call` is deliberately ABSENT — `CallToolResult` is not a
+# CacheableResult, and the v2 client's model has no ttlMs/cacheScope
+# fields at all, so stamping one would be inventing wire data.
+_CACHEABLE_METHODS = frozenset(
+    {
+        "server/discover",
+        "tools/list",
+        "prompts/list",
+        "resources/list",
+        "resources/templates/list",
+        "resources/read",
+    }
+)
+
+
+class ModernBackendPool:
+    """Gateway-owned backend children for the modern, session-less path.
+
+    #270 Phase 3 P3-B, decision D1. The modern wire has no sessions, so
+    there is no ``Mcp-Session-Id`` to key a child on — but a child still
+    has to exist, and it still needs the ``initialize`` handshake nobody
+    on the modern wire performs. This holder owns both.
+
+    KEYED ON THE AUTHENTICATED PRINCIPAL, verbatim as ``_authorized()``
+    already derived it. Not a convenience: sharing one child across
+    principals would leak child state across the authorization boundary,
+    which is why D1 refused to defer per-principal keying. Under no-auth
+    and under a static token the principal is a single constant, so those
+    collapse to one shared child — consistent with how session ownership
+    already treats them.
+
+    The handshake result is CACHED because discover needs it: the child's
+    ``capabilities`` and ``serverInfo`` are the only honest source for
+    what serve advertises, and re-asking per request would be a
+    round-trip for data that cannot change.
+
+    The gateway offers the child ``capabilities: {}`` — D4's valve. A
+    child never told the client can sample, elicit or list roots has no
+    reason to ask, so the reverse-MRTR bridge P3-B does not ship is never
+    needed by a well-behaved one; a misbehaving one meets the reject arm
+    instead of hanging the caller.
+
+    Spawning happens OUTSIDE the lock behind a per-principal latch, the
+    shape ``SessionRegistry.create`` already uses: two concurrent first
+    requests must not spawn two children, and holding the lock across a
+    process spawn plus a handshake round-trip would serialise every
+    unrelated principal behind it.
+    """
+
+    def __init__(self, command: list[str], *, max_children: int = 0) -> None:
+        if not command:
+            raise ValueError("backend command is empty")
+        self._command = command
+        self._lock = threading.Lock()
+        # principal -> entry. An entry is either READY (`backend` set) or
+        # PENDING (a placeholder another thread is filling, `event` unset).
+        # Both live in the same map so a racing thread finds the
+        # placeholder instead of starting a second spawn.
+        self._entries: dict[Any, dict[str, Any]] = {}
+        self._max_children = max_children
+        self._seq = 0
+
+    def _next_handshake_id(self) -> str:
+        with self._lock:
+            self._seq += 1
+            return f"{_SERVE_ID_NAMESPACE}init/{self._seq}"
+
+    def _evict_if_at_cap_locked(self) -> None:
+        """Make room by dropping the idlest child (§4 Q3).
+
+        Evicting beats refusing here in a way it does not for legacy
+        sessions, and the asymmetry is principled: a modern client is
+        STATELESS, so all an eviction costs it is the warm-up of a child
+        it never knew about, whereas a 503 fails a request the gateway
+        could have served. The legacy registry keeps the opposite policy
+        for the opposite reason — an evicted session strands a client
+        mid-conversation.
+        """
+        if self._max_children <= 0:
+            return
+        while len(self._entries) >= self._max_children:
+            # ONLY a ready, quiet child may be evicted (review R1F1):
+            #
+            # - a PENDING entry (another thread mid-spawn) has no backend
+            #   yet. Evicting it detaches the entry the spawner is about
+            #   to fill, and that child then belongs to nobody —
+            #   `shutdown_all` cannot reach it, so the "cap" would leak
+            #   processes rather than bound them.
+            # - a BUSY child is answering someone right now. `used` is
+            #   last-ACQUIRED time, not in-flight work, so the idlest by
+            #   that measure can still have a request on the wire;
+            #   shutting it down would fail an ordinary concurrent request
+            #   to make room for a new one.
+            #
+            # If nothing qualifies, the cap is exceeded rather than
+            # enforced. That is the right way to fail: the cap is a
+            # soft resource policy for a pool with no reaper until
+            # 3.5-C′, and every alternative here breaks a request that
+            # was already in flight.
+            evictable = [
+                (key, entry)
+                for key, entry in self._entries.items()
+                if entry.get("backend") is not None and not entry["backend"].has_pending
+            ]
+            if not evictable:
+                log(
+                    "modern pool at cap but every child is pending or busy; "
+                    "exceeding the cap rather than disturbing live work"
+                )
+                return
+            key, entry = min(evictable, key=lambda kv: kv[1].get("used", 0.0))
+            self._entries.pop(key, None)
+            log(f"modern pool at cap; evicting the idlest child for {key!r}")
+            threading.Thread(target=entry["backend"].shutdown, daemon=True).start()
+
+    def get_or_create(self, principal: Any) -> tuple[BackendProcess, dict[str, Any]]:
+        """The child for ``principal``, plus its cached InitializeResult.
+
+        Raises ``RuntimeError`` when the child cannot be spawned or does
+        not complete the handshake; the caller turns that into a JSON-RPC
+        error rather than letting it reach the never-crash net.
+        """
+        while True:
+            with self._lock:
+                entry = self._entries.get(principal)
+                if entry is None:
+                    self._evict_if_at_cap_locked()
+                    entry = {"event": threading.Event(), "backend": None, "error": None}
+                    self._entries[principal] = entry
+                    mine = True
+                else:
+                    mine = False
+                    backend = entry.get("backend")
+                    if backend is not None and not backend.closed:
+                        entry["used"] = time.monotonic()
+                        return backend, entry["init_result"]
+                    if backend is not None:
+                        # Child died. Reap it, then drop the entry and loop
+                        # to respawn — the mirror of the legacy path's
+                        # drop-then-reinit AND its stale.shutdown() reap.
+                        # Every other cleanup path here already calls
+                        # shutdown() on a leaving child (eviction, a failed
+                        # spawn, shutdown_all); skipping it here leaked a
+                        # zombie process on every pooled-child crash (#373
+                        # review, /code-review score 100). Direct call, not
+                        # the eviction daemon-thread: that pattern exists to
+                        # keep a LIVE child's terminate/kill wait off the
+                        # lock, but this child already exited, so
+                        # shutdown()'s poll() sees it dead and returns at
+                        # once.
+                        self._entries.pop(principal, None)
+                        backend.shutdown()
+                        continue
+            if not mine:
+                # Another thread is spawning: wait for its outcome rather
+                # than racing it to a second child.
+                entry["event"].wait(_BACKEND_RESPONSE_TIMEOUT_SECS)
+                if entry.get("backend") is not None and entry.get("error") is None:
+                    with self._lock:
+                        if self._entries.get(principal) is entry:
+                            entry["used"] = time.monotonic()
+                            return entry["backend"], entry["init_result"]
+                    continue
+                raise RuntimeError(entry.get("error") or "backend handshake failed")
+            try:
+                backend, init_result = self._spawn_and_handshake()
+            except Exception as exc:  # noqa: BLE001 — surfaced to the caller
+                with self._lock:
+                    if self._entries.get(principal) is entry:
+                        self._entries.pop(principal, None)
+                entry["error"] = str(exc)
+                entry["event"].set()
+                raise RuntimeError(str(exc)) from exc
+            entry["backend"] = backend
+            entry["init_result"] = init_result
+            entry["used"] = time.monotonic()
+            entry["event"].set()
+            return backend, init_result
+
+    def _spawn_and_handshake(self) -> tuple[BackendProcess, dict[str, Any]]:
+        """Spawn a child and drive the handshake the modern wire omits."""
+        backend = BackendProcess(self._command, modern_owned=True)
+        try:
+            req_id = self._next_handshake_id()
+            line = backend.send_request(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": _MODERN_CHILD_HANDSHAKE_VERSION,
+                            # D4's valve: advertise NOTHING the child could
+                            # ask us to bridge back.
+                            "capabilities": {},
+                            "clientInfo": {"name": "mcp-stdio serve", "version": "0"},
+                        },
+                    }
+                ),
+                req_id,
+                _BACKEND_RESPONSE_TIMEOUT_SECS,
+            )
+            if line is None:
+                raise RuntimeError("backend did not answer initialize")
+            result = json.loads(line).get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError("backend returned no InitializeResult")
+            # MANDATORY, and easy to miss because the legacy path never
+            # needed it: on this path serve IS the client, and FastMCP
+            # children gate post-initialize requests on this notification.
+            backend.send_oneway(
+                json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            )
+            return backend, result
+        except Exception:
+            backend.shutdown()
+            raise
+
+    def shutdown_all(self) -> None:
+        with self._lock:
+            entries = list(self._entries.values())
+            self._entries.clear()
+        for entry in entries:
+            backend = entry.get("backend")
+            if backend is not None:
+                backend.shutdown()
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+
+# --- modern dispatch: id remap and the result-rewrite seam ---
+
+_MODERN_ID_LOCK = threading.Lock()
+_MODERN_ID_SEQ = 0
+
+
+def _mint_modern_id() -> str:
+    """A globally unique upstream id for one modern request.
+
+    PROCESS-global and monotonic, not per-child: two concurrent modern
+    clients may share one pooled child, and their own ids are whatever
+    they chose — very possibly the same integer. Minting our own removes
+    the collision by construction, which is also why
+    `_DuplicateInFlightId` and the same-payload piggyback are unreachable
+    on this path. Both stay for the legacy one, where the client's id IS
+    the routing key.
+
+    Namespaced like relay's `_RELAY_ID_NAMESPACE`, so a child that echoes
+    ids into logs shows where they came from.
+    """
+    global _MODERN_ID_SEQ
+    with _MODERN_ID_LOCK:
+        _MODERN_ID_SEQ += 1
+        return f"{_SERVE_ID_NAMESPACE}{_MODERN_ID_SEQ}"
+
+
+def _is_reserved_client_id(req_id: Any) -> bool:
+    """True when a client's own id trespasses on serve's namespace.
+
+    Closes by construction the gap relay's PR C had to close by rule: a
+    client whose id is literally `mcp-stdio/serve/7` would be
+    indistinguishable from serve's own bookkeeping the moment a response
+    came back, so the id is rejected where it ENTERS rather than
+    disambiguated at every later consumer.
+    """
+    return isinstance(req_id, str) and req_id.startswith(_SERVE_ID_NAMESPACE)
+
+
+def _stamp_modern_result(
+    msg: dict[str, Any],
+    method: str | None,
+    *,
+    server_info: Any = None,
+    cache_ttl_ms: int = _DEFAULT_CACHE_TTL_MS,
+) -> dict[str, Any]:
+    """Add the fields a 2026-07-28 server owes, to a legacy child's result.
+
+    #270 Phase 3 P3-B, the rewrite seam. A legacy child emits none of
+    these, and serve — answering as a modern server — gets no waiver:
+    "The `result` MUST include a `resultType` field", and the
+    absent-means-complete leniency is explicitly a CLIENT obligation for
+    EARLIER-protocol servers, which serve is not claiming to be.
+
+    Everything is stamped IFF ABSENT, never overwritten: a child that
+    already speaks the modern dialect keeps its own values, and the seam
+    stays a widening rather than a rewrite.
+
+    - `resultType: "complete"` on EVERY modern success result. Broader
+      than the six cacheable ops, because O3's MUST is about every
+      result — and the v2 client enforces it on the cacheable ones.
+    - `ttlMs`/`cacheScope` on the SIX cacheable operations only, as
+      top-level result keys (siblings of `resultType`, not `_meta`).
+      NEVER on `tools/call`: `CallToolResult` is not a CacheableResult
+      and the v2 client's model has no such fields at all, so stamping
+      them would be inventing wire data.
+    - `_meta["io.modelcontextprotocol/serverInfo"]` on every result —
+      "Servers SHOULD include the following ... field in every result's
+      `_meta`" — echoed verbatim from the cached child InitializeResult.
+      Identity fields are "self-reported by the sender and ... not
+      verified", so echoing the child's is legal and honest; inventing
+      one would not be.
+
+    ERRORS ARE NEVER STAMPED, and that is structural rather than
+    policy: `resultType` is a field OF `result`, and a JSON-RPC error
+    response has no `result` member to put it in.
+    """
+    result = msg.get("result")
+    if not isinstance(result, dict):
+        return msg
+    result.setdefault("resultType", "complete")
+    if method in _CACHEABLE_METHODS:
+        result.setdefault("ttlMs", cache_ttl_ms)
+        result.setdefault("cacheScope", _CACHE_SCOPE)
+    if server_info is not None:
+        meta = result.get("_meta")
+        if not isinstance(meta, dict):
+            meta = {}
+            result["_meta"] = meta
+        meta.setdefault(_META_SERVER_INFO, server_info)
+    return msg
+
+
+def _modern_response_status(msg: dict[str, Any]) -> int:
+    """The HTTP status a modern JSON-RPC response rides on.
+
+    200 for a result. For an error, the spec maps one code to its own
+    status and the v2 client's own table agrees: "If the server does not
+    implement the requested RPC method, it MUST respond with `404 Not
+    Found` and ... `-32601`". Everything else keeps 200 and lets the
+    JSON-RPC error speak — the client parses an error body at any status.
+
+    This is also the carve-out `subscriptions/listen` needs until 3.5-D
+    implements it: a legacy child answers it `-32601`, and that must
+    reach the client as 404 rather than as a 200 the client would treat
+    as a malformed success.
+    """
+    error = msg.get("error")
+    if isinstance(error, dict) and error.get("code") == _JSONRPC_METHOD_NOT_FOUND:
+        return 404
+    return 200
+
+
+# The four notification-dependent capability flags discover cannot honor
+# YET (#373 review, /code-review score 85): each one promises a
+# notification kind that a gateway-owned child's real traffic never
+# reaches the client for. `_queue_server_initiated`'s modern_owned branch
+# silently discards every notification a pooled child emits — no SSE
+# stream, no consumer — until 3.5-D ships `subscriptions/listen`. This is
+# the relay's C8 principle (relay.py: "advertise exactly what is
+# forwarded") applied in reverse: C8 forwards a notification kind only for
+# a family the relay advertised; here the matching rule is to advertise a
+# family's notification flag only for a kind serve can actually forward.
+# Keyed by family -> the KEYS to strip, never the whole family object:
+# spec capability semantics are presence-based, and the REQUEST surfaces
+# in every one of these families (tools/list, resources/read,
+# prompts/get) are served today — only the notification promise is
+# undeliverable. `logging` is deliberately NOT in this table: whether its
+# `notifications/message` promise belongs in the same boat is 3.5-D
+# territory, not this fix's scope.
+_UNDELIVERABLE_NOTIFICATION_FLAGS: dict[str, tuple[str, ...]] = {
+    "tools": ("listChanged",),
+    "resources": ("subscribe", "listChanged"),
+    "prompts": ("listChanged",),
+}
+
+
+def _strip_undeliverable_capability_flags(capabilities: Any) -> dict[str, Any]:
+    """Drop the notification flags discover cannot honor yet (see above).
+
+    A non-dict `capabilities` value degrades to `{}` rather than raising
+    (#373 review R3F1): `.items()` on it would otherwise crash with an
+    uncaught `AttributeError` that aborts the whole HTTP request — a
+    misbehaving child's protocol violation must never crash the gateway's
+    request handler. Before this function existed the raw echo degraded
+    the same way on the CLIENT side instead (a `DiscoverResult`
+    `ValidationError` falling silently back to `initialize`, spec-tolerable
+    per `_synthesize_discover_result`'s own docstring); this must degrade
+    at least that gracefully. A malformed child forfeits capability
+    advertisement, never the request — `capabilities` stays the REQUIRED
+    object either way, so the v2 client still proceeds modern and the
+    request surfaces (tools/list, resources/read, prompts/get) keep
+    working regardless of what this returns.
+
+    Non-dict FAMILY values (inside an otherwise well-formed top-level
+    dict) likewise pass through un-stripped rather than crash — e.g.
+    `"tools": true` — since only a dict family has keys to strip from.
+    """
+    if not isinstance(capabilities, dict):
+        return {}
+    stripped: dict[str, Any] = {}
+    for family, value in capabilities.items():
+        flags = _UNDELIVERABLE_NOTIFICATION_FLAGS.get(family)
+        if flags and isinstance(value, dict):
+            value = {k: v for k, v in value.items() if k not in flags}
+        stripped[family] = value
+    return stripped
+
+
+def _synthesize_discover_result(
+    init_result: dict[str, Any], *, cache_ttl_ms: int = _DEFAULT_CACHE_TTL_MS
+) -> dict[str, Any]:
+    """Build the DiscoverResult serve answers `server/discover` with.
+
+    Never forwarded to the child — a legacy child has never heard of
+    `server/discover` and would answer `-32601`. Serve owns the answer,
+    sourced from the handshake it performed on the client's behalf.
+
+    `supportedVersions` is SERVE's own implemented set, never the
+    child's: the child speaks 2025-06-18 and the question being asked is
+    what the ENDPOINT supports. `capabilities` is the child's, echoed
+    almost verbatim — `_strip_undeliverable_capability_flags` removes the
+    four notification-dependent flags first (`tools.listChanged`,
+    `resources.subscribe`, `resources.listChanged`,
+    `prompts.listChanged`; see that function's comment), because those
+    are not what the endpoint can actually do until 3.5-D. Every other
+    flag, and the family objects themselves, pass through untouched.
+
+    BOTH FIELDS ARE LOAD-BEARING FOR INTEROP, not decoration. The v2
+    client validates this result as a `DiscoverResult` whose required
+    fields are exactly `supportedVersions` and `capabilities`; a
+    ValidationError makes it SILENTLY FALL BACK to `initialize` — verified
+    against the real client, which on a capabilities-less result emitted
+    `initialize` + `notifications/initialized` and left
+    `discover_result` None. Discovery would "succeed" while the modern
+    path quietly never engaged, which is why the AC1 test asserts
+    `discover_result is not None` rather than that the calls worked.
+    """
+    result: dict[str, Any] = {
+        "resultType": "complete",
+        "supportedVersions": sorted(_SERVE_IMPLEMENTED_MODERN_VERSIONS),
+        # `.get(...) or {}` deliberately: a child that answers with no
+        # capabilities key, or a null one, still yields the OBJECT the
+        # client's validation requires.
+        "capabilities": _strip_undeliverable_capability_flags(
+            init_result.get("capabilities") or {}
+        ),
+        "ttlMs": cache_ttl_ms,
+        "cacheScope": _CACHE_SCOPE,
+    }
+    server_info = init_result.get("serverInfo")
+    if server_info is not None:
+        result["_meta"] = {_META_SERVER_INFO: server_info}
+    instructions = init_result.get("instructions")
+    if isinstance(instructions, str):
+        result["instructions"] = instructions
+    return result
+
+
 class _DuplicateInFlightId(Exception):
     """A request reused a JSON-RPC id already in flight on the same session
     with a payload that DIFFERS from the one already outstanding.
@@ -415,10 +906,17 @@ class BackendProcess:
     ``server_initiated`` for the GET SSE stream to deliver.
     """
 
-    def __init__(self, command: list[str]) -> None:
+    def __init__(self, command: list[str], *, modern_owned: bool = False) -> None:
         if not command:
             raise ValueError("backend command is empty")
         self._command = command
+        # #270 Phase 3 P3-B: True for a child the MODERN pool owns. Such a
+        # child has no SSE stream and no client that could ever consume
+        # `server_initiated`, so the reader's else-arm must reject or drop
+        # instead of queueing forever. False keeps the legacy behavior
+        # byte-identical (AC2).
+        self._modern_owned = modern_owned
+        self._discarded = 0
         # text mode + line buffering so the reader thread sees one JSON-RPC
         # message per iteration. errors="replace" keeps a stray non-UTF-8 byte
         # from killing the reader (matching relay's never-crash posture).
@@ -476,6 +974,29 @@ class BackendProcess:
         finally:
             self._fail_all("backend process exited")
 
+    def _queue_server_initiated(self, line: str) -> None:
+        """Hand a server-initiated line to the SSE stream, or shed it.
+
+        #270 Phase 3 P3-B, review R1F2. Every path that used to call
+        ``server_initiated.put`` directly comes through here, because a
+        GATEWAY-OWNED child has no SSE stream and no consumer that could
+        ever drain the queue — so anything put there is retained for the
+        life of the process. The obvious sources (child requests and
+        notifications) were gated in the reader's else-arm, but the
+        `kind == "response"` arm has its OWN put for a response whose
+        waiter is gone, and repeated backend timeouts would grow that
+        without bound. One gate, so a future arm cannot reintroduce it.
+        """
+        if not self._modern_owned:
+            self.server_initiated.put(line)
+            return
+        self._discarded += 1
+        if self._discarded == 1:
+            log(
+                "modern backend produced traffic with no modern channel to "
+                "carry it; discarding (3.5-D adds the listen stream)"
+            )
+
     def _route(self, line: str) -> None:
         try:
             msg = json.loads(line)
@@ -484,7 +1005,7 @@ class BackendProcess:
             # stream rather than dropping silently, so a debugging operator can
             # see it. It cannot be a response (unparseable), so it never
             # correlates to a pending id.
-            self.server_initiated.put(line)
+            self._queue_server_initiated(line)
             return
         kind = _classify(msg)
         if kind == "response":
@@ -496,12 +1017,39 @@ class BackendProcess:
                     slot["event"].set()
                     return
             # No waiter (timed-out, or an id we never sent): expose on SSE
-            # rather than lose it.
-            self.server_initiated.put(line)
+            # rather than lose it — unless nothing can ever read it (R1F2).
+            self._queue_server_initiated(line)
+        elif self._modern_owned:
+            # #270 Phase 3 P3-B. A gateway-owned child has NO SSE stream
+            # and no client that could ever drain `server_initiated`, so
+            # queueing here would grow without bound for the life of the
+            # process — the "unbounded is fine for one client" assumption
+            # stops holding the moment a child is pooled and long-lived.
+            if kind == "request":
+                # A child-initiated request (elicitation/sampling/roots
+                # from a misbehaving child; a well-behaved one never asks,
+                # because the gateway's handshake advertised `{}`). Answer
+                # it straight from the reader thread rather than leaving
+                # the child blocked forever on a reply nobody will send.
+                # Also discharges O15: "The server MUST NOT send
+                # independent JSON-RPC requests on this stream" — nothing
+                # of the kind ever reaches a stream, because there is none.
+                # `_write` is lock-guarded and its broken-pipe path is
+                # already reentrant-safe, so this is safe off-thread.
+                self._write(
+                    _error_body(
+                        "this gateway does not bridge server-initiated requests",
+                        msg.get("id"),
+                        code=_JSONRPC_METHOD_NOT_FOUND,
+                    )
+                )
+                return
+            # Notifications and noise: shed through the same gate.
+            self._queue_server_initiated(line)
         else:
             # request / notification / invalid — all server-initiated toward
             # the client.
-            self.server_initiated.put(line)
+            self._queue_server_initiated(line)
 
     @staticmethod
     def _same_request(a: str, b: str) -> bool:
@@ -2344,6 +2892,120 @@ class _Handler(BaseHTTPRequestHandler):
         self._session_id = sid
         return backend
 
+    def _dispatch_modern(self, kind: str, msg: dict[str, Any], req_id: Any) -> None:
+        """Serve one validated modern request from a gateway-owned child.
+
+        #270 Phase 3 P3-B. Reached only after `_validate_modern` passed,
+        and it NEVER returns to the session path — which is the point.
+        Branching here fixes both of P3-A's recorded interims at once:
+
+        - a sessionless modern request no longer earns the legacy 400;
+        - a modern request carrying a valid legacy `Mcp-Session-Id` no
+          longer dispatches on that session. The header is IGNORED, per
+          the spec's instruction to a modern-era server to "ignore it,
+          and do not mint or echo session IDs" — and because this method
+          never sets `self._session_id`, `_send_json`'s auto-echo cannot
+          leak one back, which the tests assert on 200s as well as 4xxs.
+
+        The v2 client never sends that header on a modern flow anyway
+        (its session capture is gated on an `initialize` response, which
+        a modern negotiation never produces); the ignore rule is for the
+        mixed deployments D2 keeps legal.
+        """
+        method = msg.get("method")
+
+        # Intake reject for an id inside serve's own namespace (§3.3).
+        if kind == "request" and _is_reserved_client_id(req_id):
+            self._send_json(
+                400,
+                _error_body(
+                    f"request id must not start with {_SERVE_ID_NAMESPACE!r}: "
+                    "that namespace is reserved for gateway-minted requests",
+                    req_id,
+                    code=_JSONRPC_INVALID_REQUEST,
+                ),
+            )
+            return
+
+        try:
+            backend, init_result = self.modern_pool.get_or_create(self._current_user())
+        except RuntimeError as exc:
+            log(f"modern dispatch: backend unavailable: {exc}")
+            self._send_json(
+                503,
+                _error_body(
+                    "backend unavailable", req_id, code=_JSONRPC_INTERNAL_ERROR
+                ),
+            )
+            return
+
+        # Notifications: forward and acknowledge. The v2 client sends none
+        # in the discover flow (no `initialize` means no
+        # `notifications/initialized`), so this is consistency rather than
+        # liveness — but leaving modern-classified traffic to fall onto a
+        # legacy session error would be a worse answer than 202.
+        if kind == "notification":
+            backend.send_oneway(json.dumps(msg))
+            self._send_empty(202)
+            return
+
+        # `server/discover` is answered HERE, never forwarded: a legacy
+        # child has never heard of it and would answer -32601.
+        if method == _MODERN_DISCOVER_METHOD:
+            self._send_json(
+                200,
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": _synthesize_discover_result(
+                            init_result, cache_ttl_ms=self.cache_ttl_ms
+                        ),
+                    }
+                ),
+            )
+            return
+
+        upstream_id = _mint_modern_id()
+        outbound = dict(msg)
+        outbound["id"] = upstream_id
+        line = backend.send_request(
+            json.dumps(outbound), upstream_id, _BACKEND_RESPONSE_TIMEOUT_SECS
+        )
+        if line is None:
+            self._send_json(
+                504,
+                _error_body(
+                    "no response from backend", req_id, code=_JSONRPC_INTERNAL_ERROR
+                ),
+            )
+            return
+        try:
+            parsed = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            log("modern dispatch: backend returned unparseable JSON")
+            self._send_json(
+                502,
+                _error_body(
+                    "malformed response from backend",
+                    req_id,
+                    code=_JSONRPC_INTERNAL_ERROR,
+                ),
+            )
+            return
+
+        # Rekey minted -> client id. One parse total: the same dict is
+        # rekeyed and stamped, so relay's `_mrtr_rekey` (which re-parses a
+        # string) would be strictly more work for the same result here.
+        parsed["id"] = req_id
+        _stamp_modern_result(
+            parsed,
+            method,
+            server_info=init_result.get("serverInfo"),
+            cache_ttl_ms=self.cache_ttl_ms,
+        )
+        self._send_json(_modern_response_status(parsed), json.dumps(parsed))
+
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         # Reset the per-request session id (the handler instance is reused
         # across keep-alive requests); responses before resolution omit it.
@@ -2414,14 +3076,17 @@ class _Handler(BaseHTTPRequestHandler):
         # A legacy body classifies legacy and nothing below runs — the
         # whole ladder is vacuous for it, which is how AC2 holds.
         #
-        # P3-A ships ZERO modern dispatch on purpose: a request that
-        # PASSES validation falls straight through into the untouched
-        # session-resolution path below, where a sessionless one earns
-        # today's 400 `-32000` exactly as before. P3-B replaces that
-        # fallthrough wholesale with stateless dispatch.
-        if _request_era(kind, msg) == "modern" and not _validate_modern(
-            self, kind, msg, req_id
-        ):
+        # A modern request is served STATELESSLY and never reaches the
+        # session code below — spec: "Servers MUST NOT rely on prior
+        # requests over the same connection to establish context." P3-A
+        # let a validated modern request fall through to the legacy
+        # session path; P3-B (#270) replaces that seam with dispatch,
+        # which is the single change that activates everything the
+        # preceding commits put in place.
+        if _request_era(kind, msg) == "modern":
+            if not _validate_modern(self, kind, msg, req_id):
+                return
+            self._dispatch_modern(kind, msg, req_id)
             return
 
         # --- session resolution (MCP Streamable HTTP session management) ---
@@ -2609,6 +3274,7 @@ def build_server(
     max_sessions: int = _DEFAULT_MAX_SESSIONS,
     idle_ttl: float = 0.0,
     max_sessions_per_owner: int = 0,
+    cache_ttl_ms: int = _DEFAULT_CACHE_TTL_MS,
 ) -> tuple[ThreadingHTTPServer, SessionRegistry]:
     """Construct the HTTP server and session registry without running the loop.
 
@@ -2630,19 +3296,32 @@ def build_server(
         idle_ttl=idle_ttl,
         max_sessions_per_owner=max_sessions_per_owner,
     )
+    # #270 Phase 3 P3-B. Constructed unconditionally but SPAWNS NOTHING
+    # until a modern request arrives, so a deployment that never sees one
+    # pays a dict and a lock. The per-principal cap reuses the session
+    # registry's per-owner value: the same operator knob answers the same
+    # question ("how many children may one principal hold?") on both eras.
+    modern_pool = ModernBackendPool(command, max_children=max_sessions_per_owner)
     handler = type(
         "_BoundHandler",
         (_Handler,),
         {
             "registry": registry,
+            "modern_pool": modern_pool,
             "mcp_path": mcp_path,
             "auth_token": auth_token,
             "oauth": oauth,
+            "cache_ttl_ms": cache_ttl_ms,
         },
     )
     httpd = ThreadingHTTPServer((host, port), handler)
     # Don't let the process hang on lingering SSE handler threads at shutdown.
     httpd.daemon_threads = True
+    # Attached rather than returned: the (httpd, registry) tuple is this
+    # function's published contract and `tests/test_server.py` unpacks it
+    # in a dozen places. Callers that need the pool — serve()'s teardown,
+    # and tests — reach it here.
+    httpd.modern_pool = modern_pool
     return httpd, registry
 
 
@@ -2657,6 +3336,7 @@ def serve(
     max_sessions: int = _DEFAULT_MAX_SESSIONS,
     idle_ttl: float = 0.0,
     max_sessions_per_owner: int = 0,
+    cache_ttl_ms: int = _DEFAULT_CACHE_TTL_MS,
 ) -> None:
     """Run the reverse gateway until interrupted.
 
@@ -2676,6 +3356,7 @@ def serve(
         max_sessions=max_sessions,
         idle_ttl=idle_ttl,
         max_sessions_per_owner=max_sessions_per_owner,
+        cache_ttl_ms=cache_ttl_ms,
     )
     registry.start_reaper()
 
@@ -2711,6 +3392,10 @@ def serve(
         httpd.serve_forever()
     finally:
         registry.shutdown_all()
+        # #270 Phase 3 P3-B: the modern pool's children are gateway-owned
+        # and belong to no session, so `registry.shutdown_all()` cannot
+        # see them. Without this they outlive the gateway.
+        httpd.modern_pool.shutdown_all()
         httpd.server_close()
 
 
@@ -2867,6 +3552,17 @@ def serve_main(argv: list[str]) -> None:
         ),
     )
     parser.add_argument(
+        "--cache-ttl-ms",
+        type=int,
+        default=_DEFAULT_CACHE_TTL_MS,
+        help=(
+            "ttlMs stamped on cacheable results served to a modern "
+            f"(2026-07-28) client (default: {_DEFAULT_CACHE_TTL_MS}; 0 "
+            "disables caching without violating the spec, which only "
+            "requires a value >= 0)"
+        ),
+    )
+    parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
         help="backend stdio MCP server command (after the options)",
@@ -2916,6 +3612,10 @@ def serve_main(argv: list[str]) -> None:
         parser.error("--trusted-user-header must be a valid header name")
     if args.access_token_ttl <= 0:
         parser.error("--access-token-ttl must be > 0")
+    if args.cache_ttl_ms < 0:
+        # The spec's only constraint on the value: "Servers MUST provide a
+        # ttlMs value that is >= 0."
+        parser.error("--cache-ttl-ms must be >= 0")
     if args.max_sessions < 1:
         parser.error("--max-sessions must be >= 1")
     if args.session_idle_ttl < 0 or not math.isfinite(args.session_idle_ttl):
@@ -3003,4 +3703,5 @@ def serve_main(argv: list[str]) -> None:
         max_sessions=args.max_sessions,
         idle_ttl=args.session_idle_ttl,
         max_sessions_per_owner=args.max_sessions_per_owner,
+        cache_ttl_ms=args.cache_ttl_ms,
     )

@@ -35,6 +35,9 @@ import re
 import socket
 import sys
 import threading
+import time
+
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -157,6 +160,30 @@ def _assert_rejected(resp: httpx.Response, code: int, req_id: object = 1) -> dic
     return body["error"]
 
 
+def _assert_reached_dispatch(resp: httpx.Response, req_id: object = 1) -> dict:
+    """The request PASSED the ladder and was answered by the modern path.
+
+    P3-A used the legacy sessionless `-32000` as this signal, because a
+    validated modern request fell through to the session code. P3-B's
+    seam flip replaced that fallthrough with dispatch, so the signal is
+    now "answered by the gateway or the child, and NOT by a ladder rung".
+
+    Still no `Mcp-Session-Id`: the modern branch never sets
+    `self._session_id`, so `_send_json`'s auto-echo has nothing to echo —
+    asserted on SUCCESSES here, not only on rejections.
+    """
+    # STATUS is the discriminator, not the error code: every ladder
+    # rejection is a 400, while a dispatched response is 200 (or 404 for
+    # an unimplemented method). The code cannot discriminate — a child's
+    # own "unknown tool" is legitimately -32602, the same code the ladder
+    # uses for a malformed `_meta`.
+    assert resp.status_code in (200, 404), (resp.status_code, resp.text)
+    body = resp.json()
+    assert body["id"] == req_id, body
+    assert "mcp-session-id" not in resp.headers, dict(resp.headers)
+    return body
+
+
 # --- the era predicate (D5) ----------------------------------------------
 
 
@@ -258,13 +285,29 @@ class TestMetaRung:
     def test_client_info_is_never_required(self, gateway):
         """`clientInfo` is SHOULD-only; its absence must not reject."""
         body = _modern_body(meta=_meta())
-        _assert_rejected(_post(gateway, body, _modern_headers()), LEGACY_ERROR)
+        _assert_reached_dispatch(_post(gateway, body, _modern_headers()))
 
 
 # --- rung 2: the header family (O7, O8) ----------------------------------
 
 
 class TestHeaderRungs:
+    def test_null_body_version_with_absent_header_is_a_mismatch(self, gateway):
+        """#270 P3-B commit 0 — a P3-A advisory, resolved.
+
+        `None != None` is False, so an absent header paired with
+        `"protocolVersion": null` used to slip rung 2a and fall through to
+        the "unreachable" rung 3, answering -32602 for what is plainly a
+        HEADER fault. The presence test is now explicit, matching
+        python-sdk v2's own guard and its stated reason. The body still
+        classifies MODERN — D5 keys on the KEY's presence, not its value —
+        so this reaches the ladder rather than being demoted to legacy.
+        """
+        body = _modern_body(meta=_meta(None))
+        _assert_rejected(
+            _post(gateway, body, _modern_headers(version=None)), HEADER_MISMATCH
+        )
+
     def test_version_header_missing_is_a_mismatch(self, gateway):
         """The header is REQUIRED, so absence and disagreement are one
         fault with one code — `None` never equals the body value."""
@@ -311,7 +354,7 @@ class TestHeaderRungs:
         body = _modern_body("tools/call", params={"name": name}, meta=_meta())
         headers = _modern_headers("tools/call", name=_encode_mcp_name(name))
         assert headers["Mcp-Name"].startswith("=?base64?")
-        _assert_rejected(_post(gateway, body, headers), LEGACY_ERROR)
+        _assert_reached_dispatch(_post(gateway, body, headers))
 
     def test_malformed_sentinel_is_a_mismatch_not_a_crash(self, gateway):
         """A corrupt header decodes to None, which never equals the body
@@ -373,13 +416,19 @@ class TestHeaderRungs:
             "resources/read", params={"uri": "file:///a.txt"}, meta=_meta()
         )
         ok = _modern_headers("resources/read", name="file:///a.txt")
-        _assert_rejected(_post(gateway, body, ok), LEGACY_ERROR)
+        # The fake child does not implement `resources/read`, so it
+        # answers -32601 and serve maps that to HTTP 404 per the spec's
+        # "MUST respond with 404 Not Found" — the same carve-out
+        # `subscriptions/listen` relies on until 3.5-D.
+        passed = _post(gateway, body, ok)
+        assert passed.status_code == 404
+        _assert_reached_dispatch(passed)
         bad = _modern_headers("resources/read", name="file:///b.txt")
         _assert_rejected(_post(gateway, body, bad), HEADER_MISMATCH)
 
     def test_non_name_bearing_method_needs_no_name_header(self, gateway):
         body = _modern_body("tools/list", meta=_meta())
-        _assert_rejected(_post(gateway, body, _modern_headers()), LEGACY_ERROR)
+        _assert_reached_dispatch(_post(gateway, body, _modern_headers()))
 
     def test_name_bearing_method_with_no_body_value_skips_the_check(self, gateway):
         """Deliberate hole, pinned so it reads as a decision.
@@ -390,9 +439,7 @@ class TestHeaderRungs:
         mismatch for a body problem would report the wrong fault.
         """
         body = _modern_body("tools/call", meta=_meta())
-        _assert_rejected(
-            _post(gateway, body, _modern_headers("tools/call")), LEGACY_ERROR
-        )
+        _assert_reached_dispatch(_post(gateway, body, _modern_headers("tools/call")))
 
     def test_unknown_mcp_param_headers_are_ignored(self, gateway):
         """Spec: an intermediary "MUST forward it and otherwise ignore
@@ -401,7 +448,7 @@ class TestHeaderRungs:
         headers = _modern_headers()
         headers["Mcp-Param-Foo"] = "anything"
         body = _modern_body(meta=_meta())
-        _assert_rejected(_post(gateway, body, headers), LEGACY_ERROR)
+        _assert_reached_dispatch(_post(gateway, body, headers))
 
     def test_duplicate_routing_header_is_rejected(self, gateway):
         """SDK step 0, spec-silent hardening (§4 Q3, adopted).
@@ -460,48 +507,146 @@ class TestVersionRung:
 # --- exemptions and the P3-A fallthrough ---------------------------------
 
 
-class TestNotificationExemptionAndFallthrough:
-    def test_modern_notification_is_not_laddered(self, gateway):
-        """O9 + the P3-0 pin: a notification carrying modern `_meta` but NO
-        headers at all is not rejected by the ladder.
+class TestModernDispatch:
+    """What a modern request gets now that the seam is flipped (P3-B)."""
 
-        python-sdk v2 400s every notification POST; serve deliberately
-        does not copy that (divergence ledger item i). Sessionless it
-        still gets today's 400 `-32000` from session resolution — which is
-        the point: the code proves the LEGACY path answered, not the
-        ladder.
+    def test_modern_notification_is_forwarded_and_acknowledged(self, gateway):
+        """202 with no body, sessionless — §4 Q4 adopted.
+
+        P3-A left modern notifications on the legacy fallthrough, where a
+        SESSIONLESS one earned a 400 because session resolution ran
+        first. They now take the modern branch like everything else:
+        forwarded to the pooled child, acknowledged 202. The v2 client
+        sends none in the discover flow (no `initialize` means no
+        `notifications/initialized`), so this is consistency rather than
+        liveness — but leaving modern-classified traffic on a legacy
+        session error would be a worse answer than 202.
+
+        Still no header rungs: a notification carries no headers here at
+        all, and the ladder is a full no-op for it (O9).
         """
         body = _modern_body(
             "notifications/initialized", meta=_meta(), notification=True
         )
         resp = _post(gateway, body)
-        assert resp.status_code == 400
-        assert resp.json()["error"]["code"] == LEGACY_ERROR
-
-    def test_modern_notification_on_a_session_is_still_accepted(self, gateway):
-        """The O9 evidence, and the pin `test_notification_post_needs_a_
-        session_first` in its integration form: 202, exactly as today."""
-        init = _post(gateway, {"jsonrpc": "2.0", "id": "i", "method": "initialize"})
-        sid = init.headers["mcp-session-id"]
-        body = _modern_body(
-            "notifications/initialized", meta=_meta(), notification=True
-        )
-        resp = _post(gateway, body, {"Mcp-Session-Id": sid})
         assert resp.status_code == 202
         assert resp.content == b""
+        assert "mcp-session-id" not in resp.headers
 
-    def test_fully_valid_modern_request_falls_through_to_the_legacy_401(self, gateway):
-        """P3-A ships ZERO modern dispatch (§3.1(b)).
+    def test_a_valid_modern_request_is_dispatched_statelessly(self, gateway):
+        """**AC1's unit-level core**: no initialize, no session, a result.
 
-        A request that passes every rung still lands in the untouched
-        session-resolution path, so it gets today's 400 `-32000`
-        "Mcp-Session-Id required". The code being the LEGACY one is the
-        assertion: it proves the ladder let it through rather than
-        answering it, and P3-B replaces this fallthrough wholesale.
+        This is the assertion P3-A could not make. Its version of this
+        test asserted the 400 `-32000` fallthrough and was labelled "P3-A
+        ships ZERO modern dispatch"; the flip is precisely what changes
+        it, so the diff here IS the deliverable.
+
+        Spec: "Servers MUST NOT rely on prior requests over the same
+        connection to establish context." Nothing preceded this request.
         """
-        body = _modern_body(meta=_meta())
-        error = _assert_rejected(_post(gateway, body, _modern_headers()), LEGACY_ERROR)
-        assert "Mcp-Session-Id" in error["message"]
+        body = _modern_body("tools/list", meta=_meta())
+        resp = _post(gateway, body, _modern_headers())
+        assert resp.status_code == 200
+        result = resp.json()["result"]
+        assert [t["name"] for t in result["tools"]] == ["echo_tool"]
+        # Stamped on the way out, asserted on the RAW wire.
+        assert result["resultType"] == "complete"
+        assert result["ttlMs"] == server._DEFAULT_CACHE_TTL_MS
+        assert result["cacheScope"] == "private"
+        assert result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "fake"
+        assert "mcp-session-id" not in resp.headers
+
+    def test_tools_call_round_trips_without_caching_hints(self, gateway):
+        body = _modern_body(
+            "tools/call",
+            params={"name": "echo_tool", "arguments": {"text": "hi"}},
+            meta=_meta(),
+        )
+        headers = _modern_headers("tools/call", name="echo_tool")
+        resp = _post(gateway, body, headers)
+        assert resp.status_code == 200
+        result = resp.json()["result"]
+        assert json.loads(result["content"][0]["text"]) == {"text": "hi"}
+        assert result["resultType"] == "complete"
+        # `CallToolResult` is not a CacheableResult — the v2 client's model
+        # has no such fields, so stamping them would invent wire data.
+        assert "ttlMs" not in result and "cacheScope" not in result
+
+    def test_discover_is_answered_by_serve_not_the_child(self, gateway):
+        """The child has never heard of `server/discover` and would answer
+        -32601; serve owns the answer, sourced from the handshake it
+        performed on the client's behalf."""
+        body = _modern_body("server/discover", meta=_meta())
+        resp = _post(gateway, body, _modern_headers("server/discover"))
+        assert resp.status_code == 200
+        result = resp.json()["result"]
+        # The two fields the v2 client REQUIRES. Missing either makes it
+        # silently fall back to `initialize` — discovery "succeeds" while
+        # the modern path never engages.
+        assert result["supportedVersions"] == ["2026-07-28"]
+        assert isinstance(result["capabilities"], dict)
+        assert result["resultType"] == "complete"
+        assert result["ttlMs"] == server._DEFAULT_CACHE_TTL_MS
+        assert result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "fake"
+
+    def test_a_legacy_session_id_on_a_modern_request_is_ignored(self, gateway):
+        """P3-A interim, closed. The header names a REAL session here, and
+        the modern request must still be served by the POOL — not by that
+        session's child — and must echo no session id back."""
+        init = _post(gateway, {"jsonrpc": "2.0", "id": "i", "method": "initialize"})
+        sid = init.headers["mcp-session-id"]
+        assert sid
+
+        body = _modern_body("tools/list", meta=_meta())
+        resp = _post(gateway, body, {**_modern_headers(), "Mcp-Session-Id": sid})
+        assert resp.status_code == 200
+        assert "mcp-session-id" not in resp.headers
+        assert resp.json()["result"]["resultType"] == "complete"
+
+    def test_a_client_id_in_serves_namespace_is_rejected(self, gateway):
+        """Closes by construction the gap relay's PR C closed by rule: an
+        id indistinguishable from serve's own bookkeeping is refused where
+        it ENTERS, not disambiguated at every later consumer."""
+        body = _modern_body("tools/list", req_id="mcp-stdio/serve/1", meta=_meta())
+        resp = _post(gateway, body, _modern_headers())
+        assert resp.status_code == 400
+        assert resp.json()["error"]["code"] == -32600
+        assert resp.json()["id"] == "mcp-stdio/serve/1"
+
+    def test_an_unimplemented_method_comes_back_404(self, gateway):
+        """Spec: an unimplemented method "MUST respond with 404 Not Found"
+        and -32601. Also the carve-out `subscriptions/listen` needs until
+        3.5-D — the client must not read it as a malformed 200."""
+        body = _modern_body("subscriptions/listen", meta=_meta())
+        resp = _post(gateway, body, _modern_headers("subscriptions/listen"))
+        assert resp.status_code == 404
+        assert resp.json()["error"]["code"] == -32601
+
+    def test_errors_from_the_child_are_never_stamped(self, gateway):
+        """Structural: `resultType` is a field OF `result`, and an error
+        response has no `result` member to carry it."""
+        body = _modern_body(
+            "tools/call", params={"name": "nope", "arguments": {}}, meta=_meta()
+        )
+        resp = _post(gateway, body, _modern_headers("tools/call", name="nope"))
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["error"]["code"] == -32602
+        assert "result" not in payload
+
+    def test_a_child_initiated_request_is_rejected_not_queued(self, gateway):
+        """The reject arm, end to end.
+
+        A gateway-owned child has no stream and no consumer, so a
+        child-initiated request would otherwise sit in `server_initiated`
+        forever while the child blocks on a reply. It is answered from the
+        reader thread instead — which also discharges O15, since nothing
+        of the kind ever reaches a stream because there is none.
+        """
+        body = _modern_body("ask_client", meta=_meta())
+        resp = _post(gateway, body, _modern_headers("ask_client"))
+        assert resp.status_code == 200
+        assert resp.json()["result"]["asked"] is True
 
 
 # --- the -32002 prohibition (O18) ----------------------------------------
@@ -560,3 +705,466 @@ def test_encoded_name_round_trips_through_the_real_decoder():
         assert server._decode_mcp_name(header) == value
     assert base64.b64decode("QUJ=", validate=True) == b"AB"
     assert server._decode_mcp_name("=?base64?QUJ=?=") is None
+
+
+# --- the modern backend pool (#270 Phase 3 P3-B) -------------------------
+
+
+class TestModernBackendPool:
+    """Gateway-owned children for the session-less modern path (D1)."""
+
+    def test_handshake_initializes_the_child_and_caches_the_result(self):
+        """The gateway performs the handshake the modern wire omits.
+
+        Two halves matter and both are asserted: the cached
+        `InitializeResult` (discover's only honest source for the child's
+        capabilities and identity), and the `notifications/initialized`
+        that follows it — easy to miss, because on the legacy path the
+        CLIENT sends it, and FastMCP children gate post-init requests on
+        it.
+        """
+        pool = server.ModernBackendPool(_BACKEND)
+        try:
+            backend, init_result = pool.get_or_create(None)
+            assert init_result["protocolVersion"] == "2025-06-18"
+            assert init_result["serverInfo"]["name"] == "fake"
+            # A second call reuses the same child rather than respawning.
+            again, cached = pool.get_or_create(None)
+            assert again is backend
+            assert cached is init_result
+            assert pool.count() == 1
+        finally:
+            pool.shutdown_all()
+
+    def test_children_are_keyed_per_principal(self):
+        """D1's authorization boundary: one child per principal.
+
+        Sharing a child across principals would leak child state across
+        that boundary, which is why per-principal keying was not deferred.
+        Proved by the child's own pid, not by counting.
+        """
+        pool = server.ModernBackendPool(_BACKEND)
+        try:
+            alice, _ = pool.get_or_create("alice")
+            bob, _ = pool.get_or_create("bob")
+            assert alice is not bob
+            assert pool.count() == 2
+        finally:
+            pool.shutdown_all()
+
+    def test_concurrent_first_requests_spawn_one_child(self):
+        """The latch: racing first requests must not double-spawn.
+
+        Spawning happens outside the lock — holding it across a process
+        spawn plus a handshake round-trip would serialise every unrelated
+        principal — so a placeholder entry is what a racing thread finds.
+        """
+        pool = server.ModernBackendPool(_BACKEND)
+        got: list = []
+        barrier = threading.Barrier(4)
+
+        def _race():
+            barrier.wait(timeout=10)
+            got.append(pool.get_or_create("shared")[0])
+
+        threads = [threading.Thread(target=_race) for _ in range(4)]
+        try:
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+            assert len(got) == 4
+            assert len({id(b) for b in got}) == 1, "the latch let a second child spawn"
+            assert pool.count() == 1
+        finally:
+            pool.shutdown_all()
+
+    def test_a_dead_child_is_dropped_and_respawned(self):
+        """Mirror of the legacy drop-then-reinit: death is not terminal."""
+        pool = server.ModernBackendPool(_BACKEND)
+        try:
+            first, _ = pool.get_or_create(None)
+            first.shutdown()
+            assert first.closed
+            second, _ = pool.get_or_create(None)
+            assert second is not first
+            assert not second.closed
+        finally:
+            pool.shutdown_all()
+
+    def test_a_dead_child_is_reaped_when_get_or_create_drops_it(self):
+        """#373 review, /code-review score 100: the child-died branch used
+        to pop the dead entry and loop to respawn WITHOUT ever reaping the
+        popped backend — every OTHER cleanup path here (eviction, a failed
+        spawn, `shutdown_all`) already calls `shutdown()` on a leaving
+        child, and the legacy dead-session mirror's own comment says why:
+        "shutdown() reaps the already-exited child". Skipping it here
+        leaked a zombie process on every pooled-child crash.
+
+        The child exits ON ITS OWN (`exit`, no reply expected) rather than
+        via `first.shutdown()` — calling `shutdown()` directly would reap
+        it itself and prove nothing about `get_or_create()`.
+        """
+        pool = server.ModernBackendPool(_BACKEND)
+        try:
+            first, _ = pool.get_or_create(None)
+            first.send_oneway(json.dumps({"jsonrpc": "2.0", "method": "exit"}))
+            deadline = time.monotonic() + 10
+            while not first.closed and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert first.closed, "the child never closed"
+            # Not yet reaped: nothing but shutdown()/poll()/wait() collects
+            # the exit status, and nothing has called any of them yet.
+            assert first._proc.returncode is None, (
+                "the child was reaped before get_or_create() ever ran"
+            )
+
+            second, _ = pool.get_or_create(None)
+
+            assert second is not first
+            assert first._proc.returncode is not None, (
+                "get_or_create() dropped the dead child without reaping it"
+            )
+        finally:
+            pool.shutdown_all()
+
+    def test_at_cap_the_idlest_child_is_evicted(self):
+        """§4 Q3: evict, don't refuse.
+
+        A modern client is STATELESS, so an eviction costs it only the
+        warm-up of a child it never knew about — whereas a 503 fails a
+        request the gateway could have served. The legacy registry keeps
+        the opposite policy because an evicted SESSION strands a client
+        mid-conversation.
+        """
+        pool = server.ModernBackendPool(_BACKEND, max_children=2)
+        try:
+            pool.get_or_create("a")
+            pool.get_or_create("b")
+            assert pool.count() == 2
+            pool.get_or_create("c")
+            assert pool.count() == 2, "the cap did not hold"
+        finally:
+            pool.shutdown_all()
+
+    def test_eviction_never_takes_a_pending_or_busy_child(self):
+        """#373 review R1F1 — the cap must bound processes, not leak them.
+
+        Two ways the naive "evict the smallest `used`" loses:
+
+        - a PENDING entry has no backend yet and no `used`, so it sorted
+          FIRST. Evicting it detaches the entry the spawning thread is
+          about to fill, and that child then belongs to nobody —
+          `shutdown_all()` cannot reach it, so the cap would leak
+          processes rather than bound them;
+        - `used` is last-ACQUIRED time, not in-flight work, so the
+          "idlest" child can still have a request on the wire. Shutting
+          it down fails an ordinary concurrent request to make room.
+
+        When nothing qualifies the cap is EXCEEDED rather than enforced —
+        the right way to fail for a soft resource policy whose only
+        alternative is breaking work already in flight.
+        """
+        pool = server.ModernBackendPool(_BACKEND, max_children=1)
+        try:
+            busy, _ = pool.get_or_create("busy")
+            # Park a request on the child so it is provably not idle.
+            started = threading.Event()
+            done = threading.Event()
+
+            def _occupy():
+                started.set()
+                busy.send_request(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": "slow",
+                            "method": "slow_echo",
+                            "params": {"delay": 2.0},
+                        }
+                    ),
+                    "slow",
+                    30.0,
+                )
+                done.set()
+
+            worker = threading.Thread(target=_occupy, daemon=True)
+            worker.start()
+            assert started.wait(timeout=10)
+            deadline = time.monotonic() + 10
+            while not busy.has_pending and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert busy.has_pending, "the request never reached the child"
+
+            # At cap, with the only child busy: the newcomer is served and
+            # the busy child is NOT killed.
+            other, _ = pool.get_or_create("other")
+            assert other is not busy
+            assert not busy.closed, "eviction killed a child mid-request"
+            assert pool.count() == 2, "the cap was enforced by breaking live work"
+            assert done.wait(timeout=30)
+        finally:
+            pool.shutdown_all()
+
+    def test_a_child_that_never_answers_initialize_raises(self):
+        """A failed handshake leaves no entry behind to poison retries."""
+        pool = server.ModernBackendPool(
+            [sys.executable, "-c", "import sys; sys.stdin.read()"]
+        )
+        try:
+            with patch.object(server, "_BACKEND_RESPONSE_TIMEOUT_SECS", 1.0):
+                with pytest.raises(RuntimeError):
+                    pool.get_or_create(None)
+            assert pool.count() == 0
+        finally:
+            pool.shutdown_all()
+
+
+# --- the rewrite seam and discover synthesis (#270 Phase 3 P3-B) ---------
+
+
+class TestStampModernResult:
+    """What a 2026-07-28 server owes on top of a legacy child's result."""
+
+    def test_result_type_is_stamped_on_every_result(self):
+        """O3 is a MUST on EVERY result, not just the cacheable six.
+
+        The absent-means-complete leniency is explicitly a CLIENT
+        obligation toward EARLIER-protocol servers; serve, answering as a
+        2026-07-28 server, gets no waiver.
+        """
+        for method in ("tools/list", "tools/call", "resources/read", "prompts/get"):
+            msg = server._stamp_modern_result({"result": {}}, method)
+            assert msg["result"]["resultType"] == "complete", method
+
+    def test_caching_hints_land_on_the_six_and_nowhere_else(self):
+        for method in sorted(server._CACHEABLE_METHODS):
+            result = server._stamp_modern_result({"result": {}}, method)["result"]
+            assert result["ttlMs"] == server._DEFAULT_CACHE_TTL_MS, method
+            assert result["cacheScope"] == "private", method
+
+    def test_tools_call_never_gets_caching_hints(self):
+        """`CallToolResult` is not a CacheableResult, and the v2 client's
+        model has no `ttlMs`/`cacheScope` fields at all — stamping them
+        would be inventing wire data."""
+        assert "tools/call" not in server._CACHEABLE_METHODS
+        result = server._stamp_modern_result({"result": {"content": []}}, "tools/call")
+        assert "ttlMs" not in result["result"]
+        assert "cacheScope" not in result["result"]
+
+    def test_errors_are_never_stamped(self):
+        """Structural, not policy: `resultType` is a field OF `result`,
+        and an error response has no `result` member to put it in."""
+        msg = {"error": {"code": -32601, "message": "nope"}}
+        assert server._stamp_modern_result(dict(msg), "tools/list") == msg
+
+    def test_stamps_are_iff_absent(self):
+        """A child that already speaks the modern dialect keeps its own
+        values — the seam is a widening, not a rewrite."""
+        msg = server._stamp_modern_result(
+            {
+                "result": {
+                    "resultType": "input_required",
+                    "ttlMs": 5,
+                    "cacheScope": "public",
+                }
+            },
+            "tools/list",
+            server_info={"name": "ours", "version": "9"},
+        )
+        assert msg["result"]["resultType"] == "input_required"
+        assert msg["result"]["ttlMs"] == 5
+        assert msg["result"]["cacheScope"] == "public"
+
+    def test_server_info_is_echoed_into_meta_on_every_result(self):
+        info = {"name": "child", "version": "1.2.3"}
+        for method in ("tools/list", "tools/call"):
+            result = server._stamp_modern_result(
+                {"result": {}}, method, server_info=info
+            )["result"]
+            assert result["_meta"]["io.modelcontextprotocol/serverInfo"] == info, method
+
+    def test_a_custom_ttl_threads_through(self):
+        result = server._stamp_modern_result(
+            {"result": {}}, "tools/list", cache_ttl_ms=0
+        )["result"]
+        assert result["ttlMs"] == 0
+
+
+class TestSynthesizeDiscover:
+    def test_carries_the_two_fields_the_client_requires(self):
+        """Both are load-bearing for interop, not decoration: the v2
+        client validates `DiscoverResult` with exactly `supportedVersions`
+        and `capabilities` required, and a ValidationError makes it
+        SILENTLY fall back to `initialize`."""
+        result = server._synthesize_discover_result(
+            {"capabilities": {"tools": {}}, "serverInfo": {"name": "f", "version": "0"}}
+        )
+        assert result["supportedVersions"] == ["2026-07-28"]
+        assert result["capabilities"] == {"tools": {}}
+        assert result["resultType"] == "complete"
+        assert result["ttlMs"] == server._DEFAULT_CACHE_TTL_MS
+        assert result["cacheScope"] == "private"
+        assert result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "f"
+
+    def test_a_capability_less_child_still_yields_an_object(self):
+        """The silent-fallback trap: a child answering with no
+        capabilities (or a null one) must still produce the OBJECT the
+        client's validation requires, or discovery "succeeds" while the
+        modern path quietly never engages."""
+        for init in ({}, {"capabilities": None}):
+            result = server._synthesize_discover_result(init)
+            assert result["capabilities"] == {}
+            assert isinstance(result["capabilities"], dict)
+
+    def test_supported_versions_are_serves_own_not_the_childs(self):
+        """The child speaks 2025-06-18; the question is what the ENDPOINT
+        supports."""
+        result = server._synthesize_discover_result(
+            {"protocolVersion": "2025-06-18", "capabilities": {}}
+        )
+        assert "2025-06-18" not in result["supportedVersions"]
+        assert result["supportedVersions"] == sorted(
+            server._SERVE_IMPLEMENTED_MODERN_VERSIONS
+        )
+
+    def test_notification_dependent_flags_are_stripped(self):
+        """#373 review, /code-review score 85: discover cannot honor
+        `tools.listChanged`, `resources.subscribe`, `resources.listChanged`
+        or `prompts.listChanged` until 3.5-D ships `subscriptions/listen` —
+        `_queue_server_initiated`'s modern_owned branch silently discards
+        every notification a pooled child sends today. Echoing these flags
+        verbatim would advertise a promise this endpoint cannot keep.
+        """
+        result = server._synthesize_discover_result(
+            {
+                "capabilities": {
+                    "tools": {"listChanged": True},
+                    "resources": {"subscribe": True, "listChanged": True},
+                    "prompts": {"listChanged": True},
+                    "completions": {},
+                }
+            }
+        )
+        caps = result["capabilities"]
+        assert "listChanged" not in caps["tools"]
+        assert "subscribe" not in caps["resources"]
+        assert "listChanged" not in caps["resources"]
+        assert "listChanged" not in caps["prompts"]
+        # The family objects survive — the REQUEST surfaces (tools/list,
+        # resources/read, prompts/get) are served today — just emptied of
+        # the stripped keys, never removed wholesale.
+        assert "tools" in caps
+        assert "resources" in caps
+        assert "prompts" in caps
+        # Control: a non-notification-dependent capability passes through
+        # untouched, proving the filter is scoped to the four flags rather
+        # than over-stripping.
+        assert caps["completions"] == {}
+
+    def test_a_non_stripped_key_survives_within_a_stripped_family(self):
+        """The filter removes specific KEYS, never the whole family
+        object: a hypothetical `resources.other` flag must survive
+        alongside `subscribe` being stripped from the SAME family — spec
+        capability semantics are presence-based per key, not per family."""
+        result = server._synthesize_discover_result(
+            {"capabilities": {"resources": {"subscribe": True, "other": "x"}}}
+        )
+        assert result["capabilities"]["resources"] == {"other": "x"}
+
+    def test_malformed_capabilities_degrades_instead_of_crashing(self):
+        """#373 review R3F1: a misbehaving child answering `initialize`
+        with a truthy NON-dict `capabilities` (e.g. `"capabilities":
+        "tools"`) used to crash `_strip_undeliverable_capability_flags`'s
+        `.items()` call with an uncaught `AttributeError` — aborting the
+        whole discover HTTP request instead of degrading, where the RAW
+        echo (before this fix's stripping existed) degraded gracefully on
+        the client side (a spec-tolerable `ValidationError` -> silent
+        fallback to `initialize`). `capabilities` stays present — still
+        the DiscoverResult's REQUIRED object — but empty: a malformed
+        child forfeits capability advertisement, never the request."""
+        result = server._synthesize_discover_result({"capabilities": "tools"})
+        assert result["capabilities"] == {}
+        assert result["resultType"] == "complete"
+
+    def test_a_non_dict_family_value_passes_through_unstripped(self):
+        """A well-formed top-level dict whose FAMILY value is itself
+        malformed (e.g. `"tools": true`, spec-invalid) must not crash
+        either — only a dict family has keys to strip from, so it passes
+        through as-is, while a sibling well-formed family is still
+        stripped normally."""
+        result = server._synthesize_discover_result(
+            {"capabilities": {"tools": True, "resources": {"subscribe": True}}}
+        )
+        caps = result["capabilities"]
+        assert caps["tools"] is True
+        assert caps["resources"] == {}
+
+
+class TestModernIdMinting:
+    def test_minted_ids_are_unique_across_threads(self):
+        """Two concurrent modern clients may share one pooled child and
+        may well have chosen the same integer id; minting our own removes
+        the collision by construction."""
+        seen: list[str] = []
+        lock = threading.Lock()
+
+        def _mint():
+            local = [server._mint_modern_id() for _ in range(50)]
+            with lock:
+                seen.extend(local)
+
+        threads = [threading.Thread(target=_mint) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert len(seen) == 200
+        assert len(set(seen)) == 200
+        assert all(i.startswith("mcp-stdio/serve/") for i in seen)
+
+    def test_reserved_client_ids_are_recognised(self):
+        assert server._is_reserved_client_id("mcp-stdio/serve/1") is True
+        assert server._is_reserved_client_id("mcp-stdio/serve") is False
+        assert server._is_reserved_client_id(1) is False
+        assert server._is_reserved_client_id(None) is False
+
+
+def test_a_pooled_child_never_fills_the_unread_sse_queue():
+    """#373 review R1F2 — every server-initiated path sheds, not just two.
+
+    A gateway-owned child has no SSE stream and no consumer, so anything
+    put on `server_initiated` is retained for the life of the process.
+    The child-request and notification arms were gated; the
+    `kind == "response"` arm has its OWN put for a response whose waiter
+    is gone, and repeated backend timeouts would grow that without bound.
+
+    Driven through the real reader thread by feeding it lines directly:
+    an orphan RESPONSE (no waiter), a notification, and unparseable
+    noise — the three sources — must all leave the queue empty.
+    """
+    pool = server.ModernBackendPool(_BACKEND)
+    try:
+        backend, _ = pool.get_or_create(None)
+        assert backend.server_initiated.qsize() == 0
+        backend._route('{"jsonrpc":"2.0","id":"nobody-waits","result":{}}')
+        backend._route('{"jsonrpc":"2.0","method":"notifications/message"}')
+        backend._route("this is not json at all")
+        assert backend.server_initiated.qsize() == 0, "a pooled child filled the queue"
+    finally:
+        pool.shutdown_all()
+
+
+def test_a_legacy_child_still_queues_server_initiated_traffic():
+    """The other half of R1F2's gate: legacy behavior is byte-identical.
+
+    The SSE stream is a real consumer there, so shedding would be a
+    regression — `test_server.py`'s push test depends on it.
+    """
+    backend = server.BackendProcess(_BACKEND)
+    try:
+        backend._route('{"jsonrpc":"2.0","method":"notifications/message"}')
+        backend._route('{"jsonrpc":"2.0","id":"nobody-waits","result":{}}')
+        assert backend.server_initiated.qsize() == 2
+    finally:
+        backend.shutdown()

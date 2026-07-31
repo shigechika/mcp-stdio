@@ -21,15 +21,15 @@ the ordinary sessionless-POST path and got 400 `-32000`.
 **P3-A** (this revision) gives serve a modern REQUEST PLANE: the D5 era
 predicate plus the O6-O10 validation ladder. Invalid modern traffic now
 earns real codes — `-32602`, `-32020`, `-32022` — while the legacy path
-is untouched. What P3-A deliberately does NOT ship is modern DISPATCH: a
-request that passes every rung still falls through to the same 400
-`-32000` "Mcp-Session-Id required" as before, and that fallthrough is
-asserted here explicitly rather than left implicit, because it is the
-seam P3-B replaces wholesale.
+is untouched. What P3-A deliberately did NOT ship was modern DISPATCH — a request
+passing every rung still fell through to the same 400 `-32000`
+"Mcp-Session-Id required". That seam is what P3-B replaced.
 
-**P3-B** will answer `server/discover` with a `resultType: "complete"`
-DiscoverResult and dispatch validated modern requests statelessly. Every
-`-32000` fallthrough assertion below is expected to move then.
+**P3-B** (this revision) flipped the seam: `server/discover` is answered
+with a synthesized `resultType: "complete"` DiscoverResult, and validated
+modern requests are dispatched statelessly against a gateway-owned child.
+Every `-32000` fallthrough assertion P3-A left here has moved, which is
+what a change-EXPECTED file is for.
 
 The unit-level ladder coverage lives in `tests/test_server_modern.py`
 (30 tests, every rung and every boundary). These are the END-TO-END
@@ -45,6 +45,8 @@ import socket
 
 import httpx
 import pytest
+
+from ._legacy_child import SERVER_NAME, TOOLS
 
 MODERN_VERSION = "2026-07-28"
 META_VERSION = "io.modelcontextprotocol/protocolVersion"
@@ -160,23 +162,68 @@ def test_modern_rejections_carry_their_own_codes(serve_factory):
 
 
 @pytest.mark.timeout(45)
-def test_a_valid_modern_request_still_falls_through_to_the_legacy_rejection(
-    serve_factory,
-):
-    """P3-A ships ZERO modern dispatch, and this is where that is visible.
+def test_a_valid_modern_request_is_dispatched_statelessly(serve_factory):
+    """P3-B's seam flip, end to end — and the diff here IS the deliverable.
 
-    A request that satisfies every rung lands in the untouched
-    session-resolution path and gets today's 400 `-32000`
-    "Mcp-Session-Id required". The code being the LEGACY one is the whole
-    assertion: it proves the ladder passed the request through rather
-    than answering it. P3-B replaces this seam wholesale, so this test is
-    expected to move then — its presence now is what makes that move
-    visible.
+    P3-A's version of this test asserted the 400 `-32000` fallthrough and
+    was labelled "P3-A ships ZERO modern dispatch". The flip replaced that
+    seam with stateless dispatch, so a request satisfying every rung is
+    now SERVED: no `initialize`, no session, and none sent back.
+
+    Spec: "Servers MUST NOT rely on prior requests over the same
+    connection to establish context (e.g., capabilities, protocol
+    version, client identity)." Nothing preceded this request.
     """
     gateway = serve_factory()
-    valid = gateway.post(_body(), headers=_headers())
-    error = _assert_rejected(valid, LEGACY_ERROR)
-    assert "Mcp-Session-Id" in error["message"]
+    resp = gateway.post(_body(), headers=_headers())
+    assert resp.status_code == 200, resp.text
+    assert "mcp-session-id" not in resp.headers, dict(resp.headers)
+    result = resp.json()["result"]
+    assert [tool["name"] for tool in result["tools"]] == [t["name"] for t in TOOLS]
+    # Stamped, asserted on the RAW wire — the v2 client defaults these on
+    # its own models, so only the bytes prove serve emitted them.
+    assert result["resultType"] == "complete"
+    assert result["ttlMs"] >= 0
+    assert result["cacheScope"] == "private"
+    assert result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == SERVER_NAME
+
+
+@pytest.mark.timeout(45)
+def test_discover_is_synthesized_by_serve(serve_factory):
+    """`server/discover` is answered by serve, never forwarded.
+
+    P3-A pinned this as -32602 (no `_meta`); with `_meta` present it is
+    now a real DiscoverResult. Both required fields are asserted because
+    the v2 client silently falls back to `initialize` without them —
+    discovery "succeeds" while the modern path never engages.
+    """
+    gateway = serve_factory()
+    resp = gateway.post(_body("server/discover"), headers=_headers("server/discover"))
+    assert resp.status_code == 200, resp.text
+    result = resp.json()["result"]
+    assert result["supportedVersions"] == [MODERN_VERSION]
+    assert isinstance(result["capabilities"], dict)
+    assert result["resultType"] == "complete"
+    assert result["cacheScope"] == "private"
+    assert result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == SERVER_NAME
+
+
+@pytest.mark.timeout(45)
+def test_a_modern_notification_is_acknowledged(serve_factory):
+    """202, sessionless (§4 Q4 adopted).
+
+    P3-A left modern notifications on the legacy fallthrough, where a
+    sessionless one earned 400 because session resolution ran first.
+    """
+    gateway = serve_factory()
+    body = {
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {"_meta": _meta()},
+    }
+    resp = gateway.post(body)
+    assert resp.status_code == 202
+    assert resp.content == b""
 
 
 @pytest.mark.timeout(45)
