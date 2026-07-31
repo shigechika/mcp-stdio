@@ -8,6 +8,7 @@ import email.utils
 import json
 import math
 import os
+import queue
 import re
 import signal
 import socket
@@ -770,16 +771,18 @@ class _ModernState:
     is updated on every
     ``logging/setLevel`` line regardless of era (see ``_extract_log_level``).
 
-    A single plain object (no lock): ``run()``'s stdin loop dispatches one
-    line at a time, fully synchronously, on both eras — including the
-    modern path (Phase 1 implements the "don't forward
-    notifications/cancelled upstream" half of cancellation, AC #5's easy
-    half; actually ABORTING an in-flight POST when a cancel arrives would
-    require a second thread reading stdin concurrently with a blocking
-    dispatch, which is deliberately deferred: several
-    single-threaded-mutation invariants elsewhere in ``run()`` —
-    ``protocol_version``, the 401/403/404 recovery ladder — depend on "at
-    most one dispatch in flight" and would need re-auditing first).
+    A single plain object (no lock): ``run()``'s stdin loop DISPATCHES one
+    line at a time, fully synchronously, on both eras — and that is still
+    true on the modern path after #270 Phase 2 PR D added the stdin
+    handoff. What that PR moved to a second thread is READING stdin, not
+    dispatching from it: the reader enqueues every line unchanged and
+    acts out-of-band on exactly one thing, closing the published
+    in-flight response when a ``notifications/cancelled`` names it (the
+    cancellation signal on this transport — see ``_InFlightPost``). Every
+    single-writer invariant this note used to protect —
+    ``protocol_version``, the 401/403/404 recovery ladder, the MRTR
+    dicts, and this object — still has exactly one mutator, the consumer,
+    which is why the handoff needed no re-audit of them.
     """
 
     __slots__ = (
@@ -1517,9 +1520,10 @@ def _handle_modern_special_method(
     synthesized HERE and IMMEDIATELY — the legacy ``EmptyResult`` ``{}``,
     the exact shape 2025-06-18 defines for both methods (base change 3:
     reply-then-degrade). It is deliberately NOT held until the upstream
-    acknowledgement: the stdin loop is single-threaded, so waiting would
-    stall every other request behind a network round-trip, and the
-    subscription is best-effort by nature. A duplicate subscribe and an
+    acknowledgement: the stdin loop DISPATCHES one line at a time (the
+    #270 PR D handoff moved stdin READING to its own thread, not
+    dispatching), so waiting would stall every other request behind a
+    network round-trip, and the subscription is best-effort by nature. A duplicate subscribe and an
     unsubscribe for a URI that was never subscribed both answer ``{}``
     too — idempotent, because erroring would invent wire behavior the
     legacy methods never had (base change 7).
@@ -2308,6 +2312,7 @@ class _StreamResult:
         "www_authenticate",
         "protocol_version",
         "retry_after",
+        "aborted",
     )
 
     def __init__(
@@ -2317,6 +2322,8 @@ class _StreamResult:
         www_authenticate: str | None = None,
         protocol_version: str | None = None,
         retry_after: float | None = None,
+        *,
+        aborted: bool = False,
     ):
         self.session_id = session_id
         self.status_code = status_code
@@ -2328,6 +2335,17 @@ class _StreamResult:
         # whose wait exceeded the cap — surfaced in the synthesized error's
         # ``data.retryAfter`` so a client can back off. See #8.
         self.retry_after = retry_after
+        # #270 Phase 2 PR D, required change 2: this POST was deliberately
+        # aborted by a ``notifications/cancelled`` the stdin reader thread
+        # matched against the in-flight request, NOT by a transport failure.
+        # A DISTINCT TERMINAL OUTCOME, never an exception: every consumer
+        # must short-circuit on it before reading ``status_code`` — the
+        # request has already been answered by not answering it, per the
+        # cancellation spec's receiver SHOULD ("Not send a response for the
+        # cancelled request"). It is what keeps the attempt loop from
+        # re-POSTing a cancelled ``tools/call`` MAX_RETRIES times and the
+        # 401/403/404 recovery ladder from re-dispatching it.
+        self.aborted = aborted
 
 
 def _parse_auth_params(header: str | None) -> dict[str, str]:
@@ -2498,6 +2516,317 @@ def _iter_sse_events(lines: Iterable[str]) -> Iterator[tuple[str, str]]:
         yield event_type, data
 
 
+# Name of the modern era's stdin reader thread. Named rather than
+# anonymous so an operator reading a traceback or a `faulthandler` dump
+# can tell the gateway's own reader apart from the two listen threads,
+# and so the AC3 guard test can assert on `threading.enumerate()` by name
+# instead of on a thread COUNT the refresh timer and listen threads make
+# unstable.
+_STDIN_READER_THREAD_NAME = "mcp-stdio-stdin-reader"
+
+# End-of-input marker enqueued by the reader thread. A unique sentinel
+# object rather than None or "": both are legal queue payloads in
+# principle, and confusing one for EOF would silently truncate a session.
+_STDIN_EOF = object()
+
+
+def _stdin_reader_loop(
+    lines: "queue.SimpleQueue[Any]",
+    on_cancel: "Callable[[Any], None] | None" = None,
+) -> None:
+    """Read stdin on a dedicated thread and hand every line to the queue.
+
+    #270 Phase 2 PR D, §3.1 — the permanent stdin handoff, started ONCE
+    at era resolution and ONLY on the modern era. Its whole reason to
+    exist is that on that era cancellation does not exist at all today:
+    the cancel notification sits unread in the pipe while run() blocks
+    inside a dispatch, and the v2 wire offers no other signal —
+    "**Streamable HTTP**: Closing the SSE response stream is the
+    cancellation signal. The server **MUST** treat a client disconnect as
+    cancellation of that request. No ``notifications/cancelled`` message
+    is required or expected." So the only way to honor a cancel is to be
+    reading stdin while the dispatch blocks.
+
+    A blocking read on a daemon thread is the ONLY portable mechanism
+    (§3.6): `select()` does not work on pipes on Windows, a blocked
+    `ReadFile` cannot be cancelled from Python, and the between-chunks
+    `os.read` variants fail structurally anyway — during a long call the
+    consumer is parked INSIDE `resp.iter_text()`, which is precisely when
+    the cancel arrives. It follows that any second thread that ever
+    touches stdin must own it forever, which is why the handoff is
+    permanent rather than scoped to a dispatch.
+
+    It iterates ``sys.stdin`` itself — the same text-mode object
+    ``_enforce_lf_stdio`` reconfigures on win32 — and never mixes in
+    ``os.read(0)`` or ``sys.stdin.buffer``, which would strand data
+    already sitting in Python's own buffer.
+
+    THE READER MUTATES NO RELAY STATE (required change 7). Per line it
+    does exactly two things: run the cheap pure-function cancel check and,
+    on a match against the published in-flight request, invoke
+    ``on_cancel``; then enqueue the line UNCHANGED, in order, including
+    the cancel lines it acted on. ``tracker.add``, ``_mrtr_handle_cancel``,
+    ``protocol_version``, ``session_id``, the recovery ladder and every
+    MRTR dict stay on the consumer thread, so each single-dispatch
+    invariant survives the handoff untouched. It writes nothing to stdout.
+
+    Because exactly one thread ever reads stdin, nothing is reordered, no
+    double-dispatch is possible, and a partial-line split cannot occur.
+
+    EOF enqueues the sentinel and NOTHING ELSE — deliberately, and
+    contrary to the first reading of the design (#270 PR D, owner
+    question 1). Aborting the in-flight POST at EOF is not implementable:
+    "the client crashed after sending A" and "``echo A | mcp-stdio``" are
+    byte-identical at this layer, both leave the consumer mid-dispatch
+    when EOF arrives, and cutting the second one off means a piped
+    request never gets its answer. It is also unnecessary — a genuinely
+    dead client makes ``_write_line`` raise ``BrokenPipeError``, which
+    run()'s never-crash net already absorbs before the consumer drains to
+    the sentinel and exits. So EOF buys latency at best, and a regression
+    at worst.
+    """
+    cancel_check_failed = False
+    try:
+        for line in sys.stdin:
+            if on_cancel is not None:
+                try:
+                    cancel_id = _extract_cancel_id(line)
+                    if cancel_id is not None:
+                        on_cancel(cancel_id)
+                except Exception as e:  # noqa: BLE001 — per-line resilience boundary (#362 review finding 2)
+                    # The per-line half of run()'s never-crash net (#11),
+                    # one thread over: a poison line must cost only its own
+                    # cancel DETECTION, never the reader. Before this wrap,
+                    # e.g. a cancel whose ``params`` nests deep enough to
+                    # raise ``RecursionError`` through ``json.loads`` (past
+                    # ``_extract_cancel_id``'s narrow catch) ended the loop,
+                    # and the ``finally`` sentinel made a live session read
+                    # as a clean client disconnect — every later request
+                    # silently vanished. The line is still enqueued below:
+                    # the consumer's own per-line net owns rejecting it.
+                    # Logged once per reader lifetime, not per line
+                    # (the ``input_required_logged`` precedent) — a client
+                    # streaming poison must not flood stderr.
+                    if not cancel_check_failed:
+                        cancel_check_failed = True
+                        log(
+                            f"stdin reader: cancel detection failed, line still forwarded: {e}"
+                        )
+            lines.put(line)
+    except Exception as e:  # noqa: BLE001 — never crash the gateway
+        # The TRANSPORT half of the net: only a failure of stdin iteration
+        # itself lands here now (the cancel-detect step recovers per line
+        # above), and a dead stdin must end THIS thread quietly, with the
+        # sentinel still enqueued below so the consumer drains and shuts
+        # down cleanly instead of blocking on a queue nobody will feed
+        # again.
+        log(f"stdin reader stopped: {e}")
+    finally:
+        lines.put(_STDIN_EOF)
+
+
+def _iter_queued_stdin(lines: "queue.SimpleQueue[Any]") -> Iterator[str]:
+    """Yield the reader thread's lines in order, ending at the sentinel.
+
+    #270 Phase 2 PR D, §3.1/§3.8. The FIFO ordering is what makes the
+    drain automatic (required change 9): the sentinel is enqueued last,
+    so every request that arrived before EOF is already ahead of it in
+    the queue and gets served before the consumer honors the end of
+    input. Dropping them instead would silently lose work a client
+    legitimately pipelined.
+    """
+    while True:
+        item = lines.get()
+        if item is _STDIN_EOF:
+            return
+        yield item
+
+
+class _InFlightPost:
+    """The one upstream POST a modern-era stdin cancel may abort (PR D).
+
+    #270 Phase 2 PR D, required change 8. Written by run()'s CONSUMER
+    (the stdin loop thread, which owns publication and un-publication)
+    and read by the stdin READER thread, which is the only other toucher
+    and does exactly two things with it: match a
+    ``notifications/cancelled``'s ``requestId`` against the published id,
+    and — on a match — set the abort event and close the published
+    response handle. It mutates no other relay state, which is what lets
+    every single-dispatch invariant in run() (``protocol_version``, the
+    401/403/404 recovery ladder, the MRTR dicts) survive the handoff
+    without a re-audit.
+
+    The published id is always the id the LOCAL CLIENT is waiting on —
+    the only id a cancel can name. On an MRTR retry that is ``client_id``
+    (N), not the relay's own ``retry_id``, and it stays published across
+    the whole ``_mrtr_run_retry`` loop rather than per POST: a
+    ``requestState``-only chain re-POSTs with no client involvement at
+    all, so a cell published only for the duration of each POST would
+    miss a cancel landing in the gap and let the chain run on until the
+    queued cancel line finally unwinds it.
+
+    ``_response`` mirrors ``_ResourceSubscriptions``' base-change-5
+    pattern exactly (PR B): the RESPONSE is closed, never the client —
+    run()'s teardown owns the client and closing it would make every
+    later request raise. Closing a response the consumer has already
+    finished with is harmless; ``httpx`` makes it idempotent. The
+    consumer un-publishes in a ``finally`` on both levels (per attempt
+    inside ``_post_and_stream``, per stdin line in run()), so a cancel
+    can never reach a STALE handle and end request N+1's stream because
+    request N's cancel arrived late.
+
+    A fresh ``threading.Event`` per publication, rather than one
+    session-wide event that would need clearing: there is no later
+    request to hand a stale set() to, so "consuming" the abort is a
+    read (see ``_abort_requested``) and no clear-vs-set race exists.
+
+    THE WINDOW THIS COVERS, and the three it does not. A cancel is
+    honored from the moment the consumer publishes the request until the
+    per-line ``finally`` releases it, and it can actually END the POST
+    only while a response handle is published. Outside that, a cancel is
+    still enqueued and still reaches the tracker and the MRTR bridge on
+    the consumer — it simply cannot cut the request short. None of the
+    three is a regression: before this PR the modern era honored no
+    cancel at all.
+
+    1. BEFORE PUBLICATION. The reader can enqueue a request and read its
+       cancel before the consumer has picked the request up (the window
+       is the handful of parses between dequeue and publish, so this
+       needs a client that cancels essentially simultaneously). The
+       cancel then matches nothing and is not re-tried when the consumer
+       later dequeues it, so the call runs to completion. Re-arming it
+       from a "seen before publication" set is NOT obviously correct:
+       JSON-RPC lets a client reuse an id once the prior call is done —
+       which is exactly what the tracker's ``discard``-on-reuse encodes —
+       so a naive set would abort an unrelated LATER request under the
+       same id.
+    2. BEFORE RESPONSE HEADERS. ``client.stream()`` does not return until
+       the server sends headers, so a server that does its long work
+       first and only then responds leaves ``_response`` None for the
+       whole of it: the abort event is set, nothing is closed, and the
+       relay waits out the server or the read timeout. Closing that
+       window means a dedicated ``httpx.Client`` per abortable request
+       (the listen threads' pattern) so the teardown has something to
+       close — a real cost per request, deliberately not paid here.
+    3. PAGINATION. See the ``_paginate_and_stream`` branch in run()'s
+       ``_dispatch`` — continuations go through ``_post_parsed``, which
+       publishes no handle (#270 PR D owner question 2, a recorded gap).
+    """
+
+    __slots__ = ("_lock", "_req_id", "_live", "_abort", "_response")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._req_id: Any = None
+        # Explicit, because ``None`` is a legal JSON-RPC id value and an
+        # unpublished cell must never match a cancel that carries one.
+        self._live = False
+        self._abort: threading.Event | None = None
+        self._response: httpx.Response | None = None
+
+    def publish(self, req_id: Any) -> threading.Event:
+        """Claim the cell for ``req_id``; returns its fresh abort event."""
+        abort = threading.Event()
+        with self._lock:
+            self._req_id = req_id
+            self._live = True
+            self._abort = abort
+            self._response = None
+        return abort
+
+    def clear(self) -> None:
+        """Release the cell. Idempotent, and a no-op when unpublished."""
+        with self._lock:
+            self._req_id = None
+            self._live = False
+            self._abort = None
+            self._response = None
+
+    def abort_event_for(self, req_id: Any) -> "threading.Event | None":
+        """This request's abort event, or None when it is not the published one.
+
+        Compared with ``==``, which is exactly the type-aware semantics a
+        dict key already gives every other id lookup in this file (``1``
+        and ``"1"`` are different, ``1`` and ``1.0`` are not).
+        """
+        with self._lock:
+            if not self._live or req_id != self._req_id:
+                return None
+            return self._abort
+
+    def publish_response(self, resp: "httpx.Response | None") -> None:
+        """Publish (or retract) the attempt's live response handle.
+
+        Silently drops a publish for an already-released cell: the
+        consumer clears on its way out of a stdin line, and a handle
+        recorded after that could only ever be closed on behalf of a
+        request nobody is cancelling.
+        """
+        with self._lock:
+            if self._live:
+                self._response = resp
+
+    def abort_if_matches(self, cancel_id: Any) -> bool:
+        """Abort the published POST when ``cancel_id`` names it.
+
+        Called ONLY from the stdin reader thread. Sets the abort event
+        BEFORE closing the handle, so the consumer — which wakes from
+        that close inside ``_post_and_stream``'s exception arms — is
+        guaranteed to see the flag that tells a deliberate cancellation
+        apart from a transport fault. Returns whether it matched, for
+        the caller's log line.
+        """
+        with self._lock:
+            if not self._live or cancel_id != self._req_id:
+                return False
+            abort = self._abort
+            resp = self._response
+        if abort is not None:
+            abort.set()
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception as e:  # noqa: BLE001 — best-effort wake-up
+                # The consumer may have finished with it concurrently. The
+                # abort event is already set, so the outcome is classified
+                # either way; a failure here must never escape into the
+                # reader thread's per-line loop and stop it reading stdin.
+                log(f"cancel for {cancel_id!r}: closing the in-flight response: {e}")
+        return True
+
+
+def _abort_requested(abort: "threading.Event | None") -> bool:
+    """True when a stdin cancel has claimed the POST this event guards.
+
+    #270 Phase 2 PR D, required change 2 — the read half of the abort
+    protocol, factored out so every consultation site reads identically
+    (the ``_consume_restart`` template at the listen loop, minus the
+    clear: the event is created PER PUBLISHED REQUEST, so there is
+    nothing to hand back to a later one and "consuming" it is a read).
+
+    ``None`` — the legacy era in its entirety, and every modern line that
+    cannot be cancelled (a notification, a non-scalar id) — is always
+    False, which is what restores each guarded site to its pre-PR-D
+    behaviour byte for byte (acceptance criterion #3).
+    """
+    return abort is not None and abort.is_set()
+
+
+def _aborted_result() -> _StreamResult:
+    """The flagged terminal ``_StreamResult`` for a cancelled POST.
+
+    #270 Phase 2 PR D. ``status_code`` is 0 — deliberately NOT 200 — so
+    that a consumer which somehow reaches a status comparison before the
+    ``aborted`` check still falls on the silent side of every one of
+    them: ``>= 400`` (the fall-through error write), ``== 202`` (the
+    non-compliant-202 error write) and ``== 401/403/404`` (the recovery
+    ladder) are all False, and ``session_id`` is None so no rotation is
+    adopted. Silence is the correct outcome: the cancellation spec's
+    receiver SHOULD is "Not send a response for the cancelled request".
+    """
+    return _StreamResult(None, 0, aborted=True)
+
+
 def _post_and_stream(
     client: httpx.Client,
     url: str,
@@ -2510,6 +2839,8 @@ def _post_and_stream(
     has_id: bool = True,
     input_required_hook: Callable[[str], str | None] | None = None,
     input_required_abort: Callable[[str], None] | None = None,
+    abort: "threading.Event | None" = None,
+    publish_response: Callable[["httpx.Response | None"], None] | None = None,
 ) -> _StreamResult | None:
     """Send a POST and stream the response to stdout with retry.
 
@@ -2586,9 +2917,61 @@ def _post_and_stream(
     same stream can reach here — so ``input_required_abort``'s membership
     check (R1F1) finds nothing registered and no-ops instead of writing a
     second response.
+
+    ``abort`` is the true-cancellation event (#270 Phase 2 PR D, required
+    changes 2/4/6/8), set by run()'s stdin reader thread when a
+    ``notifications/cancelled`` names the request this POST is serving. It
+    is passed ONLY on the modern era, and only for a request whose id a
+    cancel can name; ``None`` — the whole legacy era, every notification,
+    ``_paginate_and_stream``'s sibling ``_post_parsed``, ``_reinitialize``,
+    run_sse and cold-start — restores this function byte for byte
+    (acceptance criterion #3).
+
+    Abort is a DISTINCT TERMINAL OUTCOME, never an exception. The
+    cancellation signal on this transport is the reader closing the
+    published response handle, so it surfaces here as an
+    ``httpx.HTTPError`` (a read-side ``TransportError``) or an
+    ``httpx.StreamClosed`` (a ``RuntimeError`` subclass) — and left
+    unclassified, ``emitted=False`` sends the attempt loop back around to
+    **re-POST a cancelled ``tools/call`` up to MAX_RETRIES times**, the
+    recorded trap this parameter exists to close. Every terminal exit
+    therefore consults the event FIRST (stop-wins, the ``_consume_restart``
+    template) and returns ``_aborted_result()`` instead — including the two
+    NORMAL returns, because a close landing between chunks can end
+    ``iter_text()`` without raising at all, which would otherwise leak a
+    false-normal 200 that the caller's recovery ladder and
+    ``_mrtr_run_retry`` would act on. Nothing is written to stdout under an
+    aborted id: the empty-response synthesis, the MRTR
+    ``input_required_abort`` funnel and the "stream interrupted" error are
+    each gated, and the cancel TRACKER cannot substitute for those gates
+    because ``tracker.add`` runs only when the CONSUMER dequeues the cancel
+    line — i.e. after every one of those writes. A deliberate abort also
+    never re-issues the request: the changelog's "broken response stream …
+    clients MUST re-issue with a new request ID" rule covers UNINTENTIONAL
+    drops only (required change 6), so the event is consulted before each
+    attempt and before the inter-attempt sleep as well.
+
+    ``publish_response`` is the other half (required change 8), the same
+    parameter ``_listen_stream_loop`` already takes from PR B: it hands
+    THIS attempt's live ``httpx.Response`` to run()'s in-flight cell so
+    the reader thread has something to close, and is called with ``None``
+    from a ``finally`` the moment the attempt ends. Never leaving a
+    finished attempt's handle published is what makes "a cancel can only
+    ever close the stream it names" true rather than merely intended —
+    a stale handle would otherwise be closable on behalf of a request
+    that already got its answer.
     """
     last_error: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
+        if _abort_requested(abort):
+            # Required change 8, the pre-ATTEMPT half: a cancel landing in
+            # the inter-attempt gap must never be answered with one more
+            # POST of a request the client has withdrawn. The rate-limit
+            # branch checks the event itself after draining the body (#362
+            # review finding 1), so this loop-top check is the backstop for
+            # a cancel that lands DURING that sleep and `continue`s here.
+            log(f"request {req_id!r} cancelled by the client before attempt {attempt}")
+            return _aborted_result()
         # Tracks whether any payload has been committed to stdout on this
         # attempt. Once a byte is written to the client the non-idempotent
         # POST can no longer be safely replayed, so a mid-stream transient
@@ -2605,11 +2988,36 @@ def _post_and_stream(
         swallowed = False
         try:
             with client.stream("POST", url, content=content, headers=headers) as resp:
+                if publish_response is not None:
+                    # Earliest point the handle exists. From here until the
+                    # `finally` below, a cancel naming this request can end
+                    # the stream from the reader thread — which IS the
+                    # cancellation signal on this transport.
+                    publish_response(resp)
                 session = resp.headers.get("mcp-session-id")
                 www_auth = resp.headers.get("www-authenticate")
 
                 if resp.status_code in _RETRYABLE_RATE_LIMIT_STATUSES:
                     resp.read()
+                    if _abort_requested(abort):
+                        # The NON-200 half of the false-normal arm below
+                        # (#362 review finding 1): a cancel that lands while
+                        # ``client.stream()`` is still awaiting headers (the
+                        # documented pre-headers window — event set, nothing
+                        # to close) arrives here once the server answers, and
+                        # ``resp.read()`` drains the small buffered body
+                        # without raising. One check after the drain covers
+                        # BOTH exits of this branch: the exhausted return
+                        # (whose ``aborted=False`` result would skip
+                        # ``_mrtr_run_retry``'s aborted-guard and reach the
+                        # recovery ladder) and the rate-limit sleep (the
+                        # client stops waiting NOW — the same pre-sleep rule
+                        # as the ``RETRY_DELAY`` sleep below).
+                        log(
+                            f"request {req_id!r} cancelled by the client "
+                            f"(rate-limited HTTP {resp.status_code})"
+                        )
+                        return _aborted_result()
                     sleep_secs = _handle_rate_limit(resp.headers, attempt)
                     if sleep_secs is None:
                         return _StreamResult(
@@ -2629,6 +3037,20 @@ def _post_and_stream(
 
                 if resp.status_code != 200:
                     resp.read()
+                    if _abort_requested(abort):
+                        # Same non-200 half of the false-normal arm (#362
+                        # review finding 1): without this check a cancelled
+                        # request answered with e.g. a plain 500 — or a 401
+                        # that the recovery ladder would then re-POST — comes
+                        # back ``aborted=False``, and run() writes an error
+                        # under the id the client just withdrew while
+                        # ``_mrtr_run_retry`` purges the transaction and
+                        # strands its outstanding minted dialogs.
+                        log(
+                            f"request {req_id!r} cancelled by the client "
+                            f"(HTTP {resp.status_code})"
+                        )
+                        return _aborted_result()
                     return _StreamResult(session, resp.status_code, www_auth)
 
                 pv: str | None = None
@@ -2676,6 +3098,19 @@ def _post_and_stream(
                             _emit(text, tracker)
                             emitted = True
 
+                if _abort_requested(abort):
+                    # Required changes 2 and 4, the FALSE-NORMAL arm. A
+                    # cross-thread close does not always raise: landing
+                    # between chunks, after the underlying stream already
+                    # reached EOF, it simply ends ``iter_text()`` and control
+                    # arrives here with ``emitted=False``. Falling through
+                    # would write "empty response from server" under the id
+                    # the client just cancelled AND hand the caller a
+                    # normal-looking 200 that the recovery ladder and
+                    # ``_mrtr_run_retry`` would act on. Classify it as the
+                    # abort it is, before either can happen.
+                    log(f"request {req_id!r} cancelled by the client mid-stream")
+                    return _aborted_result()
                 if not emitted and has_id and not swallowed:
                     # A 200 that delivered NO JSON-RPC payload (empty body, or
                     # only non-message SSE events) would leave a request-with-id
@@ -2703,6 +3138,20 @@ def _post_and_stream(
             # for-line loop and crash the whole gateway mid-session, violating
             # the #11 "never crash the stdio connection" contract. Non-HTTP
             # (programming) errors still propagate.
+            if _abort_requested(abort):
+                # #270 Phase 2 PR D, required change 2. Consulted BEFORE
+                # anything else in this arm (stop-wins, the
+                # ``_consume_restart`` template): the reader thread closed
+                # the published handle, so httpcore could not return the
+                # partially-read connection to the pool and the read failed
+                # — but that is the relay's own cancellation, not a
+                # transport fault. Without this the ``emitted=False`` path
+                # below falls straight into ``if attempt < MAX_RETRIES`` and
+                # re-POSTs a cancelled ``tools/call``. Nothing is written:
+                # not the generic interrupted error, not the MRTR abort
+                # funnel — required changes 4 and 10.
+                log(f"request {req_id!r} cancelled by the client: {e}")
+                return _aborted_result()
             last_error = e
             log(f"attempt {attempt}/{MAX_RETRIES} failed: {e}")
             if emitted or swallowed:
@@ -2739,7 +3188,43 @@ def _post_and_stream(
                 # loop ran past their assignment.)
                 return _StreamResult(session, 200, protocol_version=pv)
             if attempt < MAX_RETRIES:
+                if _abort_requested(abort):
+                    # Required change 8, the pre-SLEEP half. The loop-top
+                    # check alone would still burn RETRY_DELAY * attempt
+                    # seconds sleeping before noticing, and the whole point
+                    # of a true abort is that the client stops waiting NOW.
+                    log(f"request {req_id!r} cancelled by the client; not retrying")
+                    return _aborted_result()
                 time.sleep(RETRY_DELAY * attempt)
+        except RuntimeError as e:
+            # #270 Phase 2 PR D, required change 3. The cancellation
+            # mechanism on this transport is the reader thread closing the
+            # published response handle, and httpx raises ``StreamClosed``
+            # for a close that lands mid-read — part of the ``StreamError``
+            # family, which subclasses RuntimeError and is a SIBLING of
+            # ``HTTPError``, not a subclass, so the arm above cannot see it.
+            # Left unhandled it escapes to run()'s never-crash net, which
+            # writes "internal relay error" under the very id the client
+            # just cancelled: the loudest possible wrong answer. Shaped like
+            # the listen loop's own RuntimeError arm, which absorbs the same
+            # family for the same reason — abort set → this close is the
+            # relay's OWN doing, return the flagged terminal result
+            # silently; abort NOT set → nothing legitimate raises a
+            # RuntimeError from a POST here, so re-raise loudly rather than
+            # mask a real logic bug as a silently dropped request.
+            if _abort_requested(abort):
+                log(f"request {req_id!r} cancelled by the client: {e}")
+                return _aborted_result()
+            raise
+        finally:
+            # Never leave a finished attempt's handle published (required
+            # change 8), the same rule and the same shape as
+            # `_listen_stream_loop`'s own finally: closing a stale response
+            # is a no-op at best, and at worst ends the NEXT request's
+            # stream on behalf of a cancel that arrived after this one was
+            # already answered.
+            if publish_response is not None:
+                publish_response(None)
 
     log(f"request failed after retries: {last_error}")
     if has_id:
@@ -5620,10 +6105,12 @@ def run(
     are unaffected (their 2026 result shapes are additive-only — see
     ``_handle_modern_special_method``).
 
-    Not yet bridged (#270 Phase 2 PR D): cancelling an in-flight retry
-    POST upstream. On this transport the cancellation signal is closing
-    the response stream, which needs a second thread reading stdin
-    concurrently with a blocking dispatch — see ``_ModernState``'s note.
+    Cancelling an in-flight retry POST IS bridged (#270 Phase 2 PR D):
+    the stdin reader thread closes the published response, which is the
+    cancellation signal on this transport, and ``_mrtr_run_retry``
+    returns without purging or answering so the queued cancel line drives
+    the purge and the downstream minted cancels exactly once. Nothing is
+    translated upstream — see ``_mrtr_handle_cancel``.
 
     ``MCP_STDIO_MRTR_STRIP=1`` restores the pre-bridge advertisement
     filter, withdrawing the relay's invitation for MRTR from a compliant
@@ -5656,7 +6143,9 @@ def run(
         ),
     )
 
-    # ``run`` is otherwise single-threaded, but the proactive-refresh daemon
+    # ``run``'s own request handling is single-threaded (the modern era's
+    # stdin reader, #270 PR D, only enqueues — it never prepares or sends a
+    # request), but the proactive-refresh daemon
     # (when enabled) mutates ``headers`` concurrently. ``headers_lock`` serialises
     # every read/write of the shared ``headers`` object; ``refresh_lock`` serialises
     # the timer's refresh against the reactive 401 refresh so the two never race
@@ -5759,6 +6248,77 @@ def run(
         log(f"protocol era: {era} (auto-detected)")
     else:
         era = "legacy"
+
+    # --- modern era: true cancellation (#270 Phase 2 PR D) ---
+    # The single cell a stdin cancel can act on, created ONLY on the modern
+    # era: `None` on legacy means every `abort`/`publish_response` argument
+    # below stays `None`, which restores `_post_and_stream` byte for byte
+    # and leaves the legacy wire untouched (acceptance criterion #3). On
+    # legacy a `notifications/cancelled` keeps being forwarded upstream as
+    # an ordinary POST while the cancel tracker drops the late response —
+    # spec-compliant with the 2025-06-18 SHOULDs and deliberately unchanged.
+    in_flight = _InFlightPost() if era == "modern" else None
+
+    # The stdin handoff itself (§3.1/§3.2), started HERE — at era
+    # resolution, before the loop's first iteration — and only on the
+    # modern era. Early and once, so the whole session has ONE input
+    # regime: a cancel of the FIRST request must already be observable,
+    # and a direct-read -> queued transition state would multiply cases
+    # for no benefit. Straight-line code executed once is the one-shot
+    # spawn latch (PR A's `_ListenStream.thread` idiom, degenerate here).
+    #
+    # The era gate is not cosmetic. On legacy the loop below keeps the
+    # literal synchronous `for line in sys.stdin:` — zero threads, zero
+    # new per-line calls — so acceptance criterion #3 holds by
+    # construction including TIMING: an eager legacy-side `tracker.add`
+    # would make a cancel that today lands after a completed response
+    # start dropping that response mid-stream, a real observable change.
+    stdin_lines: "queue.SimpleQueue[Any] | None" = None
+    stdin_reader: threading.Thread | None = None
+    if era == "modern":
+        # Unbounded by construction — `SimpleQueue` has no `maxsize`
+        # parameter at all (§3.7). A cap that blocked the reader would
+        # reinstate the exact deafness this PR removes; real clients await
+        # their responses, and unlike `_MRTR_MAX_TXNS` there is no
+        # two-responses-for-one-id hazard here to bound against.
+        stdin_lines = queue.SimpleQueue()
+
+        def _reader_cancel(cancel_id: Any) -> None:
+            """Abort the in-flight POST a stdin cancel names (§3.1, step 2).
+
+            The ONLY out-of-band action the reader thread ever takes, and
+            the only thing on it that touches relay state at all: the
+            line itself is still enqueued afterwards, unchanged and in
+            order, so `tracker.add` and `_mrtr_handle_cancel` run on the
+            consumer exactly as before.
+
+            Closing the published response IS the cancellation on this
+            transport — "Closing the SSE response stream MUST be treated
+            by the server as cancellation of that request. … The server
+            SHOULD stop work on the cancelled request as soon as
+            practical and MUST NOT send any further messages for it."
+            Nothing is POSTed upstream: a `notifications/cancelled` is
+            neither "required or expected" here and a v2 server may
+            legally reject it (python-sdk answers 400). Note the spec
+            gives no rollback guarantee — abort means "stop waiting", not
+            "undo".
+
+            A miss is the common case (a cancel for a request that
+            already finished, or for one that never blocked) and is a
+            silent no-op: the queued line still reaches the tracker and
+            the MRTR bridge, which is where a late-response drop and a
+            transaction purge belong.
+            """
+            if in_flight is not None and in_flight.abort_if_matches(cancel_id):
+                log(f"cancelling id {cancel_id!r}: closing the in-flight upstream POST")
+
+        stdin_reader = threading.Thread(
+            target=_stdin_reader_loop,
+            kwargs={"lines": stdin_lines, "on_cancel": _reader_cancel},
+            name=_STDIN_READER_THREAD_NAME,
+            daemon=True,
+        )
+        stdin_reader.start()
 
     if era == "modern" and cold_start_login is not None:
         # _cold_start_loop's _reinitialize sends a legacy `initialize`
@@ -5872,9 +6432,10 @@ def run(
     # (N), plus a flat index from every outstanding minted id back to
     # ``(N, key)``. Two maps rather than one scan: the stdin hot path looks
     # a response id up once, and the id it carries is the ONLY correlation
-    # the client sends back. Plain dicts, no lock — run()'s stdin loop is
-    # single-threaded on both eras (see ``_ModernState``'s note) and the
-    # listen thread never touches these.
+    # the client sends back. Plain dicts, no lock — run()'s stdin loop
+    # dispatches one line at a time on both eras (see ``_ModernState``'s
+    # note: #270 PR D's reader thread enqueues lines, it never indexes
+    # these maps) and the listen threads never touch them either.
     mrtr_txns: dict[Any, dict[str, Any]] = {}
     mrtr_minted: dict[Any, tuple[Any, str]] = {}
     # Monotonic transaction counter feeding the minted-id namespace. Never
@@ -6267,6 +6828,25 @@ def run(
                     client_id, retry_id, txn["stored_line"]
                 ),
                 input_required_abort=_make_input_required_abort(client_id),
+                # #270 Phase 2 PR D, §3.5: a cancel arriving while THIS
+                # POST is in flight must disconnect it, never be
+                # translated into an upstream `notifications/cancelled` —
+                # "No notifications/cancelled message is required or
+                # expected" on Streamable HTTP, and per MRTR client
+                # requirement 3 the retry is an independent request the
+                # server "MUST NOT assume that clients will ... retry"
+                # (server requirement 8), so silent abandonment is
+                # spec-legal. The cell is published under `client_id` by
+                # the CONSUMER for the whole `_mrtr_run_retry` loop, so
+                # this looks the event up rather than owning it.
+                abort=(
+                    in_flight.abort_event_for(client_id)
+                    if in_flight is not None
+                    else None
+                ),
+                publish_response=(
+                    in_flight.publish_response if in_flight is not None else None
+                ),
             )
         finally:
             txn["retry_in_flight"] = False
@@ -6317,6 +6897,22 @@ def run(
         arm below, which is the original design's stance and stays loud.
         """
         while True:
+            if _abort_requested(
+                in_flight.abort_event_for(client_id) if in_flight is not None else None
+            ):
+                # #270 Phase 2 PR D, §3.5. Checked at the TOP of the loop,
+                # not merely around each POST: a `requestState`-only chain
+                # re-POSTs with no client involvement at all, so a cancel
+                # landing in the gap between two of those POSTs would
+                # otherwise let the chain run to the round cap before the
+                # QUEUED cancel line — which is stuck behind this very
+                # frame on the consumer thread — ever got a chance to
+                # unwind it. Return without purging and without answering:
+                # the queued line drives `_mrtr_handle_cancel`, which
+                # purges once and emits the downstream cancels that retire
+                # the dialogs nobody will collect.
+                log(f"MRTR retry chain for id {client_id!r} cancelled by the client")
+                return
             txn = mrtr_txns.get(client_id)
             if txn is None or not txn["retry_now"]:
                 return
@@ -6390,6 +6986,23 @@ def run(
                     # loud "HTTP 401" under its own id rather than a silent
                     # hang. (b)'s honesty half, kept.
                     log("MRTR retry token refresh failed")
+            if result is not None and result.aborted:
+                # #270 Phase 2 PR D, §3.5: the reader thread disconnected
+                # this retry's POST. Placed AFTER the 401 arm so it covers
+                # both POSTs this iteration can make — an aborted result
+                # carries status 0, so it never enters that arm. Return
+                # WITHOUT purging and WITHOUT answering: both are the
+                # QUEUED cancel line's job, and deliberately NOT
+                # `_mrtr_abort`'s, which writes an error under N — exactly
+                # wrong for a cancel the client itself sent ("Not send a
+                # response for the cancelled request"). Purging here would
+                # additionally make the queued line's `_mrtr_handle_cancel`
+                # a no-op and strand the outstanding minted requests as
+                # dialogs nobody ever retires (required change 10). Falling
+                # through instead would take the `status_code != 200` arm
+                # below and answer the cancelled id with "HTTP 0".
+                log(f"MRTR retry for id {client_id!r} aborted by the client's cancel")
+                return
             if result is None:
                 # Transport retries exhausted. _post_and_stream already
                 # wrote the error under client_id — purge silently rather
@@ -6541,18 +7154,22 @@ def run(
         Without them the client keeps an elicitation dialog open for an
         answer nobody will ever collect.
 
-        Nothing is forwarded UPSTREAM, and there is nothing in flight there
-        to cancel: a retry POST is synchronous on this same thread, so by
-        the time a stdin line can be read it has already returned. Even if
-        it had not, ``notifications/cancelled`` is not the mechanism on
-        this transport — "Streamable HTTP: Closing the SSE response stream
-        is the cancellation signal. The server MUST treat a client
-        disconnect as cancellation of that request. No
-        notifications/cancelled message is required or expected." Closing a
-        POST mid-stream needs a second thread reading stdin, which
-        ``_ModernState``'s own note defers ("actually ABORTING an in-flight
-        POST when a cancel arrives would require a second thread reading
-        stdin concurrently with a blocking dispatch") — #270 Phase 2 PR D.
+        Nothing is forwarded UPSTREAM, ever. ``notifications/cancelled``
+        is not the mechanism on this transport — "Streamable HTTP:
+        Closing the SSE response stream is the cancellation signal. The
+        server MUST treat a client disconnect as cancellation of that
+        request. No notifications/cancelled message is required or
+        expected." — and a POSTed one may be legally rejected.
+
+        Since #270 Phase 2 PR D there CAN be an upstream POST in flight
+        when this runs, and it is already handled: the stdin reader
+        thread closed its published response the moment it read this very
+        line, BEFORE enqueuing it, so by the time the consumer gets here
+        the retry has returned as an aborted terminal and
+        ``_mrtr_run_retry`` has bowed out without purging or answering,
+        deliberately leaving both to this function. That is what keeps
+        the purge and the downstream minted cancels happening exactly
+        once, in order, on this thread.
         """
         hashable = _is_scalar_id(cancel_id)
         if hashable and cancel_id in mrtr_txns:
@@ -7059,8 +7676,20 @@ def run(
         )
         cold_timer.start()
 
+    # #270 Phase 2 PR D, §3.2 — the ONE line that switches input regimes,
+    # and the reason acceptance criterion #3 survives the handoff. On the
+    # legacy era `stdin_source` IS `sys.stdin`, so the loop below is the
+    # literal synchronous `for line in sys.stdin:` it has always been: the
+    # same object, the same iteration protocol, zero threads and zero new
+    # calls per line. On the modern era it is the reader thread's queue
+    # drain instead. Duplicating the six-hundred-line loop body to keep
+    # the legacy STATEMENT byte-identical would trade a real guarantee for
+    # a cosmetic one and put the whole dispatch ladder in two places.
+    stdin_source: Iterable[str] = (
+        sys.stdin if stdin_lines is None else _iter_queued_stdin(stdin_lines)
+    )
     try:
-        for line in sys.stdin:
+        for line in stdin_source:
             line = line.strip()
             if not line:
                 continue
@@ -7180,6 +7809,17 @@ def run(
                             # on the loop's own frame, with the client's
                             # id — never through `_dispatch`, whose
                             # closure would use THIS line's minted id.
+                            #
+                            # #270 Phase 2 PR D: publish the in-flight cell
+                            # under the CLIENT's id for the whole retry
+                            # chain, for the same reason the id is passed
+                            # explicitly — a cancel names N, never this
+                            # line's minted id, and a `requestState`-only
+                            # chain must stay cancellable in the gaps
+                            # between its POSTs. Released by the per-line
+                            # `finally` below.
+                            if in_flight is not None:
+                                in_flight.publish(ready)
                             _mrtr_run_retry(ready)
                         continue
                     # The relay OWNS the "mcp-stdio/" id namespace on this
@@ -7324,6 +7964,21 @@ def run(
                     # body — no separate threading of the injected content
                     # through the recovery branches.
                     line = _inject_modern_meta(line, modern_state)
+                    # #270 Phase 2 PR D: this line has survived every
+                    # id-intake guard and is about to go upstream, so it
+                    # is now the one request a cancel may abort. Published
+                    # HERE — after the guards, not before — so a cancel can
+                    # never match an id the loop is about to reject, and
+                    # kept published across the WHOLE dispatch window
+                    # (initial POST, the 401/403/404 recovery ladder, and
+                    # the trailing `_mrtr_run_retry`) so no gap in that
+                    # window is deaf. Only an id a cancel can actually name
+                    # is publishable: a notification carries none, and a
+                    # non-scalar id can never match one
+                    # (`_extract_cancel_id` drops those on the reader
+                    # thread). Released by the per-line `finally` below.
+                    if in_flight is not None and req_has_id and _is_scalar_id(req_id):
+                        in_flight.publish(req_id)
 
                 req_headers = _prepare_headers(line)
 
@@ -7335,6 +7990,21 @@ def run(
                         # That is correct because `initialize` is not in
                         # PAGINATED_LIST_METHODS, so an initialize request can never
                         # take this branch — keep that invariant if the table grows.
+                        #
+                        # It is also not abortable (#270 Phase 2 PR D, owner
+                        # question 2, recorded as a KNOWN GAP rather than
+                        # implemented). Continuations go through
+                        # `_post_parsed`, a sibling that buffers instead of
+                        # streaming and publishes no response handle, so
+                        # wiring the abort here would mean new machinery
+                        # rather than the free ride the shared path gives
+                        # every other request. The consequence is benign and
+                        # bounded: a cancel for a paginating id sets the
+                        # abort event, finds no handle to close, and the
+                        # merged list still goes out — exactly the pre-PR-D
+                        # behaviour — after which the per-line `finally`
+                        # clears the cell. These are list methods; they are
+                        # rarely the long calls a user reaches for escape on.
                         return _paginate_and_stream(
                             client,
                             url,
@@ -7418,6 +8088,24 @@ def run(
                             if mrtr_eligible
                             else None
                         ),
+                        # #270 Phase 2 PR D. Both None unless this line was
+                        # published above — i.e. never on the legacy era,
+                        # never for a notification — which is what keeps
+                        # `_post_and_stream` byte-identical there (AC #3).
+                        # Looked up rather than closed over: the SAME
+                        # `_dispatch` is re-invoked by each recovery branch,
+                        # and every attempt must publish its own handle
+                        # under the one cell the reader watches.
+                        abort=(
+                            in_flight.abort_event_for(req_id)
+                            if in_flight is not None
+                            else None
+                        ),
+                        publish_response=(
+                            in_flight.publish_response
+                            if in_flight is not None
+                            else None
+                        ),
                     )
                     if result is not None and result.protocol_version:
                         if result.protocol_version != protocol_version:
@@ -7438,6 +8126,17 @@ def run(
                     # if the session truly expired. Clearing it here would instead
                     # defeat that recovery on a mere blip (the next 404 could not
                     # fire its recovery branch, which is gated on session_id).
+                    continue
+                if result.aborted:
+                    # #270 Phase 2 PR D, required change 2: a DELIBERATE
+                    # abort, not a failure. Short-circuited FIRST, before
+                    # the session adoption, the whole 401/403/404 recovery
+                    # ladder and the trailing `_mrtr_run_retry` — each of
+                    # which would otherwise re-POST or answer a request the
+                    # client has withdrawn. Nothing is written: the
+                    # cancellation spec's receiver SHOULD is "Not send a
+                    # response for the cancelled request". Always False on
+                    # the legacy era, where `abort` is never passed.
                     continue
 
                 # Adopt a server-rotated session id from THIS response before the
@@ -7522,6 +8221,11 @@ def run(
                             # never a 4xx). Keep session_id — see the top-level None
                             # handling: a transient blip must not defeat 404 recovery.
                             continue
+                        if result.aborted:
+                            # PR D: a cancel that landed during the token
+                            # refresh window. Same rule as the top-level
+                            # arm — stop, write nothing.
+                            continue
                         # Re-adopt a session id the server rotated alongside this 401
                         # retry's response, so a chained 403 step-up below rebuilds
                         # its retry headers from the fresh id, not the stale one.
@@ -7584,6 +8288,9 @@ def run(
                                 # is never a 4xx). Keep session_id — see the top-level
                                 # None handling.
                                 continue
+                            if result.aborted:
+                                # PR D: cancelled during the step-up window.
+                                continue
                             # Re-adopt a session id rotated alongside this step-up
                             # retry's response. Gate it like the 401 branch: adopt only on SUCCESS. After the step-up the
                             # only downstream branch is 404, which reinitializes from
@@ -7632,6 +8339,8 @@ def run(
                     req_headers = _prepare_headers(line)
                     result = _dispatch(line, req_headers)
                     if result is None:
+                        continue
+                    if result.aborted:  # PR D — see the top-level arm.
                         continue
 
                 # Fall-through error for any unhandled 4xx/5xx so the MCP client
@@ -7707,6 +8416,18 @@ def run(
                         # stderr log above already recorded it.
                         pass
                 continue
+            finally:
+                # #270 Phase 2 PR D, required change 8 — the un-publish
+                # half, on the ONE construct that covers every exit from a
+                # stdin line: the dozen `continue`s above, the normal fall
+                # off the end, and the never-crash net's own `continue`.
+                # An abort arriving after this point finds an unpublished
+                # cell and does nothing, which is precisely the guarantee
+                # that a late cancel for request N can never close request
+                # N+1's stream. Idempotent, and a no-op when this line
+                # published nothing.
+                if in_flight is not None:
+                    in_flight.clear()
     finally:
         _stop_proactive_refresh(refresh_timer, refresh_stop)
         # Modern listen thread teardown (C11 + #352 round-2 finding 2), in
@@ -7749,6 +8470,20 @@ def run(
         # process exit unblocked if it is still parked in the interactive flow.
         if cold_timer is not None:
             cold_timer.join(timeout=1.0)
+        # #270 Phase 2 PR D, §3.8. The stdin reader is the one thread here
+        # that CANNOT be woken: a read parked in the C-level `readline()`
+        # is not portably interruptible (the same Windows constraint that
+        # forced a blocking reader in the first place — a blocked
+        # `ReadFile` cannot be cancelled from Python), and there is no
+        # dedicated client to close out from under it the way the listen
+        # threads get. So the contract is `daemon=True` plus a TINY bounded
+        # join: it reaps a reader that already saw EOF and costs a tenth of
+        # a second at most for one that has not, after which process exit
+        # takes it. Reaching this point at all means the consumer already
+        # drained the queue to the sentinel or is unwinding on an
+        # exception, so nothing is lost by not waiting longer.
+        if stdin_reader is not None:
+            stdin_reader.join(timeout=0.1)
         client.close()
 
 

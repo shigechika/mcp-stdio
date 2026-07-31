@@ -32,7 +32,12 @@ Homepage = "https://github.com/shigechika/mcp-stdio"
 Issues = "https://github.com/shigechika/mcp-stdio/issues"
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-httpx>=0.35.0"]
+# pytest-timeout guards the #270 Phase 2 PR D cancellation tests. run()
+# installs signal handlers, so those tests must drive it from the MAIN
+# thread — a regression that reinstates the pre-PR-D deafness therefore
+# hangs the suite with no escape, and the timeout is what turns that into
+# a loud failure instead of a stalled CI job.
+dev = ["pytest>=8.0", "pytest-httpx>=0.35.0", "pytest-timeout>=2.3"]
 
 [tool.hatch.version]
 path = "src/mcp_stdio/__init__.py"
