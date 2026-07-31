@@ -101,6 +101,18 @@ def _handle_tools_call(req_id, params: dict) -> None:
         _result(req_id, _text_content({"echoed": arguments, "pid": os.getpid()}))
         return
     if name == "slow":
+        # `started_marker` makes "the slow call is now in flight" an
+        # OBSERVED event rather than a timing assumption (conftest rules 1
+        # and 4). Without it a test racing to send the colliding request
+        # can register the shared JSON-RPC id FIRST, in which case the slow
+        # request is the one that gets rejected and nothing is ever left in
+        # flight — the collision under test never happens. The file is
+        # created before the sleep, so a caller that polls for it is
+        # guaranteed to be inside the window.
+        marker = arguments.get("started_marker")
+        if marker:
+            with open(marker, "w", encoding="utf-8") as handle:
+                handle.write("started")
         # The ONLY wait in this file, and the caller owns its length: it
         # exists so a test can keep one request in flight while it sends a
         # second one under the same JSON-RPC id (serve's 409 path).
