@@ -13315,6 +13315,52 @@ class TestRunModernEra:
         err = capsys.readouterr().err
         assert f"{_LISTEN_MAX_SUBSCRIPTIONS}-subscription cap" in err
 
+    def test_subscribe_cap_refusal_is_logged_exactly_once(
+        self, httpx_mock, capsys, monkeypatch
+    ):
+        """REVERT-CHECK for the #367 once-latch: the cap refusal is logged
+        ONCE per session, as `_LISTEN_MAX_SUBSCRIPTIONS`' own comment has
+        always promised ("logged once") — the log had no latch until #367.
+
+        Global rather than per-URI on purpose: a per-URI latch would let a
+        client spam stderr with distinct over-cap URIs, which is exactly
+        the unbounded state the cap exists to refuse. Reverting the latch
+        (dropping the `refusal_logged` check) makes this fail with 2
+        refusal lines instead of 1, while every other assertion below —
+        both over-cap requests still answered `{}`, the under-cap
+        subscriptions untouched — keeps passing, so the test fails ONLY on
+        the behavior it pins.
+        """
+        monkeypatch.setattr("mcp_stdio.relay._LISTEN_MAX_SUBSCRIPTIONS", 2)
+        self._register_listen_stream(httpx_mock)
+        self._register_discover_with_resources(httpx_mock)
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._init_line(),
+                self._initialized_line(),
+                self._subscribe_line(10, "file:///a"),
+                self._subscribe_line(11, "file:///b"),
+                # Both over the cap of 2, with DISTINCT URIs — the spam
+                # shape a per-URI latch would not stop.
+                self._subscribe_line(12, "file:///over1"),
+                self._subscribe_line(13, "file:///over2"),
+            ],
+            protocol_era="modern",
+        )
+        lines = [json.loads(line) for line in output.strip().split("\n") if line]
+        # Reply-then-degrade (base change 7) is unchanged: the two
+        # over-cap subscribes are still answered `{}`, like the two that
+        # fit.
+        assert [line.get("id") for line in lines] == [1, 10, 11, 12, 13]
+        assert all(line["result"] == {} for line in lines[1:])
+        err = capsys.readouterr().err
+        assert err.count("-subscription cap") == 1
+        # The ONE line names the FIRST refused URI (whichever it is, the
+        # latch must not suppress the very first one).
+        assert "file:///over1" in err
+        assert "file:///over2" not in err
+
     def test_resource_stream_posts_current_uris_under_its_own_id_prefix(
         self, httpx_mock
     ):
@@ -18728,6 +18774,67 @@ class TestResourceListenStreamLoop:
             "resourceSubscriptions": ["file:///a", "file:///b"]
         }
         assert stop.waits == []  # no reconnect backoff was ever taken
+
+    # The third registration is only ever REQUESTED by the reverted build
+    # (see the test below), so the mocked-but-unused check has to come off
+    # for this one test — otherwise the fixed build fails on pytest_httpx
+    # bookkeeping instead of passing, and the revert-check would be
+    # discriminating on the wrong thing entirely.
+    @pytest.mark.httpx_mock(assert_all_responses_were_requested=False)
+    def test_a_reopen_still_consumes_the_pending_restart(self, httpx_mock):
+        """REVERT-CHECK for the #367 operand swap at the reopen arm:
+        `_consume_restart(stop, restart) or reopen`, not `reopen or ...`.
+
+        `or` keeps both operands either way, so the reopen DECISION is
+        identical — what changes is whether the restart event is still set
+        afterwards. With `reopen` on the left it short-circuits and the
+        event survives the attempt that consumed nothing; the next
+        attempt's unrelated `RuntimeError` (stop unset — the "nothing
+        legitimate produces this" case #352 R5F1 re-raises loudly) then
+        finds that stale event, mistakes it for a subscription change and
+        continues quietly, deferring a deliberate re-raise by an
+        iteration.
+
+        Attempt 1 acks with a stale generation (reopen=True) while a
+        restart is already pending; attempt 2 raises RuntimeError with
+        stop unset. Fixed: the restart was consumed at the end of attempt
+        1, so attempt 2 re-raises. Reverted: the restart survives, the
+        RuntimeError arm consumes it, and the loop quietly runs a third
+        attempt (registered below) that ends gracefully — no raise, test
+        fails.
+        """
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=self._sse(self._ack()),
+            headers={"content-type": "text/event-stream"},
+        )
+        # Not an httpx error: this is the plain RuntimeError httpx raises
+        # from a closed client, the exact shape the re-raise arm exists
+        # for.
+        httpx_mock.add_exception(RuntimeError("Cannot send a request"))
+        httpx_mock.add_response(
+            url=self.URL,
+            stream=self._sse(self._ack(), self._graceful(attempt=3)),
+            headers={"content-type": "text/event-stream"},
+        )
+        restart = threading.Event()
+        restart.set()
+        stop = _RecordingStop()
+        with pytest.raises(RuntimeError):
+            self._run_loop(
+                uris=[["file:///a"]],
+                # Attempt 1 is stale (0 != 1) and reopens; every later
+                # attempt snapshots the current generation, so nothing but
+                # the pending restart can drive a further reopen.
+                snapshot_gens=[0, 1],
+                live_generation=1,
+                stop=stop,
+                restart=restart,
+            )
+        # Exactly two attempts: the reverted build reaches three.
+        assert len(httpx_mock.get_requests()) == 2
+        assert not restart.is_set()
+        assert stop.waits == []  # no reconnect backoff on either arm
 
     def test_restart_on_a_dropped_attempt_reopens_even_before_establishment(
         self, httpx_mock, capsys

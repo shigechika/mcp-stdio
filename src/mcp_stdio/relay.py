@@ -4618,9 +4618,18 @@ class _ResourceSubscriptions:
     closed here: run()'s teardown owns that, and a closed client makes
     every later attempt raise). Closing a response the reader has already
     finished with is harmless; ``httpx`` makes it idempotent.
+
+    ``refusal_logged`` is the once-latch the ``_LISTEN_MAX_SUBSCRIPTIONS``
+    comment already promises ("logged once"), added by #367. GLOBAL, not
+    per-URI: a per-URI latch would let a hostile client spam the log with
+    distinct URIs, which is the very thing the cap exists to bound. It
+    needs no lock — the only reader/writer is the stdin thread's
+    ``_handle_resource_subscription`` (single writer, and the listen
+    thread never looks at it), unlike ``_uris``/``_response``, which are
+    genuinely shared.
     """
 
-    __slots__ = ("_lock", "_uris", "generation", "_response")
+    __slots__ = ("_lock", "_uris", "generation", "_response", "refusal_logged")
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -4628,6 +4637,8 @@ class _ResourceSubscriptions:
         # Read lock-free by the listen thread (GIL-atomic single read).
         self.generation = 0
         self._response: httpx.Response | None = None
+        # Stdin-thread-only (see the docstring): no lock, no publication.
+        self.refusal_logged = False
 
     def snapshot(self) -> tuple[frozenset[str], int]:
         with self._lock:
@@ -5195,7 +5206,23 @@ def _listen_stream_loop(
             # restart meant for the NEXT attempt at worst.
             if publish_response is not None:
                 publish_response(None)
-        if reopen or _consume_restart(stop, restart):
+        # `_consume_restart` FIRST, deliberately (#367, PR B sub-threshold
+        # advisory). `or` evaluates both arms for the reopen decision
+        # either way, but only the left one runs unconditionally — and
+        # this arm is the only place a restart set DURING a completed
+        # attempt gets consumed. With `reopen` on the left, a stale-filter
+        # reopen short-circuits and leaves the event SET, so an unrelated
+        # `RuntimeError` on the next attempt (stop unset — the "nothing
+        # legitimate produces this" case) finds a pending restart in the
+        # `except RuntimeError` arm above, takes it for a subscription
+        # change and continues quietly instead of re-raising as #352 R5F1
+        # intends. Consuming
+        # first costs nothing else: coalescing still holds (the next
+        # attempt's `body_provider` snapshot sees the newest URI set, and
+        # the ack-time generation check covers the race), and stop still
+        # wins (`_consume_restart` checks `stop` internally, and the
+        # `stop.is_set()` return below is unchanged).
+        if _consume_restart(stop, restart) or reopen:
             if stop.is_set():
                 return
             log(f"{label}: subscription filter changed; reopening")
@@ -7163,13 +7190,14 @@ def run(
 
         Since #270 Phase 2 PR D there CAN be an upstream POST in flight
         when this runs, and it is already handled: the stdin reader
-        thread closed its published response the moment it read this very
-        line, BEFORE enqueuing it, so by the time the consumer gets here
-        the retry has returned as an aborted terminal and
-        ``_mrtr_run_retry`` has bowed out without purging or answering,
-        deliberately leaving both to this function. That is what keeps
-        the purge and the downstream minted cancels happening exactly
-        once, in order, on this thread.
+        thread set the abort event before enqueuing this line (closing
+        the published response too when one was up — in the pre-headers
+        window there is nothing to close yet), so the retry terminates as
+        an aborted terminal — via the closed handle or the abort checks
+        before every terminal return (D2) — and ``_mrtr_run_retry`` has
+        bowed out without purging or answering, deliberately leaving both
+        to this function. That is what keeps the purge and the downstream
+        minted cancels happening exactly once, in order, on this thread.
         """
         hashable = _is_scalar_id(cancel_id)
         if hashable and cancel_id in mrtr_txns:
@@ -7622,11 +7650,17 @@ def run(
             return False
         if method == _SUBSCRIBE_METHOD:
             outcome = subscriptions.add(uri)
-            if outcome == "refused":
+            if outcome == "refused" and not subscriptions.refusal_logged:
+                # Once for the life of the session (#367), as the
+                # `_LISTEN_MAX_SUBSCRIPTIONS` comment already promised.
+                # Check-and-set unlocked: this runs on the stdin thread
+                # only. The `unhonored_logged` idiom, minus the per-URI
+                # set — see `_ResourceSubscriptions` for why global.
+                subscriptions.refusal_logged = True
                 log(
                     f"resources/subscribe: refusing {uri!r}; already at the "
                     f"{_LISTEN_MAX_SUBSCRIPTIONS}-subscription cap (existing "
-                    "subscriptions keep working)"
+                    "subscriptions keep working; logged once)"
                 )
         else:
             outcome = "added" if subscriptions.discard(uri) else "duplicate"

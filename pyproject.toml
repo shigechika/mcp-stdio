@@ -38,6 +38,21 @@ Issues = "https://github.com/shigechika/mcp-stdio/issues"
 # hangs the suite with no escape, and the timeout is what turns that into
 # a loud failure instead of a stalled CI job.
 dev = ["pytest>=8.0", "pytest-httpx>=0.35.0", "pytest-timeout>=2.3"]
+# Integration harness only (#367): the reference peer (python-sdk v2, the
+# first official implementation of spec rev 2026-07-28) and its ASGI
+# runner. NEVER a runtime dependency — [project].dependencies stays
+# httpx-only, and nothing under src/ imports either of these.
+#
+# A RANGE, not an exact pin: a 2.x minor that breaks the harness is itself
+# interop signal worth seeing, and the blast radius is bounded because the
+# integration workflow is advisory. Revisit only after >=2 spurious
+# breakages. uvicorn is declared even though `mcp` already depends on it —
+# tests_integration imports it directly, and declaring what you import
+# survives a future SDK that drops the transitive dep.
+integration = [
+    "mcp>=2.0,<3",
+    "uvicorn>=0.30",
+]
 
 [tool.hatch.version]
 path = "src/mcp_stdio/__init__.py"
