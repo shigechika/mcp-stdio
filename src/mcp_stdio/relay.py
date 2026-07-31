@@ -771,16 +771,18 @@ class _ModernState:
     is updated on every
     ``logging/setLevel`` line regardless of era (see ``_extract_log_level``).
 
-    A single plain object (no lock): ``run()``'s stdin loop dispatches one
-    line at a time, fully synchronously, on both eras — including the
-    modern path (Phase 1 implements the "don't forward
-    notifications/cancelled upstream" half of cancellation, AC #5's easy
-    half; actually ABORTING an in-flight POST when a cancel arrives would
-    require a second thread reading stdin concurrently with a blocking
-    dispatch, which is deliberately deferred: several
-    single-threaded-mutation invariants elsewhere in ``run()`` —
-    ``protocol_version``, the 401/403/404 recovery ladder — depend on "at
-    most one dispatch in flight" and would need re-auditing first).
+    A single plain object (no lock): ``run()``'s stdin loop DISPATCHES one
+    line at a time, fully synchronously, on both eras — and that is still
+    true on the modern path after #270 Phase 2 PR D added the stdin
+    handoff. What that PR moved to a second thread is READING stdin, not
+    dispatching from it: the reader enqueues every line unchanged and
+    acts out-of-band on exactly one thing, closing the published
+    in-flight response when a ``notifications/cancelled`` names it (the
+    cancellation signal on this transport — see ``_InFlightPost``). Every
+    single-writer invariant this note used to protect —
+    ``protocol_version``, the 401/403/404 recovery ladder, the MRTR
+    dicts, and this object — still has exactly one mutator, the consumer,
+    which is why the handoff needed no re-audit of them.
     """
 
     __slots__ = (
@@ -1518,9 +1520,10 @@ def _handle_modern_special_method(
     synthesized HERE and IMMEDIATELY — the legacy ``EmptyResult`` ``{}``,
     the exact shape 2025-06-18 defines for both methods (base change 3:
     reply-then-degrade). It is deliberately NOT held until the upstream
-    acknowledgement: the stdin loop is single-threaded, so waiting would
-    stall every other request behind a network round-trip, and the
-    subscription is best-effort by nature. A duplicate subscribe and an
+    acknowledgement: the stdin loop DISPATCHES one line at a time (the
+    #270 PR D handoff moved stdin READING to its own thread, not
+    dispatching), so waiting would stall every other request behind a
+    network round-trip, and the subscription is best-effort by nature. A duplicate subscribe and an
     unsubscribe for a URI that was never subscribed both answer ``{}``
     too — idempotent, because erroring would invent wire behavior the
     legacy methods never had (base change 7).
@@ -6012,10 +6015,12 @@ def run(
     are unaffected (their 2026 result shapes are additive-only — see
     ``_handle_modern_special_method``).
 
-    Not yet bridged (#270 Phase 2 PR D): cancelling an in-flight retry
-    POST upstream. On this transport the cancellation signal is closing
-    the response stream, which needs a second thread reading stdin
-    concurrently with a blocking dispatch — see ``_ModernState``'s note.
+    Cancelling an in-flight retry POST IS bridged (#270 Phase 2 PR D):
+    the stdin reader thread closes the published response, which is the
+    cancellation signal on this transport, and ``_mrtr_run_retry``
+    returns without purging or answering so the queued cancel line drives
+    the purge and the downstream minted cancels exactly once. Nothing is
+    translated upstream — see ``_mrtr_handle_cancel``.
 
     ``MCP_STDIO_MRTR_STRIP=1`` restores the pre-bridge advertisement
     filter, withdrawing the relay's invitation for MRTR from a compliant
@@ -6048,7 +6053,9 @@ def run(
         ),
     )
 
-    # ``run`` is otherwise single-threaded, but the proactive-refresh daemon
+    # ``run``'s own request handling is single-threaded (the modern era's
+    # stdin reader, #270 PR D, only enqueues — it never prepares or sends a
+    # request), but the proactive-refresh daemon
     # (when enabled) mutates ``headers`` concurrently. ``headers_lock`` serialises
     # every read/write of the shared ``headers`` object; ``refresh_lock`` serialises
     # the timer's refresh against the reactive 401 refresh so the two never race
@@ -6335,9 +6342,10 @@ def run(
     # (N), plus a flat index from every outstanding minted id back to
     # ``(N, key)``. Two maps rather than one scan: the stdin hot path looks
     # a response id up once, and the id it carries is the ONLY correlation
-    # the client sends back. Plain dicts, no lock — run()'s stdin loop is
-    # single-threaded on both eras (see ``_ModernState``'s note) and the
-    # listen thread never touches these.
+    # the client sends back. Plain dicts, no lock — run()'s stdin loop
+    # dispatches one line at a time on both eras (see ``_ModernState``'s
+    # note: #270 PR D's reader thread enqueues lines, it never indexes
+    # these maps) and the listen threads never touch them either.
     mrtr_txns: dict[Any, dict[str, Any]] = {}
     mrtr_minted: dict[Any, tuple[Any, str]] = {}
     # Monotonic transaction counter feeding the minted-id namespace. Never
@@ -7056,18 +7064,22 @@ def run(
         Without them the client keeps an elicitation dialog open for an
         answer nobody will ever collect.
 
-        Nothing is forwarded UPSTREAM, and there is nothing in flight there
-        to cancel: a retry POST is synchronous on this same thread, so by
-        the time a stdin line can be read it has already returned. Even if
-        it had not, ``notifications/cancelled`` is not the mechanism on
-        this transport — "Streamable HTTP: Closing the SSE response stream
-        is the cancellation signal. The server MUST treat a client
-        disconnect as cancellation of that request. No
-        notifications/cancelled message is required or expected." Closing a
-        POST mid-stream needs a second thread reading stdin, which
-        ``_ModernState``'s own note defers ("actually ABORTING an in-flight
-        POST when a cancel arrives would require a second thread reading
-        stdin concurrently with a blocking dispatch") — #270 Phase 2 PR D.
+        Nothing is forwarded UPSTREAM, ever. ``notifications/cancelled``
+        is not the mechanism on this transport — "Streamable HTTP:
+        Closing the SSE response stream is the cancellation signal. The
+        server MUST treat a client disconnect as cancellation of that
+        request. No notifications/cancelled message is required or
+        expected." — and a POSTed one may be legally rejected.
+
+        Since #270 Phase 2 PR D there CAN be an upstream POST in flight
+        when this runs, and it is already handled: the stdin reader
+        thread closed its published response the moment it read this very
+        line, BEFORE enqueuing it, so by the time the consumer gets here
+        the retry has returned as an aborted terminal and
+        ``_mrtr_run_retry`` has bowed out without purging or answering,
+        deliberately leaving both to this function. That is what keeps
+        the purge and the downstream minted cancels happening exactly
+        once, in order, on this thread.
         """
         hashable = _is_scalar_id(cancel_id)
         if hashable and cancel_id in mrtr_txns:
