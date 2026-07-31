@@ -2507,6 +2507,19 @@ def _post_and_stream(
     partial-delivery behavior of this function on both eras, unchanged by
     and pre-dating the bridge; ``_mrtr_run_retry`` merely purges afterwards
     so no THIRD response follows.)
+
+    A non-compliant server can also make a payload LOOK swallowed when
+    nothing is actually pending: a duplicate of an already-emitted terminal
+    answer hits the hook's per-POST latch and is dropped via ``return
+    None``, which reads to this function exactly like a swallow (#356
+    review R5F1). That would wrongly route an interrupt AFTER such a
+    duplicate through ``input_required_abort`` even though the transaction
+    already has its answer. It stays safe because
+    ``_make_input_required_hook`` purges the transaction at the moment it
+    computes the terminal answer — BEFORE any duplicate or interrupt in the
+    same stream can reach here — so ``input_required_abort``'s membership
+    check (R1F1) finds nothing registered and no-ops instead of writing a
+    second response.
     """
     last_error: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -5622,8 +5635,12 @@ def run(
             log(f"MRTR retry {txn['rounds']} for id {client_id!r} as {retry_id!r}")
             result = _mrtr_post_retry(client_id, txn, retry_id, retry_line)
             if mrtr_txns.get(client_id) is not txn:
-                # Aborted from inside the hook (an unbridgeable round);
-                # _mrtr_abort already answered the client.
+                # Either aborted from inside the hook (an unbridgeable
+                # round; _mrtr_abort already answered the client) or the
+                # hook already purged after emitting the terminal answer
+                # (#356 review R5F1, see _make_input_required_hook) — the
+                # common successful-retry case. Either way the transaction
+                # is already gone and already answered; nothing left to do.
                 return
             if (
                 result is not None
@@ -5689,10 +5706,14 @@ def run(
                 # A new round with real questions: the minted requests are
                 # on stdout and the transaction now waits for the client.
                 return
-            # Nothing left to ask: the final result was emitted under the
-            # client's id (re-keyed by the hook) or _post_and_stream
-            # synthesized an empty-response error for it. Either way this
-            # transaction is finished.
+            # Nothing left to ask: _post_and_stream synthesized an
+            # empty-response error for this id (the only way to reach here
+            # with the transaction still registered — a genuine terminal
+            # answer is purged by the hook itself at emit time, #356 review
+            # R5F1, which short-circuits out via the `is not txn` check
+            # above before this line is reached). Purge is otherwise a
+            # harmless no-op here, kept as the defensive fallback for that
+            # empty-response case.
             _mrtr_purge(client_id)
             return
 
@@ -5925,6 +5946,26 @@ def run(
         ``_mrtr_rekey``'s own id comparison, which short-circuits on the
         INITIAL POST (``upstream_id == client_id``) before ever looking at
         the payload — see ``_is_pure_response_for``.
+
+        PURGED AT EMIT (#356 review R5F1): the FIRST match that turns out to
+        be the terminal answer (``is_match`` true, ``result`` is ``None`` —
+        i.e. not another ``input_required``) purges ``client_id``'s
+        transaction right here, before the rekeyed payload is even
+        returned — not later, when ``_mrtr_run_retry`` notices after the
+        whole retry POST/stream has finished. Without this, a duplicate
+        terminal response arriving later in the SAME stream hits the
+        "already matched" branch above and is dropped via ``return None`` —
+        which ``_post_and_stream`` reads as a fresh swallow — and if the
+        stream then breaks, ``_make_input_required_abort``'s membership
+        check finds the transaction "still registered" (the late purge
+        hasn't run yet) and answers a SECOND time under ``client_id``: an
+        error, after the valid result was already emitted under that same
+        id. Purging here closes that window: by the time the duplicate or a
+        subsequent transport error is processed, the transaction is already
+        gone, so the abort callback correctly no-ops. Never fires for a
+        round-opening match (the ``result is not None`` branch below,
+        returns early) — only for the one payload that actually finishes
+        the transaction.
         """
         matched = False
 
@@ -5945,6 +5986,13 @@ def run(
             if result is not None:
                 _mrtr_open_round(client_id, stored_line, result)
                 return None
+            if is_match:
+                # #356 review R5F1: this payload is the terminal answer —
+                # purge NOW, at emit time, so a later duplicate or transport
+                # error in this same stream sees an already-finished
+                # transaction instead of one that only looks abandoned to
+                # `_post_and_stream` but is still registered in `mrtr_txns`.
+                _mrtr_purge(client_id)
             return _mrtr_rekey(payload, upstream_id, client_id)
 
         return hook

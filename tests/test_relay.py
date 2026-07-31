@@ -14323,6 +14323,108 @@ class TestRunModernMrtrBridge:
         assert len(answers) == 1
         assert "never declared" in answers[0]["error"]["message"]
 
+    def test_duplicate_of_the_final_retry_answer_then_interrupt_answers_once(
+        self, httpx_mock
+    ):
+        """#356 review R5F1. The RETRY stream delivers its valid final
+        answer, then a non-compliant duplicate under the SAME retry id
+        (dropped by the per-POST latch, #356 deep-review finding
+        minted-orphan), and only THEN does the connection drop. Pre-fix,
+        the latch's `return None` for that duplicate read to
+        `_post_and_stream` as a fresh swallow even though nothing was left
+        pending — the transaction already had its answer — so the interrupt
+        ran through `_make_input_required_abort` (R1F1) and found the
+        transaction "still registered" (it was only purged later, in
+        `_mrtr_run_retry`, after this whole POST returned), writing a
+        SECOND response — an error — under id 2 after the valid result. The
+        fix purges the transaction the moment the hook computes the
+        terminal answer, so the duplicate and the interrupt both find
+        nothing left to abort. Reusing id 2 for a fresh call right after
+        proves the transaction really is gone, not just quiet."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        self._register_json(
+            httpx_mock, self._input_required(2, {"who": self._elicit()})
+        )
+
+        def gen():
+            final = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "mcp-stdio/mrtr-retry/1/1",
+                    "result": {"content": [{"type": "text", "text": "hi octocat"}]},
+                }
+            )
+            duplicate = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "mcp-stdio/mrtr-retry/1/1",
+                    "result": {
+                        "content": [{"type": "text", "text": "hi octocat again"}]
+                    },
+                }
+            )
+            yield f"event: message\ndata: {final}\n\n".encode()
+            yield f"event: message\ndata: {duplicate}\n\n".encode()
+            raise httpx.ReadError("connection dropped after the duplicate")
+
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            stream=IteratorStream(gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+        # id 2 is free again once the transaction is purged, so a fresh
+        # call under the SAME id must be accepted, not rejected as "still
+        # owns a pending MRTR transaction".
+        self._register_json(
+            httpx_mock,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"content": [{"type": "text", "text": "second call"}]},
+            },
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [
+                self._initialize({"elicitation": {}}),
+                self._call(),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mcp-stdio/mrtr/1/who",
+                        "result": {"action": "accept", "content": {"name": "octocat"}},
+                    }
+                ),
+                self._call(req_id=2),
+            ],
+            protocol_era="modern",
+        )
+        lines = self._out(output)
+        # InitializeResult, the mint, the retry's valid answer, the reused
+        # call's answer. No error line anywhere.
+        assert len(lines) == 4
+        assert not [line for line in lines if "error" in line]
+        assert (
+            [line for line in lines if line.get("method") == "notifications/cancelled"]
+            == []
+        )
+        # The literal R5F1 claim, checked BEFORE the reuse tail is even
+        # possible (id 2 is only free to reuse once the transaction is
+        # purged): exactly one message under id 2 out of the R5F1 sequence
+        # alone — [0] init, [1] mint, [2] the retry's answer — and it is
+        # the valid result, never the dropped duplicate and never an error.
+        r5f1_answers = [line for line in lines[:3] if line.get("id") == 2]
+        assert len(r5f1_answers) == 1
+        assert "error" not in r5f1_answers[0]
+        assert r5f1_answers[0]["result"]["content"][0]["text"] == "hi octocat"
+        # And the transaction really is gone, not just quiet: id 2 was
+        # legitimately reused for a second call and got its own answer.
+        answers = [line for line in lines if line.get("id") == 2]
+        assert len(answers) == 2
+        assert answers[1]["result"]["content"][0]["text"] == "second call"
+
     def _register_status(self, httpx_mock, status_code):
         httpx_mock.add_response(
             url=self.URL,
