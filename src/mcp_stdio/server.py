@@ -316,10 +316,21 @@ def _validate_modern(handler: Any, kind: str, msg: dict[str, Any], req_id: Any) 
 
     body_version = meta.get(_META_PROTOCOL_VERSION)
 
-    # Rung 2a — header/body version agreement (O7, and this PR's AC4).
-    # ABSENCE IS A MISMATCH: the header is REQUIRED, and `None` never
-    # equals the body value, so the one comparison covers both faults.
-    if handler.headers.get("MCP-Protocol-Version") != body_version:
+    # Rung 2a — header/body version agreement (O7, and P3-A's AC4).
+    # ABSENCE IS A MISMATCH: the header is REQUIRED, so a missing one is a
+    # HeaderMismatch condition in its own right.
+    #
+    # The presence test is EXPLICIT rather than folded into the equality,
+    # and that is #270 P3-B commit 0 closing a P3-A advisory: `None !=
+    # None` is False, so an absent header paired with a body carrying
+    # `"protocolVersion": null` slipped rung 2a entirely and fell through
+    # to the "unreachable" rung 3, answering -32602 for what is plainly a
+    # header fault. python-sdk v2 guards it the same way, for the same
+    # stated reason (`mcp/shared/inbound.py`): "Presence is checked
+    # explicitly: a null body version would otherwise slip the equality
+    # check (None == None) and mask the absent header."
+    version_header = handler.headers.get("MCP-Protocol-Version")
+    if version_header is None or version_header != body_version:
         return _reject(
             "MCP-Protocol-Version header does not match the protocol version "
             "in the request body's _meta",

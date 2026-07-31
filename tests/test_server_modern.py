@@ -265,6 +265,22 @@ class TestMetaRung:
 
 
 class TestHeaderRungs:
+    def test_null_body_version_with_absent_header_is_a_mismatch(self, gateway):
+        """#270 P3-B commit 0 — a P3-A advisory, resolved.
+
+        `None != None` is False, so an absent header paired with
+        `"protocolVersion": null` used to slip rung 2a and fall through to
+        the "unreachable" rung 3, answering -32602 for what is plainly a
+        HEADER fault. The presence test is now explicit, matching
+        python-sdk v2's own guard and its stated reason. The body still
+        classifies MODERN — D5 keys on the KEY's presence, not its value —
+        so this reaches the ladder rather than being demoted to legacy.
+        """
+        body = _modern_body(meta=_meta(None))
+        _assert_rejected(
+            _post(gateway, body, _modern_headers(version=None)), HEADER_MISMATCH
+        )
+
     def test_version_header_missing_is_a_mismatch(self, gateway):
         """The header is REQUIRED, so absence and disagreement are one
         fault with one code — `None` never equals the body value."""
