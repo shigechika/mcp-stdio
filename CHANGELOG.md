@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.34.1](https://github.com/shigechika/mcp-stdio/compare/v0.34.0...v0.34.1) (2026-07-31)
+
+
+### Bug Fixes
+
+* **ci:** close the supplement bypass and size the ledger cap by measurement ([#363](https://github.com/shigechika/mcp-stdio/issues/363)) ([7feccf4](https://github.com/shigechika/mcp-stdio/commit/7feccf454724e9f1ebf3ec173a0845c98d78410f))
+
+## [0.34.0](https://github.com/shigechika/mcp-stdio/compare/v0.33.0...v0.34.0) (2026-07-31)
+
+
+### Features
+
+* intercept resources/subscribe with dedicated resource listen stream ([#270](https://github.com/shigechika/mcp-stdio/issues/270) Phase 2 PR B) ([#358](https://github.com/shigechika/mcp-stdio/issues/358)) ([8a0947b](https://github.com/shigechika/mcp-stdio/commit/8a0947b886288d44f9df544fe0634bb273c41d08))
+
+
+### Bug Fixes
+
+* **ci:** close five correctness gaps in the ai-review ledger machinery ([#360](https://github.com/shigechika/mcp-stdio/issues/360)) ([e7b9239](https://github.com/shigechika/mcp-stdio/commit/e7b9239d7d5c988a10c63110d637ccbb1d65f4f3))
+
 ## [0.33.0](https://github.com/shigechika/mcp-stdio/compare/v0.32.0...v0.33.0) (2026-07-31)
 
 
