@@ -129,10 +129,16 @@ def test_subscribe_publish_and_forward(harness_server, relay_factory):
     # The subscribe re-opens the resource listen stream, so the server may
     # not have the new filter yet. Publishing until the notification lands
     # keeps this deterministic without asserting on timing (rule 4).
+    received: list[dict] = []
+
     def _published_and_forwarded() -> bool:
         harness_server.publish_resource_updated()
         try:
-            client.expect_notification("notifications/resources/updated", timeout=0.5)
+            received.append(
+                client.expect_notification(
+                    "notifications/resources/updated", timeout=0.5
+                )
+            )
         except TimeoutError:
             return False
         return True
@@ -142,18 +148,16 @@ def test_subscribe_publish_and_forward(harness_server, relay_factory):
         timeout=15.0,
         what="a resources/updated notification forwarded downstream",
     )
+    # Assert on the notification that was actually matched, not on whatever
+    # a later drain happens to hold — a drain can legitimately come back
+    # empty, which would make these checks silently vacuous.
+    message = received[-1]
+    assert message["params"]["uri"] == RESOURCE_URI
     # The relay must NOT leak the subscription id `_meta` the SDK stamps on
     # every listen frame: a 2025-era client never saw one.
-    forwarded = [
-        m
-        for m in client.drain(0.3)
-        if m.get("method") == "notifications/resources/updated"
-    ]
-    for message in forwarded:
-        assert message["params"]["uri"] == RESOURCE_URI
-        assert "io.modelcontextprotocol/subscriptionId" not in message["params"].get(
-            "_meta", {}
-        )
+    assert "io.modelcontextprotocol/subscriptionId" not in message["params"].get(
+        "_meta", {}
+    )
 
 
 def test_listen_graceful_end_does_not_reconnect(dedicated_server, relay_factory):
@@ -197,6 +201,16 @@ def test_listen_graceful_end_does_not_reconnect(dedicated_server, relay_factory)
         timeout=10.0,
         what="the relay to recognize the graceful end",
     )
+
+    # Clear the decks BEFORE the quiescence check, or it is unsound. Two
+    # legitimate sources of an in-flight update survive the establishment
+    # probe: the probe publishes once per poll, so the iteration that
+    # succeeded may have left an earlier duplicate still travelling; and
+    # `ListenHandler.close()` explicitly "drains its buffered events" before
+    # sending the final frame, so a buffered publish is forwarded BY the
+    # graceful end itself. Neither says anything about a reconnect, which is
+    # the only thing the check below is about.
+    client.drain(0.5)
 
     # Bounded quiescence: a reconnect would produce a fresh ack and, with it,
     # a fresh forwarded update for the publish below. Neither may appear.
