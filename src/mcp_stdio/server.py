@@ -2961,14 +2961,17 @@ class _Handler(BaseHTTPRequestHandler):
         # A legacy body classifies legacy and nothing below runs — the
         # whole ladder is vacuous for it, which is how AC2 holds.
         #
-        # P3-A ships ZERO modern dispatch on purpose: a request that
-        # PASSES validation falls straight through into the untouched
-        # session-resolution path below, where a sessionless one earns
-        # today's 400 `-32000` exactly as before. P3-B replaces that
-        # fallthrough wholesale with stateless dispatch.
-        if _request_era(kind, msg) == "modern" and not _validate_modern(
-            self, kind, msg, req_id
-        ):
+        # A modern request is served STATELESSLY and never reaches the
+        # session code below — spec: "Servers MUST NOT rely on prior
+        # requests over the same connection to establish context." P3-A
+        # let a validated modern request fall through to the legacy
+        # session path; P3-B (#270) replaces that seam with dispatch,
+        # which is the single change that activates everything the
+        # preceding commits put in place.
+        if _request_era(kind, msg) == "modern":
+            if not _validate_modern(self, kind, msg, req_id):
+                return
+            self._dispatch_modern(kind, msg, req_id)
             return
 
         # --- session resolution (MCP Streamable HTTP session management) ---

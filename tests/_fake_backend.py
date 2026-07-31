@@ -140,6 +140,20 @@ def main() -> None:
             )
         elif method == "exit":
             sys.exit(0)
+        elif "id" in msg:
+            # #270 Phase 3 P3-B: any OTHER request gets method-not-found
+            # rather than silence. Once serve dispatches modern requests
+            # here, a silent child means the handler blocks for the full
+            # 120 s backend timeout — a hang indistinguishable from a
+            # gateway bug. (`noreply` above stays silent on purpose: that
+            # IS the timeout path, and it is opt-in by name.)
+            _send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": mid,
+                    "error": {"code": -32601, "message": f"method not found: {method}"},
+                }
+            )
         # any other notification: ignore
 
 

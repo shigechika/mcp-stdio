@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from ._legacy_child import INITIALIZE_RESULT, LEGACY_PROTOCOL_VERSION, TOOLS
 
 
@@ -85,3 +87,45 @@ def test_sandwich_surfaces_a_child_error_under_the_clients_own_id(
     req_id = client.send_request("tools/call", {"name": "nope", "arguments": {}})
     error = client.expect_error(req_id)
     assert error["code"] == -32602
+
+
+@pytest.mark.timeout(60)
+def test_auto_era_sandwich_classifies_our_serve_as_modern(serve_gateway, relay_factory):
+    """The other half of the sandwich, reserved by P3-0 and delivered here.
+
+    `--protocol-era auto` makes the RELAY probe our own serve with
+    `server/discover`. That closes the loop in a way neither side's own
+    tests can: the relay is strict in both directions, so serve's discover
+    has to satisfy a real consumer that was written independently of it.
+
+    Three independent checks ride on one flow:
+
+    1. the relay's era probe must classify serve as MODERN — it demands an
+       object result, so a malformed discover falls back to legacy and the
+       stderr below says so;
+    2. the relay's modern POSTs must pass serve's OWN P3-A ladder — both
+       gateways have to agree on `_meta`, `MCP-Protocol-Version`,
+       `Mcp-Method` and the `Mcp-Name` sentinel, and a disagreement is a
+       -32020 rather than a silent degradation;
+    3. the relay's cacheable-list merge FAILS CLOSED on a page with a
+       missing or malformed `ttlMs`/`cacheScope` (#350), so a successful
+       `tools/list` through it is independent evidence that serve stamped
+       the hints correctly — evidence the v2 client cannot give for the
+       auto-pagination path.
+    """
+    client = relay_factory(serve_gateway.port, protocol_era="auto")
+    client.initialize(protocol_version=LEGACY_PROTOCOL_VERSION)
+
+    listed = client.request("tools/list")
+    assert [tool["name"] for tool in listed["tools"]] == [t["name"] for t in TOOLS]
+
+    called = client.request(
+        "tools/call", {"name": "echo", "arguments": {"text": "auto era"}}
+    )
+    payload = json.loads(called["content"][0]["text"])
+    assert payload["echoed"] == {"text": "auto era"}
+
+    # The probe's verdict, from the relay's own log. Asserted because a
+    # legacy classification would still make every line above pass — serve
+    # is dual-era, so the legacy path answers too.
+    assert client.stderr.contains("protocol era: modern"), client.stderr.tail()

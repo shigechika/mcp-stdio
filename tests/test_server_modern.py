@@ -159,6 +159,30 @@ def _assert_rejected(resp: httpx.Response, code: int, req_id: object = 1) -> dic
     return body["error"]
 
 
+def _assert_reached_dispatch(resp: httpx.Response, req_id: object = 1) -> dict:
+    """The request PASSED the ladder and was answered by the modern path.
+
+    P3-A used the legacy sessionless `-32000` as this signal, because a
+    validated modern request fell through to the session code. P3-B's
+    seam flip replaced that fallthrough with dispatch, so the signal is
+    now "answered by the gateway or the child, and NOT by a ladder rung".
+
+    Still no `Mcp-Session-Id`: the modern branch never sets
+    `self._session_id`, so `_send_json`'s auto-echo has nothing to echo —
+    asserted on SUCCESSES here, not only on rejections.
+    """
+    # STATUS is the discriminator, not the error code: every ladder
+    # rejection is a 400, while a dispatched response is 200 (or 404 for
+    # an unimplemented method). The code cannot discriminate — a child's
+    # own "unknown tool" is legitimately -32602, the same code the ladder
+    # uses for a malformed `_meta`.
+    assert resp.status_code in (200, 404), (resp.status_code, resp.text)
+    body = resp.json()
+    assert body["id"] == req_id, body
+    assert "mcp-session-id" not in resp.headers, dict(resp.headers)
+    return body
+
+
 # --- the era predicate (D5) ----------------------------------------------
 
 
@@ -260,7 +284,7 @@ class TestMetaRung:
     def test_client_info_is_never_required(self, gateway):
         """`clientInfo` is SHOULD-only; its absence must not reject."""
         body = _modern_body(meta=_meta())
-        _assert_rejected(_post(gateway, body, _modern_headers()), LEGACY_ERROR)
+        _assert_reached_dispatch(_post(gateway, body, _modern_headers()))
 
 
 # --- rung 2: the header family (O7, O8) ----------------------------------
@@ -329,7 +353,7 @@ class TestHeaderRungs:
         body = _modern_body("tools/call", params={"name": name}, meta=_meta())
         headers = _modern_headers("tools/call", name=_encode_mcp_name(name))
         assert headers["Mcp-Name"].startswith("=?base64?")
-        _assert_rejected(_post(gateway, body, headers), LEGACY_ERROR)
+        _assert_reached_dispatch(_post(gateway, body, headers))
 
     def test_malformed_sentinel_is_a_mismatch_not_a_crash(self, gateway):
         """A corrupt header decodes to None, which never equals the body
@@ -391,13 +415,19 @@ class TestHeaderRungs:
             "resources/read", params={"uri": "file:///a.txt"}, meta=_meta()
         )
         ok = _modern_headers("resources/read", name="file:///a.txt")
-        _assert_rejected(_post(gateway, body, ok), LEGACY_ERROR)
+        # The fake child does not implement `resources/read`, so it
+        # answers -32601 and serve maps that to HTTP 404 per the spec's
+        # "MUST respond with 404 Not Found" — the same carve-out
+        # `subscriptions/listen` relies on until 3.5-D.
+        passed = _post(gateway, body, ok)
+        assert passed.status_code == 404
+        _assert_reached_dispatch(passed)
         bad = _modern_headers("resources/read", name="file:///b.txt")
         _assert_rejected(_post(gateway, body, bad), HEADER_MISMATCH)
 
     def test_non_name_bearing_method_needs_no_name_header(self, gateway):
         body = _modern_body("tools/list", meta=_meta())
-        _assert_rejected(_post(gateway, body, _modern_headers()), LEGACY_ERROR)
+        _assert_reached_dispatch(_post(gateway, body, _modern_headers()))
 
     def test_name_bearing_method_with_no_body_value_skips_the_check(self, gateway):
         """Deliberate hole, pinned so it reads as a decision.
@@ -408,9 +438,7 @@ class TestHeaderRungs:
         mismatch for a body problem would report the wrong fault.
         """
         body = _modern_body("tools/call", meta=_meta())
-        _assert_rejected(
-            _post(gateway, body, _modern_headers("tools/call")), LEGACY_ERROR
-        )
+        _assert_reached_dispatch(_post(gateway, body, _modern_headers("tools/call")))
 
     def test_unknown_mcp_param_headers_are_ignored(self, gateway):
         """Spec: an intermediary "MUST forward it and otherwise ignore
@@ -419,7 +447,7 @@ class TestHeaderRungs:
         headers = _modern_headers()
         headers["Mcp-Param-Foo"] = "anything"
         body = _modern_body(meta=_meta())
-        _assert_rejected(_post(gateway, body, headers), LEGACY_ERROR)
+        _assert_reached_dispatch(_post(gateway, body, headers))
 
     def test_duplicate_routing_header_is_rejected(self, gateway):
         """SDK step 0, spec-silent hardening (§4 Q3, adopted).
@@ -478,48 +506,146 @@ class TestVersionRung:
 # --- exemptions and the P3-A fallthrough ---------------------------------
 
 
-class TestNotificationExemptionAndFallthrough:
-    def test_modern_notification_is_not_laddered(self, gateway):
-        """O9 + the P3-0 pin: a notification carrying modern `_meta` but NO
-        headers at all is not rejected by the ladder.
+class TestModernDispatch:
+    """What a modern request gets now that the seam is flipped (P3-B)."""
 
-        python-sdk v2 400s every notification POST; serve deliberately
-        does not copy that (divergence ledger item i). Sessionless it
-        still gets today's 400 `-32000` from session resolution — which is
-        the point: the code proves the LEGACY path answered, not the
-        ladder.
+    def test_modern_notification_is_forwarded_and_acknowledged(self, gateway):
+        """202 with no body, sessionless — §4 Q4 adopted.
+
+        P3-A left modern notifications on the legacy fallthrough, where a
+        SESSIONLESS one earned a 400 because session resolution ran
+        first. They now take the modern branch like everything else:
+        forwarded to the pooled child, acknowledged 202. The v2 client
+        sends none in the discover flow (no `initialize` means no
+        `notifications/initialized`), so this is consistency rather than
+        liveness — but leaving modern-classified traffic on a legacy
+        session error would be a worse answer than 202.
+
+        Still no header rungs: a notification carries no headers here at
+        all, and the ladder is a full no-op for it (O9).
         """
         body = _modern_body(
             "notifications/initialized", meta=_meta(), notification=True
         )
         resp = _post(gateway, body)
-        assert resp.status_code == 400
-        assert resp.json()["error"]["code"] == LEGACY_ERROR
-
-    def test_modern_notification_on_a_session_is_still_accepted(self, gateway):
-        """The O9 evidence, and the pin `test_notification_post_needs_a_
-        session_first` in its integration form: 202, exactly as today."""
-        init = _post(gateway, {"jsonrpc": "2.0", "id": "i", "method": "initialize"})
-        sid = init.headers["mcp-session-id"]
-        body = _modern_body(
-            "notifications/initialized", meta=_meta(), notification=True
-        )
-        resp = _post(gateway, body, {"Mcp-Session-Id": sid})
         assert resp.status_code == 202
         assert resp.content == b""
+        assert "mcp-session-id" not in resp.headers
 
-    def test_fully_valid_modern_request_falls_through_to_the_legacy_401(self, gateway):
-        """P3-A ships ZERO modern dispatch (§3.1(b)).
+    def test_a_valid_modern_request_is_dispatched_statelessly(self, gateway):
+        """**AC1's unit-level core**: no initialize, no session, a result.
 
-        A request that passes every rung still lands in the untouched
-        session-resolution path, so it gets today's 400 `-32000`
-        "Mcp-Session-Id required". The code being the LEGACY one is the
-        assertion: it proves the ladder let it through rather than
-        answering it, and P3-B replaces this fallthrough wholesale.
+        This is the assertion P3-A could not make. Its version of this
+        test asserted the 400 `-32000` fallthrough and was labelled "P3-A
+        ships ZERO modern dispatch"; the flip is precisely what changes
+        it, so the diff here IS the deliverable.
+
+        Spec: "Servers MUST NOT rely on prior requests over the same
+        connection to establish context." Nothing preceded this request.
         """
-        body = _modern_body(meta=_meta())
-        error = _assert_rejected(_post(gateway, body, _modern_headers()), LEGACY_ERROR)
-        assert "Mcp-Session-Id" in error["message"]
+        body = _modern_body("tools/list", meta=_meta())
+        resp = _post(gateway, body, _modern_headers())
+        assert resp.status_code == 200
+        result = resp.json()["result"]
+        assert [t["name"] for t in result["tools"]] == ["echo_tool"]
+        # Stamped on the way out, asserted on the RAW wire.
+        assert result["resultType"] == "complete"
+        assert result["ttlMs"] == server._DEFAULT_CACHE_TTL_MS
+        assert result["cacheScope"] == "private"
+        assert result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "fake"
+        assert "mcp-session-id" not in resp.headers
+
+    def test_tools_call_round_trips_without_caching_hints(self, gateway):
+        body = _modern_body(
+            "tools/call",
+            params={"name": "echo_tool", "arguments": {"text": "hi"}},
+            meta=_meta(),
+        )
+        headers = _modern_headers("tools/call", name="echo_tool")
+        resp = _post(gateway, body, headers)
+        assert resp.status_code == 200
+        result = resp.json()["result"]
+        assert json.loads(result["content"][0]["text"]) == {"text": "hi"}
+        assert result["resultType"] == "complete"
+        # `CallToolResult` is not a CacheableResult — the v2 client's model
+        # has no such fields, so stamping them would invent wire data.
+        assert "ttlMs" not in result and "cacheScope" not in result
+
+    def test_discover_is_answered_by_serve_not_the_child(self, gateway):
+        """The child has never heard of `server/discover` and would answer
+        -32601; serve owns the answer, sourced from the handshake it
+        performed on the client's behalf."""
+        body = _modern_body("server/discover", meta=_meta())
+        resp = _post(gateway, body, _modern_headers("server/discover"))
+        assert resp.status_code == 200
+        result = resp.json()["result"]
+        # The two fields the v2 client REQUIRES. Missing either makes it
+        # silently fall back to `initialize` — discovery "succeeds" while
+        # the modern path never engages.
+        assert result["supportedVersions"] == ["2026-07-28"]
+        assert isinstance(result["capabilities"], dict)
+        assert result["resultType"] == "complete"
+        assert result["ttlMs"] == server._DEFAULT_CACHE_TTL_MS
+        assert result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "fake"
+
+    def test_a_legacy_session_id_on_a_modern_request_is_ignored(self, gateway):
+        """P3-A interim, closed. The header names a REAL session here, and
+        the modern request must still be served by the POOL — not by that
+        session's child — and must echo no session id back."""
+        init = _post(gateway, {"jsonrpc": "2.0", "id": "i", "method": "initialize"})
+        sid = init.headers["mcp-session-id"]
+        assert sid
+
+        body = _modern_body("tools/list", meta=_meta())
+        resp = _post(gateway, body, {**_modern_headers(), "Mcp-Session-Id": sid})
+        assert resp.status_code == 200
+        assert "mcp-session-id" not in resp.headers
+        assert resp.json()["result"]["resultType"] == "complete"
+
+    def test_a_client_id_in_serves_namespace_is_rejected(self, gateway):
+        """Closes by construction the gap relay's PR C closed by rule: an
+        id indistinguishable from serve's own bookkeeping is refused where
+        it ENTERS, not disambiguated at every later consumer."""
+        body = _modern_body("tools/list", req_id="mcp-stdio/serve/1", meta=_meta())
+        resp = _post(gateway, body, _modern_headers())
+        assert resp.status_code == 400
+        assert resp.json()["error"]["code"] == -32600
+        assert resp.json()["id"] == "mcp-stdio/serve/1"
+
+    def test_an_unimplemented_method_comes_back_404(self, gateway):
+        """Spec: an unimplemented method "MUST respond with 404 Not Found"
+        and -32601. Also the carve-out `subscriptions/listen` needs until
+        3.5-D — the client must not read it as a malformed 200."""
+        body = _modern_body("subscriptions/listen", meta=_meta())
+        resp = _post(gateway, body, _modern_headers("subscriptions/listen"))
+        assert resp.status_code == 404
+        assert resp.json()["error"]["code"] == -32601
+
+    def test_errors_from_the_child_are_never_stamped(self, gateway):
+        """Structural: `resultType` is a field OF `result`, and an error
+        response has no `result` member to carry it."""
+        body = _modern_body(
+            "tools/call", params={"name": "nope", "arguments": {}}, meta=_meta()
+        )
+        resp = _post(gateway, body, _modern_headers("tools/call", name="nope"))
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["error"]["code"] == -32602
+        assert "result" not in payload
+
+    def test_a_child_initiated_request_is_rejected_not_queued(self, gateway):
+        """The reject arm, end to end.
+
+        A gateway-owned child has no stream and no consumer, so a
+        child-initiated request would otherwise sit in `server_initiated`
+        forever while the child blocks on a reply. It is answered from the
+        reader thread instead — which also discharges O15, since nothing
+        of the kind ever reaches a stream because there is none.
+        """
+        body = _modern_body("ask_client", meta=_meta())
+        resp = _post(gateway, body, _modern_headers("ask_client"))
+        assert resp.status_code == 200
+        assert resp.json()["result"]["asked"] is True
 
 
 # --- the -32002 prohibition (O18) ----------------------------------------
