@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import json
 
-from ._legacy_child import LEGACY_PROTOCOL_VERSION, SERVER_NAME, TOOLS
+from ._legacy_child import INITIALIZE_RESULT, LEGACY_PROTOCOL_VERSION, TOOLS
 
 
 def test_full_sandwich_completes_a_tools_flow(serve_gateway, relay_factory):
@@ -50,14 +50,13 @@ def test_full_sandwich_completes_a_tools_flow(serve_gateway, relay_factory):
     client = relay_factory(serve_gateway.port, protocol_era="legacy")
 
     init = client.initialize(protocol_version=LEGACY_PROTOCOL_VERSION)
-    # The child's InitializeResult, not the relay's or serve's invention.
-    assert init["protocolVersion"] == LEGACY_PROTOCOL_VERSION
-    assert init["serverInfo"]["name"] == SERVER_NAME
+    # The child's InitializeResult in FULL, unaltered by either gateway —
+    # not the relay's or serve's invention, and not a spot check that
+    # would miss one rewritten field (#370 review R1F1).
+    assert init == INITIALIZE_RESULT
 
     listed = client.request("tools/list")
-    assert [tool["name"] for tool in listed["tools"]] == [
-        tool["name"] for tool in TOOLS
-    ]
+    assert listed["tools"] == TOOLS
     # The legacy face carries no modern stamping at any hop.
     assert "resultType" not in listed
     assert "ttlMs" not in listed and "cacheScope" not in listed

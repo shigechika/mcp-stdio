@@ -24,8 +24,13 @@ Assertion style, tuned for a zero-diff invariant:
   is precisely what P3-A ships, and it must move a test here);
 - wire-visible contract fields (`Mcp-Session-Id` presence and echo, the
   `id` correlation, `result` vs `error`);
-- NOT full response bodies — the child's payloads are our own fixture and
-  restating them here would pin the fixture, not the gateway.
+- where the claim is that a payload rides through VERBATIM, whole-object
+  equality against the child's own exported constant (`INITIALIZE_RESULT`,
+  `TOOLS`) — never a restatement of the payload here, and never a spot
+  check of two fields, which would stay green while serve rewrote a third
+  (#370 review R1F1). Comparing against the constant is what keeps
+  "verbatim" literal while still pinning the GATEWAY rather than the
+  fixture: the fixture is free to change, and both sides move together.
 """
 
 from __future__ import annotations
@@ -38,9 +43,9 @@ import threading
 import httpx
 
 from ._legacy_child import (
+    INITIALIZE_RESULT,
     LEGACY_PROTOCOL_VERSION,
     PUSH_NOTIFICATION,
-    SERVER_NAME,
     TOOLS,
 )
 from .conftest import QUIESCENCE_WINDOW, wait_until
@@ -96,14 +101,20 @@ def test_initialize_mints_a_session_and_returns_the_child_result(serve_gateway):
 
     body = resp.json()
     assert body["id"] == "init"
-    result = body["result"]
-    assert result["protocolVersion"] == LEGACY_PROTOCOL_VERSION
-    assert result["serverInfo"]["name"] == SERVER_NAME
-    # The legacy contract has no `resultType` and no caching hints. Both
-    # are what P3-B adds on the MODERN path only; their absence here is
-    # the AC2 assertion.
-    assert "resultType" not in result
-    assert "ttlMs" not in result and "cacheScope" not in result
+    # WHOLE-object equality against the child's own exported constant —
+    # not a few field checks, and not a restatement (#370 review R1F1).
+    # Spot-checking `protocolVersion` and `serverInfo.name` would stay
+    # green while serve rewrote `serverInfo.version` or the capabilities,
+    # which is precisely the drift AC2 exists to catch. Comparing against
+    # the constant keeps "verbatim" literal without duplicating the
+    # payload into the assertion.
+    assert body["result"] == INITIALIZE_RESULT
+    # Named explicitly as well, because these two absences are the AC2
+    # statement a reader is looking for: P3-B adds both on the MODERN
+    # path only, and the equality above would flag them in a diff that
+    # says far less about intent.
+    assert "resultType" not in body["result"]
+    assert "ttlMs" not in body["result"] and "cacheScope" not in body["result"]
 
     serve_gateway.delete(sid=sid)
 
@@ -125,9 +136,10 @@ def test_tools_list_and_call_round_trip_on_a_session(serve_gateway):
     assert listed.headers.get("mcp-session-id") == sid
     body = listed.json()
     assert body["id"] == 1
-    assert [tool["name"] for tool in body["result"]["tools"]] == [
-        tool["name"] for tool in TOOLS
-    ]
+    # Whole-list equality, same reasoning as the initialize pin: a
+    # name-only check would not notice serve rewriting a description or
+    # an inputSchema on its way through.
+    assert body["result"]["tools"] == TOOLS
     assert "resultType" not in body["result"]
     assert "ttlMs" not in body["result"]
 

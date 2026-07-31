@@ -43,6 +43,18 @@ LEGACY_PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "mcp-stdio-legacy-fake"
 SERVER_VERSION = "1.2.3"
 
+# The WHOLE `InitializeResult`, declared once and answered verbatim below.
+# Exported so a test can assert serve forwards it byte-for-byte by
+# comparing against this object rather than restating a few fields: a pin
+# that checks `protocolVersion` and `serverInfo.name` stays green while
+# serve rewrites `serverInfo.version` or the capabilities, which is
+# exactly the drift AC2 exists to catch (#370 review R1F1).
+INITIALIZE_RESULT: dict = {
+    "protocolVersion": LEGACY_PROTOCOL_VERSION,
+    "capabilities": {"tools": {"listChanged": False}},
+    "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+}
+
 # `tools/list`'s payload, declared once so the pin suite can import and
 # compare against it instead of restating it (a restatement drifts).
 TOOLS: list[dict] = [
@@ -142,14 +154,7 @@ def main() -> None:
         has_id = "id" in msg
 
         if method == "initialize" and has_id:
-            _result(
-                req_id,
-                {
-                    "protocolVersion": LEGACY_PROTOCOL_VERSION,
-                    "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                },
-            )
+            _result(req_id, INITIALIZE_RESULT)
         elif method == "tools/list" and has_id:
             _result(req_id, {"tools": TOOLS})
         elif method == "tools/call" and has_id:
