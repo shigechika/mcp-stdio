@@ -53,9 +53,13 @@ def test_initialize_tools_list_and_call(harness_server, relay_factory):
     the only way to find out short of reading its source: the relay's own
     tests can only assert that it SENT them.
 
-    `resultType` is the modern envelope field; the relay must strip it (and
-    the server's `_meta`) down to something a 2025-era client understands
-    without choking.
+    `resultType` is the modern envelope field, and the observed behaviour is
+    PASS-THROUGH, not translation: the relay interprets it only to spot
+    `input_required` (the MRTR branch, scenario 3) and otherwise forwards
+    the result verbatim, server `_meta` included. That is sound — MCP
+    results are open, so a 2025-era client ignores fields it does not know —
+    and it is pinned below because it is the kind of thing a future
+    "normalize the envelope" change would break silently.
     """
     client = relay_factory(harness_server.port)
     client.initialize()
@@ -69,6 +73,13 @@ def test_initialize_tools_list_and_call(harness_server, relay_factory):
     )
     assert result["content"][0]["text"] == "5"
     assert result["isError"] is False
+    assert result["structuredContent"] == {"result": 5}
+    # Pass-through, pinned (see the docstring): the modern envelope reaches
+    # the 2025-era client untouched, and the relay does not choke on it.
+    assert result["resultType"] == "complete"
+    assert result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == (
+        _reference_server.SERVER_NAME
+    )
 
 
 def test_mrtr_full_loop_under_the_original_id(harness_server, relay_factory):
