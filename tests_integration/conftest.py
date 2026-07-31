@@ -265,11 +265,11 @@ def harness_server(reference_peer_version):
     """
     from . import _reference_server
 
-    app = _reference_server.build_app()
+    app, extras = _reference_server.build_app()
     sock, port = free_port()
     server, thread = _serve(app, sock)
     try:
-        yield _reference_server.Harness(app=app, port=port, server=server)
+        yield _reference_server.Harness(app=app, port=port, server=server, **extras)
     finally:
         _shutdown(server, thread)
 
@@ -287,11 +287,11 @@ def dedicated_server(reference_peer_version):
     made: list[tuple] = []
 
     def _make():
-        app = _reference_server.build_app()
+        app, extras = _reference_server.build_app()
         sock, port = free_port()
         server, thread = _serve(app, sock)
         made.append((server, thread))
-        return _reference_server.Harness(app=app, port=port, server=server)
+        return _reference_server.Harness(app=app, port=port, server=server, **extras)
 
     try:
         yield _make
