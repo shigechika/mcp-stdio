@@ -373,8 +373,11 @@ def relay_factory() -> Iterator[Callable]:
 
     clients: list[StdioClient] = []
 
-    def _spawn(port: int, *, extra_args: list[str] | None = None) -> StdioClient:
-        proc = spawn_relay(port, extra_args=extra_args)
+    def _spawn(port: int, **kwargs) -> StdioClient:
+        # kwargs pass straight through to `spawn_relay` (`extra_args`,
+        # `protocol_era`, `path`) rather than being enumerated here, so a
+        # new relay flag needs one signature change, not two.
+        proc = spawn_relay(port, **kwargs)
         client = StdioClient(proc, stderr=_StderrDrain(proc.stderr))
         clients.append(client)
         return client
