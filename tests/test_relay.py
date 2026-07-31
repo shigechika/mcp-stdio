@@ -51,6 +51,7 @@ from mcp_stdio.relay import (
     _handle_rate_limit,
     _inject_modern_meta,
     _listen_stream_loop,
+    _log_unhonored_subscriptions,
     _is_initialize_request,
     _is_pure_response_for,
     _is_recognized_modern_error,
@@ -17134,6 +17135,59 @@ class TestHandleListenResourceUpdated:
         assert self._run(ack, state)[0] == "ack"
         assert state["honored_resources"] == [self.URI]
         assert "honored a subset" not in capsys.readouterr().err
+
+    def test_malformed_ack_echo_sanitizes_non_string_elements(self, capsys):
+        """#358 review R2F1: an ack echo containing a non-string element —
+        e.g. a nested list — used to be stored verbatim, and
+        `_log_unhonored_subscriptions`'s `set(honored)` then raised
+        `TypeError: unhashable type: 'list'`, killing the daemon thread (no
+        except arm in `_listen_stream_loop` catches a `TypeError`). The
+        store site now keeps only the `str` elements, order preserved, so a
+        broken/hostile server can only narrow what is treated as honored —
+        never crash the stream."""
+        ack = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/subscriptions/acknowledged",
+                "params": {
+                    "notifications": {
+                        "resourceSubscriptions": [["file:///a"], self.URI, 42]
+                    },
+                },
+            }
+        )
+        state = self._state()
+        assert self._run(ack, state)[0] == "ack"
+        # The consumer that used to crash on the raw, unsanitized list —
+        # exercised BEFORE the storage assertion below, so a revert of the
+        # sanitize surfaces here as the TypeError this fix prevents, not
+        # merely as a value mismatch on the next line.
+        attempt_params = {"notifications": {"resourceSubscriptions": [self.URI]}}
+        _log_unhonored_subscriptions(state, attempt_params, "resource listen stream")
+        assert capsys.readouterr().err == ""
+        assert state["honored_resources"] == [self.URI]
+
+    def test_malformed_ack_echo_non_list_reads_as_unsupported(self):
+        """A non-list echo — e.g. a server sending
+        `resourceSubscriptions: "file:///a.txt,other"` (a bare string
+        instead of an array) — must not let `uri in honored` fall back to
+        SUBSTRING matching against that string. It stores `None`, the same
+        "feature unsupported" reading an absent field gets, so the
+        forwarding gate correctly refuses to treat any URI as honored."""
+        ack = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/subscriptions/acknowledged",
+                "params": {
+                    "notifications": {"resourceSubscriptions": f"{self.URI},other"},
+                },
+            }
+        )
+        state = self._state()
+        assert self._run(ack, state)[0] == "ack"
+        assert state["honored_resources"] is None
+        # Would have substring-matched `self.URI` out of the raw string.
+        assert self._run(self._updated(), state)[1] == ""
 
     def test_list_changed_stream_still_logs_the_subset_divergence(self, capsys):
         ack = json.dumps(

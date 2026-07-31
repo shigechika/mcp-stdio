@@ -3851,14 +3851,40 @@ def _handle_listen_message(
             # ``notifications`` filter — the same nested path the REQUEST
             # uses (Design A9) — through the one shared reader, so what
             # was asked and what was honored cannot be read from
-            # different places. Recorded RAW: the absent
-            # field is recorded as None and read as "nothing honored"
-            # (feature unsupported) by the forwarding gate below, which is
-            # the defensive reading base change 5 mandates: the spec only
-            # defines type-level omission, so a per-URI narrowing is not
-            # something the relay may assume away. Overwritten by every
+            # different places. SANITIZED here, not stored raw (#358
+            # review R2F1): a malformed echo — e.g.
+            # ``resourceSubscriptions: [["file:///a"]]`` (a non-string
+            # element) — used to be stored verbatim, and
+            # ``_log_unhonored_subscriptions``'s ``set(honored)`` then
+            # raised ``TypeError: unhashable type: 'list'`` on the nested
+            # list, killing this daemon thread (none of
+            # ``_listen_stream_loop``'s except arms catches a
+            # ``TypeError``). ``_listen_resource_subscriptions`` itself
+            # still returns the field RAW — its docstring deliberately
+            # leaves defensive reading to the caller — so the sanitizing
+            # belongs HERE, the one place both consumers
+            # (``_log_unhonored_subscriptions``'s ``set(honored)`` and the
+            # forwarding gate's ``uri in honored_uris``) read from.
+            # Invariant enforced from here on: ``state["honored_resources"]``
+            # is always ``list[str] | None``. A list keeps only its
+            # ``str`` elements, order preserved (a malformed element
+            # narrows the honored set instead of poisoning the whole
+            # read); anything that is not a list — including a bare
+            # string, which would otherwise let ``uri in honored`` do
+            # substring matching instead of membership — stores ``None``
+            # and reads as "nothing honored" (feature unsupported) by the
+            # forwarding gate below, the defensive reading base change 5
+            # mandates: the spec only defines type-level omission, so a
+            # per-URI narrowing is not something the relay may assume
+            # away. A malformed echo must degrade exactly like an absent
+            # field, never crash the thread. Overwritten by every
             # reconnect's fresh ack, exactly like ``honored``.
-            state["honored_resources"] = _listen_resource_subscriptions(params)
+            raw_honored_resources = _listen_resource_subscriptions(params)
+            state["honored_resources"] = (
+                [uri for uri in raw_honored_resources if isinstance(uri, str)]
+                if isinstance(raw_honored_resources, list)
+                else None
+            )
         # The resource stream requests ONLY resourceSubscriptions (Design
         # A9), so its ack legitimately honors none of the three
         # list_changed booleans this compares against — not news worth a
