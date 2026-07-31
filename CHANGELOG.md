@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.36.0](https://github.com/shigechika/mcp-stdio/compare/v0.35.0...v0.36.0) (2026-07-31)
+
+
+### Features
+
+* integration harness against python-sdk v2.0.0 as the 2026-07-28 reference peer ([#367](https://github.com/shigechika/mcp-stdio/issues/367)) ([#368](https://github.com/shigechika/mcp-stdio/issues/368)) ([8838f23](https://github.com/shigechika/mcp-stdio/commit/8838f232ad4b44289619a826a557b51459b0e59c))
+
 ## [0.35.0](https://github.com/shigechika/mcp-stdio/compare/v0.34.1...v0.35.0) (2026-07-31)
 
 
