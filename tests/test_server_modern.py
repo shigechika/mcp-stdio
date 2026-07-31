@@ -36,6 +36,8 @@ import socket
 import sys
 import threading
 
+from unittest.mock import patch
+
 import httpx
 import pytest
 
@@ -576,3 +578,121 @@ def test_encoded_name_round_trips_through_the_real_decoder():
         assert server._decode_mcp_name(header) == value
     assert base64.b64decode("QUJ=", validate=True) == b"AB"
     assert server._decode_mcp_name("=?base64?QUJ=?=") is None
+
+
+# --- the modern backend pool (#270 Phase 3 P3-B) -------------------------
+
+
+class TestModernBackendPool:
+    """Gateway-owned children for the session-less modern path (D1)."""
+
+    def test_handshake_initializes_the_child_and_caches_the_result(self):
+        """The gateway performs the handshake the modern wire omits.
+
+        Two halves matter and both are asserted: the cached
+        `InitializeResult` (discover's only honest source for the child's
+        capabilities and identity), and the `notifications/initialized`
+        that follows it — easy to miss, because on the legacy path the
+        CLIENT sends it, and FastMCP children gate post-init requests on
+        it.
+        """
+        pool = server.ModernBackendPool(_BACKEND)
+        try:
+            backend, init_result = pool.get_or_create(None)
+            assert init_result["protocolVersion"] == "2025-06-18"
+            assert init_result["serverInfo"]["name"] == "fake"
+            # A second call reuses the same child rather than respawning.
+            again, cached = pool.get_or_create(None)
+            assert again is backend
+            assert cached is init_result
+            assert pool.count() == 1
+        finally:
+            pool.shutdown_all()
+
+    def test_children_are_keyed_per_principal(self):
+        """D1's authorization boundary: one child per principal.
+
+        Sharing a child across principals would leak child state across
+        that boundary, which is why per-principal keying was not deferred.
+        Proved by the child's own pid, not by counting.
+        """
+        pool = server.ModernBackendPool(_BACKEND)
+        try:
+            alice, _ = pool.get_or_create("alice")
+            bob, _ = pool.get_or_create("bob")
+            assert alice is not bob
+            assert pool.count() == 2
+        finally:
+            pool.shutdown_all()
+
+    def test_concurrent_first_requests_spawn_one_child(self):
+        """The latch: racing first requests must not double-spawn.
+
+        Spawning happens outside the lock — holding it across a process
+        spawn plus a handshake round-trip would serialise every unrelated
+        principal — so a placeholder entry is what a racing thread finds.
+        """
+        pool = server.ModernBackendPool(_BACKEND)
+        got: list = []
+        barrier = threading.Barrier(4)
+
+        def _race():
+            barrier.wait(timeout=10)
+            got.append(pool.get_or_create("shared")[0])
+
+        threads = [threading.Thread(target=_race) for _ in range(4)]
+        try:
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+            assert len(got) == 4
+            assert len({id(b) for b in got}) == 1, "the latch let a second child spawn"
+            assert pool.count() == 1
+        finally:
+            pool.shutdown_all()
+
+    def test_a_dead_child_is_dropped_and_respawned(self):
+        """Mirror of the legacy drop-then-reinit: death is not terminal."""
+        pool = server.ModernBackendPool(_BACKEND)
+        try:
+            first, _ = pool.get_or_create(None)
+            first.shutdown()
+            assert first.closed
+            second, _ = pool.get_or_create(None)
+            assert second is not first
+            assert not second.closed
+        finally:
+            pool.shutdown_all()
+
+    def test_at_cap_the_idlest_child_is_evicted(self):
+        """§4 Q3: evict, don't refuse.
+
+        A modern client is STATELESS, so an eviction costs it only the
+        warm-up of a child it never knew about — whereas a 503 fails a
+        request the gateway could have served. The legacy registry keeps
+        the opposite policy because an evicted SESSION strands a client
+        mid-conversation.
+        """
+        pool = server.ModernBackendPool(_BACKEND, max_children=2)
+        try:
+            pool.get_or_create("a")
+            pool.get_or_create("b")
+            assert pool.count() == 2
+            pool.get_or_create("c")
+            assert pool.count() == 2, "the cap did not hold"
+        finally:
+            pool.shutdown_all()
+
+    def test_a_child_that_never_answers_initialize_raises(self):
+        """A failed handshake leaves no entry behind to poison retries."""
+        pool = server.ModernBackendPool(
+            [sys.executable, "-c", "import sys; sys.stdin.read()"]
+        )
+        try:
+            with patch.object(server, "_BACKEND_RESPONSE_TIMEOUT_SECS", 1.0):
+                with pytest.raises(RuntimeError):
+                    pool.get_or_create(None)
+            assert pool.count() == 0
+        finally:
+            pool.shutdown_all()

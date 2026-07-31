@@ -383,6 +383,224 @@ def _validate_modern(handler: Any, kind: str, msg: dict[str, Any], req_id: Any) 
     return True
 
 
+# --- modern dispatch: gateway-owned children (#270 Phase 3 P3-B) ---
+
+# The id namespace serve mints into, mirroring relay's `_RELAY_ID_NAMESPACE`
+# precedent. Process-global and monotonic, so two concurrent modern clients
+# sharing one child can never collide on an id — which is also what makes
+# `_DuplicateInFlightId` and the same-payload piggyback unreachable on this
+# path. They stay, harmlessly, for the legacy one.
+_SERVE_ID_NAMESPACE = "mcp-stdio/serve/"
+
+# The revision the gateway speaks to its OWN pooled children. They are
+# ordinary legacy stdio servers — the modern wire stops at serve — so the
+# handshake is a 2025-06-18 one, which any unmodified child understands.
+_MODERN_CHILD_HANDSHAKE_VERSION = "2025-06-18"
+
+# Caching hints serve stamps on the six cacheable operations (§4 Q2).
+# `ttlMs` is operator-tunable via --cache-ttl-ms; the spec's only hard
+# constraint is ">= 0". `cacheScope` is hardcoded "private" and should
+# stay that way: "public" asserts the response contains no user-specific
+# data, which a gateway cannot know about an arbitrary child.
+_DEFAULT_CACHE_TTL_MS = 60000
+_CACHE_SCOPE = "private"
+
+# The six operations spec rev 2026-07-28 requires caching hints on.
+# `tools/call` is deliberately ABSENT — `CallToolResult` is not a
+# CacheableResult, and the v2 client's model has no ttlMs/cacheScope
+# fields at all, so stamping one would be inventing wire data.
+_CACHEABLE_METHODS = frozenset(
+    {
+        "server/discover",
+        "tools/list",
+        "prompts/list",
+        "resources/list",
+        "resources/templates/list",
+        "resources/read",
+    }
+)
+
+
+class ModernBackendPool:
+    """Gateway-owned backend children for the modern, session-less path.
+
+    #270 Phase 3 P3-B, decision D1. The modern wire has no sessions, so
+    there is no ``Mcp-Session-Id`` to key a child on — but a child still
+    has to exist, and it still needs the ``initialize`` handshake nobody
+    on the modern wire performs. This holder owns both.
+
+    KEYED ON THE AUTHENTICATED PRINCIPAL, verbatim as ``_authorized()``
+    already derived it. Not a convenience: sharing one child across
+    principals would leak child state across the authorization boundary,
+    which is why D1 refused to defer per-principal keying. Under no-auth
+    and under a static token the principal is a single constant, so those
+    collapse to one shared child — consistent with how session ownership
+    already treats them.
+
+    The handshake result is CACHED because discover needs it: the child's
+    ``capabilities`` and ``serverInfo`` are the only honest source for
+    what serve advertises, and re-asking per request would be a
+    round-trip for data that cannot change.
+
+    The gateway offers the child ``capabilities: {}`` — D4's valve. A
+    child never told the client can sample, elicit or list roots has no
+    reason to ask, so the reverse-MRTR bridge P3-B does not ship is never
+    needed by a well-behaved one; a misbehaving one meets the reject arm
+    instead of hanging the caller.
+
+    Spawning happens OUTSIDE the lock behind a per-principal latch, the
+    shape ``SessionRegistry.create`` already uses: two concurrent first
+    requests must not spawn two children, and holding the lock across a
+    process spawn plus a handshake round-trip would serialise every
+    unrelated principal behind it.
+    """
+
+    def __init__(self, command: list[str], *, max_children: int = 0) -> None:
+        if not command:
+            raise ValueError("backend command is empty")
+        self._command = command
+        self._lock = threading.Lock()
+        # principal -> entry. An entry is either READY (`backend` set) or
+        # PENDING (a placeholder another thread is filling, `event` unset).
+        # Both live in the same map so a racing thread finds the
+        # placeholder instead of starting a second spawn.
+        self._entries: dict[Any, dict[str, Any]] = {}
+        self._max_children = max_children
+        self._seq = 0
+
+    def _next_handshake_id(self) -> str:
+        with self._lock:
+            self._seq += 1
+            return f"{_SERVE_ID_NAMESPACE}init/{self._seq}"
+
+    def _evict_if_at_cap_locked(self) -> None:
+        """Make room by dropping the idlest child (§4 Q3).
+
+        Evicting beats refusing here in a way it does not for legacy
+        sessions, and the asymmetry is principled: a modern client is
+        STATELESS, so all an eviction costs it is the warm-up of a child
+        it never knew about, whereas a 503 fails a request the gateway
+        could have served. The legacy registry keeps the opposite policy
+        for the opposite reason — an evicted session strands a client
+        mid-conversation.
+        """
+        if self._max_children <= 0:
+            return
+        while len(self._entries) >= self._max_children:
+            key, entry = min(
+                self._entries.items(), key=lambda kv: kv[1].get("used", 0.0)
+            )
+            self._entries.pop(key, None)
+            backend = entry.get("backend")
+            if backend is not None:
+                log(f"modern pool at cap; evicting the idlest child for {key!r}")
+                threading.Thread(target=backend.shutdown, daemon=True).start()
+
+    def get_or_create(self, principal: Any) -> tuple[BackendProcess, dict[str, Any]]:
+        """The child for ``principal``, plus its cached InitializeResult.
+
+        Raises ``RuntimeError`` when the child cannot be spawned or does
+        not complete the handshake; the caller turns that into a JSON-RPC
+        error rather than letting it reach the never-crash net.
+        """
+        while True:
+            with self._lock:
+                entry = self._entries.get(principal)
+                if entry is None:
+                    self._evict_if_at_cap_locked()
+                    entry = {"event": threading.Event(), "backend": None, "error": None}
+                    self._entries[principal] = entry
+                    mine = True
+                else:
+                    mine = False
+                    backend = entry.get("backend")
+                    if backend is not None and not backend.closed:
+                        entry["used"] = time.monotonic()
+                        return backend, entry["init_result"]
+                    if backend is not None:
+                        # Child died. Drop it and loop to respawn — the
+                        # mirror of the legacy path's drop-then-reinit.
+                        self._entries.pop(principal, None)
+                        continue
+            if not mine:
+                # Another thread is spawning: wait for its outcome rather
+                # than racing it to a second child.
+                entry["event"].wait(_BACKEND_RESPONSE_TIMEOUT_SECS)
+                if entry.get("backend") is not None and entry.get("error") is None:
+                    with self._lock:
+                        if self._entries.get(principal) is entry:
+                            entry["used"] = time.monotonic()
+                            return entry["backend"], entry["init_result"]
+                    continue
+                raise RuntimeError(entry.get("error") or "backend handshake failed")
+            try:
+                backend, init_result = self._spawn_and_handshake()
+            except Exception as exc:  # noqa: BLE001 — surfaced to the caller
+                with self._lock:
+                    if self._entries.get(principal) is entry:
+                        self._entries.pop(principal, None)
+                entry["error"] = str(exc)
+                entry["event"].set()
+                raise RuntimeError(str(exc)) from exc
+            entry["backend"] = backend
+            entry["init_result"] = init_result
+            entry["used"] = time.monotonic()
+            entry["event"].set()
+            return backend, init_result
+
+    def _spawn_and_handshake(self) -> tuple[BackendProcess, dict[str, Any]]:
+        """Spawn a child and drive the handshake the modern wire omits."""
+        backend = BackendProcess(self._command, modern_owned=True)
+        try:
+            req_id = self._next_handshake_id()
+            line = backend.send_request(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": _MODERN_CHILD_HANDSHAKE_VERSION,
+                            # D4's valve: advertise NOTHING the child could
+                            # ask us to bridge back.
+                            "capabilities": {},
+                            "clientInfo": {"name": "mcp-stdio serve", "version": "0"},
+                        },
+                    }
+                ),
+                req_id,
+                _BACKEND_RESPONSE_TIMEOUT_SECS,
+            )
+            if line is None:
+                raise RuntimeError("backend did not answer initialize")
+            result = json.loads(line).get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError("backend returned no InitializeResult")
+            # MANDATORY, and easy to miss because the legacy path never
+            # needed it: on this path serve IS the client, and FastMCP
+            # children gate post-initialize requests on this notification.
+            backend.send_oneway(
+                json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            )
+            return backend, result
+        except Exception:
+            backend.shutdown()
+            raise
+
+    def shutdown_all(self) -> None:
+        with self._lock:
+            entries = list(self._entries.values())
+            self._entries.clear()
+        for entry in entries:
+            backend = entry.get("backend")
+            if backend is not None:
+                backend.shutdown()
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+
 class _DuplicateInFlightId(Exception):
     """A request reused a JSON-RPC id already in flight on the same session
     with a payload that DIFFERS from the one already outstanding.
@@ -426,10 +644,17 @@ class BackendProcess:
     ``server_initiated`` for the GET SSE stream to deliver.
     """
 
-    def __init__(self, command: list[str]) -> None:
+    def __init__(self, command: list[str], *, modern_owned: bool = False) -> None:
         if not command:
             raise ValueError("backend command is empty")
         self._command = command
+        # #270 Phase 3 P3-B: True for a child the MODERN pool owns. Such a
+        # child has no SSE stream and no client that could ever consume
+        # `server_initiated`, so the reader's else-arm must reject or drop
+        # instead of queueing forever. False keeps the legacy behavior
+        # byte-identical (AC2).
+        self._modern_owned = modern_owned
+        self._discarded = 0
         # text mode + line buffering so the reader thread sees one JSON-RPC
         # message per iteration. errors="replace" keeps a stray non-UTF-8 byte
         # from killing the reader (matching relay's never-crash posture).
@@ -2620,6 +2845,7 @@ def build_server(
     max_sessions: int = _DEFAULT_MAX_SESSIONS,
     idle_ttl: float = 0.0,
     max_sessions_per_owner: int = 0,
+    cache_ttl_ms: int = _DEFAULT_CACHE_TTL_MS,
 ) -> tuple[ThreadingHTTPServer, SessionRegistry]:
     """Construct the HTTP server and session registry without running the loop.
 
@@ -2641,19 +2867,32 @@ def build_server(
         idle_ttl=idle_ttl,
         max_sessions_per_owner=max_sessions_per_owner,
     )
+    # #270 Phase 3 P3-B. Constructed unconditionally but SPAWNS NOTHING
+    # until a modern request arrives, so a deployment that never sees one
+    # pays a dict and a lock. The per-principal cap reuses the session
+    # registry's per-owner value: the same operator knob answers the same
+    # question ("how many children may one principal hold?") on both eras.
+    modern_pool = ModernBackendPool(command, max_children=max_sessions_per_owner)
     handler = type(
         "_BoundHandler",
         (_Handler,),
         {
             "registry": registry,
+            "modern_pool": modern_pool,
             "mcp_path": mcp_path,
             "auth_token": auth_token,
             "oauth": oauth,
+            "cache_ttl_ms": cache_ttl_ms,
         },
     )
     httpd = ThreadingHTTPServer((host, port), handler)
     # Don't let the process hang on lingering SSE handler threads at shutdown.
     httpd.daemon_threads = True
+    # Attached rather than returned: the (httpd, registry) tuple is this
+    # function's published contract and `tests/test_server.py` unpacks it
+    # in a dozen places. Callers that need the pool — serve()'s teardown,
+    # and tests — reach it here.
+    httpd.modern_pool = modern_pool
     return httpd, registry
 
 
@@ -2668,6 +2907,7 @@ def serve(
     max_sessions: int = _DEFAULT_MAX_SESSIONS,
     idle_ttl: float = 0.0,
     max_sessions_per_owner: int = 0,
+    cache_ttl_ms: int = _DEFAULT_CACHE_TTL_MS,
 ) -> None:
     """Run the reverse gateway until interrupted.
 
@@ -2687,6 +2927,7 @@ def serve(
         max_sessions=max_sessions,
         idle_ttl=idle_ttl,
         max_sessions_per_owner=max_sessions_per_owner,
+        cache_ttl_ms=cache_ttl_ms,
     )
     registry.start_reaper()
 
@@ -2722,6 +2963,10 @@ def serve(
         httpd.serve_forever()
     finally:
         registry.shutdown_all()
+        # #270 Phase 3 P3-B: the modern pool's children are gateway-owned
+        # and belong to no session, so `registry.shutdown_all()` cannot
+        # see them. Without this they outlive the gateway.
+        httpd.modern_pool.shutdown_all()
         httpd.server_close()
 
 
@@ -2878,6 +3123,17 @@ def serve_main(argv: list[str]) -> None:
         ),
     )
     parser.add_argument(
+        "--cache-ttl-ms",
+        type=int,
+        default=_DEFAULT_CACHE_TTL_MS,
+        help=(
+            "ttlMs stamped on cacheable results served to a modern "
+            f"(2026-07-28) client (default: {_DEFAULT_CACHE_TTL_MS}; 0 "
+            "disables caching without violating the spec, which only "
+            "requires a value >= 0)"
+        ),
+    )
+    parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
         help="backend stdio MCP server command (after the options)",
@@ -2927,6 +3183,10 @@ def serve_main(argv: list[str]) -> None:
         parser.error("--trusted-user-header must be a valid header name")
     if args.access_token_ttl <= 0:
         parser.error("--access-token-ttl must be > 0")
+    if args.cache_ttl_ms < 0:
+        # The spec's only constraint on the value: "Servers MUST provide a
+        # ttlMs value that is >= 0."
+        parser.error("--cache-ttl-ms must be >= 0")
     if args.max_sessions < 1:
         parser.error("--max-sessions must be >= 1")
     if args.session_idle_ttl < 0 or not math.isfinite(args.session_idle_ttl):
@@ -3014,4 +3274,5 @@ def serve_main(argv: list[str]) -> None:
         max_sessions=args.max_sessions,
         idle_ttl=args.session_idle_ttl,
         max_sessions_per_owner=args.max_sessions_per_owner,
+        cache_ttl_ms=args.cache_ttl_ms,
     )
