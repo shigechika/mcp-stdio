@@ -203,6 +203,7 @@ mcp-stdio は可能な限りワイヤーレベルでこれらの問題を回避�
 | `MCP_OAUTH_CLIENT_ID` | 事前登録済み OAuth クライアント ID |
 | `MCP_OAUTH_REFRESH_LEEWAY` | トークン有効期限の何秒前にリフレッシュを開始するか（デフォルト: 60） |
 | `MCP_STDIO_SERVE_TOKEN` | Serve モード用の静的ベアラートークン |
+| `MCP_STDIO_MRTR_STRIP` | `1` を設定すると、modern era のリモートに対してクライアントの `sampling` / `elicitation` / `roots` ケーパビリティを広告しなくなり、multi round-trip requests（MRTR）パターンを使う「招待」を取り下げる。既定では MRTR をブリッジするため、これは緊急回避用。設定してもブリッジ自体は無効化されない（送ってきたサーバーには応答する） |
 | `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` | 標準プロキシ設定 |
 
 ---

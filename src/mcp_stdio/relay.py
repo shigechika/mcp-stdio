@@ -7,6 +7,7 @@ import copy
 import email.utils
 import json
 import math
+import os
 import re
 import signal
 import socket
@@ -417,29 +418,137 @@ _META_LOG_LEVEL = "io.modelcontextprotocol/logLevel"
 # reaches the legacy stdio client (see _strip_listen_subscription_id).
 _META_SUBSCRIPTION_ID = "io.modelcontextprotocol/subscriptionId"
 
-# Client capability keys whose MODERN semantics this Phase 1 relay cannot
-# bridge (#350 review round 10, finding 10-1). Spec rev 2026-07-28
-# (SEP-2322) REPLACED the server-initiated ``sampling``/``elicitation``/
-# ``roots`` round-trips these keys advertise with MRTR: a server needing
-# client input answers the request itself with an ``InputRequiredResult``
-# (``resultType: "input_required"``) that the client must satisfy by
-# re-issuing the request with ``inputResponses``. Translating that exchange
-# back into the legacy server-initiated requests a 2025-era stdio client
-# understands is #270's explicitly-phased Phase 2 work — so forwarding these
-# keys upstream in ``_meta``'s ``clientCapabilities`` would ADVERTISE flows
-# this relay cannot deliver: a modern server, told the client supports them,
-# may legitimately answer e.g. a ``tools/call`` with an MRTR result that
-# Phase 1 forwards verbatim to a client that cannot answer it (misread as an
-# oddly-shaped success, or a hang). Stripping the keys at CAPTURE time
-# (``_handle_modern_special_method``'s ``initialize`` interception) removes
-# the invitation at every downstream use in one place — per-request
-# ``_meta`` injection AND the reseed re-probe's advertised capabilities —
-# and makes the reseed's "client has real capabilities" condition naturally
-# correct for a client whose ONLY capabilities are un-bridgeable ones.
-# Every other key (notably ``experimental``, and any future additions) does
-# not map to an MRTR-replaced flow and passes through untouched. Remove
-# entries here only when Phase 2 actually bridges the corresponding flow.
+# Client capability keys spec rev 2026-07-28 (SEP-2322) REPLACED with MRTR:
+# a server needing ``sampling``/``elicitation``/``roots`` input no longer
+# initiates a request of its own, it answers the client's request with an
+# ``InputRequiredResult``. Phase 1 could not translate that exchange back
+# into the server-initiated requests a 2025-era stdio client understands, so
+# #350 review round 10 (finding 10-1) STRIPPED these keys before anything
+# was advertised upstream: advertising a flow the relay could not deliver
+# invited exactly the ``input_required`` results it could only forward
+# verbatim.
+#
+# #270 Phase 2 PR C bridges that exchange, so the strip is gone by default —
+# the relay now advertises what the client really declared and answers the
+# MRTR results that invitation legitimately produces. The set survives as
+# the KILL-SWITCH's filter (``MCP_STDIO_MRTR_STRIP``, see
+# ``_mrtr_strip_enabled``), which restores the round-10 behavior in one
+# environment variable if a real deployment needs the invitation withdrawn.
+# Every other key (notably ``experimental``, and any future additions) never
+# mapped to an MRTR-replaced flow and was always passed through untouched.
 _MRTR_REPLACED_CLIENT_CAPABILITIES = frozenset({"sampling", "elicitation", "roots"})
+
+# --- MRTR bridge (#270 Phase 2 PR C) ---------------------------------
+#
+# The multi round-trip requests pattern (spec rev 2026-07-28,
+# /basic/patterns/mrtr, SEP-2322) is how a modern server asks the client
+# for input: "Servers MUST send server-to-client requests (such as
+# roots/list, sampling/createMessage, or elicitation/create) using the
+# MRTR pattern. The previous pattern of server-initiated requests is no
+# longer supported. This is a breaking change." Instead of initiating a
+# request of its own, the server ANSWERS the client's request with an
+# InputRequiredResult, and the client re-issues the SAME request carrying
+# the answers in ``params.inputResponses``.
+#
+# A 2025-era stdio client understands only the previous pattern, so this
+# relay bridges the two: an ``input_required`` result is swallowed, its
+# ``inputRequests`` entries are minted as ordinary server-initiated
+# JSON-RPC requests on stdout, the client's responses are collected, and
+# the original request is re-POSTed with ``inputResponses``. The final
+# result is re-keyed to the client's original id and emitted. Everything
+# unbridgeable (an undeclared capability, ``mode: "url"``, a client error
+# on a minted id, a cap breach) funnels into ONE clean JSON-RPC error
+# under the client's id — never a verbatim ``input_required`` forwarded to
+# a client that would misread it as an oddly-shaped success (the Phase 1
+# residual this PR closes).
+_MRTR_RESULT_TYPE = "input_required"
+# The ONLY client requests a server may answer with an InputRequiredResult
+# ("Supported Requests": prompts/get, resources/read, tools/call, followed
+# by "Servers MUST NOT send InputRequiredResult responses on any other
+# client requests"). The bridge hooks exactly these three; every other
+# dispatch runs with no hook at all, so an ``input_required`` smuggled onto
+# e.g. ``tools/list`` keeps Phase 1's verbatim-forward behavior rather than
+# being silently swallowed by a path the spec says cannot produce it.
+# None of the three is in ``PAGINATED_LIST_METHODS``, so an MRTR-eligible
+# request never takes ``_dispatch``'s pagination branch (which buffers
+# through ``_post_parsed`` and has no hook) — keep that true if either
+# table grows.
+_MRTR_SUPPORTED_METHODS = frozenset({"tools/call", "resources/read", "prompts/get"})
+# The three request kinds an ``inputRequests`` entry may carry ("values are
+# request objects that MUST be one of ElicitRequest, CreateMessageRequest,
+# or ListRootsRequest"), mapped to the client capability key that legitimises
+# each one. Server requirement 7 is the gate: "Servers MUST NOT send an
+# inputRequests that the client has not declared support for in its
+# capabilities." The relay enforces the same rule from the client's side —
+# it will not mint a request the local client never declared, because that
+# client has no handler for it and would answer with -32601 (or nothing).
+# An entry naming any OTHER method is unbridgeable and aborts the whole
+# transaction.
+_MRTR_REQUEST_CAPABILITY = {
+    "elicitation/create": "elicitation",
+    "sampling/createMessage": "sampling",
+    "roots/list": "roots",
+}
+# The relay's RESERVED JSON-RPC id namespace. Every id the relay mints for
+# itself — the MRTR pair below, ``_LISTEN_ID_PREFIX`` (PR A, C10) — lives
+# under it, and on the modern era an incoming client REQUEST claiming a
+# string id in this namespace is REJECTED at intake (#356 review R2F1).
+# C10's original argument was that a collision needs a client that
+# "maliciously adopts the relay's prefix"; PR C made the consequence worse
+# than a curiosity — a client request whose own id is literally a minted id
+# routes its cancellation into ANOTHER transaction — so the namespace is now
+# owned rather than merely assumed. Everything derives from this one string
+# so the reservation and the minting cannot drift apart.
+_RELAY_ID_NAMESPACE = "mcp-stdio/"
+# Relay-minted MRTR id namespaces (design change 8; ``_LISTEN_ID_PREFIX``
+# C10 precedent). STRING ids, and `"1" == 1` is False in Python, so even a
+# numeric-looking suffix can never alias an int id. Two DISTINCT prefixes so
+# a server-chosen ``inputRequests`` key (arbitrary text) can never forge a
+# retry id: "<seq>/<key>" lives under the first, "<seq>/<round>" under the
+# second.
+_MRTR_ID_PREFIX = f"{_RELAY_ID_NAMESPACE}mrtr/"
+_MRTR_RETRY_ID_PREFIX = f"{_RELAY_ID_NAMESPACE}mrtr-retry/"
+# Round cap per transaction (design change 4). An InputRequiredResult that
+# carries ONLY ``requestState`` is legal ("Servers MUST include at least one
+# of inputRequests or requestState") and the client "MAY retry the original
+# request immediately" — so a hostile or looping server can drive the relay
+# through unbounded POSTs with zero client involvement. Cap the rounds and
+# fail the transaction to the client's id instead.
+_MRTR_MAX_ROUNDS = 32
+# Hard cap on pending transactions (design change 5). Deliberately NOT a TTL:
+# a transaction waits on a human at an elicitation dialog, so a TTL races the
+# user and — worse — would put a synthesized error AND a later real result on
+# the wire for one id, the two-responses-one-id hazard ``_SSE_PENDING_MAX``
+# documents. At the cap the NEW transaction fails with an error under its own
+# id (never-hang beats hang); the older, already-prompted ones survive.
+_MRTR_MAX_TXNS = 256
+# Kill-switch environment variable. Setting it restores the pre-PR-C
+# advertisement filter (``_MRTR_REPLACED_CLIENT_CAPABILITIES``), so a
+# COMPLIANT modern server is told the client cannot do sampling /
+# elicitation / roots and therefore has no standing invitation to send MRTR
+# at all ("Only use capabilities that were successfully negotiated" —
+# lifecycle spec). One variable, no arg-surface change.
+#
+# It does NOT disable the bridge: the minting legitimacy gate reads the
+# client's DECLARED capabilities, not the advertised ones, so a
+# NON-compliant server that sends ``input_required`` anyway is still
+# bridged rather than rejected. The local client genuinely declared those
+# flows, so answering serves the user better than failing — and this is
+# exactly the state PR C's own commits 2-5 ran and were tested in, while
+# the strip was still in place. A full off-switch would be a separate flag.
+_MRTR_STRIP_ENV = "MCP_STDIO_MRTR_STRIP"
+_MRTR_STRIP_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _mrtr_strip_enabled() -> bool:
+    """Whether the operator asked for the pre-PR-C capability strip back.
+
+    Read per ``initialize`` rather than cached at import: the cost is one
+    dict lookup on a once-per-session path, and it keeps the switch
+    observable in tests without module reloading.
+    """
+    return os.environ.get(_MRTR_STRIP_ENV, "").strip().lower() in _MRTR_STRIP_TRUTHY
+
 
 # MCP request metadata headers (spec rev 2026-07-28, "Request Metadata",
 # SEP-2243). Every Streamable HTTP POST on the modern path mirrors the
@@ -647,11 +756,18 @@ class _ModernState:
     ``negotiated_version`` are captured once from the local stdio client's
     own ``initialize`` request (see ``_handle_modern_special_method`` — the
     modern path never forwards that request upstream, so this is the only
-    place those values are ever seen). ``client_capabilities`` holds the
-    client's set MINUS the MRTR-replaced keys this Phase 1 relay cannot
-    bridge (``_MRTR_REPLACED_CLIENT_CAPABILITIES``, #350 review round 10,
-    finding 10-1) — every upstream advertisement reads this field, so the
-    filter applies once, here. ``log_level`` is updated on every
+    place those values are ever seen). ``client_capabilities`` is what the
+    relay ADVERTISES upstream — the client's own set, or that set minus
+    ``_MRTR_REPLACED_CLIENT_CAPABILITIES`` when the
+    ``MCP_STDIO_MRTR_STRIP`` kill-switch restores #350 round 10's filter —
+    and every upstream advertisement reads this one field, so the decision
+    is made once, at capture. ``client_capabilities_declared`` is what the
+    client actually DECLARED, always unfiltered (#270 PR C design change
+    2): the MRTR bridge may only mint a server-requested
+    elicitation/sampling/roots request when the local client said it can
+    answer that kind, and that question is about the client's real
+    abilities, not about what the relay chose to advertise. ``log_level``
+    is updated on every
     ``logging/setLevel`` line regardless of era (see ``_extract_log_level``).
 
     A single plain object (no lock): ``run()``'s stdin loop dispatches one
@@ -671,6 +787,7 @@ class _ModernState:
         "capabilities",
         "supported_versions",
         "client_capabilities",
+        "client_capabilities_declared",
         "client_info",
         "negotiated_version",
         "log_level",
@@ -682,6 +799,7 @@ class _ModernState:
         self.capabilities: dict[str, Any] = {}
         self.supported_versions: list[str] = []
         self.client_capabilities: dict[str, Any] | None = None
+        self.client_capabilities_declared: dict[str, Any] | None = None
         self.client_info: dict[str, Any] | None = None
         self.negotiated_version: str | None = None
         self.log_level: str | None = None
@@ -1315,16 +1433,17 @@ def _handle_modern_special_method(
       the real result payload, SEP-2322) — it substitutes for
       server-INITIATED sampling/elicitation/roots round-trips, so a
       COMPLIANT server only initiates it when the client's advertised
-      capabilities include those flows. Since round 10 (finding 10-1)
-      this relay never advertises them upstream — the capture above
-      strips ``_MRTR_REPLACED_CLIENT_CAPABILITIES`` — so a compliant
-      modern server has no standing invitation to send MRTR at all;
-      relaying/bridging it is explicitly Phase 2 (#270 "Phase 2 — MRTR
-      passthrough"). A NON-compliant server that sends
-      ``input_required`` unprovoked is still forwarded verbatim — a
-      KNOWN residual documented in run()'s "Limitation — MRTR" section,
-      not a consequence of which version this field echoes: it would be
-      forwarded verbatim no matter what the echo said.
+      capabilities include those flows. #350 review round 10 (finding
+      10-1) removed that invitation by stripping the keys here; #270
+      Phase 2 PR C instead BRIDGES the exchange — the capture below
+      advertises what the client really declared, and an
+      ``input_required`` result is translated back into the
+      server-initiated requests a 2025-era client understands (see
+      run()'s MRTR section). What survives is the strip as an operator
+      kill-switch (``MCP_STDIO_MRTR_STRIP``) and the clean-reject
+      fallback for shapes the bridge cannot carry — never a verbatim
+      forward of a result the client would misread, whatever this field
+      echoes.
 
       (3) Why not report ``negotiated_version`` (the reviewer-proposed
       alternative): lifecycle spec, Version Negotiation — "If the client
@@ -1402,24 +1521,52 @@ def _handle_modern_special_method(
         # Presence-based, like every other MCP capabilities object (see
         # _report_initialize's own note) — an absent/malformed capabilities
         # object becomes {} (present, empty), never omitted downstream.
-        # Un-bridgeable keys are stripped HERE, at the single capture site
-        # (#350 review round 10, finding 10-1): sampling/elicitation/roots
-        # map to the MRTR flows Phase 1 defers to Phase 2 (see
-        # _MRTR_REPLACED_CLIENT_CAPABILITIES), so advertising them upstream
-        # would invite exactly the input_required results this relay can
-        # only forward verbatim. Filtering at capture covers every
-        # downstream use at once — _inject_modern_meta's per-request _meta
-        # and the reseed re-probe — and the reseed condition below then
-        # correctly treats a client whose ONLY capabilities are
-        # un-bridgeable as having none to advertise. The SERVER capability
-        # set echoed in the synthesized result is untouched: this filter
-        # applies to what the relay claims the CLIENT can do, never to what
-        # the remote reported.
+        #
+        # THE UN-STRIP (#270 Phase 2 PR C, final commit). #350 review round
+        # 10 (finding 10-1) filtered sampling/elicitation/roots out here,
+        # because advertising a flow Phase 1 could not deliver invited
+        # exactly the ``input_required`` results it could only forward
+        # verbatim. PR C delivers the flow — the bridge mints those
+        # requests onto stdout and re-POSTs the original with
+        # ``inputResponses`` — so withholding the declaration now costs the
+        # user the feature for nothing: a COMPLIANT server may "only use
+        # capabilities that were successfully negotiated" (lifecycle spec),
+        # and one told the client cannot elicit will refuse rather than
+        # ask. Only keys the client ITSELF declared reach the wire, by
+        # construction — this is a copy of its own object, never a
+        # fabrication.
+        #
+        # ``MCP_STDIO_MRTR_STRIP`` puts the filter back for an operator who
+        # needs the invitation withdrawn (see ``_mrtr_strip_enabled``); the
+        # bridge itself keeps working for a non-compliant server, because
+        # the minting gate reads the DECLARED set below.
+        #
+        # The SERVER capability set echoed in the synthesized result is
+        # untouched either way: this is about what the relay claims the
+        # CLIENT can do, never about what the remote reported.
         caps = params.get("capabilities")
         caps = caps if isinstance(caps, dict) else {}
-        modern_state.client_capabilities = {
-            k: v for k, v in caps.items() if k not in _MRTR_REPLACED_CLIENT_CAPABILITIES
-        }
+        # The UNFILTERED declaration (#270 PR C design change 2). This is
+        # the ONLY observation point for what the local client can actually
+        # do — the modern path never forwards the initialize that carries
+        # it — and the MRTR bridge needs it to decide whether a
+        # server-requested elicitation / sampling / roots round-trip may
+        # legitimately be minted onto stdout: "Servers MUST NOT send an
+        # inputRequests that the client has not declared support for in its
+        # capabilities" (MRTR server requirement 7) is a rule the relay
+        # enforces from this side too. It stays distinct from the
+        # advertised set below because the kill-switch can still narrow
+        # that one.
+        modern_state.client_capabilities_declared = dict(caps)
+        modern_state.client_capabilities = (
+            {
+                k: v
+                for k, v in caps.items()
+                if k not in _MRTR_REPLACED_CLIENT_CAPABILITIES
+            }
+            if _mrtr_strip_enabled()
+            else dict(caps)
+        )
         client_info = params.get("clientInfo")
         modern_state.client_info = (
             client_info if isinstance(client_info, dict) else None
@@ -1436,11 +1583,15 @@ def _handle_modern_special_method(
         # capabilities is the ONE field that placeholder can plausibly
         # distort. A client that itself has no capabilities gets no
         # retry: the re-probe would carry the same ``{}`` the startup
-        # probe already sent and cannot change the outcome. That includes
-        # (round 10, finding 10-1) a client whose only capabilities were
-        # the MRTR-replaced keys stripped at capture above — after
-        # filtering it HAS nothing this relay may advertise, so the
-        # re-probe would again carry ``{}``. Latch the
+        # probe already sent and cannot change the outcome. The condition
+        # reads the ADVERTISED set (``client_capabilities``), which is
+        # what the re-probe would actually send — so it stays correct as
+        # that set's contents change: round 10's carve-out for "a client
+        # whose only capabilities are the MRTR-replaced keys" applied
+        # while they were stripped, and #270 PR C's un-strip retires it
+        # by making such a client have something real to advertise again.
+        # Under ``MCP_STDIO_MRTR_STRIP`` the round-10 reading returns,
+        # unchanged and for the same reason. Latch the
         # attempt BEFORE probing so neither a failed retry nor a
         # re-initialize can ever probe a second time (zero extra
         # round-trips on the common path: a non-empty capabilities seed
@@ -1546,10 +1697,13 @@ def _inject_modern_meta(line: str, modern_state: "_ModernState") -> str:
     clientInfo/serverInfo revision comment — capabilities uses presence-based
     semantics like every other MCP capabilities object, so an empty client
     capabilities set is sent as ``{}`` rather than omitted).
-    ``client_capabilities`` arrives here already stripped of the
-    MRTR-replaced keys Phase 1 cannot bridge — the filter lives at the
-    single capture site (``_handle_modern_special_method``, #350 review
-    round 10, finding 10-1), never re-applied per request.
+    ``client_capabilities`` arrives here exactly as it will go on the wire
+    — the client's own declaration since #270 Phase 2 PR C bridged the MRTR
+    flows, or that declaration minus the MRTR-replaced keys when the
+    ``MCP_STDIO_MRTR_STRIP`` kill-switch is set. Either way the decision
+    was made once, at the single capture site
+    (``_handle_modern_special_method``), and is never re-applied per
+    request.
     ``.../clientInfo`` is sent only when the LOCAL client's own ``initialize``
     actually provided one (SHOULD, never fabricated — see
     ``_handle_modern_special_method``). ``.../logLevel`` is sent only once
@@ -1734,14 +1888,26 @@ def _extract_cancel_id(line: str) -> Any:
     return rid
 
 
-def _error_response(message: str, req_id: Any = None, data: Any = None) -> str:
+def _error_response(
+    message: str, req_id: Any = None, data: Any = None, code: int = -32000
+) -> str:
     """Build a JSON-RPC error response.
 
     ``data`` is attached as the optional ``error.data`` member when not None
     (JSON-RPC 2.0 §5.1) — used to surface machine-readable hints such as a 429
     ``retryAfter`` alongside the human-readable message.
+
+    ``code`` defaults to -32000 (the implementation-defined server-error
+    range JSON-RPC 2.0 §5.1 reserves for exactly this kind of gateway-
+    synthesized failure), which every pre-existing caller relies on. The
+    MRTR bridge (#270 PR C, #356 review R2F1) overrides it with -32600
+    Invalid Request for the cases where the fault is in the MESSAGE rather
+    than in the relay's attempt to deliver it: an unbridgeable
+    ``input_required`` result, a client reusing an id that still has a
+    transaction pending, and a client request whose id intrudes on the
+    relay's reserved minted-id namespace.
     """
-    error: dict[str, Any] = {"code": -32000, "message": message}
+    error: dict[str, Any] = {"code": code, "message": message}
     if data is not None:
         error["data"] = data
     return json.dumps(
@@ -1920,6 +2086,151 @@ def _extract_response_id(line: str) -> Any:
     if _is_pure_response(msg) and _is_scalar_id(msg["id"]):
         return msg["id"]
     return None
+
+
+def _parse_client_response(line: str) -> dict[str, Any] | None:
+    """Return the parsed message when ``line`` is a pure JSON-RPC response.
+
+    The stdin-side counterpart of ``_extract_response_id``, sharing the same
+    ``_is_pure_response`` gate so the two can never drift: a line with an id
+    and ``result``/``error`` but no ``method`` is the client ANSWERING
+    something, not asking for anything.
+
+    Used only on the modern era (#270 PR C), where such a line is either a
+    response to a relay-minted MRTR request or a spec violation: rev
+    2026-07-28 states "Servers MUST send server-to-client requests (such as
+    roots/list, sampling/createMessage, or elicitation/create) using the
+    MRTR pattern. The previous pattern of server-initiated requests is no
+    longer supported." — so nothing upstream can have asked the client a
+    question that a POSTed response would answer.
+
+    Deliberately does NOT apply the ``_is_scalar_id`` filter that
+    ``_extract_response_id`` needs for its dict keys: a response with a
+    non-scalar (object/array) id is malformed and could never match a
+    minted id, but it is still a response, and the caller must recognise it
+    as one so it takes the drop path rather than being POSTed upstream.
+    """
+    try:
+        msg = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return msg if _is_pure_response(msg) else None
+
+
+def _extract_input_required(payload: str, upstream_id: Any) -> dict[str, Any] | None:
+    """Return the ``InputRequiredResult`` of ``payload``, or ``None``.
+
+    ``payload`` is one streamed JSON-RPC message from the POST that carried
+    ``upstream_id``; ``None`` means "not an MRTR result — emit it normally".
+
+    Three gates, all deliberate (#270 PR C):
+
+    - ``_is_pure_response`` — a notification or a server-initiated request
+      interleaved on the same stream is not a result for our request.
+    - id equality with the request we actually sent. On a RETRY the id is
+      the relay's own fresh one ("The JSON-RPC ``id`` MUST be different
+      between the initial request and the retry, as they are independent
+      requests" — MRTR client requirement 3), so this is the only way to
+      tell our own answer from an unrelated frame.
+    - ``resultType`` compared EXACTLY to ``"input_required"``. The schema
+      types ``resultType`` as an open-ended ``string``, so prefix/substring
+      matching would swallow a future ``input_required_v2``-style result the
+      bridge does not understand; an exact miss falls through to verbatim
+      forwarding, which is Phase 1's documented behavior.
+    """
+    try:
+        msg = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not _is_pure_response(msg):
+        return None
+    # Type-aware: `"1" == 1` is False in Python, so a string minted id can
+    # never alias a numeric client id (the _LISTEN_ID_PREFIX C10 argument).
+    if msg["id"] != upstream_id:
+        return None
+    result = msg.get("result")
+    if not isinstance(result, dict):
+        return None
+    if result.get("resultType") != _MRTR_RESULT_TYPE:
+        return None
+    return result
+
+
+def _mrtr_rekey(payload: str, upstream_id: Any, client_id: Any) -> str:
+    """Re-key a retry's answer from the relay's upstream id to the client's.
+
+    MRTR client requirement 3: "The JSON-RPC ``id`` MUST be different
+    between the initial request and the retry, as they are independent
+    requests." The relay is the one that retries, so the FINAL result comes
+    back under an id the local client never sent and could not correlate.
+    Rewriting it is the last step of the bridge.
+
+    A no-op — not even a parse — when the two ids are equal (the initial
+    POST, and every non-MRTR request), so the common path pays nothing.
+    Only a pure response carrying exactly ``upstream_id`` is rewritten;
+    notifications and anything else interleaved on the stream pass through
+    untouched.
+    """
+    if upstream_id == client_id:
+        return payload
+    try:
+        msg = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        return payload
+    if not _is_pure_response(msg) or msg["id"] != upstream_id:
+        return payload
+    msg["id"] = client_id
+    return json.dumps(msg)
+
+
+def _is_pure_response_for(payload: str, target_id: Any) -> bool:
+    """True when ``payload`` is a pure JSON-RPC response carrying ``target_id``.
+
+    The per-POST MRTR hook (``_make_input_required_hook``) needs this as a
+    standalone check, independent of ``_extract_input_required``'s
+    ``resultType`` gate and of ``_mrtr_rekey``'s ``upstream_id == client_id``
+    short-circuit (which — on the INITIAL POST, where the two ids are equal
+    by construction — returns the payload untouched without ever looking at
+    whether it carries ``target_id`` at all). The hook's latch (#356
+    deep-review finding, minted-orphan) has to know "did THIS payload match
+    the id I'm listening for", regardless of which of those two downstream
+    functions would go on to treat it specially.
+
+    Parse-lenient like its siblings: a malformed payload is simply "not a
+    match", not an error to raise here.
+    """
+    try:
+        msg = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return _is_pure_response(msg) and msg["id"] == target_id
+
+
+def _mrtr_pinned_version(line: str) -> str | None:
+    """The ``_meta`` protocol version of a stored MRTR request line.
+
+    Pinned at transaction start and replayed on every retry (design change
+    7): ``_prepare_headers`` re-derives ``MCP-Protocol-Version`` from LIVE
+    state, so a client-driven re-``initialize`` between rounds would send a
+    header disagreeing with the ``_meta`` version frozen in the stored
+    body — HeaderMismatch (-32020) on a compliant server, killing a
+    transaction the user has already answered dialogs for. Same pinning
+    rule PR A (#352) applies to listen reconnects.
+
+    ``None`` (no override) when the line has no usable version, which can
+    only happen if the stored body never went through
+    ``_inject_modern_meta``.
+    """
+    try:
+        msg = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(msg, dict):
+        return None
+    params = msg.get("params")
+    meta = params.get("_meta") if isinstance(params, dict) else None
+    version = meta.get(_META_PROTOCOL_VERSION) if isinstance(meta, dict) else None
+    return version if isinstance(version, str) and version else None
 
 
 class _StreamResult:
@@ -2131,6 +2442,8 @@ def _post_and_stream(
     *,
     capture_init: bool = False,
     has_id: bool = True,
+    input_required_hook: Callable[[str], str | None] | None = None,
+    input_required_abort: Callable[[str], None] | None = None,
 ) -> _StreamResult | None:
     """Send a POST and stream the response to stdout with retry.
 
@@ -2149,6 +2462,64 @@ def _post_and_stream(
     synthesized error response, so the retry-exhausted / stream-interrupted
     error writes below are suppressed when ``has_id`` is False (the failure
     is still logged to stderr), matching the ``req_has_id`` gating in run().
+
+    ``input_required_hook`` is the MRTR interception point (#270 Phase 2 PR
+    C, design change 1). It is passed ONLY by run()'s modern-era dispatch of
+    an MRTR-eligible request; every other caller (``_paginate_and_stream``'s
+    sibling ``_post_parsed``, ``_reinitialize``, run_sse, cold-start, and
+    the legacy era in its entirety) leaves it ``None``, which restores this
+    function byte-for-byte — the interception CANNOT be "when dispatch
+    returns", because a payload is committed to stdout the moment it is
+    parsed off the stream, before any caller regains control. The hook is
+    called with each streamed message and returns either the line to emit
+    (possibly REWRITTEN — a retry answers under the relay's own fresh id and
+    must be re-keyed to the id the client is waiting on) or ``None`` to
+    swallow it. A swallow suppresses the empty-response synthesis below:
+    the hook has taken responsibility for answering this request (it either
+    put minted requests on stdout and is now waiting for the client, it
+    already wrote a JSON-RPC error, or — the hook's own per-POST latch,
+    #356 deep-review finding, minted-orphan — this id was already matched
+    earlier in this same POST and the payload is a non-compliant server's
+    extra frame), so synthesizing "empty response from server" on top would
+    put a SECOND response on the wire for one id.
+    A swallow also disables the mid-stream retry for the same reason
+    ``emitted`` does: minted requests are already on the client's stdin and
+    the tool call may already have run server-side, so replaying the POST
+    is not safe. A swallow is therefore TERMINAL for this POST: every exit
+    below it returns a 200 ``_StreamResult``, so neither this function's own
+    attempt loop nor run()'s 401/403/404 recovery ladder can re-POST the
+    original body while a transaction it opened is still alive.
+
+    ``input_required_abort`` (#356 review R1F1) is the failure counterpart,
+    passed by exactly the same two call sites and never alone. When the
+    stream breaks AFTER a swallow, writing the ordinary
+    "upstream stream interrupted" error under ``req_id`` would answer the
+    client while the transaction stays alive and its minted requests stay on
+    the client's stdin — the client then answers them, the retry fires, and
+    the final result lands under the SAME id: two responses for one id, the
+    hazard ``_SSE_PENDING_MAX`` documents. So on that one path the abort
+    callback is invoked INSTEAD of the generic write; it funnels through
+    ``_mrtr_abort``, which purges the transaction, cancels the outstanding
+    minted requests downstream and writes exactly one error under the
+    client's id. (Only the SWALLOWED case is special. A retry whose re-keyed
+    final result was already emitted and is then interrupted still gets a
+    result plus an interrupted error under one id — that is the generic
+    partial-delivery behavior of this function on both eras, unchanged by
+    and pre-dating the bridge; ``_mrtr_run_retry`` merely purges afterwards
+    so no THIRD response follows.)
+
+    A non-compliant server can also make a payload LOOK swallowed when
+    nothing is actually pending: a duplicate of an already-emitted terminal
+    answer hits the hook's per-POST latch and is dropped via ``return
+    None``, which reads to this function exactly like a swallow (#356
+    review R5F1). That would wrongly route an interrupt AFTER such a
+    duplicate through ``input_required_abort`` even though the transaction
+    already has its answer. It stays safe because
+    ``_make_input_required_hook`` purges the transaction at the moment it
+    computes the terminal answer — BEFORE any duplicate or interrupt in the
+    same stream can reach here — so ``input_required_abort``'s membership
+    check (R1F1) finds nothing registered and no-ops instead of writing a
+    second response.
     """
     last_error: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -2159,6 +2530,13 @@ def _post_and_stream(
         # server re-streams and the client sees duplicate JSON-RPC responses
         # (and tools/call may execute twice server-side).
         emitted = False
+        # Whether the MRTR hook swallowed a payload on THIS attempt (#270
+        # PR C). Tracked separately from ``emitted`` because nothing
+        # reached stdout under the request's own id — but the hook has
+        # already answered for it (minted requests emitted, or an error
+        # written), so both the empty-response synthesis and the
+        # mid-stream replay must treat it exactly like a partial delivery.
+        swallowed = False
         try:
             with client.stream("POST", url, content=content, headers=headers) as resp:
                 session = resp.headers.get("mcp-session-id")
@@ -2204,6 +2582,12 @@ def _post_and_stream(
                         # to run()/run_sse()'s outer `except Exception` safety
                         # net, which swallows the re-raised write error: a dead
                         # reader cannot observe the truncated body anyway.
+                        if input_required_hook is not None:
+                            replacement = input_required_hook(payload)
+                            if replacement is None:
+                                swallowed = True
+                                continue
+                            payload = replacement
                         _emit(payload, tracker)
                         emitted = True
                 else:
@@ -2212,10 +2596,21 @@ def _post_and_stream(
                     if text:
                         if capture_init:
                             pv = _extract_protocol_version(text)
-                        _emit(text, tracker)
-                        emitted = True
+                        # Same hook on the non-SSE branch: a modern server
+                        # may answer with a bare JSON body, and an MRTR
+                        # result arrives there just as legitimately.
+                        if input_required_hook is not None:
+                            replacement = input_required_hook(text)
+                            if replacement is None:
+                                swallowed = True
+                                text = ""
+                            else:
+                                text = replacement
+                        if text:
+                            _emit(text, tracker)
+                            emitted = True
 
-                if not emitted and has_id:
+                if not emitted and has_id and not swallowed:
                     # A 200 that delivered NO JSON-RPC payload (empty body, or
                     # only non-message SSE events) would leave a request-with-id
                     # waiting forever. Synthesize an error so the client is not
@@ -2244,12 +2639,28 @@ def _post_and_stream(
             # (programming) errors still propagate.
             last_error = e
             log(f"attempt {attempt}/{MAX_RETRIES} failed: {e}")
-            if emitted:
+            if emitted or swallowed:
                 # Response already partially delivered to the client; replaying
                 # the POST would duplicate it. Surface a stream-interrupted
-                # error (at-most-once) rather than retry.
+                # error (at-most-once) rather than retry. ``swallowed`` joins
+                # the guard (#270 PR C): an MRTR round already put minted
+                # requests on the client's stdin and the server-side work may
+                # already have run, so a replay would duplicate both.
                 log("upstream stream interrupted after partial delivery; not retrying")
-                if has_id:
+                if swallowed and input_required_abort is not None:
+                    # #356 review R1F1: the swallowed payload opened (or
+                    # extended) an MRTR transaction that is STILL alive, with
+                    # minted requests already on the client's stdin. A plain
+                    # error under req_id would answer the client now and the
+                    # completed retry would answer it again later. Route
+                    # through the transaction's own abort funnel instead —
+                    # exactly one error under this id, plus the downstream
+                    # cancels that retire the dialogs nobody will collect.
+                    # The callback is a no-op when the hook ALREADY aborted
+                    # (an unbridgeable round answers and purges from inside
+                    # the swallow), so this path can never write twice.
+                    input_required_abort(f"upstream stream interrupted: {e}")
+                elif has_id:
                     _write_line(
                         _error_response(f"upstream stream interrupted: {e}", req_id)
                     )
@@ -2258,8 +2669,8 @@ def _post_and_stream(
                 # would discard the negotiated version, leaving the relay's
                 # protocol_version None and omitting MCP-Protocol-Version on every
                 # subsequent request — which a strict 2025-06-18 server 400s.
-                # (session/pv are bound here: emitted implies the loop ran past
-                # their assignment.)
+                # (session/pv are bound here: emitted/swallowed both imply the
+                # loop ran past their assignment.)
                 return _StreamResult(session, 200, protocol_version=pv)
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY * attempt)
@@ -2969,14 +3380,17 @@ def _cold_start_loop(
 # (#270 Phase 2 phasing).
 _LISTEN_METHOD = "subscriptions/listen"
 _LISTEN_ACK_METHOD = "notifications/subscriptions/acknowledged"
-# Relay-minted JSON-RPC id prefix for the listen request (C10). STRING ids
-# under the relay's own "mcp-stdio/" namespace cannot collide with a
-# client-minted id unless the client maliciously adopts the relay's prefix:
-# _emit's cancel tracker compares ids by exact value (and `"1" == 1` is
-# False in Python, so even a numeric suffix can never alias an int id) —
-# and the listen request's own terminal result is swallowed here, never
-# emitted, so the tracker never even sees a listen id.
-_LISTEN_ID_PREFIX = "mcp-stdio/listen/"
+# Relay-minted JSON-RPC id prefix for the listen request (C10), under the
+# relay's reserved ``_RELAY_ID_NAMESPACE``: _emit's cancel tracker compares
+# ids by exact value (and `"1" == 1` is False in Python, so even a numeric
+# suffix can never alias an int id) — and the listen request's own terminal
+# result is swallowed here, never emitted, so a listen id never reaches
+# stdout at all and no client response can ever be keyed to one. The intake
+# rejection that closes the modern era's namespace (#356 review R2F1)
+# therefore adds nothing this prefix needed; it covers the whole namespace
+# for uniformity, which is cheaper to reason about than a per-prefix
+# argument.
+_LISTEN_ID_PREFIX = f"{_RELAY_ID_NAMESPACE}listen/"
 # The notification kinds requested on every listen POST: all three
 # list_changed booleans, no ``resourceSubscriptions`` until PR B. Also the
 # reference set the ack's honored subset is compared against.
@@ -4466,29 +4880,49 @@ def run(
     headers/session/byte-identity) is unaffected: the legacy path never
     runs any of this.
 
-    Limitation — MRTR (``resultType: "input_required"``) results are
-    forwarded verbatim (#350 review round 4 / #270 Phase 2): a modern
-    upstream that needs client input mid-request replaces the real result
-    with an ``InputRequiredResult`` (SEP-2322) that the client must answer
-    by re-issuing the request with ``inputResponses``. Phase 1 does not
-    translate that exchange into the legacy server-initiated
-    sampling/elicitation/roots requests a 2025-era stdio client would
-    understand — the ``input_required`` result reaches the client
-    unchanged, and a client that does not know the discriminator will
-    misread it as an oddly-shaped success. Since round 10 (finding 10-1)
-    the relay no longer INVITES that flow: the client capability keys MRTR
-    replaced (``sampling``/``elicitation``/``roots``) are stripped before
-    anything is advertised upstream (``_MRTR_REPLACED_CLIENT_CAPABILITIES``,
-    applied at capture in ``_handle_modern_special_method``), and a server
-    may only use "capabilities that were successfully negotiated"
-    (lifecycle spec) — so a COMPLIANT modern server now has no legitimate
-    reason to send ``input_required`` through this relay. The
-    verbatim-forward caveat therefore covers only a NON-compliant upstream
-    that initiates MRTR despite the client never advertising the flows; the
-    ordinary tools/resources/prompts flows are unaffected (their 2026
-    result shapes are additive-only — see
-    ``_handle_modern_special_method``). MRTR passthrough is #270's
-    explicitly-phased Phase 2 work, not an oversight in Phase 1.
+    MRTR (``resultType: "input_required"``, SEP-2322) — #270 Phase 2 PR C:
+    a modern upstream that needs client input mid-request replaces the
+    real result with an ``InputRequiredResult`` the client must answer by
+    re-issuing the request with ``inputResponses``. A 2025-era stdio
+    client knows only the server-INITIATED sampling/elicitation/roots
+    requests MRTR replaced, so Phase 1 forwarded such a result verbatim
+    and the client misread it as an oddly-shaped success. The relay now
+    BRIDGES the two patterns, on the three methods the spec allows the
+    result on (``tools/call`` / ``resources/read`` / ``prompts/get``):
+    the result is swallowed, its ``inputRequests`` entries are minted as
+    ordinary server-initiated requests on stdout under
+    ``mcp-stdio/mrtr/<seq>/<key>`` ids, the client's answers are
+    collected, and the ORIGINAL request is re-POSTed with
+    ``inputResponses`` plus a value-exact ``requestState`` echo under a
+    fresh id (the spec requires the retry id to differ). The final result
+    is re-keyed to the client's own id on the way out. Multi-round works;
+    a ``requestState``-only result re-POSTs immediately.
+
+    Bounds and fallbacks, all of which answer the client rather than
+    hanging it: 32 rounds per transaction (a ``requestState``-only loop
+    needs no user involvement at all, so it is the hostile-server case),
+    256 pending transactions (a hard count, never a TTL — a TTL races the
+    human at the dialog), a clean JSON-RPC error for anything unbridgeable
+    (an undeclared capability, ``mode: "url"``, tool-augmented sampling, an
+    unknown request kind, a client error on a minted id), and rejection of
+    a client id that still owns a pending transaction. A cancel for the
+    client's id drops the transaction and cancels the outstanding minted
+    requests downstream. On any method OTHER than the three above the spec
+    forbids the result outright ("Servers MUST NOT send InputRequiredResult
+    responses on any other client requests"), so it keeps the
+    verbatim-forward behavior rather than being swallowed by a path that
+    cannot legitimately see it. The ordinary tools/resources/prompts flows
+    are unaffected (their 2026 result shapes are additive-only — see
+    ``_handle_modern_special_method``).
+
+    Not yet bridged (#270 Phase 2 PR D): cancelling an in-flight retry
+    POST upstream. On this transport the cancellation signal is closing
+    the response stream, which needs a second thread reading stdin
+    concurrently with a blocking dispatch — see ``_ModernState``'s note.
+
+    ``MCP_STDIO_MRTR_STRIP=1`` restores the pre-bridge advertisement
+    filter, withdrawing the relay's invitation for MRTR from a compliant
+    server. It does not disable the bridge (see ``_MRTR_STRIP_ENV``).
     """
 
     # Graceful shutdown on SIGTERM/SIGINT
@@ -4718,6 +5152,891 @@ def run(
             client, url, snapshot, modern_state, auth_recovery=_probe_auth_recovery
         )
 
+    # --- modern era: MRTR bridge (#270 Phase 2 PR C) ---
+    # ARRANGED here (era-resolution scope) rather than inside the stdin
+    # loop for the reason design change 7 names: a retry POST is fired
+    # from a LATER stdin line (the one carrying the client's last minted
+    # response), and the loop's own ``_dispatch`` closure would capture
+    # THAT line's ``req_id`` — the minted id — instead of the id the
+    # client is waiting on. Everything MRTR re-POSTs therefore goes
+    # through this scope, with the client's original id passed
+    # explicitly. The legacy era never reaches any of it: the only call
+    # sites are inside `era == "modern"` branches (acceptance criterion
+    # #3).
+    # Pending transactions, keyed by the id the local client is waiting on
+    # (N), plus a flat index from every outstanding minted id back to
+    # ``(N, key)``. Two maps rather than one scan: the stdin hot path looks
+    # a response id up once, and the id it carries is the ONLY correlation
+    # the client sends back. Plain dicts, no lock — run()'s stdin loop is
+    # single-threaded on both eras (see ``_ModernState``'s note) and the
+    # listen thread never touches these.
+    mrtr_txns: dict[Any, dict[str, Any]] = {}
+    mrtr_minted: dict[Any, tuple[Any, str]] = {}
+    # Monotonic transaction counter feeding the minted-id namespace. Never
+    # reused within a session, so a stale client response for a dropped
+    # transaction can never be mistaken for a live one.
+    mrtr_seq = 0
+
+    def _mrtr_purge(client_id: Any) -> dict[str, Any] | None:
+        """Drop a transaction and every minted id it still owns.
+
+        Returns the dropped transaction (or None). Purging BOTH maps in
+        one place is what keeps a half-dropped transaction impossible: an
+        orphan ``mrtr_minted`` entry would route a later client response
+        into a transaction that no longer exists.
+        """
+        txn = mrtr_txns.pop(client_id, None)
+        if txn is None:
+            return None
+        for minted_id in txn["minted"]:
+            mrtr_minted.pop(minted_id, None)
+        return txn
+
+    def _mrtr_abort(client_id: Any, reason: str, code: int = -32600) -> None:
+        """The single funnel for every unbridgeable MRTR outcome.
+
+        One place so no path can leak a half-purged transaction or a
+        differently-shaped error: an undeclared capability, an unknown
+        request kind, a malformed ``inputRequests`` (missing entirely, or
+        with neither ``inputRequests`` nor ``requestState`` present),
+        ``mode: "url"``, a sampling request carrying ``tools``, both caps
+        (transaction and round), a client JSON-RPC error on a minted id, a
+        client cancelling a minted id, and an upstream stream interrupted
+        after a swallow (via ``_make_input_required_abort``) all land here.
+
+        Outstanding minted requests are cancelled downstream before the
+        error goes out. The relay issued them and they ARE still in
+        progress, which is exactly what the cancellation spec requires of
+        a canceller ("Cancellation notifications MUST only reference
+        requests that: were previously issued by the client; are believed
+        to still be in-progress"), and without it the client sits on an
+        elicitation dialog nobody will ever collect. ``-32600`` Invalid
+        Request is the default because the usual fault is the shape of the
+        server's MRTR message; callers pass ``-32000`` for every other
+        reason the exchange could not be completed — not only the relay's
+        own resource limits (the two caps), but also a client answer that
+        cannot be used (a JSON-RPC error or a cancel on a minted id) and an
+        interrupted upstream transport after a round was already opened.
+        """
+        txn = _mrtr_purge(client_id)
+        if txn is not None:
+            for minted_id in txn["minted"]:
+                _emit(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "notifications/cancelled",
+                            "params": {
+                                "requestId": minted_id,
+                                "reason": "MRTR transaction aborted",
+                            },
+                        }
+                    ),
+                    tracker,
+                )
+        log(f"MRTR transaction for id {client_id!r} aborted: {reason}")
+        _write_line(_error_response(f"MRTR bridge: {reason}", client_id, code=code))
+
+    def _mrtr_translate(entry: Any) -> tuple[str | None, Any]:
+        """Translate one ``inputRequests`` entry into a legacy request.
+
+        Returns ``(capability_key, envelope_without_id)`` on success, or
+        ``(None, reason)`` when the entry cannot be bridged — the caller
+        aborts the transaction with that reason.
+
+        An ``inputRequests`` value is a bare ``{method, params}`` object,
+        NOT a JSON-RPC message — "values are request objects that MUST be
+        one of ElicitRequest, CreateMessageRequest, or ListRootsRequest" —
+        so the bridge mints the full envelope around it (design change 8).
+        The method names are already the legacy ones a 2025-era client
+        understands (``elicitation/create`` / ``sampling/createMessage`` /
+        ``roots/list``); what MRTR changed is who sends them and how the
+        answer travels back, which is precisely what this bridge restores.
+
+        Params are otherwise passed VERBATIM. Spec rev 2026-07-28 adds
+        fields to these request shapes (richer elicitation schemas) that a
+        2025 client will not recognise, but every MCP request object is
+        open/extensible and inventing a lossy down-translation would be
+        worse than passing what the server actually said. ``roots/list``
+        takes no params at all, so none are minted for it.
+        """
+        if not isinstance(entry, dict):
+            return None, "server sent a malformed input request"
+        method = entry.get("method")
+        capability = _MRTR_REQUEST_CAPABILITY.get(method) if method else None
+        if capability is None:
+            return None, "server requested an input kind the relay cannot bridge"
+        envelope: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if method == "roots/list":
+            # ListRootsRequest carries no params at all.
+            return capability, envelope
+        params = entry.get("params")
+        if not isinstance(params, dict):
+            return None, "server sent an input request with no params object"
+        if method == "elicitation/create":
+            mode = params.get("mode")
+            if mode == "url":
+                # Design change 10. URL-mode elicitation (introduced in rev
+                # 2025-11-25) loads a pile of MUSTs onto the CLIENT that
+                # this relay can neither perform nor verify: "MUST NOT
+                # automatically pre-fetch the URL", "MUST NOT open the URL
+                # without explicit consent from the user", "MUST show the
+                # full URL to the user for examination before consent",
+                # "MUST open the URL provided by the server in a secure
+                # manner that does not enable the client or LLM to inspect
+                # the content or user inputs" — and the spec devotes a
+                # whole section to the phishing attack that follows when
+                # they are not honored. A 2025-era stdio client predates
+                # URL mode entirely and would render the request as a form,
+                # so the bridge refuses rather than silently downgrading
+                # what is usually a credential or payment flow. The
+                # capability gate in the caller should normally have caught
+                # this first: an ``elicitation: {}`` declaration "is
+                # equivalent to declaring support for form mode only", and
+                # "Servers MUST NOT send elicitation requests with modes
+                # that are not supported by the client" — this arm is the
+                # defensive backstop for a server that ignores that MUST.
+                return None, (
+                    "server requested URL-mode elicitation, which cannot "
+                    "be bridged to a legacy client"
+                )
+            if "mode" in params:
+                # Strip ``mode: "form"``: "For backwards compatibility,
+                # servers MAY omit the mode field for form mode elicitation
+                # requests. Clients MUST treat requests without a mode
+                # field as form mode." Omitting it hands the 2025-era
+                # client exactly the shape it has always known instead of
+                # an unrecognised discriminator it might reject. Any other
+                # value than "form"/"url" is unknown to this relay too, and
+                # dropping it degrades to form mode — the same reading the
+                # spec gives a client that sees no mode at all.
+                params = {k: v for k, v in params.items() if k != "mode"}
+        elif method == "sampling/createMessage" and "tools" in params:
+            # Tool-augmented sampling is a 2026 addition whose answer a
+            # 2025 client cannot produce: it would return a plain
+            # CreateMessageResult with no tool calls and the server would
+            # act on an answer that silently dropped half the request.
+            # (The sampling leg as a whole is best-effort — SEP-2577
+            # deprecates it — so this stays a hard abort rather than
+            # growing a translation.)
+            return None, (
+                "server requested tool-augmented sampling, which cannot be "
+                "bridged to a legacy client"
+            )
+        envelope["params"] = params
+        return capability, envelope
+
+    def _mrtr_open_round(
+        client_id: Any, stored_line: str, result: dict[str, Any]
+    ) -> None:
+        """Record one ``InputRequiredResult`` and mint its requests.
+
+        ``stored_line`` is the POST-form body of the client's ORIGINAL
+        request (post ``_inject_modern_meta``), kept for the retry —
+        re-deriving it later would pick up live state (a re-negotiated
+        version, a changed log level) the server never saw on round 1.
+
+        Validate-then-emit: every entry is translated and capability-gated
+        BEFORE anything reaches stdout, so an abort never leaves a
+        half-minted round the client is expected to answer.
+        """
+        nonlocal mrtr_seq
+        requests = result.get("inputRequests", {})
+        if requests is None:
+            requests = {}
+        if not isinstance(requests, dict):
+            _mrtr_abort(client_id, "server sent a malformed inputRequests object")
+            return
+        has_state = "requestState" in result
+        if not requests and not has_state:
+            # Server requirement 6: "Servers MUST include at least one of
+            # inputRequests or requestState in every InputRequiredResult
+            # response." Neither means there is nothing to ask the client
+            # and nothing to echo back — the retry would be byte-identical
+            # to the request that just failed, i.e. an infinite loop.
+            _mrtr_abort(
+                client_id,
+                "server sent an input_required result with neither "
+                "inputRequests nor requestState",
+            )
+            return
+        declared = modern_state.client_capabilities_declared or {}
+        txn = mrtr_txns.get(client_id)
+        if txn is None and len(mrtr_txns) >= _MRTR_MAX_TXNS:
+            # Design change 5: a hard count cap, never a TTL. Fail the NEW
+            # transaction rather than evicting an old one — the old ones
+            # already have dialogs in front of a user, and never-hang beats
+            # hang. -32000: the relay's own resource limit, not a malformed
+            # message.
+            _mrtr_abort(
+                client_id,
+                f"too many pending input-required transactions (cap {_MRTR_MAX_TXNS})",
+                code=-32000,
+            )
+            return
+        if txn is None:
+            mrtr_seq += 1
+            txn = {
+                "seq": mrtr_seq,
+                "stored_line": stored_line,
+                # Pinned once (design change 7): the retry MUST NOT
+                # renegotiate mid-transaction — a header/_meta version
+                # mismatch is -32020 HeaderMismatch on a compliant server
+                # (the same pinning PR A #352 applies to listen reconnects).
+                "pinned_version": _mrtr_pinned_version(stored_line),
+                "request_state": None,
+                "has_request_state": False,
+                "expected_keys": set(),
+                "responses": {},
+                "minted": {},
+                "rounds": 0,
+                "retry_now": False,
+                # Set by this function, cleared by the retry driver before
+                # each POST: it is how the driver tells "the server opened
+                # another round, wait for the client" apart from "the
+                # server finally answered, the transaction is done".
+                "round_opened": False,
+                "retry_id": None,
+                "retry_in_flight": False,
+            }
+            mrtr_txns[client_id] = txn
+        # Translate and gate the WHOLE round before emitting any of it.
+        minted: list[tuple[Any, str, dict[str, Any]]] = []
+        for key, entry in requests.items():
+            capability, translated = _mrtr_translate(entry)
+            if capability is None:
+                # `translated` is the failure reason on this branch.
+                _mrtr_abort(client_id, f"{translated} (key {key!r})")
+                return
+            envelope = translated
+            if capability not in declared:
+                # MRTR server requirement 7: "Servers MUST NOT send an
+                # inputRequests that the client has not declared support
+                # for in its capabilities. For example, if a client does
+                # not declare support for elicitation, the server MUST NOT
+                # include any elicitation/create requests in the
+                # inputRequests field." Minting it anyway would put a
+                # request on stdout that the local client has no handler
+                # for — an unanswerable question, and a hang.
+                _mrtr_abort(
+                    client_id,
+                    f"server requested {capability!r} input, which the "
+                    f"client never declared (key {key!r})",
+                )
+                return
+            minted.append((f"{_MRTR_ID_PREFIX}{txn['seq']}/{key}", key, envelope))
+        # Commit the round: this round's keys REPLACE the previous
+        # round's ("inputRequests keys ... MUST be unique within the scope
+        # of the request" is a per-result guarantee, not a cross-round
+        # one), and the latest requestState replaces the old one.
+        txn["expected_keys"] = {key for _, key, _ in minted}
+        txn["responses"] = {}
+        # #356 deep-review finding (minted-orphan): retire the OLD round's
+        # ids from the global `mrtr_minted` index here, before dropping
+        # `txn["minted"]` — not just from the transaction's own dict below.
+        # `_mrtr_purge` only ever walks the CURRENT `txn["minted"]`, and the
+        # 256-txn cap bounds `mrtr_txns`, not this map, so an id left behind
+        # here would live in `mrtr_minted` forever: a PERMANENT orphan that
+        # a later, UNRELATED reuse of `client_id` could resolve a stale
+        # cancel or answer into. In the normal cross-POST multi-round flow
+        # this is a no-op (a retry only fires once every prior key has been
+        # answered, which already pops it from both maps) — it only bites
+        # when a non-compliant server streams a second `input_required`
+        # under one upstream id within a single POST, a class of violation
+        # this file elsewhere absorbs rather than trusts (cf.
+        # `_SSE_PENDING_MAX`). The per-POST hook latch below normally keeps
+        # that second frame from ever reaching this function at all; this
+        # stays as defense in depth for `_mrtr_open_round` itself.
+        for old_minted_id in txn["minted"]:
+            mrtr_minted.pop(old_minted_id, None)
+        txn["minted"] = {}
+        txn["has_request_state"] = has_state
+        txn["request_state"] = result.get("requestState") if has_state else None
+        for minted_id, key, envelope in minted:
+            envelope["id"] = minted_id
+            mrtr_minted[minted_id] = (client_id, key)
+            txn["minted"][minted_id] = key
+            # _emit, not _write_line (design change 8, PR A's C4): the
+            # U+2028/U+2029 escaping lives there, and a minted request
+            # carries `method`, so the cancel filter passes it through by
+            # construction.
+            _emit(json.dumps(envelope), tracker)
+        if not minted:
+            # requestState-only round: "If the InputRequiredResult does
+            # not contain the inputRequests field, the client MAY retry
+            # the original request immediately." Nothing to ask the
+            # client, so the retry is fired by the caller as soon as this
+            # POST unwinds.
+            txn["retry_now"] = True
+        txn["round_opened"] = True
+        log(
+            f"MRTR round opened for id {client_id!r}: "
+            f"{len(minted)} request(s) minted, "
+            f"requestState {'present' if has_state else 'absent'}"
+        )
+
+    def _mrtr_build_retry(txn: dict[str, Any], retry_id: Any) -> str:
+        """Build the retry body from the STORED original request.
+
+        Design change 7: the retry is the stored POST-form line with a
+        fresh id and two params added — never a re-derivation. Re-running
+        ``_inject_modern_meta`` would refresh ``_meta`` from LIVE state (a
+        client-driven re-``initialize``, a ``logging/setLevel`` between
+        rounds), so the retry would carry a different protocol version or
+        capability set than the round the server is holding state for.
+
+        ``inputResponses`` carries the client's results verbatim under the
+        server's own keys. ``requestState`` is echoed value-exactly and ONLY
+        when the latest result carried one: "If an InputRequiredResult
+        contains the requestState field, the client MUST echo back the
+        exact value of that field when retrying the original request.
+        Clients MUST NOT inspect, parse, modify, or make any assumptions
+        about the requestState contents. If the InputRequiredResult does
+        not contain a requestState field, the client MUST NOT include one
+        in the retry." — hence the explicit presence flag rather than a
+        truthiness test, and hence no type policing of the value.
+
+        ``stored_line`` is parseable by construction: a line only becomes
+        MRTR-eligible after ``_extract_method_and_name`` parsed a method
+        out of it.
+        """
+        msg = json.loads(txn["stored_line"])
+        # "The JSON-RPC id MUST be different between the initial request
+        # and the retry, as they are independent requests."
+        msg["id"] = retry_id
+        params = msg.get("params")
+        params = dict(params) if isinstance(params, dict) else {}
+        if txn["responses"]:
+            params["inputResponses"] = txn["responses"]
+        if txn["has_request_state"]:
+            params["requestState"] = txn["request_state"]
+        msg["params"] = params
+        return json.dumps(msg)
+
+    def _mrtr_post_retry(
+        client_id: Any, txn: dict[str, Any], retry_id: Any, retry_line: str
+    ) -> _StreamResult | None:
+        """POST one retry body: headers prepared, version re-pinned, hooked.
+
+        Factored out because the retry may be sent TWICE for one round —
+        once, and again after a 401 token refresh (#356 review R1F2) — and
+        every part of this preparation has to be redone for the second POST:
+
+        - ``_prepare_headers`` derives ``MCP-Protocol-Version`` from LIVE
+          state, so re-preparing without re-applying ``pinned_version``
+          would send a version disagreeing with the stored body's ``_meta``
+          — ``-32020`` HeaderMismatch on a compliant server, the exact
+          failure design change 7 exists to prevent (the same override PR A
+          (#352) applies to every listen reconnect).
+        - a FRESH interception hook and abort callback per POST, mirroring
+          ``_dispatch``'s own rule: no state may leak between the attempts
+          one logical dispatch makes.
+
+        ``retry_in_flight`` is raised and lowered here so it stays truthful
+        on every exit, including an exception unwinding to run()'s safety
+        net. ``round_opened`` is cleared per POST for the same reason: it
+        must describe THIS POST's outcome, never the previous attempt's.
+        """
+        retry_headers = _prepare_headers(retry_line)
+        if txn["pinned_version"]:
+            retry_headers = {
+                k: v
+                for k, v in retry_headers.items()
+                if k.lower() != "mcp-protocol-version"
+            }
+            retry_headers["MCP-Protocol-Version"] = txn["pinned_version"]
+        txn["round_opened"] = False
+        txn["retry_in_flight"] = True
+        try:
+            return _post_and_stream(
+                client,
+                url,
+                retry_line,
+                retry_headers,
+                # Every synthesized error inside belongs to the client's
+                # request, not to the relay's retry id.
+                client_id,
+                tracker,
+                has_id=True,
+                input_required_hook=_make_input_required_hook(
+                    client_id, retry_id, txn["stored_line"]
+                ),
+                input_required_abort=_make_input_required_abort(client_id),
+            )
+        finally:
+            txn["retry_in_flight"] = False
+
+    def _mrtr_run_retry(client_id: Any) -> None:
+        """Drive a transaction's retries until it needs the client again.
+
+        Loops rather than recurses because a ``requestState``-only result
+        means "retry immediately" with no client involvement at all, and a
+        server may legitimately chain several of those.
+
+        Defined at this scope, NOT inside the stdin loop (design change 7):
+        a retry is fired from the stdin line carrying the client's LAST
+        minted response, and the loop's ``_dispatch`` closure would capture
+        that line's id — the minted one — instead of the id the client is
+        waiting on. ``req_id`` is therefore passed explicitly as
+        ``client_id`` all the way down, so every synthesized error
+        ``_post_and_stream`` may write lands under the right id.
+
+        AUTH RECOVERY is deliberately ONE stage wide (#356 review R1F2):
+        a 401 gets a single bounded ``token_refresher`` refresh and one
+        re-POST, and nothing else does. The original design took the
+        no-recovery stance ("it self-heals on the client's next request"),
+        which is true of an ordinary dispatch and false here: a retry is
+        USER-WORK-BEARING. The human has already answered the elicitation
+        dialogs this POST carries, and "self-heals next request" means the
+        client re-asks them. A token expiring between the dialog going up
+        and the answer coming back is the ordinary case, not an exotic one.
+
+        Why it is safe to run here when the listen thread deliberately runs
+        NO recovery at all: that exemption is about THREADS —
+        ``_probe_auth_recovery``'s lock ordering "is not safe from a third
+        concurrent caller", and the listen thread would be that third
+        caller. A retry runs on the stdin loop thread, the FIRST caller,
+        the one the loop's own 401 branch already refreshes from; and
+        ``refresh_lock`` (serialising against the proactive-refresh daemon's
+        rotation) and ``headers_lock`` are taken sequentially, never nested,
+        exactly as they are there. So this adds no lock ordering.
+
+        And why ONLY 401 -> refresh: a 403 step-up and a 404 re-initialize
+        are session-era machinery. The 404 branch rebuilds a session this
+        era does not have (every session adoption site in run() is gated on
+        ``era == "legacy"``), and a step-up mid-transaction changes the
+        scope the server granted the round it is holding state for. Both are
+        wider than the user-work argument justifies. Everything else — a
+        refresh that fails, a second 401, any other status — falls through
+        to the single "upstream error on retry -> error under N, drop txn"
+        arm below, which is the original design's stance and stays loud.
+        """
+        while True:
+            txn = mrtr_txns.get(client_id)
+            if txn is None or not txn["retry_now"]:
+                return
+            txn["retry_now"] = False
+            txn["rounds"] += 1
+            if txn["rounds"] > _MRTR_MAX_ROUNDS:
+                # Design change 4. A ``requestState``-only result costs the
+                # client nothing and the relay one POST, so a hostile or
+                # merely looping server can spin this thread forever with
+                # no user involvement. -32000: the relay's own resource
+                # limit, not a malformed message.
+                _mrtr_abort(
+                    client_id,
+                    f"upstream asked for more input more than {_MRTR_MAX_ROUNDS} times",
+                    code=-32000,
+                )
+                return
+            retry_id = f"{_MRTR_RETRY_ID_PREFIX}{txn['seq']}/{txn['rounds']}"
+            retry_line = _mrtr_build_retry(txn, retry_id)
+            txn["retry_id"] = retry_id
+            log(f"MRTR retry {txn['rounds']} for id {client_id!r} as {retry_id!r}")
+            result = _mrtr_post_retry(client_id, txn, retry_id, retry_line)
+            if mrtr_txns.get(client_id) is not txn:
+                # Either aborted from inside the hook (an unbridgeable
+                # round; _mrtr_abort already answered the client) or the
+                # hook already purged after emitting the terminal answer
+                # (#356 review R5F1, see _make_input_required_hook) — the
+                # common successful-retry case. Either way the transaction
+                # is already gone and already answered; nothing left to do.
+                return
+            if (
+                result is not None
+                and result.status_code == 401
+                and token_refresher is not None
+            ):
+                # ONE bounded refresh, then ONE re-POST (#356 review R1F2).
+                # Same shape and same locks as the stdin loop's own 401
+                # branch, on the same thread: `refresh_lock` serialises
+                # against the proactive-refresh daemon so the two never race
+                # the AS's refresh-token rotation (#242), `headers_lock`
+                # guards the shared header dict, and the two are taken
+                # sequentially, never nested.
+                #
+                # The round is NOT re-counted and the retry id is NOT
+                # reissued: this is the same JSON-RPC request being re-sent
+                # after a challenge the server answered without processing
+                # it — precisely what the loop does when it re-dispatches
+                # the same `line` under the same id. The MUST that binds
+                # here is only "different between the INITIAL request and
+                # the retry", which `retry_id` already satisfies. Charging a
+                # round for an auth failure would also let a 401-happy
+                # server burn the cap.
+                log("MRTR retry received 401, attempting token refresh")
+                with refresh_lock:
+                    new_headers = token_refresher()
+                if new_headers:
+                    with headers_lock:
+                        headers.update(new_headers)
+                    # Fresh headers, re-pinned version, fresh hook — see
+                    # _mrtr_post_retry. Re-clearing `round_opened` there
+                    # discards nothing: the hook runs only on a 200, and
+                    # this arm is reached only on a 401, so the challenged
+                    # POST cannot have opened a round. Keep that true if a
+                    # future status ever joins this branch.
+                    result = _mrtr_post_retry(client_id, txn, retry_id, retry_line)
+                    if mrtr_txns.get(client_id) is not txn:
+                        return
+                else:
+                    # Refresh declined/failed: fall through to the terminal
+                    # arm below with the 401 intact, so the client gets a
+                    # loud "HTTP 401" under its own id rather than a silent
+                    # hang. (b)'s honesty half, kept.
+                    log("MRTR retry token refresh failed")
+            if result is None:
+                # Transport retries exhausted. _post_and_stream already
+                # wrote the error under client_id — purge silently rather
+                # than answering twice.
+                _mrtr_purge(client_id)
+                return
+            if result.status_code != 200:
+                _mrtr_purge(client_id)
+                log(f"MRTR retry for id {client_id!r} got HTTP {result.status_code}")
+                _write_line(_error_response(f"HTTP {result.status_code}", client_id))
+                return
+            if txn["retry_now"]:
+                # requestState-only round: loop straight back into another
+                # POST, which is what "the client MAY retry the original
+                # request immediately" means — and why the round cap above
+                # counts these too.
+                continue
+            if txn["round_opened"]:
+                # A new round with real questions: the minted requests are
+                # on stdout and the transaction now waits for the client.
+                return
+            # Nothing left to ask: _post_and_stream synthesized an
+            # empty-response error for this id (the only way to reach here
+            # with the transaction still registered — a genuine terminal
+            # answer is purged by the hook itself at emit time, #356 review
+            # R5F1, which short-circuits out via the `is not txn` check
+            # above before this line is reached). Purge is otherwise a
+            # harmless no-op here, kept as the defensive fallback for that
+            # empty-response case.
+            _mrtr_purge(client_id)
+            return
+
+    def _mrtr_record_client_response(msg: dict[str, Any]) -> Any:
+        """Consume a client response to a relay-minted MRTR request.
+
+        Every response-shaped line is either one of these or a spec
+        violation on this era (rev 2026-07-28 removed server-initiated
+        requests outright), so an unrecognised one is logged and DROPPED
+        rather than POSTed upstream, which is what the pre-PR-C loop did.
+
+        Returns the client id whose transaction is now ready to retry, or
+        ``None``. The caller — not this function — fires the retry, so the
+        POST happens on the stdin loop's own frame rather than nested
+        inside the bookkeeping.
+        """
+        rid = msg["id"]
+        entry = mrtr_minted.get(rid) if _is_scalar_id(rid) else None
+        if entry is None:
+            log(
+                f"dropping client response for unknown id {rid!r}: the "
+                f"modern era has no server-initiated requests to answer "
+                f"(spec rev 2026-07-28 replaced them with MRTR)"
+            )
+            return None
+        client_id, key = entry
+        txn = mrtr_txns.get(client_id)
+        if txn is None:
+            # Defensive: _mrtr_purge clears both maps together, so this
+            # cannot happen — log rather than KeyError if it ever does.
+            mrtr_minted.pop(rid, None)
+            log(f"dropping client response for orphaned MRTR id {rid!r}")
+            return None
+        if "error" in msg:
+            # This key IS answered, badly — retire its minted id before
+            # aborting. The abort cancels what is still OUTSTANDING, and a
+            # cancellation for a request the client just replied to is
+            # exactly what the spec calls invalid ("Cancellation
+            # notifications MUST only reference requests that ... are
+            # believed to still be in-progress").
+            mrtr_minted.pop(rid, None)
+            txn["minted"].pop(rid, None)
+            # Design change 3: abort the whole transaction rather than
+            # retrying with the remaining keys. A partial ``inputResponses``
+            # IS spec-legal — "If the client fails to send all the
+            # information requested in a previous InputRequests, and the
+            # missing information is necessary for the server to process
+            # the request, the server SHOULD respond with a new
+            # InputRequiredResult requesting the missing information again,
+            # rather than returning an error" — but a client that answers
+            # an elicitation with a JSON-RPC error is telling us it cannot
+            # answer it at all, so the partial retry would only burn a
+            # round and come back asking for the same key. Abandoning the
+            # transaction is equally legal: "Servers MUST NOT assume that
+            # clients will fulfill the inputRequests or retry the original
+            # request."
+            _mrtr_abort(
+                client_id,
+                f"client returned a JSON-RPC error for input request {key!r}",
+                code=-32000,
+            )
+            return None
+        # The result object goes into inputResponses VERBATIM, with no
+        # wrapper, under the server's OWN key: "InputResponses object is a
+        # map of client responses to the server requests. Keys correspond
+        # to the keys in the InputRequests map; values are the client's
+        # result for each request (e.g. ElicitResult, CreateMessageResult,
+        # or ListRootsResult)." An elicitation decline or cancel is one of
+        # those results ({"action": "decline"} / {"action": "cancel"} —
+        # the three-action model), not an error, so it rides this path
+        # like any other answer and the server decides what to do.
+        txn["responses"][key] = msg.get("result")
+        mrtr_minted.pop(rid, None)
+        txn["minted"].pop(rid, None)
+        if txn["expected_keys"] <= set(txn["responses"]):
+            txn["retry_now"] = True
+            return client_id
+        return None
+
+    def _mrtr_handle_cancel(cancel_id: Any) -> None:
+        """Drop a transaction the client just cancelled (design change 11).
+
+        TWO kinds of id can arrive here, and both must be handled or the
+        transaction hangs forever. They are tried in that order — the
+        client's OWN transactions first, minted ids second (#356 review
+        R2F1, defense in depth behind the intake rejection that now keeps a
+        client id out of the relay's namespace entirely). A cancel names
+        something the CLIENT sent, so the client's own id is the more
+        authoritative reading of an ambiguous one; and this ordering is what
+        keeps a collision from aborting a DIFFERENT transaction. The
+        ``mrtr_txns`` probe is deliberately non-destructive: purging first
+        and returning on a miss would send every minted-id cancel down the
+        "unknown id" path and resurrect the hang the minted arm exists to
+        fix.
+
+        - the CLIENT's own id, handled first.
+        - a MINTED id — the client giving up on an input request the
+          bridge asked it. That answer is never coming, so the round can
+          never complete, the retry can never fire, and the transaction
+          would sit forever holding the client's OWN id hostage (the
+          reuse check in the stdin loop rejects every new request under
+          it). Abort the whole transaction instead. The client is still
+          waiting on the original call — it cancelled a nested question,
+          not the call — so this one DOES get an error under that id,
+          which is the #11 never-hang contract. (The spec's own way to
+          back out of an elicitation is the ``{"action": "decline"}`` /
+          ``{"action": "cancel"}`` RESULT, which rides ``inputResponses``
+          normally; this arm covers a client that reaches for
+          cancellation instead.)
+
+        For the client's own id: it cancelled the request it is waiting
+        on, so per the
+        cancellation spec's receiver SHOULD ("Not send a response for the
+        cancelled request") nothing is answered for it. What DOES go out is
+        one ``notifications/cancelled`` per still-outstanding minted
+        request: the relay issued those, they are still in progress, and
+        both conditions the spec puts on a canceller ("Cancellation
+        notifications MUST only reference requests that: were previously
+        issued by the client; are believed to still be in-progress") hold.
+        Without them the client keeps an elicitation dialog open for an
+        answer nobody will ever collect.
+
+        Nothing is forwarded UPSTREAM, and there is nothing in flight there
+        to cancel: a retry POST is synchronous on this same thread, so by
+        the time a stdin line can be read it has already returned. Even if
+        it had not, ``notifications/cancelled`` is not the mechanism on
+        this transport — "Streamable HTTP: Closing the SSE response stream
+        is the cancellation signal. The server MUST treat a client
+        disconnect as cancellation of that request. No
+        notifications/cancelled message is required or expected." Closing a
+        POST mid-stream needs a second thread reading stdin, which
+        ``_ModernState``'s own note defers ("actually ABORTING an in-flight
+        POST when a cancel arrives would require a second thread reading
+        stdin concurrently with a blocking dispatch") — #270 Phase 2 PR D.
+        """
+        hashable = _is_scalar_id(cancel_id)
+        if hashable and cancel_id in mrtr_txns:
+            # The client's OWN id, checked FIRST and non-destructively (see
+            # the docstring): purging on a miss would swallow every
+            # minted-id cancel below.
+            txn = _mrtr_purge(cancel_id)
+            if txn is None:  # pragma: no cover — membership was just checked
+                return
+            log(f"MRTR transaction for id {cancel_id!r} cancelled by the client")
+            for minted_id in txn["minted"]:
+                _emit(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "notifications/cancelled",
+                            "params": {
+                                "requestId": minted_id,
+                                "reason": "originating request cancelled",
+                            },
+                        }
+                    ),
+                    tracker,
+                )
+            return
+        minted_entry = mrtr_minted.get(cancel_id) if hashable else None
+        if minted_entry is not None:
+            owner_id, key = minted_entry
+            # Retire the cancelled request before the funnel runs, so the
+            # abort's downstream cancels cover only what is still
+            # outstanding — re-cancelling the one the client just
+            # cancelled would violate "are believed to still be
+            # in-progress".
+            mrtr_minted.pop(cancel_id, None)
+            owner = mrtr_txns.get(owner_id)
+            if owner is None:
+                # Defense in depth (#356 deep-review finding, minted-orphan):
+                # the pop-before-reset fix in `_mrtr_open_round` and the
+                # per-POST latch in the hook now keep `mrtr_minted` from
+                # ever outliving the round that minted an id, so a resolved
+                # `owner_id` with no live transaction here should no longer
+                # be reachable. If it ever is — a future orphan source, or
+                # this guard outliving whatever introduced it — `owner_id`
+                # is either a live id doing something unrelated or an
+                # already-answered one: either way the client already has
+                # its answer, there is no transaction left to purge, and no
+                # dialog left to cancel, so writing an error under it here
+                # would be a stale or simply WRONG response under someone
+                # else's id. Do nothing.
+                log(
+                    f"MRTR: dropping stale cancel for minted id {cancel_id!r}: "
+                    f"owner {owner_id!r} has no live transaction"
+                )
+                return
+            owner["minted"].pop(cancel_id, None)
+            _mrtr_abort(
+                owner_id,
+                f"client cancelled input request {key!r}",
+                code=-32000,
+            )
+
+    def _make_input_required_hook(
+        client_id: Any, upstream_id: Any, stored_line: str
+    ) -> Callable[[str], str | None]:
+        """Build the per-POST MRTR interception hook (design change 1).
+
+        ``client_id`` is the id the local stdio client is waiting on (N);
+        ``upstream_id`` is the id THIS POST carried, which differs from N
+        on a retry ("The JSON-RPC ``id`` MUST be different between the
+        initial request and the retry" — MRTR client requirement 3).
+        A fresh hook per POST, so no state can leak between the up-to-four
+        dispatches one stdin line may make (initial + 401 + 403 + 404).
+
+        Returns the line to emit, or ``None`` to swallow it. Anything that
+        is not an ``input_required`` result for ``upstream_id`` is returned
+        untouched, so the hook is transparent to interleaved notifications,
+        server-initiated requests, and ordinary results — except for the
+        final answer on a retry, which arrives under the relay's own
+        upstream id and is RE-KEYED to ``client_id`` before it goes out:
+        the client correlates on the id it sent, and the spec MUST above
+        guarantees those two differ.
+
+        LATCHED per POST (#356 deep-review finding, minted-orphan): once a
+        payload carrying ``upstream_id`` has been matched once — whether it
+        opened/replaced a round (a swallow) or was the terminal answer
+        (rekeyed and emitted) — every later payload in the SAME stream that
+        still carries ``upstream_id`` is dropped instead of processed again.
+        A compliant server sends exactly one response per request id; a
+        server that streams a second one under an id already answered is
+        the same class of hostile/non-compliant peer this file elsewhere
+        absorbs rather than trusts (cf. ``_SSE_PENDING_MAX``). Without the
+        latch, a second ``input_required`` would re-enter
+        ``_mrtr_open_round`` for a still-live round — orphaning the first
+        round's minted ids in ``mrtr_minted`` — and a second terminal result
+        would double-emit under ``client_id``. The check is independent of
+        ``_mrtr_rekey``'s own id comparison, which short-circuits on the
+        INITIAL POST (``upstream_id == client_id``) before ever looking at
+        the payload — see ``_is_pure_response_for``.
+
+        PURGED AT EMIT (#356 review R5F1): the FIRST match that turns out to
+        be the terminal answer (``is_match`` true, ``result`` is ``None`` —
+        i.e. not another ``input_required``) purges ``client_id``'s
+        transaction right here, before the rekeyed payload is even
+        returned — not later, when ``_mrtr_run_retry`` notices after the
+        whole retry POST/stream has finished. Without this, a duplicate
+        terminal response arriving later in the SAME stream hits the
+        "already matched" branch above and is dropped via ``return None`` —
+        which ``_post_and_stream`` reads as a fresh swallow — and if the
+        stream then breaks, ``_make_input_required_abort``'s membership
+        check finds the transaction "still registered" (the late purge
+        hasn't run yet) and answers a SECOND time under ``client_id``: an
+        error, after the valid result was already emitted under that same
+        id. Purging here closes that window: by the time the duplicate or a
+        subsequent transport error is processed, the transaction is already
+        gone, so the abort callback correctly no-ops. Never fires for a
+        round-opening match (the ``result is not None`` branch below,
+        returns early) — only for the one payload that actually finishes
+        the transaction.
+        """
+        matched = False
+
+        def hook(payload: str) -> str | None:
+            nonlocal matched
+            result = _extract_input_required(payload, upstream_id)
+            is_match = result is not None or _is_pure_response_for(payload, upstream_id)
+            if is_match:
+                if matched:
+                    log(
+                        f"MRTR: dropping extra response for id {upstream_id!r} "
+                        "already matched earlier in this POST (non-compliant "
+                        "server streaming more than one response under one "
+                        "id; #356 deep-review finding, minted-orphan)"
+                    )
+                    return None
+                matched = True
+            if result is not None:
+                _mrtr_open_round(client_id, stored_line, result)
+                return None
+            if is_match:
+                # #356 review R5F1: this payload is the terminal answer —
+                # purge NOW, at emit time, so a later duplicate or transport
+                # error in this same stream sees an already-finished
+                # transaction instead of one that only looks abandoned to
+                # `_post_and_stream` but is still registered in `mrtr_txns`.
+                _mrtr_purge(client_id)
+            return _mrtr_rekey(payload, upstream_id, client_id)
+
+        return hook
+
+    def _make_input_required_abort(client_id: Any) -> Callable[[str], None]:
+        """Build the failure counterpart of the interception hook (R1F1).
+
+        Handed to ``_post_and_stream`` alongside every hook and invoked on
+        the ONE path that would otherwise answer the client twice: a stream
+        that breaks after a payload was SWALLOWED. The swallow means a round
+        was opened — minted requests are on the client's stdin and the
+        transaction is waiting for them — so the generic
+        "upstream stream interrupted" error would land under the client's id
+        now, and the retry those answers eventually fire would land a result
+        under the same id later. Funnelling through ``_mrtr_abort`` instead
+        purges the transaction, cancels the outstanding minted requests
+        downstream, and writes exactly one error under N.
+
+        The membership check is what makes "exactly once" true rather than
+        merely intended: a swallow does NOT imply a live transaction — an
+        unbridgeable round (undeclared capability, ``mode: "url"``, a cap
+        breach) is swallowed by the hook and aborted from inside
+        ``_mrtr_open_round``, which has already answered and purged. Aborting
+        again on the way out would put a second error on the wire for one id,
+        which is the very failure this callback exists to prevent.
+
+        ``-32000`` rather than the funnel's ``-32600`` default: the fault is
+        an upstream transport failure, not a malformed MRTR message from the
+        server, and the same code already covers the other "the exchange
+        could not be completed" outcomes (cap breaches, a client error on a
+        minted id).
+        """
+
+        def abort(reason: str) -> None:
+            if client_id not in mrtr_txns:
+                log(
+                    f"MRTR POST for id {client_id!r} failed after the "
+                    f"transaction was already answered: {reason}"
+                )
+                return
+            _mrtr_abort(client_id, reason, code=-32000)
+
+        return abort
+
     # --- modern era: subscriptions/listen stream (#270 Phase 2 PR A) ---
     # ARRANGED here (era-resolution scope); the body snapshot is SEEDED by
     # each intercepted `initialize` (_handle_modern_special_method's
@@ -4874,14 +6193,30 @@ def run(
                 continue
 
             req_id, req_has_id = None, False
+            # Whether THIS line may legitimately be answered with an MRTR
+            # InputRequiredResult (#270 PR C). Set only inside the modern
+            # branch below; stays False on the legacy era, so `_dispatch`
+            # passes no hook and `_post_and_stream` is byte-identical
+            # there (acceptance criterion #3).
+            mrtr_eligible = False
             try:
                 if normalize_arguments:
                     line = _normalize_null_arguments(line)
 
-                if tracker is not None:
+                # The cancel id is extracted for TWO consumers now (#270 PR
+                # C, design change 11): the cancel filter's tracker (only
+                # when the filter is on) and the MRTR bridge (only on the
+                # modern era, and regardless of `--no-cancel-filter` — a
+                # transaction must be droppable either way). The outer
+                # guard keeps the legacy era's work identical to pre-#270
+                # when the filter is off: no extraction, no branch.
+                if tracker is not None or era == "modern":
                     cid = _extract_cancel_id(line)
                     if cid is not None:
-                        tracker.add(cid)
+                        if tracker is not None:
+                            tracker.add(cid)
+                        if era == "modern":
+                            _mrtr_handle_cancel(cid)
 
                 # Derive both the id value and its presence from one parse (the
                 # hot path). A notification (no id) must never receive a response —
@@ -4939,6 +6274,119 @@ def run(
                         if modern_reply is not None:
                             _emit(modern_reply, tracker)
                         continue
+                    # MRTR interception point (b) (#270 PR C): a
+                    # RESPONSE-shaped line — an id plus result/error and no
+                    # method — is the client ANSWERING something. On this
+                    # era the only thing it can be answering is a request
+                    # the BRIDGE minted: rev 2026-07-28 states "Servers
+                    # MUST send server-to-client requests ... using the
+                    # MRTR pattern. The previous pattern of
+                    # server-initiated requests is no longer supported."
+                    # so nothing upstream ever asked the client anything.
+                    # Consume it here; anything unrecognised is logged and
+                    # dropped rather than POSTed (which is what the
+                    # pre-PR-C loop did — a request with no `method`,
+                    # hence no Mcp-Method header, which "Required For: All
+                    # requests" already made non-compliant). Placed
+                    # immediately after the special-method block and
+                    # BEFORE the Mcp-Method safety check and
+                    # `_inject_modern_meta`, both of which are about
+                    # outbound requests this line will never become. The
+                    # legacy era keeps forwarding such lines verbatim —
+                    # there, server-initiated requests are still a real
+                    # thing (pinned by
+                    # test_legacy_response_shaped_stdin_line_is_posted_verbatim).
+                    client_response = _parse_client_response(line)
+                    if client_response is not None:
+                        ready = _mrtr_record_client_response(client_response)
+                        if ready is not None:
+                            # The last answer this round was waiting on:
+                            # re-POST the original request carrying every
+                            # collected inputResponse. Driven from HERE,
+                            # on the loop's own frame, with the client's
+                            # id — never through `_dispatch`, whose
+                            # closure would use THIS line's minted id.
+                            _mrtr_run_retry(ready)
+                        continue
+                    # The relay OWNS the "mcp-stdio/" id namespace on this
+                    # era (#356 review R2F1). A client request whose own id
+                    # is literally a minted id — say "mcp-stdio/mrtr/1/a" —
+                    # is indistinguishable from the relay's own bookkeeping
+                    # afterwards: a `notifications/cancelled` naming it
+                    # matches `mrtr_minted` and aborts ANOTHER transaction
+                    # instead of dropping this one, and its own response
+                    # would be re-keyed or intercepted by whatever else
+                    # holds that id. C10 argued a collision needs a client
+                    # that "maliciously adopts the relay's prefix"; PR C
+                    # made the consequence a misrouted abort rather than a
+                    # curiosity, so the assumption is upgraded to a rule and
+                    # enforced where the id ENTERS — one check, before any
+                    # state can key on it, instead of a collision test in
+                    # every consumer.
+                    #
+                    # Placed AFTER the response interception above, so the
+                    # client's genuine answers to minted requests (which of
+                    # course carry minted ids) are consumed first, and
+                    # before the reuse check below, which this makes
+                    # unreachable for a reserved id. Deliberately gated on
+                    # `req_has_id` alone rather than on a parsed method: an
+                    # id-bearing line that is neither a response nor a
+                    # recognisable request must not be POSTed into the
+                    # relay's own namespace either. Notifications carry no
+                    # id and are untouched — including a
+                    # `notifications/cancelled` whose params.requestId names
+                    # a minted request, which is a legitimate thing for a
+                    # client to send. The legacy era is untouched (AC #3):
+                    # this whole block is inside `era == "modern"`, so a
+                    # legacy client using such an id is forwarded exactly as
+                    # before.
+                    if (
+                        req_has_id
+                        and isinstance(req_id, str)
+                        and req_id.startswith(_RELAY_ID_NAMESPACE)
+                    ):
+                        log(
+                            f"rejecting request: id {req_id!r} is inside the "
+                            f"relay's reserved {_RELAY_ID_NAMESPACE!r} namespace"
+                        )
+                        _write_line(
+                            _error_response(
+                                f"request id must not start with "
+                                f"{_RELAY_ID_NAMESPACE!r}: that namespace is "
+                                f"reserved for relay-minted requests",
+                                req_id,
+                                code=-32600,
+                            )
+                        )
+                        continue
+                    # Client id reuse while a transaction is pending
+                    # (design change 6). JSON-RPC lets a client reuse an id
+                    # once the prior call is DONE, and the cancel tracker's
+                    # `discard` above encodes exactly that — but PR C makes
+                    # the collision stateful: this id currently owns minted
+                    # requests, a stored body and a round counter, and
+                    # accepting a second request under it would either
+                    # clobber that state or put two responses on the wire
+                    # for one id. Reject the newcomer and leave the
+                    # transaction alone; the client can cancel it (which
+                    # frees the id) or answer it. `_is_scalar_id` guards
+                    # the dict lookup against an unhashable id, and the
+                    # comparison is type-aware by construction — `1` and
+                    # `"1"` are different keys.
+                    if req_has_id and _is_scalar_id(req_id) and req_id in mrtr_txns:
+                        log(
+                            f"rejecting request: id {req_id!r} still owns a "
+                            f"pending MRTR transaction"
+                        )
+                        _write_line(
+                            _error_response(
+                                "request id is still awaiting input for an "
+                                "earlier request (MRTR transaction pending)",
+                                req_id,
+                                code=-32600,
+                            )
+                        )
+                        continue
                     # Reject a method that cannot ride the REQUIRED Mcp-Method
                     # header (#350 review round 5, finding 5-2). JSON-RPC 2.0
                     # allows ANY string as `method`, but Streamable HTTP
@@ -4982,6 +6430,17 @@ def run(
                                 )
                             )
                         continue
+                    # MRTR eligibility (#270 PR C): only the three methods
+                    # the spec allows an InputRequiredResult on, and only
+                    # when the line is a real request whose id can key a
+                    # transaction. ``unsafe_method`` was just parsed above
+                    # and is the same value `_inject_modern_meta` leaves
+                    # untouched, so no second parse is needed.
+                    mrtr_eligible = (
+                        req_has_id
+                        and _is_scalar_id(req_id)
+                        and unsafe_method in _MRTR_SUPPORTED_METHODS
+                    )
                     # Every other request/notification carries the modern
                     # per-request _meta block (protocol version, client
                     # capabilities, optionally clientInfo/logLevel). Reassigning
@@ -5064,6 +6523,27 @@ def run(
                         tracker,
                         capture_init=capture_init,
                         has_id=req_has_id,
+                        # Fresh hook per POST (#270 PR C) — one stdin line
+                        # can dispatch up to four times through the
+                        # recovery ladder, and each POST must intercept
+                        # under its own id with no state carried over.
+                        # None on every non-eligible line and on the whole
+                        # legacy era.
+                        input_required_hook=(
+                            _make_input_required_hook(req_id, req_id, content)
+                            if mrtr_eligible
+                            else None
+                        ),
+                        # Always paired with the hook (#356 review R1F1): a
+                        # stream that breaks after a swallow must answer
+                        # through the transaction's abort funnel, not with a
+                        # bare error that leaves the transaction alive to
+                        # answer a second time.
+                        input_required_abort=(
+                            _make_input_required_abort(req_id)
+                            if mrtr_eligible
+                            else None
+                        ),
                     )
                     if result is not None and result.protocol_version:
                         if result.protocol_version != protocol_version:
@@ -5322,6 +6802,16 @@ def run(
                             else f"HTTP {result.status_code}"
                         )
                         _write_line(_error_response(msg, req_id, data=err_data))
+
+                # A ``requestState``-only round opened on THIS dispatch has
+                # nothing to ask the client ("If the InputRequiredResult
+                # does not contain the inputRequests field, the client MAY
+                # retry the original request immediately"), so it must be
+                # re-POSTed now rather than waiting for a stdin line that
+                # will never come. A no-op for every other line: the driver
+                # returns immediately unless a transaction is flagged.
+                if mrtr_eligible:
+                    _mrtr_run_retry(req_id)
             except Exception as e:  # noqa: BLE001 — never crash the gateway
                 # The #11 contract is structural here, not just per-helper: an
                 # unexpected non-httpx exception escaping _dispatch / the recovery
