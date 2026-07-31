@@ -15556,6 +15556,13 @@ class _AbortableStream(httpx.SyncByteStream):
       partially-read connection cannot be returned to the pool;
     - the test releases it -> deliver ``after`` and end normally.
 
+    ``close_ends_quietly`` selects the OTHER thing a real close can do,
+    and the one Design Amendment D2 exists for: landing between chunks
+    after the underlying stream already reached EOF, it ends
+    ``iter_text()`` with no exception at all. Neither of
+    ``_post_and_stream``'s exception arms sees that, so only the check on
+    the normal terminal return catches it.
+
     Both signals ride ONE queue, so the choice is made by arrival order
     with no polling, no timers and no sleeps. ``opened`` fires once the
     POST is genuinely streaming, which is what lets a test send its
@@ -15567,11 +15574,12 @@ class _AbortableStream(httpx.SyncByteStream):
     _CLOSED = "closed"
     _RELEASED = "released"
 
-    def __init__(self, before=(), after=(), *, opened=None):
+    def __init__(self, before=(), after=(), *, opened=None, close_ends_quietly=False):
         self.before = list(before)
         self.after = list(after)
         self.opened = opened or threading.Event()
         self.closed = threading.Event()
+        self.close_ends_quietly = close_ends_quietly
         self._wake: queue.SimpleQueue = queue.SimpleQueue()
         self._done = False
 
@@ -15592,6 +15600,12 @@ class _AbortableStream(httpx.SyncByteStream):
         self.opened.set()
         signal = self._wake.get(timeout=10)
         if signal == self._CLOSED:
+            if self.close_ends_quietly:
+                # The close landed between chunks with the underlying
+                # stream already at EOF: iteration simply stops, and NO
+                # exception is raised anywhere (Design Amendment D2).
+                self._done = True
+                return
             raise httpx.ReadError("connection closed while the response was streaming")
         self._done = True
         yield from self.after
@@ -16298,16 +16312,69 @@ class TestRunModernStdinHandoff:
                 _post_and_stream(client, self.URL, '{"id":2}', {}, 2)
         client.close()
 
+    @pytest.mark.timeout(30)
     def test_abort_on_a_stream_that_ends_without_raising(self, httpx_mock):
-        """The FALSE-NORMAL terminal: a close landing between chunks,
-        after the underlying stream already reached EOF, ends
-        `iter_text()` without raising anything at all.
+        """DESIGN AMENDMENT D2 (approved on #270): the FALSE-NORMAL
+        terminal. A close landing between chunks, after the underlying
+        stream already reached EOF, ends `iter_text()` without raising
+        anything at all.
 
-        Neither exception arm sees that, so without the gate on the
+        Neither exception arm sees that, so without the check on the
         NORMAL 200 return `_post_and_stream` writes "empty response from
         server" under the cancelled id and hands the caller a
         healthy-looking 200 that the recovery ladder and
-        `_mrtr_run_retry` then act on."""
+        `_mrtr_run_retry` then act on.
+
+        Two halves. The unit half isolates the classification; the
+        END-TO-END half is the real article — the reader THREAD closes
+        the published handle while the consumer is provably parked
+        mid-stream, and the stream ends quietly rather than raising, so
+        the non-raising path is driven by an actual cross-thread close
+        rather than simulated. Removing the pre-return check fails
+        both."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        opened = threading.Event()
+        holder: list = []
+
+        def tool_callback(request):
+            stream = _AbortableStream(
+                before=[b": open\n\n"], opened=opened, close_ends_quietly=True
+            )
+            holder.append(stream)
+            return httpx.Response(
+                200, stream=stream, headers={"content-type": "text/event-stream"}
+            )
+
+        httpx_mock.add_callback(
+            tool_callback,
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            is_reusable=True,
+        )
+        stdout = StringIO()
+
+        def stdin_gen():
+            yield self._call() + "\n"
+            assert opened.wait(timeout=10)
+            yield self._cancel(2) + "\n"
+
+        with patch("sys.stdin", stdin_gen()), patch("sys.stdout", stdout):
+            run(self.URL, {"Content-Type": "application/json"}, protocol_era="modern")
+
+        # The close really happened, on the reader thread, and the stream
+        # ended without raising — yet nothing was written under the
+        # cancelled id and the request was not replayed.
+        assert holder and holder[0].closed.is_set()
+        assert len(self._tool_calls(httpx_mock)) == 1
+        assert not [
+            line for line in self._out(stdout.getvalue()) if line.get("id") == 2
+        ]
+        assert "empty response from server" not in stdout.getvalue()
+
+        # And the classification in isolation, for a sharper failure
+        # message when the gate itself is what regressed.
+        httpx_mock.reset()
         abort = threading.Event()
 
         def gen():
