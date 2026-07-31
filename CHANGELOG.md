@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.34.1](https://github.com/shigechika/mcp-stdio/compare/v0.34.0...v0.34.1) (2026-07-31)
+
+
+### Bug Fixes
+
+* **ci:** close the supplement bypass and size the ledger cap by measurement ([#363](https://github.com/shigechika/mcp-stdio/issues/363)) ([7feccf4](https://github.com/shigechika/mcp-stdio/commit/7feccf454724e9f1ebf3ec173a0845c98d78410f))
+
 ## [0.34.0](https://github.com/shigechika/mcp-stdio/compare/v0.33.0...v0.34.0) (2026-07-31)
 
 
