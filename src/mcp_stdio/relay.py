@@ -644,6 +644,83 @@ def _encode_mcp_name(value: str) -> str:
     return f"=?base64?{encoded}?="
 
 
+# The literal markers spec rev 2026-07-28 mandates around an encoded value.
+# Sliced off by `_decode_mcp_name` rather than re-matched with a capturing
+# group, so encoder and decoder cannot drift apart on what the sentinel is.
+_BASE64_SENTINEL_PREFIX = "=?base64?"
+_BASE64_SENTINEL_SUFFIX = "?="
+
+
+def _decode_mcp_name(value: str | None) -> str | None:
+    """Decode a received ``Mcp-Name`` header value — the inverse of the encoder.
+
+    #270 Phase 3 P3-A. Spec rev 2026-07-28 "Server Validation" makes this a
+    server obligation, not a nicety: servers "**MUST** decode an encoded
+    ``Mcp-Name`` or ``Mcp-Param-{Name}`` value before comparing it to the
+    corresponding request body value". Without it a compliant client that
+    encodes a non-ASCII tool name gets a spurious ``-32020 HeaderMismatch``
+    for a header that in fact matches.
+
+    ``None`` in, ``None`` out (an absent header). A value that does not
+    match the sentinel rides back VERBATIM — the encoder only encodes what
+    it must, so most values never took the sentinel path at all.
+
+    INVALID INPUT RETURNS ``None``, NEVER RAISES, and gets no distinct
+    error code. That is the load-bearing design decision (mirroring the
+    SDK's own): ``None`` never equals a body string, so a corrupt header
+    surfaces through the ordinary comparison as ``-32020`` — "a corrupt
+    header never matches a body value by accident" — instead of needing a
+    second rejection path with its own code the spec does not define.
+
+    Three ways to be invalid, all folded into that one outcome:
+
+    1. the payload is not valid Base64 (``validate=True``, so characters
+       outside the standard alphabet are rejected rather than discarded).
+       Caught as ``ValueError``, NOT the narrower ``binascii.Error``:
+       HTTP headers decode as latin-1, so a header can legitimately hand
+       us a non-ASCII payload, and ``b64decode`` fails such a string at
+       its internal ``s.encode("ascii")`` step — BEFORE the base64
+       decoder runs — with a plain ``ValueError`` that ``binascii.Error``
+       does not cover. Missing that raised straight out of serve's
+       validation ladder and killed the handler thread, so a request with
+       ``Mcp-Name: =?base64?<0xFF>?=`` got NO response at all instead of
+       the ``-32020`` it had earned (#371 review R1F1). ``binascii.Error``
+       is itself a ``ValueError`` subclass, so the wider catch is a
+       superset, not a trade;
+    2. the payload is not CANONICAL. ``validate=True`` still accepts
+       encodings with non-zero trailing bits, which decode fine but are
+       not what ``b64encode`` would produce — so a round-trip check
+       rejects them. Without it, two distinct header values could decode
+       to the same string and one of them was never emitted by any
+       compliant encoder;
+    3. the decoded bytes are not UTF-8. The spec defines the payload as
+       Base64 of the UTF-8 bytes, so anything else is malformed.
+
+    Uses relay's OWN ``_BASE64_SENTINEL_RE`` (DOTALL, deliberately — an
+    encoded value may contain a newline, which the encoder happily
+    produces and a non-DOTALL pattern would then fail to recognise), so
+    ``_decode_mcp_name(_encode_mcp_name(v)) == v`` holds for every ``v``.
+    It lives here, next to the encoder, for exactly that reason; serve
+    imports it.
+    """
+    if value is None:
+        return None
+    if not _BASE64_SENTINEL_RE.match(value):
+        return value
+    payload = value[len(_BASE64_SENTINEL_PREFIX) : -len(_BASE64_SENTINEL_SUFFIX)]
+    try:
+        raw = base64.b64decode(payload, validate=True)
+    except ValueError:
+        return None
+    if base64.b64encode(raw).decode("ascii") != payload:
+        # Non-canonical encoding (see point 2 above).
+        return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
 def _mcp_request_headers(line: str) -> dict[str, str]:
     """Build the ``Mcp-Method``/``Mcp-Name`` headers for one dispatched line.
 

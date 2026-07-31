@@ -50,7 +50,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from .relay import log
+from .relay import (
+    _META_CLIENT_CAPABILITIES,
+    _META_PROTOCOL_VERSION,
+    _NAME_BEARING_METHODS,
+    _decode_mcp_name,
+    log,
+)
 from .token_store import _atomic_write_json_file, _read_json_object_file
 
 # Bound how long an HTTP request waits for the backend to answer before the
@@ -107,15 +113,263 @@ def _classify(msg: Any) -> str:
     return "invalid"
 
 
-def _error_body(message: str, req_id: Any = None) -> str:
-    """Build a JSON-RPC error response line (-32000 server error)."""
-    return json.dumps(
-        {
-            "jsonrpc": "2.0",
-            "error": {"code": -32000, "message": message},
-            "id": req_id,
-        }
-    )
+def _error_body(
+    message: str, req_id: Any = None, *, code: int = -32000, data: Any = None
+) -> str:
+    """Build a JSON-RPC error response line.
+
+    ``code`` defaults to ``-32000`` — the implementation-defined
+    server-error range — so every pre-existing call site keeps emitting
+    byte-identical bytes, which is what lets #270 Phase 3 P3-A widen the
+    MODERN path's codes without touching a single legacy rejection (AC2,
+    and the P3-0 pin suite is the judge).
+
+    ``data`` is attached as the optional ``error.data`` member (JSON-RPC
+    2.0 §5.1) when not None — INSIDE the error object, not beside it.
+    Spec rev 2026-07-28 makes it mandatory on exactly one code:
+    ``-32022 UnsupportedProtocolVersion`` must carry the versions the
+    server does support, so a client can renegotiate instead of guessing.
+
+    Deliberately NOT relay's ``_error_response``: that one is
+    line-oriented for the stdio wire and carries its own defaults. Same
+    shape, different transport, no import.
+    """
+    error: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    return json.dumps({"jsonrpc": "2.0", "error": error, "id": req_id})
+
+
+# --- modern (spec rev 2026-07-28) request-plane validation (#270 P3-A) ---
+
+# The modern revisions SERVE claims to implement. Deliberately NOT reused
+# from relay's `_RELAY_IMPLEMENTED_MODERN_VERSIONS`: the two gateways make
+# separate conformance claims about opposite sides of the wire, and a
+# future revision one of them implements first must not be advertised by
+# the other for free. Fed verbatim into `-32022`'s `data.supported`.
+_SERVE_IMPLEMENTED_MODERN_VERSIONS = frozenset({"2026-07-28"})
+
+# Spec rev 2026-07-28 error codes. -32602 is JSON-RPC's own Invalid Params;
+# the other two are MCP's, from the -32020..-32099 range the spec reserves
+# for itself (which is also why serve mints no NEW -32002: that code is
+# grandfathered for relay's cold-start gate only, obligation O18).
+_JSONRPC_INVALID_PARAMS = -32602
+_MCP_HEADER_MISMATCH = -32020
+_MCP_UNSUPPORTED_PROTOCOL_VERSION = -32022
+
+# Headers whose value the spec mirrors from the request body, and which a
+# compliant server therefore validates. A REPEATED one is ambiguous — the
+# folded `headers.get()` silently returns the first — so they are checked
+# for duplication before anything reads them.
+_MODERN_ROUTING_HEADERS = ("MCP-Protocol-Version", "Mcp-Method", "Mcp-Name")
+
+_MODERN_DISCOVER_METHOD = "server/discover"
+
+
+def _request_era(kind: str, msg: dict[str, Any]) -> str:
+    """Classify one parsed POST body as ``"modern"`` or ``"legacy"``.
+
+    #270 Phase 3 decision D5, and it is deliberately CONSERVATIVE: modern
+    only on POSITIVE modern evidence, everything else falls through to the
+    untouched legacy path, so a legacy client can never be misclassified
+    into a validation ladder it has no idea exists. That direction is what
+    makes AC2 hold for shapes nobody thought to test.
+
+    The evidence, matching the spec's own discrimination rule ("A request
+    carrying modern per-request `_meta` is served statelessly … An
+    `initialize` request selects legacy semantics"):
+
+    - ``params._meta`` carries the ``protocolVersion`` key. PRESENCE, not
+      validity: a malformed value must reach the ladder and earn a real
+      rejection, not be quietly demoted to legacy where it would get a
+      session error that says nothing about what was wrong.
+    - or the method is ``server/discover``, which exists only on the
+      modern wire. This arm is an mcp-stdio-local widening for
+      CLASSIFICATION only — the SDK routes by header, which serve cannot
+      see before parsing — and it softens nothing: a `_meta`-less
+      discover classifies modern and is rejected by the ladder's first
+      rung like any other modern request missing `_meta`.
+
+    A ``response``-shaped body is never modern (spec rev 2026-07-28
+    removed server-initiated requests, so clients never POST responses),
+    and neither is anything that failed the shape checks upstream — both
+    keep today's behavior exactly.
+    """
+    if kind not in ("request", "notification"):
+        return "legacy"
+    if msg.get("method") == _MODERN_DISCOVER_METHOD:
+        return "modern"
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return "legacy"
+    meta = params.get("_meta")
+    if not isinstance(meta, dict):
+        return "legacy"
+    return "modern" if _META_PROTOCOL_VERSION in meta else "legacy"
+
+
+def _modern_name_bearing_value(msg: dict[str, Any]) -> str | None:
+    """The body value ``Mcp-Name`` must mirror, or None when there is none.
+
+    ``None`` covers both "this method has no name-bearing field" and "the
+    field is absent from this body". The second is deliberate (design
+    §2.2 rung 2c): a name-bearing method whose ``params`` are missing
+    entirely has no body value to compare against, so the header check is
+    SKIPPED and the request falls through — dispatch owns missing-param
+    errors, and inventing a header mismatch for a body problem would
+    report the wrong fault.
+
+    Reads the parsed body directly rather than calling relay's
+    ``_extract_method_and_name``, which takes a serialized line: the
+    handler already has the object, and re-serializing to re-parse cannot
+    round-trip exactly.
+    """
+    method = msg.get("method")
+    if not isinstance(method, str):
+        return None
+    name_key = _NAME_BEARING_METHODS.get(method)
+    if name_key is None:
+        return None
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return None
+    value = params.get(name_key)
+    return value if isinstance(value, str) else None
+
+
+def _validate_modern(handler: Any, kind: str, msg: dict[str, Any], req_id: Any) -> bool:
+    """Run the modern validation ladder; False means a 4xx was already sent.
+
+    #270 Phase 3 P3-A, obligations O6-O10. FIRST FAILURE WINS, in the
+    order python-sdk v2 uses — which is NOT the order the obligations are
+    numbered in. The header rungs run BEFORE the unsupported-version rung,
+    for the SDK's own stated reason: it "runs before the supported-version
+    rung so a client that disagrees with itself is told so, rather than
+    told the body's version is unsupported." That ordering is load-bearing
+    rather than cosmetic: ``-32022`` is the one code an auto-negotiating
+    client does NOT fall back from, so emitting it for a self-inconsistent
+    request would strand a client that could have fixed its headers.
+
+    NOTIFICATIONS ARE A FULL NO-OP — no `_meta` check, no header checks.
+    The spec says "header requirements for notification POSTs are not
+    defined by this revision" (obligation O9), so both accepting and
+    rejecting are conformant, and the tie is broken by the P3-0 pin:
+    `test_notification_post_needs_a_session_first` says a sessioned
+    notification is 202 and a sessionless one is 400 `-32000`, today and
+    after this PR. python-sdk v2 400s every notification POST; serve
+    deliberately does NOT copy that (divergence ledger item i). The
+    exemption is broader than O9's headers-only wording on purpose:
+    validating `_meta` would 400 a sessioned notification that 202s
+    today, which is exactly the behavior change D5's conservatism forbids.
+
+    Messages NAME the offending header and never echo its value or the
+    body's. The spec's value-echoing example is non-normative, and
+    reflecting attacker-controlled header bytes into a response body is
+    not a thing to do for a debugging nicety (the SDK makes the same
+    choice). `-32020` carries no `data` at all per the schema.
+
+    Every rejection here runs AFTER the body was drained (`do_POST` reads
+    it before any early return) so the keep-alive contract holds by
+    construction, and BEFORE session resolution, so `handler._session_id`
+    is still None and no `Mcp-Session-Id` can leak onto a rejection.
+    """
+    if kind == "notification":
+        return True
+
+    def _reject(message: str, code: int, data: Any = None) -> bool:
+        handler._send_json(400, _error_body(message, req_id, code=code, data=data))
+        return False
+
+    # Rung 0 — a repeated routing header (SDK step 0; the spec is silent).
+    # `headers.get()` folds duplicates to the first value, so without this
+    # a client could send one `Mcp-Method` that matches the body and a
+    # second that does not, and serve would validate the one an
+    # intermediary might not forward. Checked on the raw pairs.
+    for header in _MODERN_ROUTING_HEADERS:
+        values = handler.headers.get_all(header)
+        if values is not None and len(values) > 1:
+            return _reject(
+                f"{header} header appears more than once",
+                _MCP_HEADER_MISMATCH,
+            )
+
+    # Rung 1 — required `_meta` (O6). Both keys are REQUIRED; `clientInfo`
+    # is SHOULD-only and is never rejected on.
+    params = msg.get("params")
+    meta = params.get("_meta") if isinstance(params, dict) else None
+    if not isinstance(meta, dict):
+        return _reject(
+            "request params._meta is required and must be an object carrying "
+            f"{_META_PROTOCOL_VERSION} and {_META_CLIENT_CAPABILITIES}",
+            _JSONRPC_INVALID_PARAMS,
+        )
+    missing = [
+        key
+        for key in (_META_PROTOCOL_VERSION, _META_CLIENT_CAPABILITIES)
+        if key not in meta
+    ]
+    if missing:
+        return _reject(
+            f"request params._meta is missing required key(s): {', '.join(missing)}",
+            _JSONRPC_INVALID_PARAMS,
+        )
+
+    body_version = meta.get(_META_PROTOCOL_VERSION)
+
+    # Rung 2a — header/body version agreement (O7, and this PR's AC4).
+    # ABSENCE IS A MISMATCH: the header is REQUIRED, and `None` never
+    # equals the body value, so the one comparison covers both faults.
+    if handler.headers.get("MCP-Protocol-Version") != body_version:
+        return _reject(
+            "MCP-Protocol-Version header does not match the protocol version "
+            "in the request body's _meta",
+            _MCP_HEADER_MISMATCH,
+        )
+
+    # Rung 2b — `Mcp-Method` mirrors `method`, compared RAW. The base64
+    # sentinel is defined only for `Mcp-Name`/`Mcp-Param-{Name}` (the
+    # "Server Validation" section names exactly those two), so decoding
+    # here would accept an encoding no compliant client may send.
+    if handler.headers.get("Mcp-Method") != msg.get("method"):
+        return _reject(
+            "Mcp-Method header does not match the request method",
+            _MCP_HEADER_MISMATCH,
+        )
+
+    # Rung 2c — `Mcp-Name` mirrors the body's name/uri, DECODED first
+    # (O8's MUST). A malformed sentinel decodes to None, which never
+    # equals the body value, so a corrupt header lands here rather than
+    # needing a code of its own.
+    name_value = _modern_name_bearing_value(msg)
+    if name_value is not None:
+        if _decode_mcp_name(handler.headers.get("Mcp-Name")) != name_value:
+            return _reject(
+                "Mcp-Name header does not match the corresponding request body value",
+                _MCP_HEADER_MISMATCH,
+            )
+
+    # Rung 3 — defensive only, and unreachable over HTTP: a non-string
+    # body version cannot equal the header string, so rung 2a already
+    # rejected it. Kept so the rung below can assume a string.
+    if not isinstance(body_version, str):  # pragma: no cover — see above
+        return _reject(
+            f"{_META_PROTOCOL_VERSION} must be a string",
+            _JSONRPC_INVALID_PARAMS,
+        )
+
+    # Rung 4 — the version is one serve implements (O10). `data` is
+    # SCHEMA-MANDATED here, not a nicety: without `supported` a client has
+    # nothing to renegotiate toward.
+    if body_version not in _SERVE_IMPLEMENTED_MODERN_VERSIONS:
+        return _reject(
+            "Unsupported protocol version",
+            _MCP_UNSUPPORTED_PROTOCOL_VERSION,
+            data={
+                "supported": sorted(_SERVE_IMPLEMENTED_MODERN_VERSIONS),
+                "requested": body_version,
+            },
+        )
+    return True
 
 
 class _DuplicateInFlightId(Exception):
@@ -2148,6 +2402,27 @@ class _Handler(BaseHTTPRequestHandler):
             if req_id is not None and not isinstance(req_id, (str, int, float)):
                 self._send_json(400, _error_body("invalid JSON-RPC id"))
                 return
+
+        # --- modern request-plane validation (#270 Phase 3 P3-A) ---
+        # Placed HERE, and the position is load-bearing three ways: the
+        # body is parsed (so the era predicate can read `_meta`), it is
+        # already DRAINED (line ~2112, so every rejection below inherits
+        # the keep-alive contract by construction rather than by
+        # remembering), and `self._session_id` is still None (so no
+        # session header can leak onto a rejection).
+        #
+        # A legacy body classifies legacy and nothing below runs — the
+        # whole ladder is vacuous for it, which is how AC2 holds.
+        #
+        # P3-A ships ZERO modern dispatch on purpose: a request that
+        # PASSES validation falls straight through into the untouched
+        # session-resolution path below, where a sessionless one earns
+        # today's 400 `-32000` exactly as before. P3-B replaces that
+        # fallthrough wholesale with stateless dispatch.
+        if _request_era(kind, msg) == "modern" and not _validate_modern(
+            self, kind, msg, req_id
+        ):
+            return
 
         # --- session resolution (MCP Streamable HTTP session management) ---
         # When OAuth is enabled, sessions are bound to the authenticated user so

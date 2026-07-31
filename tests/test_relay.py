@@ -1,5 +1,6 @@
 """Tests for mcp_stdio.relay module."""
 
+import base64
 import copy
 import email.utils
 import json
@@ -35,6 +36,7 @@ from mcp_stdio.relay import (
     _build_discover_probe_request,
     _build_listen_params,
     _consume_restart,
+    _decode_mcp_name,
     _detect_paginated_list,
     _drain_pending,
     _emit,
@@ -9572,6 +9574,95 @@ class TestEncodeMcpName:
         encoded = _encode_mcp_name(tricky)
         assert encoded != tricky
         assert encoded.startswith("=?base64?") and encoded.endswith("?=")
+
+
+class TestDecodeMcpName:
+    """The receive-side inverse of `_encode_mcp_name` (#270 Phase 3 P3-A).
+
+    Spec rev 2026-07-28 "Server Validation" makes decoding a server MUST
+    before comparing a header to the body. Every invalid input returns
+    `None` rather than raising or carrying its own code: `None` never
+    equals a body string, so a corrupt header surfaces as the ordinary
+    `-32020 HeaderMismatch` — a corrupt header never matches by accident.
+    """
+
+    def test_none_in_none_out(self):
+        assert _decode_mcp_name(None) is None
+
+    def test_plain_value_rides_back_verbatim(self):
+        assert _decode_mcp_name("echo") == "echo"
+        # Not every non-sentinel value is ASCII-safe on the wire, but if
+        # one arrives the decoder must not mangle it.
+        assert _decode_mcp_name("file:///a b.txt") == "file:///a b.txt"
+
+    def test_decodes_the_specs_worked_example(self):
+        assert _decode_mcp_name("=?base64?SGVsbG8sIOS4lueVjA==?=") == "Hello, 世界"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "echo",
+            "Hello, 世界",
+            " leading-space",
+            "trailing-space ",
+            "\tleading-tab",
+            # A value that LOOKS encoded: the encoder double-wraps it, so
+            # the decoder must return the original, not the inner text.
+            "=?base64?not-really-encoded?=",
+            "",
+            "with\nnewline",
+        ],
+    )
+    def test_round_trips_whatever_the_encoder_produced(self, value):
+        """The property that matters: decode(encode(v)) == v, for every v.
+
+        This is why the decoder reuses relay's OWN `_BASE64_SENTINEL_RE`
+        (DOTALL included) instead of a fresh pattern — the two would drift
+        and the drift would only show up on the values a regex disagrees
+        about, e.g. one containing a newline.
+        """
+        assert _decode_mcp_name(_encode_mcp_name(value)) == value
+
+    def test_invalid_base64_returns_none(self):
+        # "!" is outside the standard alphabet; validate=True rejects it
+        # rather than silently discarding it.
+        assert _decode_mcp_name("=?base64?not-base64!!?=") is None
+
+    def test_non_canonical_base64_returns_none(self):
+        """`validate=True` accepts non-zero trailing bits; canonicality does not.
+
+        "QUJ=" and "QUI=" both decode to b"AB", but only "QUI=" is what
+        `b64encode` emits. Accepting both would let two distinct header
+        values compare equal to one body value, one of which no compliant
+        encoder ever produced.
+        """
+        assert base64.b64decode("QUJ=", validate=True) == b"AB"
+        assert _decode_mcp_name("=?base64?QUI=?=") == "AB"
+        assert _decode_mcp_name("=?base64?QUJ=?=") is None
+
+    def test_invalid_utf8_returns_none(self):
+        # 0xFF is never a valid UTF-8 byte.
+        payload = base64.b64encode(b"\xff").decode("ascii")
+        assert _decode_mcp_name(f"=?base64?{payload}?=") is None
+
+    def test_non_ascii_payload_returns_none_instead_of_raising(self):
+        """#371 review R1F1 — the one invalid input that is NOT a
+        `binascii.Error`.
+
+        HTTP headers decode as latin-1, so a header can hand this
+        function a payload containing non-ASCII characters. `b64decode`
+        rejects such a string at its internal `s.encode("ascii")` step,
+        BEFORE the base64 decoder runs, with a plain `ValueError` that
+        `binascii.Error` does not cover — and that escaped serve's
+        validation ladder and killed the handler thread, so the request
+        got NO response at all rather than the `-32020` it had earned.
+        """
+        assert _decode_mcp_name("=?base64?\xff?=") is None
+        # Mixed ASCII and non-ASCII takes the same path.
+        assert _decode_mcp_name("=?base64?QUI\xff?=") is None
+
+    def test_empty_payload_decodes_to_empty_string(self):
+        assert _decode_mcp_name("=?base64??=") == ""
 
 
 class TestMcpRequestHeaders:
