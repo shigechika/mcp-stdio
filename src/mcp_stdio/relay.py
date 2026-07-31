@@ -4043,10 +4043,20 @@ def _handle_listen_message(
                 # makes sure the violation is not ALSO misread as the
                 # graceful end below, which would silently stop listening
                 # for the rest of the session. Swallowed instead: the
-                # stream then ends without a signal and takes the ordinary
-                # reconnect / reopen path. Logged once per stream, because
-                # a server that does this once will do it on every
-                # attempt.
+                # stream then ends without a signal, and what happens next
+                # is NOT uniformly "the ordinary reconnect path" (#358
+                # review R1F2) — it depends on C7's ``established`` split,
+                # exactly like every other signal-less stream end.
+                # PRE-establishment (this is the very first attempt's
+                # answer) the no-ack fail-fast below finds ``established``
+                # still ``False`` and returns, permanently disabling the
+                # thread with no reconnect — correctly: a server that
+                # violates this spec rule on attempt 1 will violate it on
+                # every attempt, exactly the 1 Hz hammering C7 exists to
+                # stop. POST-establishment it is an ordinary
+                # end-without-signal and does take the usual reconnect
+                # path. Logged once per stream, because a server that does
+                # this once will do it on every attempt.
                 if not (state is not None and state.get("input_required_logged")):
                     if state is not None:
                         state["input_required_logged"] = True

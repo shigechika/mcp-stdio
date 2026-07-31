@@ -16334,6 +16334,49 @@ class TestListenStreamLoop:
         assert err.count("before the stream was ever established") == 1
         assert "disabled for this session" in err
 
+    def test_input_required_result_fails_fast_pre_establishment_no_reconnect(
+        self, httpx_mock, capsys
+    ):
+        """#358 review R1F2 pin, the BEHAVIOR half (not just the comment
+        wording it guards): `subscriptions/listen` is not MRTR-eligible,
+        so a FIRST-attempt result with `resultType: "input_required"` is a
+        server-side spec violation. `_handle_listen_message` swallows it
+        (returns None — neither "ack" nor terminal), and the stream then
+        ends with neither graceful signal — PRE-establishment, that is
+        C7's ordinary no-ack fail-fast (`established` is still False
+        here): exactly one POST, the thread exits, no reconnect.
+        Reconnecting forever instead would be exactly the 1 Hz hammering
+        of a server that will answer input_required on every attempt that
+        C7 exists to prevent. This pins the BEHAVIOR so a future fix to
+        the misleading in-branch comment above this case (which used to
+        claim "the ordinary reconnect path") can never accidentally
+        become a fix to the reconnect behavior it describes."""
+        httpx_mock.add_response(
+            stream=self._sse(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "mcp-stdio/listen/1",
+                    "result": {"resultType": "input_required", "requestState": "X"},
+                }
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+        self._add_regression_escape_hatch(httpx_mock)
+        state = {}
+        with (
+            patch("mcp_stdio.relay.RETRY_DELAY", 0),
+            patch("sys.stdout", StringIO()),
+        ):
+            self._run_loop(state=state)
+        assert len(httpx_mock.get_requests()) == 1
+        err = capsys.readouterr().err
+        assert err.count("input_required result") == 1
+        # No MRTR transaction state was touched: this loop is never even
+        # given an `mrtr_txns` handle (the listen loops deliberately do
+        # not go through `_post_and_stream`), and the only thing this
+        # branch writes to `state` is the once-per-stream log latch.
+        assert state == {"input_required_logged": True}
+
     def test_established_then_ackless_junk_reconnect_keeps_retrying(
         self, httpx_mock, capsys
     ):
