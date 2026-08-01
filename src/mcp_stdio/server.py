@@ -1409,14 +1409,16 @@ def _modern_response_status(msg: dict[str, Any]) -> int:
 # `tools.listChanged`, `resources.listChanged` and `prompts.listChanged`
 # are honest promises and were removed from this table.
 #
-# `resources.subscribe` stays stripped: it promises PER-URI subscription
-# driving (`resources/subscribe` + `notifications/resources/updated`),
-# which serve does not do yet — the listen ack explicitly declines
-# `resourceSubscriptions`, so advertising the flag would promise the one
-# thing the ack refuses. Tracked in #381; the fix there is to make this
-# conditional on the child's own advertised `resources.subscribe` inside
-# `_synthesize_discover_result` (which already holds `init_result`)
-# rather than a static table.
+# #381 made the fourth deliverable too, but CONDITIONALLY — which is why
+# `resources.subscribe` is still listed here rather than deleted. Serve
+# can honor `resourceSubscriptions` only when the child itself advertises
+# `resources.subscribe`, because that is what the subscription is driven
+# against. So this table stays the DEFAULT answer ("cannot honor, strip
+# it") and `_synthesize_discover_result` lifts it for the one case where
+# serve can, reading `_child_supports_resource_subscribe` — the same
+# single predicate the listen ack's gate reads. One predicate, two call
+# sites, so what discover advertises and what the ack honors cannot
+# drift apart.
 #
 # Keyed by family -> the KEYS to strip, never the whole family object:
 # spec capability semantics are presence-based, and the REQUEST surface
@@ -1429,7 +1431,9 @@ _UNDELIVERABLE_NOTIFICATION_FLAGS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _strip_undeliverable_capability_flags(capabilities: Any) -> dict[str, Any]:
+def _strip_undeliverable_capability_flags(
+    capabilities: Any, keep: frozenset[tuple[str, str]] = frozenset()
+) -> dict[str, Any]:
     """Drop the capability flags discover still cannot honor (see above).
 
     A non-dict `capabilities` value degrades to `{}` rather than raising
@@ -1451,12 +1455,20 @@ def _strip_undeliverable_capability_flags(capabilities: Any) -> dict[str, Any]:
     `"tools": true` — since only a dict family has keys to strip from.
     A family absent from the table passes through whole, which is what
     makes the post-#374 one-entry table work unchanged.
+
+    `keep` names flags the caller has established serve CAN honor for
+    this particular child, lifting them out of the static table for this
+    call only (#381 §3.6). The table stays the default because it
+    describes serve's own capability; `keep` describes the child's, and
+    only the two together decide whether a promise is honest.
     """
     if not isinstance(capabilities, dict):
         return {}
     stripped: dict[str, Any] = {}
     for family, value in capabilities.items():
         flags = _UNDELIVERABLE_NOTIFICATION_FLAGS.get(family)
+        if flags and keep:
+            flags = tuple(f for f in flags if (family, f) not in keep)
         if flags and isinstance(value, dict):
             value = {k: v for k, v in value.items() if k not in flags}
         stripped[family] = value
@@ -1500,7 +1512,16 @@ def _synthesize_discover_result(
         # capabilities key, or a null one, still yields the OBJECT the
         # client's validation requires.
         "capabilities": _strip_undeliverable_capability_flags(
-            init_result.get("capabilities") or {}
+            init_result.get("capabilities") or {},
+            # #381 §3.6. Advertised only when the CHILD advertises it,
+            # because that is what serve drives the subscription against
+            # — the same predicate the listen ack's gate uses, so the
+            # advertisement and the honoring can never disagree.
+            keep=(
+                frozenset({("resources", "subscribe")})
+                if _child_supports_resource_subscribe(init_result)
+                else frozenset()
+            ),
         ),
         "ttlMs": cache_ttl_ms,
         "cacheScope": _CACHE_SCOPE,

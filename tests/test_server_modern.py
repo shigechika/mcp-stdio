@@ -1294,20 +1294,19 @@ class TestSynthesizeDiscover:
             server._SERVE_IMPLEMENTED_MODERN_VERSIONS
         )
 
-    def test_the_listchanged_trio_is_advertised_and_subscribe_is_not(self):
-        """#374's half of the un-strip, and the half that stayed.
+    def test_all_four_flags_are_advertised_when_the_child_supports_them(self):
+        """The un-strip, completed by #381.
 
         The rule is the relay's C8 principle in reverse — advertise a
         notification flag only for a kind serve can actually deliver.
-        Before #374 all four flags were stripped, because a pooled
-        child's notifications went nowhere. `subscriptions/listen` now
-        delivers the listChanged trio, so those three flags became true
-        statements and are echoed again.
+        Before #374 all four were stripped, because a pooled child's
+        notifications went nowhere. #374's `subscriptions/listen` made the
+        listChanged trio true; #381 made `resources.subscribe` true too,
+        by actually driving the subscription against the child.
 
-        `resources.subscribe` stays stripped: it promises per-URI
-        subscription driving, which the listen ack explicitly DECLINES
-        (`resourceSubscriptions: false`) until #381. Advertising it would
-        promise the one thing the ack refuses.
+        A child advertising all four now has all four echoed — but only
+        BECAUSE it advertises `subscribe` itself, which the next test
+        pins from the other side.
         """
         result = server._synthesize_discover_result(
             {
@@ -1322,12 +1321,44 @@ class TestSynthesizeDiscover:
         caps = result["capabilities"]
         assert caps["tools"] == {"listChanged": True}
         assert caps["prompts"] == {"listChanged": True}
-        assert caps["resources"] == {"listChanged": True}
-        assert "subscribe" not in caps["resources"]
+        assert caps["resources"] == {"subscribe": True, "listChanged": True}
         # Control: an unrelated capability passes through untouched,
-        # proving the filter is scoped to one key rather than
-        # over-stripping.
+        # proving the filter is scoped rather than over-stripping.
         assert caps["completions"] == {}
+
+    def test_subscribe_is_stripped_when_the_child_does_not_support_it(self):
+        """The conditional half — and why the table entry survives #381.
+
+        Serve honors `resourceSubscriptions` only by driving
+        `resources/subscribe` at the child, so a child that does not
+        advertise it makes the flag a promise serve cannot keep.
+        `subscribe: false` is the case that makes this observable at all:
+        the key is PRESENT, so a raw echo would forward a falsy flag the
+        ack would then also decline.
+        """
+        result = server._synthesize_discover_result(
+            {"capabilities": {"resources": {"subscribe": False, "listChanged": True}}}
+        )
+        assert result["capabilities"]["resources"] == {"listChanged": True}
+
+    def test_the_discover_gate_and_the_ack_gate_are_one_predicate(self):
+        """Pinned against each other rather than restated.
+
+        Two independent capability checks would be free to drift — serve
+        advertising `subscribe` while the ack declines it, or the reverse
+        — and both are invisible until a client actually tries.
+        """
+        for init_result, expected in (
+            ({"capabilities": {"resources": {"subscribe": True}}}, True),
+            ({"capabilities": {"resources": {"subscribe": False}}}, False),
+            ({"capabilities": {"resources": {}}}, False),
+            ({"capabilities": {}}, False),
+        ):
+            resources = server._synthesize_discover_result(init_result)[
+                "capabilities"
+            ].get("resources", {})
+            assert ("subscribe" in resources) is expected
+            assert server._child_supports_resource_subscribe(init_result) is expected
 
     def test_the_advertised_trio_matches_what_listen_forwards(self):
         """The advertisement and the delivery table cannot drift apart.
@@ -1349,9 +1380,14 @@ class TestSynthesizeDiscover:
         """The filter removes specific KEYS, never the whole family
         object: a hypothetical `resources.other` flag must survive
         alongside `subscribe` being stripped from the SAME family — spec
-        capability semantics are presence-based per key, not per family."""
+        capability semantics are presence-based per key, not per family.
+
+        `subscribe: False` is what makes this reachable post-#381: a
+        truthy `subscribe` is now KEPT (serve can honor it), so the
+        stripping path needs a child that does not support it.
+        """
         result = server._synthesize_discover_result(
-            {"capabilities": {"resources": {"subscribe": True, "other": "x"}}}
+            {"capabilities": {"resources": {"subscribe": False, "other": "x"}}}
         )
         assert result["capabilities"]["resources"] == {"other": "x"}
 
@@ -1377,7 +1413,7 @@ class TestSynthesizeDiscover:
         through as-is, while a sibling well-formed family is still
         stripped normally."""
         result = server._synthesize_discover_result(
-            {"capabilities": {"tools": True, "resources": {"subscribe": True}}}
+            {"capabilities": {"tools": True, "resources": {"subscribe": False}}}
         )
         caps = result["capabilities"]
         assert caps["tools"] is True

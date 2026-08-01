@@ -302,13 +302,19 @@ def test_a_gateway_shutdown_ends_the_stream_without_losing_it(serve_factory):
 
 
 @pytest.mark.timeout(60)
-def test_discover_advertises_the_trio_and_still_withholds_subscribe(serve_gateway):
+def test_discover_advertises_all_four_flags_the_child_supports(serve_gateway):
     """The un-strip, on raw bytes, against the child's real capabilities.
 
-    The child advertises all four flags. Three are now promises serve can
-    keep — `subscriptions/listen` delivers them — and one is not:
-    per-URI subscription driving is #381, and the listen ack declines it,
-    so advertising it here would promise exactly what the ack refuses.
+    The child advertises all four flags, and #381 completed the un-strip
+    so all four are echoed: `subscriptions/listen` delivers the
+    listChanged trio (#374/#382), and serve now drives per-URI
+    `resources/subscribe` at the child for the fourth.
+
+    The conditionality is the point, and it is asserted separately (a
+    child WITHOUT `resources.subscribe` must still have the flag
+    stripped) — see the unit suite's one-predicate pin. Here the child
+    does support it, so advertising it is an honest promise rather than
+    the one thing the ack refuses.
     """
     resp = httpx.post(
         serve_gateway.url,
@@ -335,7 +341,7 @@ def test_discover_advertises_the_trio_and_still_withholds_subscribe(serve_gatewa
     assert caps["tools"]["listChanged"] is True
     assert caps["prompts"]["listChanged"] is True
     assert caps["resources"]["listChanged"] is True
-    assert "subscribe" not in caps["resources"], caps["resources"]
+    assert caps["resources"]["subscribe"] is True, caps["resources"]
 
 
 @pytest.mark.timeout(120)
