@@ -125,6 +125,15 @@ def test_get_sse_stream_closes_when_the_session_child_dies(serve_factory):
         except httpx.HTTPError as exc:  # pragma: no cover - defensive
             failures.append(f"{type(exc).__name__}: {exc}")
             opened.set()
+            # `stream_ended` too, and it means "this reader is DONE" rather
+            # than "the stream closed cleanly" — `failures` is what draws
+            # that distinction (#384 Copilot review). Without it, an error
+            # raised from `iter_lines()` AFTER `opened` was set leaves the
+            # real cause sitting in `failures` while the main thread waits
+            # out its full 25 s on `stream_ended` and then reports the
+            # generic "did not close after its child dies" — the true
+            # diagnosis recorded and then buried under a misleading one.
+            stream_ended.set()
 
     reader = threading.Thread(target=_read, daemon=True)
     reader.start()
