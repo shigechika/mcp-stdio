@@ -39,7 +39,7 @@ Arguments:
 | `--sse-read-timeout SEC` | 300 | SSE GET ストリームのアイドル読み取りタイムアウト（SSE トランスポートのみ; 0 で無効化） |
 | `--no-tcp-keepalive` | — | HTTP ソケット上の TCP キープアライブを無効化 |
 
-<a id="modern-era-2026-07-28"></a>
+<a id="modern-era-client"></a>
 
 ### modern era（2026-07-28）
 
@@ -125,7 +125,7 @@ Arguments:
 | `--session-idle-ttl SECONDS` | `0`（無効） | アイドルタイムアウト；非アクティブ後にセッションと子を削除。DELETE なしで接続を切ったクライアントがスロットをピンしない |
 | `--max-sessions-per-owner N` | `0`（無効） | 新しい initialize 時に、その OAuth ユーザーの古いセッションを `N` 件まで LRU で削除し、DELETE せず再接続するクライアントが残したゴーストを回収。static-token と open-gateway のセッションは対象外 |
 
-<a id="modern-era-2026-07-28"></a>
+<a id="modern-era-serve"></a>
 
 ### modern era（2026-07-28）
 

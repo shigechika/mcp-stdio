@@ -39,6 +39,8 @@ Arguments:
 | `--sse-read-timeout SEC` | 300 | Idle read timeout on the SSE GET stream (SSE transport only; 0 disables) |
 | `--no-tcp-keepalive` | — | Disable TCP keepalive on the HTTP socket |
 
+<a id="modern-era-client"></a>
+
 ### Modern era (2026-07-28)
 
 MCP spec revision 2026-07-28 replaced the `initialize` handshake and
@@ -123,6 +125,8 @@ Arguments:
 | `--max-sessions N` | `100` | Maximum concurrent sessions; an initialize past the cap gets `503` |
 | `--session-idle-ttl SECONDS` | `0` (disabled) | Idle timeout; evict a session and its child after this much inactivity so a client that disconnects without DELETE does not pin a slot |
 | `--max-sessions-per-owner N` | `0` (disabled) | On a new initialize, LRU-evict that OAuth user's older sessions down to `N`, reclaiming ghosts left by a client that reconnects without DELETE; static-token and open-gateway sessions are exempt |
+
+<a id="modern-era-serve"></a>
 
 ### Modern era (2026-07-28)
 

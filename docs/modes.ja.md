@@ -184,7 +184,7 @@ MCP クライアントは終始これまでどおり 2025-06-18 の方言を話�
   セッションは発行されず、呼び出し側が送ってきても echo し返しません。
   結果は送出時に**刻印**され、リビジョンが要求する `resultType` と、
   cacheable な 6 つの操作には `ttlMs` / `cacheScope` のキャッシュヒントが
-  付きます（[`--cache-ttl-ms`](reference.md#modern-era-2026-07-28) 参照）。
+  付きます（[`--cache-ttl-ms`](reference.md#modern-era-serve) 参照）。
 - **legacy クライアント**は従来どおりの挙動のままです：`initialize` が
   `Mcp-Session-Id` を発行し、セッションごとに子プロセス 1 つ、`GET` で
   SSE ストリーム、`DELETE` で終了。

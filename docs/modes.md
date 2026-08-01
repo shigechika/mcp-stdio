@@ -177,7 +177,7 @@ endpoint, and your stdio server never has to know:
   caller sends one. Results are **stamped** on the way out with the
   fields the revision requires: `resultType`, plus `ttlMs` / `cacheScope`
   caching hints on the six cacheable operations (see
-  [`--cache-ttl-ms`](reference.md#modern-era-2026-07-28)).
+  [`--cache-ttl-ms`](reference.md#modern-era-serve)).
 - **A legacy client** keeps exactly the behaviour it always had:
   `initialize` mints an `Mcp-Session-Id`, one child process per session,
   `GET` for the SSE stream, `DELETE` to terminate.
