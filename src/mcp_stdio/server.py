@@ -3559,7 +3559,8 @@ class _Handler(BaseHTTPRequestHandler):
             # the same omission: its `while not backend.closed` loop can
             # also end server-side, on child death. Not touched here —
             # AC2 keeps the legacy path byte-identical in this PR — but
-            # it is a real defect, filed rather than fixed in passing.
+            # it is a real defect, filed as #383 rather than fixed in
+            # passing.
             self.close_connection = True
             self._write_sse(
                 {
