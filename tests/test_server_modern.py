@@ -2234,6 +2234,54 @@ class TestListenDelivery:
             frames, _ = ln.snapshot()
         assert len(frames) == 1, frames
 
+    def test_a_malformed_notification_is_stamped_not_fatal(self, monkeypatch):
+        """#382 Copilot review — a misbehaving child must not be able to
+        drop a well-behaved client's subscription.
+
+        A notification whose `params` is not an object (`"params":
+        "oops"`) used to reach `dict(...)` on the handler thread and
+        raise `ValueError` there, killing the stream abruptly — the
+        client would see it as LOST and re-listen, into the same child.
+        It now degrades: the malformed part is forfeited, the connection
+        is not, and the stamp the client routes on still arrives.
+
+        Same posture `_strip_undeliverable_capability_flags` takes for
+        the same reason (#373 review R3F1).
+
+        Revert-check: restore `dict(stamped.get("params") or {})` and the
+        stream ends with only the ack on it.
+        """
+        httpd, registry = server.build_server(_BACKEND, host="127.0.0.1", port=0)
+        host, port = httpd.server_address[0], httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://{host}:{port}/mcp"
+        try:
+            with _Listener(
+                url, _listen_body(notifications={"toolsListChanged": True})
+            ) as ln:
+                ln.wait_frames(1)
+                for entry in list(httpd.modern_pool._entries.values()):
+                    backend = entry.get("backend")
+                    if backend is not None:
+                        backend._queue_server_initiated(
+                            json.dumps(
+                                {
+                                    "jsonrpc": "2.0",
+                                    "method": "notifications/tools/list_changed",
+                                    "params": "oops",
+                                }
+                            )
+                        )
+                event = ln.wait_frames(2)[1]
+        finally:
+            httpd.shutdown()
+            registry.shutdown_all()
+            httpd.modern_pool.shutdown_all()
+            httpd.server_close()
+        assert event["method"] == "notifications/tools/list_changed"
+        assert event["params"]["_meta"][SUBSCRIPTION_ID] == "listen-1"
+
     def test_two_streams_on_one_child_each_get_their_own_stamp(self, gateway):
         """Both streams share the pooled child (same principal), so this
         pins fan-out proper: one parse, two deliveries, two ids."""
@@ -2311,6 +2359,23 @@ class TestListenRejections:
 
     def test_a_wildcard_accept_is_enough(self, gateway):
         with _Listener(gateway, _listen_body(), accept="*/*") as ln:
+            assert ln.wait_frames(1)[0]["method"] == ACK_METHOD
+
+    def test_the_accept_check_is_case_insensitive(self, gateway):
+        """#382 Copilot review. "Media types are case-insensitive"
+        (RFC 9110 §8.3.1), so this is the SAME request as the lowercase
+        one and a 406 here would be rejecting a client over its
+        capitalisation.
+
+        NO `*/*` in the header, deliberately: with a wildcard present the
+        other branch of the check accepts it and the test proves nothing
+        about case at all. (It was written that way first, and the
+        revert-check is what caught it.)
+
+        Revert-check: drop the `.lower()` and this earns a 406.
+        """
+        with _Listener(gateway, _listen_body(), accept="Text/Event-Stream") as ln:
+            assert ln.status == 200, ln.error_body
             assert ln.wait_frames(1)[0]["method"] == ACK_METHOD
 
     def test_the_per_child_stream_cap_is_refused_pre_ack(self, gateway, monkeypatch):

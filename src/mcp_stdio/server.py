@@ -3477,7 +3477,10 @@ class _Handler(BaseHTTPRequestHandler):
 
         # The success path is an SSE stream, so a client that cannot
         # accept one gets 406 rather than a stream it will not read.
-        accept = self.headers.get("Accept") or ""
+        # CASEFOLDED: "media types are case-insensitive" (RFC 9110
+        # §8.3.1), so `Accept: Text/Event-Stream` is the same request and
+        # must not earn a 406 for its capitalisation.
+        accept = (self.headers.get("Accept") or "").lower()
         if "text/event-stream" not in accept and "*/*" not in accept:
             self._send_json(
                 406,
@@ -3541,13 +3544,22 @@ class _Handler(BaseHTTPRequestHandler):
             # RE-ASSERTED, and this line is load-bearing:
             # `BaseHTTPRequestHandler.send_header` treats `Connection` as
             # a COMMAND, not a string — the `keep-alive` above silently
-            # set `close_connection` back to False. An SSE body has
-            # neither Content-Length nor chunked framing, so the close IS
-            # its delimiter: leave this off and a stream that ends
-            # normally (graceful shutdown, dead child) leaves the client
-            # blocked on a socket nobody will ever write to again. The
-            # legacy GET stream never hit this because it only ever exits
-            # on the client's own disconnect.
+            # set `close_connection` back to False.
+            #
+            # The general rule, which is what to carry away: any
+            # close-delimited SSE response that can end SERVER-side must
+            # keep `close_connection` true after sending the header. An
+            # SSE body has neither Content-Length nor chunked framing, so
+            # the close IS its delimiter — leave this off and a stream
+            # that ends normally (graceful shutdown, dead child) leaves
+            # the client blocked on a socket nobody will ever write to
+            # again.
+            #
+            # NB the legacy GET stream (`do_GET`) has the same shape and
+            # the same omission: its `while not backend.closed` loop can
+            # also end server-side, on child death. Not touched here —
+            # AC2 keeps the legacy path byte-identical in this PR — but
+            # it is a real defect, filed rather than fixed in passing.
             self.close_connection = True
             self._write_sse(
                 {
@@ -3662,9 +3674,25 @@ class _Handler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                     last_keepalive = now
                 continue
+            # Copied, never mutated in place: `_queue_server_initiated`
+            # parses ONCE and hands the same dict to every matching
+            # stream, so stamping in place would put one stream's
+            # subscription id on another's frame.
+            #
+            # A non-dict `params` or `_meta` DEGRADES to `{}` rather than
+            # raising. `dict("oops")` is a `ValueError` on the handler
+            # thread, which would kill the stream abruptly — a
+            # misbehaving child must not be able to drop a well-behaved
+            # client's subscription. Same posture
+            # `_strip_undeliverable_capability_flags` takes for the same
+            # reason (#373 review R3F1): the malformed part is forfeited,
+            # never the connection. The stamp is what the client routes
+            # on, so it has to survive whatever the child sent.
             stamped = dict(message)
-            params = dict(stamped.get("params") or {})
-            meta = dict(params.get("_meta") or {})
+            raw_params = stamped.get("params")
+            params = dict(raw_params) if isinstance(raw_params, dict) else {}
+            raw_meta = params.get("_meta")
+            meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
             meta[_META_SUBSCRIPTION_ID] = listener.listen_id
             params["_meta"] = meta
             stamped["params"] = params
