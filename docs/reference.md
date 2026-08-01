@@ -145,10 +145,13 @@ Newer clients can also open a long-lived connection to hear when your
 server's tool, prompt or resource lists change — see
 [Telling clients your lists changed](modes.md#listchanged-serve).
 There is no flag for it. A client may hold up to **four** such
-connections per authenticated user; a fifth is refused rather than
-queued. Each one sends a comment every 15 seconds so proxies do not time
-it out, and a backend with a connection attached is never reclaimed by
-`--modern-idle-ttl`.
+connections per backend — with `--enable-oauth`, that means per
+authenticated user. Without auth, or with a shared `--auth-token`,
+every client shares one backend, so the four connections are a
+gateway-wide total: a fifth connection from any client is refused
+rather than queued. Each one sends a comment every 15 seconds so
+proxies do not time it out, and a backend with a connection attached is
+never reclaimed by `--modern-idle-ttl`.
 
 Note that `--modern-idle-ttl` counts from the last *request*, and a
 long-lived connection is one request that never finishes — so a user who
