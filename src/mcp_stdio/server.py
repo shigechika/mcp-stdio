@@ -525,6 +525,32 @@ _LISTEN_MAX_RESOURCE_SUBSCRIPTIONS = 256
 # callers — so the real worst case is one timeout, not one per URI.
 _RESOURCE_SUBSCRIBE_TIMEOUT_SECS = 5.0
 
+# How long a reverse-MRTR round may stay PARKED before serve gives up on
+# the client retrying, unblocks the child and drops the txn (#375 §3.8).
+#
+# This is a genuine gap rather than an already-covered case, and the
+# comment exists so nobody "simplifies" it away on the reasoning that the
+# dispatch timeout already handles it. It does not: the 120 s
+# `send_request` wait belongs to the ORIGINAL handler thread. The moment
+# a round parks, that HTTP request completes and its `_pending` slot
+# detaches, so the 120 s clock stops governing anything. The child is
+# left blocked on a reply to its OWN minted request id, which nothing
+# else tracks a deadline for.
+#
+# Expressed as a RELATIONSHIP to the dispatch timeout, never a literal —
+# #388's review round found exactly this class of ratio silently rotting
+# once the general constant is bumped. A test pins the inequality.
+#
+# DELIBERATE POLICY INVERSION FROM RELAY'S PR C, named here because a
+# reviewer who knows that code would otherwise read this as a
+# contradiction: PR C refuses a TTL on its round because "a transaction
+# waits on a human at an elicitation dialog, so a TTL races the user".
+# Here the waiter is a POOLED SUBPROCESS holding a resource slot, not a
+# human, and Server Requirements item 8 licenses abandoning it outright.
+# Bounding this side is correct precisely because bounding the
+# human-facing side is not.
+_MRTR_PARK_TIMEOUT_SECS = _BACKEND_RESPONSE_TIMEOUT_SECS / 2
+
 
 def _child_supports_resource_subscribe(init_result: Any) -> bool:
     """Does the pooled child advertise `resources.subscribe`? (#381 §3.2)
@@ -1865,6 +1891,21 @@ class BackendProcess:
         # reverse.
         self._sub_lock = threading.Lock()
         self._resource_refs: dict[str, tuple[int, bool]] = {}
+        # #375 PR 1: reverse-MRTR rounds parked on THIS child, keyed by
+        # the `tools/call`'s own minted upstream id. Sited here for the
+        # same reason `_resource_refs` is — the state dies with the child
+        # for free, so a respawn starts clean and no separate
+        # clear-on-death path exists to drift out of sync.
+        #
+        # This table, not `requestState`, is the single source of truth
+        # for a round. The client-held blob is only a signed pointer into
+        # it (see `_mrtr_encode_pointer`): duplicating the round state
+        # into a wire-visible value would leak the child's own internal
+        # request id to the client and enlarge what a captured blob can
+        # carry, for no gain — the table has to exist regardless, because
+        # correlation and eligibility need it.
+        self._mrtr_lock = threading.Lock()
+        self._mrtr_pending: dict[Any, dict[str, Any]] = {}
         self._closed = threading.Event()
         self._reader = threading.Thread(
             target=self._read_loop, name="backend-reader", daemon=True
@@ -2197,6 +2238,136 @@ class BackendProcess:
                     is None
                 ):
                     responsive = False
+
+    # --- reverse MRTR: the parked-round table (#375 PR 1, §3.1) --------
+    #
+    # NOTHING IN PR 1 OPENS A ROUND. Every method below is exercised
+    # directly by unit tests and by nothing else, so the table is
+    # permanently empty on every live code path and this whole seam is
+    # behaviour-inert — the same discipline P3-A used to ship the modern
+    # validation ladder ahead of P3-B's dispatch.
+
+    def mrtr_round_open(
+        self,
+        upstream_id: Any,
+        *,
+        method: str,
+        child_request_id: Any,
+        declared_caps: dict[str, Any],
+        principal: str | None,
+        round_no: int = 1,
+        now: float | None = None,
+    ) -> str:
+        """Park a round on this child and return its txn id.
+
+        The txn id is random rather than derived: it appears inside a
+        client-held blob, so a guessable value would let a client name
+        another round it never opened. Guessing is not sufficient to USE
+        one — the pointer still has to carry a valid MAC — but there is
+        no reason to hand out the first factor for free.
+        """
+        txn_id = secrets.token_urlsafe(16)
+        deadline = (time.monotonic() if now is None else now) + _MRTR_PARK_TIMEOUT_SECS
+        with self._mrtr_lock:
+            self._mrtr_pending[upstream_id] = {
+                "txn_id": txn_id,
+                "method": method,
+                "child_request_id": child_request_id,
+                "declared_caps": declared_caps,
+                "principal": principal,
+                "round": round_no,
+                "park_deadline": deadline,
+            }
+        return txn_id
+
+    def mrtr_round_for_txn(self, txn_id: str) -> tuple[Any, dict[str, Any]] | None:
+        """The `(upstream_id, entry)` a verified pointer names, or None.
+
+        Verification of the pointer itself happens in
+        `_mrtr_decode_pointer`; this only resolves it. A caller must do
+        both — a well-signed pointer to a txn that no longer exists is
+        the ordinary post-restart / post-timeout case, not an attack, and
+        earns a clean "unknown or expired" rather than anything louder.
+        """
+        with self._mrtr_lock:
+            for upstream_id, entry in self._mrtr_pending.items():
+                if hmac.compare_digest(str(entry["txn_id"]), str(txn_id)):
+                    return upstream_id, dict(entry)
+        return None
+
+    def mrtr_round_consume(self, txn_id: str) -> dict[str, Any] | None:
+        """Atomically take a round out of the table — SINGLE USE.
+
+        This is what actually closes the replay hole. HMAC alone stops
+        forgery but not the re-sending of a genuine, still-validly-signed
+        blob after its round already completed; removing the entry makes
+        the second attempt find nothing. Pop and read under ONE lock hold,
+        so two concurrent retries cannot both observe it.
+        """
+        with self._mrtr_lock:
+            for upstream_id, entry in list(self._mrtr_pending.items()):
+                if hmac.compare_digest(str(entry["txn_id"]), str(txn_id)):
+                    return {
+                        **self._mrtr_pending.pop(upstream_id),
+                        "upstream_id": upstream_id,
+                    }
+        return None
+
+    def mrtr_has_pending(self) -> bool:
+        """Whether any round is parked — the concurrency invariant's read.
+
+        #375 §1.2. A pooled child answers several callers, and
+        `send_request` allows several ids in flight on it at once. A bare
+        legacy out-of-band request carries NO field linking it back to
+        whichever call provoked it, so with two eligible calls in flight
+        the correlation is genuinely ambiguous — not hard, ambiguous.
+        The invariant is therefore "at most one MRTR-eligible request in
+        flight per child", enforced rather than assumed.
+        """
+        with self._mrtr_lock:
+            return bool(self._mrtr_pending)
+
+    def mrtr_expire_parked(self, *, now: float | None = None) -> list[dict[str, Any]]:
+        """Drop rounds past their park deadline; return what was dropped.
+
+        Returning the entries rather than acting on them keeps this
+        callable from a sweep without deciding policy: PR 2 writes a
+        JSON-RPC error back to the child under its own
+        `child_request_id`, which unblocks it and returns it to the pool.
+        No client-facing action is owed — Server Requirements item 8
+        licenses giving up on a retry that never came.
+        """
+        stamp = time.monotonic() if now is None else now
+        expired: list[dict[str, Any]] = []
+        with self._mrtr_lock:
+            for upstream_id, entry in list(self._mrtr_pending.items()):
+                if stamp <= entry["park_deadline"]:
+                    continue
+                # ONCE PER TRANSACTION, and the mechanism is the pop on
+                # the next line rather than a latch flag (#375 §4 Q7,
+                # trap 3). Expiry is checked on a POLL, so a log emitted
+                # while the entry SURVIVES would repeat once per tick for
+                # as long as it lasted — the flood #388's own
+                # failure-logged latch exists to prevent. Here the entry
+                # is removed in the same lock hold that logs it, so the
+                # second sweep finds nothing to say.
+                #
+                # A latch was written first and deleted: with an
+                # unconditional pop it could never fire twice, so it was
+                # dead code AND made the guarding test vacuous — the test
+                # passed with the latch removed. The test now pins the
+                # property (repeated sweeps => exactly one line), which
+                # catches the real regression: making expiry non-popping
+                # or retry-on-failure.
+                log(
+                    f"mrtr: round {entry['txn_id']!r} abandoned after "
+                    f"{_MRTR_PARK_TIMEOUT_SECS:g}s with no client retry; "
+                    "unblocking the child"
+                )
+                expired.append(
+                    {**self._mrtr_pending.pop(upstream_id), "upstream_id": upstream_id}
+                )
+        return expired
 
     def _drive_resource_subscription(self, method: str, uri: str) -> bool | None:
         """Send one `resources/subscribe`/`unsubscribe` to the child.

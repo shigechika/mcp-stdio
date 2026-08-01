@@ -3967,3 +3967,217 @@ class TestMrtrPointer:
         assert source.count("_MRTR_POINTER_KEY") == 3, (
             "the key should only be defined and used by encode/decode"
         )
+
+
+class TestMrtrParkedRoundTable:
+    """The per-child table that is the single source of truth for a round.
+
+    Nothing in PR 1 opens a round on a live path, so every method here is
+    exercised directly and the table stays permanently empty in
+    production — which is what makes this PR behaviour-inert.
+    """
+
+    def _backend(self):
+        return server.BackendProcess([*_BACKEND], modern_owned=True)
+
+    def test_a_parked_round_is_findable_by_its_txn_id(self):
+        backend = self._backend()
+        try:
+            txn = backend.mrtr_round_open(
+                "mcp-stdio/serve/1",
+                method="elicitation/create",
+                child_request_id="child-1",
+                declared_caps={"elicitation": {}},
+                principal="alice",
+            )
+            found = backend.mrtr_round_for_txn(txn)
+            assert found is not None
+            upstream_id, entry = found
+            assert upstream_id == "mcp-stdio/serve/1"
+            assert entry["child_request_id"] == "child-1"
+            assert entry["round"] == 1
+        finally:
+            backend.shutdown()
+
+    def test_the_txn_id_is_not_guessable(self):
+        """It rides inside a client-held blob. Guessing is not sufficient
+        to USE a round — the pointer still needs a valid MAC — but there
+        is no reason to hand out the first factor for free."""
+        backend = self._backend()
+        try:
+            seen = {
+                backend.mrtr_round_open(
+                    f"u{i}",
+                    method="roots/list",
+                    child_request_id=i,
+                    declared_caps={},
+                    principal="alice",
+                )
+                for i in range(50)
+            }
+            assert len(seen) == 50
+            assert all(len(t) >= 16 for t in seen)
+        finally:
+            backend.shutdown()
+
+    def test_consume_is_single_use(self):
+        """The replay closure. HMAC stops forgery but not the re-sending
+        of a genuine, still-validly-signed blob after its round finished;
+        removing the entry is what makes the second attempt find nothing.
+
+        Revert-check: make `mrtr_round_consume` a lookup that does not
+        pop, and the second call starts succeeding.
+        """
+        backend = self._backend()
+        try:
+            txn = backend.mrtr_round_open(
+                "u1",
+                method="sampling/createMessage",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+            )
+            first = backend.mrtr_round_consume(txn)
+            assert first is not None and first["upstream_id"] == "u1"
+            assert backend.mrtr_round_consume(txn) is None
+            assert backend.mrtr_round_for_txn(txn) is None
+        finally:
+            backend.shutdown()
+
+    def test_two_concurrent_consumers_cannot_both_win(self):
+        """Pop-and-read under one lock hold, so a racing pair of retries
+        resolves to exactly one winner rather than both proceeding."""
+        backend = self._backend()
+        try:
+            txn = backend.mrtr_round_open(
+                "u1",
+                method="roots/list",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+            )
+            results: list = []
+            barrier = threading.Barrier(8)
+
+            def _race():
+                barrier.wait()
+                results.append(backend.mrtr_round_consume(txn))
+
+            threads = [threading.Thread(target=_race) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+            assert sum(1 for r in results if r is not None) == 1, results
+        finally:
+            backend.shutdown()
+
+    def test_has_pending_is_the_concurrency_invariant_read(self):
+        backend = self._backend()
+        try:
+            assert backend.mrtr_has_pending() is False
+            txn = backend.mrtr_round_open(
+                "u1",
+                method="roots/list",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+            )
+            assert backend.mrtr_has_pending() is True
+            backend.mrtr_round_consume(txn)
+            assert backend.mrtr_has_pending() is False
+        finally:
+            backend.shutdown()
+
+    def test_a_round_past_its_deadline_expires(self):
+        backend = self._backend()
+        try:
+            backend.mrtr_round_open(
+                "u1",
+                method="roots/list",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+                now=1000.0,
+            )
+            # Still inside the window.
+            assert backend.mrtr_expire_parked(now=1000.0) == []
+            assert backend.mrtr_has_pending() is True
+            expired = backend.mrtr_expire_parked(
+                now=1000.0 + server._MRTR_PARK_TIMEOUT_SECS + 1
+            )
+            assert [e["child_request_id"] for e in expired] == ["c1"]
+            assert backend.mrtr_has_pending() is False
+        finally:
+            backend.shutdown()
+
+    def test_abandonment_is_logged_once_per_transaction_not_per_poll(self, capsys):
+        """#375 §4 Q7 trap 3 — the log-flood class.
+
+        Expiry is checked on a POLL, so a line emitted while the entry
+        SURVIVES would repeat once per tick for as long as it lasted.
+        Here the entry is removed in the same lock hold that logs it, so
+        the second sweep finds nothing to say.
+
+        Asserted as a COUNT, since "the log looked fine" is exactly the
+        observation this class of finding hides behind.
+
+        Revert-check that BITES: make expiry non-popping (leave the entry
+        in place) and this floods. A revert-check on the latch flag that
+        was originally written here did NOT bite — the unconditional pop
+        already guaranteed once-per-txn, so the flag was dead code and
+        this test could not tell the difference. The flag is gone; the
+        property it was supposed to protect is what is pinned.
+        """
+        backend = self._backend()
+        try:
+            backend.mrtr_round_open(
+                "u1",
+                method="roots/list",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+                now=1000.0,
+            )
+            capsys.readouterr()
+            late = 1000.0 + server._MRTR_PARK_TIMEOUT_SECS + 1
+            for _ in range(5):
+                backend.mrtr_expire_parked(now=late)
+            assert capsys.readouterr().err.count("abandoned after") == 1
+        finally:
+            backend.shutdown()
+
+    def test_the_park_timeout_is_a_ratio_not_a_literal(self):
+        """#388's review found this exact class of ratio silently rotting
+        when the general constant is bumped, so the RELATIONSHIP is what
+        gets pinned.
+
+        And the relationship is the load-bearing one: the dispatch
+        timeout belongs to the original handler thread, which is already
+        gone by the time a round is parked — so a park timeout at or
+        above it would never fire before the child was abandoned anyway.
+        """
+        assert server._MRTR_PARK_TIMEOUT_SECS < server._BACKEND_RESPONSE_TIMEOUT_SECS
+        assert server._MRTR_PARK_TIMEOUT_SECS > 0
+
+    def test_the_table_dies_with_the_child(self):
+        """No clear-on-death path exists, deliberately: the table lives on
+        the `BackendProcess`, so a respawn gets an empty one for free —
+        the same lifetime discipline `_resource_refs` established."""
+        backend = self._backend()
+        try:
+            backend.mrtr_round_open(
+                "u1",
+                method="roots/list",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+            )
+            assert backend.mrtr_has_pending() is True
+        finally:
+            backend.shutdown()
+        replacement = self._backend()
+        try:
+            assert replacement.mrtr_has_pending() is False
+        finally:
+            replacement.shutdown()
