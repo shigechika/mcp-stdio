@@ -41,6 +41,7 @@ import httpx
 import pytest
 
 from ._legacy_child import SERVER_NAME, TOOLS
+from .conftest import wait_until
 
 MODERN_VERSION = "2026-07-28"
 SERVER_INFO_KEY = "io.modelcontextprotocol/serverInfo"
@@ -338,7 +339,7 @@ def test_discover_advertises_the_trio_and_still_withholds_subscribe(serve_gatewa
 
 @pytest.mark.timeout(120)
 def test_the_auto_era_sandwich_carries_a_listchanged_end_to_end(
-    serve_gateway, relay_factory
+    serve_factory, relay_factory
 ):
     """Both halves of this project, pointed at each other, over listen.
 
@@ -357,11 +358,37 @@ def test_the_auto_era_sandwich_carries_a_listchanged_end_to_end(
     notification kind for a family it advertised to ITS client, and what
     it advertises comes from serve's discover. A still-stripped
     `tools.listChanged` would make the relay drop this silently.
+
+    **The wait before driving is not decoration.** The relay opens its
+    upstream listen on a BACKGROUND thread after
+    `notifications/initialized`, so `initialize()` returning proves
+    nothing about whether that stream exists yet — and a notification
+    with no listener attached is discarded by design, which is the
+    correct product behaviour and a silent test failure. This passed
+    locally and failed in CI on exactly that race. Serve logs the attach,
+    so the test waits for the OBSERVED attach (conftest rule 1) instead
+    of driving into a window it hopes is open.
+
+    A DEDICATED gateway rather than the module-scoped one, for that same
+    signal: on a shared gateway the stderr carries every other test's
+    streams too, and its drain is a BOUNDED deque, so a "the count went
+    up" predicate is not stable against eviction. On a gateway of our
+    own, the line appearing at all is the signal. `serve_factory` comes
+    first in the signature so the relay — set up second — is torn down
+    FIRST, per conftest rule 6.
     """
-    client = relay_factory(serve_gateway.port, protocol_era="auto")
+    gateway = serve_factory()
+    client = relay_factory(gateway.port, protocol_era="auto")
     client.initialize(protocol_version=MODERN_VERSION)
 
-    _drive_list_changed(serve_gateway)
+    wait_until(
+        lambda: any(": streaming " in line for line in gateway.stderr.lines),
+        timeout=30.0,
+        what="the relay's upstream listen stream to attach at serve",
+        diagnose=gateway.diagnose,
+    )
+
+    _drive_list_changed(gateway)
 
     event = client.expect_notification("notifications/tools/list_changed", timeout=30.0)
     assert event["jsonrpc"] == "2.0"

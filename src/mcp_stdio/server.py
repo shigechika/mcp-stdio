@@ -3520,6 +3520,14 @@ class _Handler(BaseHTTPRequestHandler):
         # Attach first (see the docstring): the buffer has to exist before
         # anything can be published against it.
         backend.attach_listener(listener)
+        # Logged unconditionally: a subscription opening is a fact an
+        # operator wants in the log ("who is listening, and to what"),
+        # alongside the access line the response itself produces. It is
+        # also the only externally visible moment at which this stream
+        # exists — the ack has not been written yet and the connection
+        # stays open — which is what lets a test wait for the attach
+        # rather than race it.
+        log(f"listen {req_id!r}: streaming {sorted(honored) or 'nothing'}")
         unhonored = sorted(set(requested) - set(honored))
         if unhonored:
             log(f"listen {req_id!r}: not honoring {unhonored} (#374 serves the trio)")
