@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.37.0](https://github.com/shigechika/mcp-stdio/compare/v0.36.0...v0.37.0) (2026-08-01)
+
+
+### Features
+
+* modern dispatch for serve — discover, dual-era, result stamping ([#270](https://github.com/shigechika/mcp-stdio/issues/270) Phase 3 P3-B) ([#373](https://github.com/shigechika/mcp-stdio/issues/373)) ([3686ec3](https://github.com/shigechika/mcp-stdio/commit/3686ec3bca4ebd3fe6ce15064fde7f9589ffe072))
+* modern request-plane validation ladder for serve ([#270](https://github.com/shigechika/mcp-stdio/issues/270) Phase 3 P3-A) ([#371](https://github.com/shigechika/mcp-stdio/issues/371)) ([f8f916d](https://github.com/shigechika/mcp-stdio/commit/f8f916d03fb5eeca63183118572b567e401ae964))
+
 ## [0.36.0](https://github.com/shigechika/mcp-stdio/compare/v0.35.0...v0.36.0) (2026-07-31)
 
 
