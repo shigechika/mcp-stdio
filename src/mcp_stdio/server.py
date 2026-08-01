@@ -784,11 +784,20 @@ class ModernBackendPool:
         """
         if self._idle_ttl <= 0 or self._reaper is not None:
             return
-        self._reaper_stop.clear()  # allow a restart after a prior stop
         interval = max(1.0, min(self._idle_ttl, _MAX_REAP_INTERVAL_SECS))
+        # A FRESH stop event per thread (#379 Copilot review), not a
+        # shared one cleared on restart: `stop_reaper` does not join —
+        # the thread is a daemon parked in `wait(interval)` — so a
+        # restart that CLEARED a shared event could un-stop a predecessor
+        # that had not yet observed the set, leaving two reapers sweeping
+        # the same pool. Each loop closes over the event it was born
+        # with, so a stop is permanent for that thread whatever happens
+        # afterwards.
+        stop = threading.Event()
+        self._reaper_stop = stop
 
         def _loop() -> None:
-            while not self._reaper_stop.wait(interval):
+            while not stop.wait(interval):
                 try:
                     self.reap_idle()
                 except Exception as e:  # pragma: no cover - defensive

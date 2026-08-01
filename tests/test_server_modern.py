@@ -983,52 +983,67 @@ class TestModernBackendPool:
         the next NEW principal arrived — in a two-principal deployment,
         never.
 
-        Both spawns are gated on one event so the placeholders provably
-        coexist. After both finish and both holds are released, the pool
-        must be back at the cap.
+        Both racers first park with their placeholders in the map, which
+        is what establishes the overshoot. They are then released ONE AT
+        A TIME, and that ordering is deliberate rather than incidental:
+        the second racer's post-spawn sweep can only reclaim the first
+        child once it is quiet AND released, so gating on that makes the
+        outcome deterministic instead of a race the CI host wins or loses
+        (it lost on Windows, where the slower spawn let both children be
+        held at once).
 
-        Revert-check: without the post-spawn `_evict_if_at_cap_locked()`
+        Revert-check: without the post-spawn `_evict_if_at_cap_locked`
         the count stays at 2.
         """
         pool = server.ModernBackendPool(_BACKEND, max_children=1)
-        gate = threading.Event()
         both_pending = threading.Barrier(3)
-        results: list = []
-        lock = threading.Lock()
+        gates = {"alice": threading.Event(), "bob": threading.Event()}
+        done = {"alice": threading.Event(), "bob": threading.Event()}
+        current = threading.local()
         real_spawn = pool._spawn_and_handshake
 
         def _gated_spawn():
-            # Both racers park here, so both placeholders are in the map
-            # at once — the state that produces the overshoot.
+            # Both racers park here, so both placeholders coexist — the
+            # state that produces the overshoot.
             both_pending.wait(timeout=15)
-            assert gate.wait(timeout=15)
+            assert gates[current.principal].wait(timeout=15)
             return real_spawn()
 
         pool._spawn_and_handshake = _gated_spawn
 
         def _racer(principal):
+            current.principal = principal
             backend, _, entry = pool.get_or_create(principal)
             pool.release(entry)
-            with lock:
-                results.append((principal, backend))
+            done[principal].set()
 
         threads = [
-            threading.Thread(target=_racer, args=(p,), daemon=True)
-            for p in ("alice", "bob")
+            threading.Thread(target=_racer, args=(name,), daemon=True)
+            for name in ("alice", "bob")
         ]
         try:
             for t in threads:
                 t.start()
             both_pending.wait(timeout=15)
             assert pool.count() == 2, "the racers did not both hold a placeholder"
-            gate.set()
-            for t in threads:
-                t.join(timeout=30)
-            assert len(results) == 2
+
+            # Alice finishes and releases. Her own sweep finds nothing to
+            # take (bob is still PENDING), so the pool stays over cap.
+            gates["alice"].set()
+            assert done["alice"].wait(timeout=30)
+            assert pool.count() == 2, "alice's sweep should have found no victim"
+
+            # Bob finishes. His sweep now finds alice ready, quiet and
+            # unheld — the overshoot is reclaimed.
+            gates["bob"].set()
+            assert done["bob"].wait(timeout=30)
             assert pool.count() == 1, "the spawn-race overshoot was never re-bounded"
         finally:
             pool._spawn_and_handshake = real_spawn
-            gate.set()
+            for gate in gates.values():
+                gate.set()
+            for t in threads:
+                t.join(timeout=30)
             pool.shutdown_all()
 
     def test_reaching_the_cap_does_not_evict(self):
@@ -1658,5 +1673,38 @@ def test_a_newborn_child_is_published_atomically():
         assert entry["holds"] == 1
         assert entry["used"] == clock[0]
         pool.release(entry)
+    finally:
+        pool.shutdown_all()
+
+
+def test_restarting_the_reaper_does_not_leave_two_running():
+    """#379 Copilot review — a restart must not un-stop its predecessor.
+
+    `stop_reaper` does not join: the thread is a daemon parked in
+    `wait(interval)`. With a SHARED stop event, a restart that cleared it
+    could revive a predecessor that had not yet observed the set, leaving
+    two reapers sweeping the same pool. Each loop now closes over the
+    event it was born with, so a stop is permanent for that thread.
+
+    Revert-check: sharing one event and clearing it on start leaves the
+    first thread alive.
+    """
+    pool = server.ModernBackendPool(_BACKEND, idle_ttl=30.0)
+    try:
+        pool.start_reaper()
+        first = pool._reaper
+        assert first is not None and first.is_alive()
+        first_stop = pool._reaper_stop
+
+        pool.stop_reaper()
+        pool.start_reaper()
+        second = pool._reaper
+        assert second is not None and second is not first
+
+        # The first thread's own event stays set no matter what the
+        # restart did to the pool's current one.
+        assert first_stop.is_set()
+        assert pool._reaper_stop is not first_stop
+        assert not pool._reaper_stop.is_set()
     finally:
         pool.shutdown_all()
