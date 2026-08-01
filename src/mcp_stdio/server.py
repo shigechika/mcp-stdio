@@ -1299,9 +1299,7 @@ class ModernBackendPool:
                         "method": "initialize",
                         "params": {
                             "protocolVersion": _MODERN_CHILD_HANDSHAKE_VERSION,
-                            # D4's valve: advertise NOTHING the child could
-                            # ask us to bridge back.
-                            "capabilities": {},
+                            "capabilities": _modern_child_capabilities(),
                             "clientInfo": {"name": "mcp-stdio serve", "version": "0"},
                         },
                     }
@@ -1611,6 +1609,56 @@ _MRTR_ELIGIBLE_METHODS = frozenset({"tools/call", "resources/read", "prompts/get
 # (`_MRTR_REQUEST_CAPABILITY`) because the method names are the SAME on
 # both sides — what MRTR rev 2026-07-28 changed is who sends them and how
 # the answer travels back, not what they are called.
+_MRTR_REVERSE_ENV = "MCP_STDIO_MRTR_REVERSE_ENABLE"
+
+
+def _modern_child_capabilities() -> dict[str, Any]:
+    """What serve advertises to a pooled child during the handshake.
+
+    **THIS IS D4'S VALVE, and removing it is what activates the reverse
+    bridge.** Everything else in #375 is inert while this returns `{}`:
+    a well-behaved child does not raise `elicitation/create`,
+    `sampling/createMessage` or `roots/list` at a peer that never claimed
+    to support them, so the translation, the minting and the retry
+    correlation all sit behind a door nobody knocks on.
+
+    OFF BY DEFAULT, behind `MCP_STDIO_MRTR_REVERSE_ENABLE` (§4 Q3,
+    mirroring relay's own `MCP_STDIO_MRTR_STRIP` caution). This is a
+    genuine, observable handshake change on EVERY pooled child, so an
+    operator must be able to withdraw it without a code rollback.
+
+    `elicitation: {}` is the form-mode-equivalent posture — an empty
+    declaration "is equivalent to declaring support for form mode only"
+    — and `roots.listChanged: false` says roots can be listed but never
+    announces changes, which is true: nothing here watches for them.
+
+    SEP-2577 deprecates Roots and Sampling, and bridging them anyway is
+    inside its own carve-out: "New implementations SHOULD NOT add support
+    for deprecated features unless needed for backward compatibility with
+    existing counterparts" — pre-existing legacy children reached by a
+    modern client is exactly that case.
+
+    NOTE the advertisement is per-GATEWAY while the bridge is per-request
+    OAuth-only (§4 Q1). A no-auth deployment that enables the flag tells
+    its child the capabilities exist and then answers `-32601` to any
+    request raised under them. That is deliberate — a clean refusal the
+    child already handles, and the same answer it gets today — but it is
+    why the flag exists rather than the capabilities simply being on.
+    """
+    if os.environ.get(_MRTR_REVERSE_ENV, "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return {}
+    return {
+        "sampling": {},
+        "elicitation": {},
+        "roots": {"listChanged": False},
+    }
+
+
 _MRTR_REQUEST_CAPABILITY = {
     "elicitation/create": "elicitation",
     "sampling/createMessage": "sampling",

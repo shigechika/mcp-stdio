@@ -579,6 +579,7 @@ def spawn_serve(
     *,
     command: list[str] | None = None,
     extra_args: list[str] | None = None,
+    env: dict[str, str] | None = None,
 ) -> ServeHarness:
     """Start `mcp-stdio serve` as a subprocess and wait for it to answer.
 
@@ -598,7 +599,7 @@ def spawn_serve(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env=_clean_env(),
+        env={**_clean_env(), **(env or {})},
     )
     harness = ServeHarness(proc, port, _StderrDrain(proc.stderr))
     try:
