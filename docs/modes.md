@@ -173,7 +173,8 @@ mcp-stdio serve -- python -m my_mcp_server
   results may be cached (tune with
   [`--cache-ttl-ms`](reference.md#modern-era-serve)).
 - **An older client** works exactly as it always has, with its own
-  isolated child process per session.
+  isolated child process per session — unless you pass `--modern-only`,
+  which turns older clients away instead.
 
 For newer clients, mcp-stdio starts one copy of your server per
 authenticated user (or a single shared one if you run without
