@@ -2322,6 +2322,38 @@ class TestListenDelivery:
         assert a.next_message(1.0) is b.next_message(1.0) is message
 
 
+@pytest.mark.parametrize(
+    ("accept_header", "expected"),
+    [
+        ("text/event-stream", True),
+        ("Text/Event-Stream", True),
+        ("text/*", True),
+        ("*/*", True),
+        ("application/json, text/event-stream", True),
+        ("text/event-stream;q=0", False),
+        ("text/event-stream;q=0.5", True),
+        ("application/json", False),
+        (None, True),
+        ("", True),
+        ("text/event-stream ; q=0", False),
+    ],
+)
+def test_accepts_sse_matches_media_ranges(accept_header, expected):
+    """#382 review R1F2 remainder — table-driven over the helper directly.
+
+    A prior fix casefolded the old substring check but left two classes
+    of media-range handling wrong in opposite directions: `text/*` is a
+    valid range that MATCHES `text/event-stream` but does not contain
+    that literal substring, so it earned a false 406; `;q=0` is an
+    explicit REFUSAL (RFC 9110 §12.4.2) that the substring check does
+    not parse at all, so it was let through. Absent/empty is RFC
+    9110 §12.5.1's "accept anything", which the substring check also
+    got backwards (`""` contains no substring, so omitting Accept
+    entirely earned a 406).
+    """
+    assert server._accepts_sse(accept_header) is expected
+
+
 class TestListenRejections:
     """Everything refused BEFORE a stream is committed."""
 
@@ -2377,6 +2409,38 @@ class TestListenRejections:
         with _Listener(gateway, _listen_body(), accept="Text/Event-Stream") as ln:
             assert ln.status == 200, ln.error_body
             assert ln.wait_frames(1)[0]["method"] == ACK_METHOD
+
+    def test_a_text_star_range_is_enough(self, gateway):
+        """#382 review R1F2 remainder. `text/*` is a valid media RANGE
+        that matches `text/event-stream` (RFC 9110 §12.5.1), but the old
+        substring check missed it — `"text/*"` does not contain the
+        literal substring `"text/event-stream"`.
+
+        Revert-check: swap `_accepts_sse` back for the substring check
+        and this earns a 406.
+        """
+        with _Listener(gateway, _listen_body(), accept="text/*") as ln:
+            assert ln.status == 200, ln.error_body
+            assert ln.wait_frames(1)[0]["method"] == ACK_METHOD
+
+    def test_an_explicit_q_zero_refusal_earns_406(self, gateway):
+        """#382 review R1F2 remainder. `q=0` is an explicit REFUSAL of a
+        media range (RFC 9110 §12.4.2 — "a value of 0 means 'not
+        acceptable'"), but the old substring check does not parse
+        quality parameters at all, so `text/event-stream;q=0` passed it
+        and opened a stream the client had explicitly said it did not
+        want.
+
+        Revert-check: swap `_accepts_sse` back for the substring check
+        and this gets a 200 stream instead of a 406.
+        """
+        resp = _post(
+            gateway,
+            _listen_body(),
+            {**_modern_headers(LISTEN_METHOD), "Accept": "text/event-stream;q=0"},
+        )
+        assert resp.status_code == 406, resp.text
+        assert resp.json()["error"]["code"] == INVALID_REQUEST
 
     def test_the_per_child_stream_cap_is_refused_pre_ack(self, gateway, monkeypatch):
         """One client must not be able to pin unbounded handler threads.

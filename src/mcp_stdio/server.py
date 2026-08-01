@@ -459,6 +459,54 @@ _LISTEN_QUEUE_MAX = 1024
 # A cap exists so one client cannot pin unbounded handler threads.
 _LISTEN_MAX_STREAMS_PER_CHILD = 4
 
+
+def _accepts_sse(accept_header: str | None) -> bool:
+    """Whether an `Accept` header (RFC 9110 §12) permits `text/event-stream`.
+
+    #382 review R1F2 remainder. A prior fix casefolded the comparison but
+    kept it a bare substring check, which gets two cases wrong in
+    opposite directions:
+
+    - `Accept: text/*` is a valid media RANGE that matches
+      `text/event-stream` and must be honored, but does not contain the
+      substring `"text/event-stream"`, so it earned a 406.
+    - `Accept: text/event-stream;q=0` is an explicit REFUSAL of that
+      type (RFC 9110 §12.4.2: q=0 means "not acceptable"), but the
+      substring IS present, so it passed.
+
+    Missing or empty is `True`: RFC 9110 §12.5.1 — "A request without
+    any Accept header field implies that the user agent will accept any
+    media type in response." Absent means accept anything, not accept
+    nothing; the substring check used to get this backwards too (`""`
+    contains no substring, so a client that omits Accept entirely was
+    406'd).
+
+    Each comma-separated range is matched by exact media type or by the
+    `text/*` / `*/*` wildcards, case-insensitively (media types are
+    case-insensitive, RFC 9110 §8.3.1). An unparsable `q` parameter is
+    treated as `q=1` — lenient parsing, consistent with the rest of this
+    header's handling — rather than rejected outright.
+    """
+    if not accept_header:
+        return True
+    for range_spec in accept_header.split(","):
+        params = range_spec.split(";")
+        media_range = params[0].strip().casefold()
+        if media_range not in ("text/event-stream", "text/*", "*/*"):
+            continue
+        q = 1.0
+        for param in params[1:]:
+            name, _, value = param.strip().partition("=")
+            if name.strip().casefold() == "q":
+                try:
+                    q = float(value.strip())
+                except ValueError:
+                    q = 1.0
+        if q > 0:
+            return True
+    return False
+
+
 # How often a stream waiting for its next notification re-checks whether
 # it has been told to end. A `queue.Queue` and a `threading.Event` cannot
 # be waited on jointly, and BOTH endings (gateway shutdown, child death)
@@ -3498,11 +3546,12 @@ class _Handler(BaseHTTPRequestHandler):
 
         # The success path is an SSE stream, so a client that cannot
         # accept one gets 406 rather than a stream it will not read.
-        # CASEFOLDED: "media types are case-insensitive" (RFC 9110
-        # §8.3.1), so `Accept: Text/Event-Stream` is the same request and
-        # must not earn a 406 for its capitalisation.
-        accept = (self.headers.get("Accept") or "").lower()
-        if "text/event-stream" not in accept and "*/*" not in accept:
+        # MEDIA-RANGE MATCHED, not a substring check (#382 review R1F2):
+        # `_accepts_sse` honors `text/*`/`*/*` ranges, an explicit `q=0`
+        # refusal, and an absent header (RFC 9110 says that means accept
+        # anything) — see its docstring for what a substring check got
+        # wrong in both directions.
+        if not _accepts_sse(self.headers.get("Accept")):
             self._send_json(
                 406,
                 _error_body(
