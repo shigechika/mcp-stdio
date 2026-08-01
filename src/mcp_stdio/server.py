@@ -1656,13 +1656,25 @@ class BackendProcess:
         # Empty is the steady state and restores the discard behaviour by
         # construction.
         self._listeners: list[Any] = []
-        # #381: resource URI -> how many attached listen streams honored
-        # it. Sited HERE rather than on the pool entry so it dies with the
+        # #381: resource URI -> (how many attached listen streams honored
+        # it, whether a drive attempt has actually reached the child).
+        # Sited HERE rather than on the pool entry so it dies with the
         # child: `ModernBackendPool.get_or_create`'s died-child arm drops
         # the whole `BackendProcess`, and a respawn gets an empty map for
         # free. No explicit "clear subscriptions on death" step exists on
         # purpose — object lifetime already guarantees it, and a separate
         # step is one more thing a future edit can get out of sync.
+        #
+        # THE BOOL IS NOT REDUNDANT (#388 review R2F1). The count alone
+        # answers "does a stream claim this URI"; it says nothing about
+        # whether the child was ever actually asked. A batch that stops
+        # partway (see `responsive` in `add_resource_subscriptions`)
+        # still takes the reference for every named URI, including ones
+        # it never got to drive — collapsing that into one int made
+        # "referenced" indistinguishable from "the child was told", so a
+        # later stream naming the same URI would see count > 0 and skip
+        # driving FOREVER, even though nothing had ever reached the
+        # child. See both methods' docstrings.
         #
         # ITS OWN LOCK, not `self._lock`. `send_request` takes `_lock`
         # internally, and this lock is deliberately HELD ACROSS that call
@@ -1674,7 +1686,7 @@ class BackendProcess:
         # forever. Acquisition order is `_sub_lock` -> `_lock`, never the
         # reverse.
         self._sub_lock = threading.Lock()
-        self._resource_refs: dict[str, int] = {}
+        self._resource_refs: dict[str, tuple[int, bool]] = {}
         self._closed = threading.Event()
         self._reader = threading.Thread(
             target=self._read_loop, name="backend-reader", daemon=True
@@ -1843,13 +1855,31 @@ class BackendProcess:
     def add_resource_subscriptions(
         self, uris: Iterable[str], listen_id: Any, listener: Any = None
     ) -> None:
-        """Take a reference on each URI, subscribing the child on the first.
+        """Take a reference on each URI, driving `resources/subscribe` for
+        any URI not yet driven.
 
-        #381 §3.1/§3.3. A modern child is SHARED, so N listen streams can
-        name the same URI; the child must be told once and untold once.
-        The refcount is what makes that true, and it is why the first
-        `add` for a URI drives `resources/subscribe` while later ones only
-        increment.
+        #381 §3.1/§3.3, #388 review R2F1. A modern child is SHARED, so N
+        listen streams can name the same URI; the child must be told once
+        and untold once. The refcount is what makes that true — but
+        `count > 0` must not be read as "the child was told"; it only
+        means "a stream has claimed this URI". Whether a drive attempt has
+        actually reached the child is tracked SEPARATELY as `driven`
+        (see the field's own comment), which is why a URI is driven when
+        it is either brand new (`count == 0`) OR already referenced but
+        never driven — not only on the first reference.
+
+        The per-call `responsive` short-circuit below (stop driving the
+        REST OF THIS BATCH once the child goes unresponsive) is
+        unchanged and still correct: it bounds one call's worst case
+        against a hung child, which is what `_RESOURCE_SUBSCRIBE_TIMEOUT_SECS`
+        and `TestResourceSubscribeDriveIsBounded` are about. What changed
+        is that skipping a URI this way no longer marks it `driven` —
+        before this fix it did, via the single-int refcount, which meant
+        a batch's first timeout could silently strand every LATER
+        first-reference URI in that batch as "subscribed" forever: no
+        later call — different stream, possibly a healthy child by
+        then — could ever tell it apart from a real success, so it never
+        got retried.
 
         Runs on a BACKGROUND thread, after the ack is already on the wire
         — see `_serve_listen_stream`. Nothing here can delay the ack or
@@ -1858,12 +1888,18 @@ class BackendProcess:
         per-URI confirmation, so blocking on it would buy a hang vector
         and no information.
 
-        ON FAILURE — an error response, or `None` from a timeout or a
-        dead child — the URI KEEPS its reference and stays in the ack's
-        already-sent honored set. There is no unwind: the ack has shipped,
-        a timeout does not say whether the child processed the request,
-        and #374's own precedent is that "a subscription that never fires
-        is still honored". Logged once per URI instead.
+        ON A DRIVEN BUT UNCONFIRMED OUTCOME — an error response, or
+        `None` from a timeout or a dead child — the URI KEEPS its
+        reference, is marked DRIVEN anyway, and stays in the ack's
+        already-sent honored set. There is no unwind and no retry within
+        this URI's own lifetime: the ack has shipped, a timeout does not
+        say whether the child processed the request, and #374's own
+        precedent is that "a subscription that never fires is still
+        honored". Logged once per URI instead. This is deliberately
+        DIFFERENT from a URI that was never driven at all (short-circuited
+        by `responsive`): an attempt that reached the wire is trusted not
+        to need a second try; a URI nothing was ever sent for is not the
+        same claim.
 
         `listener.torn_down` is checked under the SAME lock the refs use,
         which is what makes a stream that dies before its subscriptions
@@ -1877,9 +1913,10 @@ class BackendProcess:
                 return
             responsive = True
             for uri in uris:
-                count = self._resource_refs.get(uri, 0)
-                self._resource_refs[uri] = count + 1
-                if count:
+                count, driven = self._resource_refs.get(uri, (0, False))
+                new_count = count + 1
+                self._resource_refs[uri] = (new_count, driven)
+                if driven:
                     continue
                 if not responsive:
                     # The child stopped answering; the refcount is still
@@ -1887,8 +1924,15 @@ class BackendProcess:
                     # unresponsive child 255 more times only holds
                     # `_sub_lock` — and every other stream's teardown —
                     # for longer. See `_RESOURCE_SUBSCRIBE_TIMEOUT_SECS`.
+                    # `driven` stays False (#388 review R2F1): a LATER
+                    # call for this URI must retry the drive, not treat
+                    # this skip as a subscribe that happened.
                     continue
                 outcome = self._drive_resource_subscription("resources/subscribe", uri)
+                # An attempt reached the wire — mark it driven regardless
+                # of the reply, including a timeout/`None`: only a URI
+                # nothing was ever SENT for should be retried later.
+                self._resource_refs[uri] = (new_count, True)
                 if outcome is None:
                     responsive = False
                 if not outcome:
@@ -1898,7 +1942,8 @@ class BackendProcess:
                     )
 
     def release_resource_subscriptions(self, uris: Iterable[str]) -> None:
-        """Drop a reference on each URI, unsubscribing on the last.
+        """Drop a reference on each URI, unsubscribing on the last — but
+        only if a subscribe ever actually reached the child.
 
         The mirror of `add_resource_subscriptions`, called from the listen
         handler's `finally`. Unsubscribing a child that is already gone is
@@ -1910,17 +1955,37 @@ class BackendProcess:
         `_ListenStream.torn_down`): the drive never ran, so there is
         nothing to undo, and sending an unsubscribe the child never had a
         subscribe for would be serve inventing traffic.
+
+        #388 review R2F1 extends that same "nothing to undo" reasoning to
+        an UNDRIVEN reference — one whose count went to zero without
+        `driven` ever becoming True, because `add_resource_subscriptions`
+        skipped it (unresponsive child mid-batch) rather than actually
+        sending it. Before this fix a plain int refcount could not tell
+        that apart from a real subscribe, so this could drive a
+        `resources/unsubscribe` for a URI the child was never told about
+        — and, the other direction, drop the reference on a URI whose
+        drive DID silently land moments later (a timeout says the child
+        did not ANSWER, not that it did not PROCESS), leaving a stale
+        subscription on the child that nothing tracks anymore. Checking
+        `driven` here closes the first hole outright and narrows the
+        second to the same "timeout != processed" ambiguity
+        `add_resource_subscriptions` already lives with.
         """
         with self._sub_lock:
             responsive = True
             for uri in uris:
-                count = self._resource_refs.get(uri, 0)
-                if count == 0:
+                entry = self._resource_refs.get(uri)
+                if entry is None:
                     continue
+                count, driven = entry
                 if count > 1:
-                    self._resource_refs[uri] = count - 1
+                    self._resource_refs[uri] = (count - 1, driven)
                     continue
                 self._resource_refs.pop(uri, None)
+                if not driven:
+                    # Never actually subscribed (#388 review R2F1) —
+                    # there is nothing on the child to undo.
+                    continue
                 if not responsive:
                     # Same short-circuit as `add`, and it matters more
                     # here: this runs in the handler's `finally`, so a

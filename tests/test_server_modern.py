@@ -3400,7 +3400,10 @@ class TestResourceSubscriptionRefcounts:
         backend = server.BackendProcess([*_BACKEND], modern_owned=True)
         try:
             backend.add_resource_subscriptions(["res://a"], "l1")
-            assert backend._resource_refs == {"res://a": 1}
+            # (count, driven) — #388 review R2F1. The real fake backend
+            # answers resources/subscribe, so this URI is both referenced
+            # and actually driven.
+            assert backend._resource_refs == {"res://a": (1, True)}
         finally:
             backend.shutdown()
         # A fresh child starts clean — the state is object-scoped.
@@ -3539,5 +3542,135 @@ class TestResourceSubscribeDriveIsBounded:
         try:
             backend.add_resource_subscriptions(["res://a", "res://b"], "l1")
             assert seen == ["res://a", "res://b"]
+        finally:
+            backend.shutdown()
+
+
+def _selective_recorder(calls: list, *, times_out: frozenset):
+    """A `_drive_resource_subscription` stand-in: any URI in `times_out`
+    returns `None` (the child never answers); everything else returns
+    `True` (a real success) — WHEN it is actually asked. Every call is
+    recorded in `calls` as `(method, uri)`, which is the wire evidence
+    these tests assert on (this file's own precedent, see
+    `_subscribe_calls`'s docstring): whether the request actually
+    reached the child, not whether an update later showed up.
+    """
+
+    def _drive(self, method, uri):
+        calls.append((method, uri))
+        return None if uri in times_out else True
+
+    return _drive
+
+
+class TestResourceSubscriptionDrivenTracking:
+    """#388 review R2F1 — a refcount must not conflate "referenced" with
+    "successfully driven".
+
+    `add_resource_subscriptions` used a plain `int` refcount: `count > 0`
+    meant both "a stream claims this URI" AND "the child was told",
+    which are not the same claim. A batch whose first URI times out
+    stops driving the REST of that batch (the existing, correct
+    `responsive` short-circuit — see `TestResourceSubscribeDriveIsBounded`)
+    but the refcount for every later first-reference URI in that batch
+    still went to 1, indistinguishable from a URI that really was
+    subscribed. No LATER call — a different stream, possibly against a
+    since-recovered child — could ever tell the two apart, so the gap
+    was permanent.
+    """
+
+    def test_a_batch_timeout_leaves_a_later_uri_undriven_not_subscribed(
+        self, monkeypatch
+    ):
+        """The sticky's exact reproduction. `res://slow` (first in the
+        batch) never answers, so `responsive` flips False and
+        `res://healthy` (second) never gets a drive attempt at all —
+        wire evidence: `calls` has no entry for it. That URI must be
+        left marked UNDRIVEN, not silently treated as subscribed.
+        """
+        calls: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            server.BackendProcess,
+            "_drive_resource_subscription",
+            _selective_recorder(calls, times_out=frozenset({"res://slow"})),
+        )
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            backend.add_resource_subscriptions(["res://slow", "res://healthy"], "l1")
+            assert calls == [("resources/subscribe", "res://slow")], calls
+            # res://slow WAS driven — an attempt reached the wire, even
+            # though the reply never came back.
+            assert backend._resource_refs["res://slow"] == (1, True)
+            # res://healthy was only ever refcounted; nothing was sent.
+            assert backend._resource_refs["res://healthy"] == (1, False), (
+                "an undriven URI must not be marked as subscribed"
+            )
+        finally:
+            backend.shutdown()
+
+    def test_an_undriven_uri_is_retried_by_a_later_call(self, monkeypatch):
+        """The fix's whole point: once something asks about `res://healthy`
+        again — a different stream, the child now answering — the drive
+        must be RE-ATTEMPTED, not skipped as "already subscribed".
+
+        Wire evidence, not absence-of-updates: asserts the child actually
+        RECEIVES a second `resources/subscribe` for `res://healthy`.
+
+        Revert-check: restore the single-int refcount and the `if count:
+        continue` skip (drop the `driven` tracking) — the second call
+        never reaches `calls`, because a plain positive count already
+        reads as "subscribed".
+        """
+        calls: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            server.BackendProcess,
+            "_drive_resource_subscription",
+            _selective_recorder(calls, times_out=frozenset({"res://slow"})),
+        )
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            # First stream: the batch that leaves res://healthy undriven
+            # — the undriven state itself is pinned by the sibling test
+            # above; this one only needs it to set up the retry.
+            backend.add_resource_subscriptions(["res://slow", "res://healthy"], "l1")
+            calls.clear()
+
+            # Second stream, later: only res://healthy, child responsive
+            # this time (nothing here times out).
+            backend.add_resource_subscriptions(["res://healthy"], "l2")
+
+            assert calls == [("resources/subscribe", "res://healthy")], calls
+            assert backend._resource_refs["res://healthy"] == (2, True)
+        finally:
+            backend.shutdown()
+
+    def test_release_skips_the_unsubscribe_for_an_undriven_uri(self, monkeypatch):
+        """The mirror bug, on the release side. A URI whose refcount
+        reaches zero without ever having been driven has nothing on the
+        child to undo — sending `resources/unsubscribe` anyway would be
+        serve inventing traffic for a subscribe that never happened.
+
+        Revert-check: restore the plain-int refcount (which drives
+        `resources/unsubscribe` unconditionally once count hits zero,
+        with no driven check) — a spurious unsubscribe reaches the
+        child for `res://healthy`.
+        """
+        calls: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            server.BackendProcess,
+            "_drive_resource_subscription",
+            _selective_recorder(calls, times_out=frozenset({"res://slow"})),
+        )
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            # The undriven state itself is pinned by the first test in
+            # this class; this one only needs it to set up the release.
+            backend.add_resource_subscriptions(["res://slow", "res://healthy"], "l1")
+            calls.clear()
+
+            backend.release_resource_subscriptions(["res://healthy"])
+
+            assert calls == [], calls
+            assert "res://healthy" not in backend._resource_refs
         finally:
             backend.shutdown()
