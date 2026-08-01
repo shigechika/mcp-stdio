@@ -526,7 +526,7 @@ class ModernBackendPool:
         with self._lock:
             entry["holds"] = max(0, entry.get("holds", 0) - 1)
 
-    def _evict_if_at_cap_locked(self) -> None:
+    def _evict_if_at_cap_locked(self, *, reserve: int = 1) -> None:
         """Make room by dropping the idlest child (§4 Q3).
 
         Evicting beats refusing here in a way it does not for legacy
@@ -539,7 +539,13 @@ class ModernBackendPool:
         """
         if self._max_children <= 0:
             return
-        while len(self._entries) >= self._max_children:
+        # `reserve` is how many slots the caller still needs. The
+        # PRE-insert callers need one (the entry they are about to add),
+        # which is the default and the original behaviour. The post-spawn
+        # re-check (#376 §3.2) has ALREADY inserted, so it needs none —
+        # passing `reserve=1` there would evict a child every time the
+        # pool merely reached the cap, rather than exceeded it.
+        while len(self._entries) + reserve > self._max_children:
             # ONLY a ready, quiet child may be evicted (review R1F1):
             #
             # - a PENDING entry (another thread mid-spawn) has no backend
@@ -680,7 +686,10 @@ class ModernBackendPool:
                 # is the documented posture: every alternative kills work
                 # already in flight. The reaper makes that exceedance
                 # time-bounded rather than permanent.
-                self._evict_if_at_cap_locked()
+                #
+                # `reserve=0`: this entry is already IN the map, so the
+                # sweep must trim down to the cap, not below it.
+                self._evict_if_at_cap_locked(reserve=0)
             entry["event"].set()
             return backend, init_result, entry
 

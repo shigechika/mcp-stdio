@@ -1031,6 +1031,24 @@ class TestModernBackendPool:
             gate.set()
             pool.shutdown_all()
 
+    def test_reaching_the_cap_does_not_evict(self):
+        """At the cap is not over it — the off-by-one guard.
+
+        `_evict_if_at_cap_locked` means "make room for one more", so the
+        pre-insert callers pass `reserve=1`. The post-spawn re-check
+        (#376 §3.2) has already inserted; with the same reserve it would
+        evict a child every time the pool merely REACHED the cap. With
+        `max_children=2`, two principals must both survive.
+        """
+        pool = server.ModernBackendPool(_BACKEND, max_children=2)
+        try:
+            first, _ = _checkout_and_release(pool, "a")
+            second, _ = _checkout_and_release(pool, "b")
+            assert pool.count() == 2, "reaching the cap evicted a child"
+            assert not first.closed and not second.closed
+        finally:
+            pool.shutdown_all()
+
     def test_a_child_that_never_answers_initialize_raises(self):
         """A failed handshake leaves no entry behind to poison retries."""
         pool = server.ModernBackendPool(
