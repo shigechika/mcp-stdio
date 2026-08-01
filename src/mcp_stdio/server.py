@@ -41,7 +41,9 @@ import os
 import queue
 import re
 import secrets
+import select
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -3494,6 +3496,15 @@ class _Handler(BaseHTTPRequestHandler):
         listener = _ListenStream(req_id, honored)
 
         if len(backend._snapshot_listeners()) >= _LISTEN_MAX_STREAMS_PER_CHILD:
+            # ADVISORY under concurrency, and deliberately so: the count
+            # and the attach below are not one atomic step, so N
+            # simultaneous listens can each see N-1 and all attach. That
+            # is acceptable for what the cap is FOR — stopping one client
+            # from pinning unbounded handler threads over time — while a
+            # lock spanning the check, the SSE headers and the ack write
+            # would serialise every listen on that child behind a socket
+            # write.
+            #
             # Pre-ack rejection, single JSON: -32603 rather than a fresh
             # -32000-range mint (O18).
             self._send_json(
@@ -3554,6 +3565,36 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(f"data: {json.dumps(message)}\n\n".encode("utf-8"))
         self.wfile.flush()
 
+    def _peer_gone(self) -> bool:
+        """Has the client closed its end of this stream?
+
+        Waiting for a WRITE to fail is not good enough, and the number
+        that proves it is 30 SECONDS: the first keepalive after a
+        disconnect lands in the kernel's send buffer and succeeds, so
+        only the SECOND one raises — two full keepalive intervals during
+        which the stream still holds a slot against
+        `_LISTEN_MAX_STREAMS_PER_CHILD` and a hold against the idle
+        reaper. A client on a flaky network that drops and re-listens
+        locks ITSELF out with 503s for half a minute.
+
+        A committed SSE response has nothing left to read from the peer,
+        so readable-and-empty is unambiguously EOF. Readable-with-DATA is
+        a client pipelining onto a response whose framing is
+        close-delimited; that is its own protocol error, but not this
+        method's to answer, so it reports "still here" and the stream
+        carries on.
+
+        Fails SAFE in the other direction too: any socket error here
+        means the connection is unusable, which is the same conclusion.
+        """
+        try:
+            ready, _, _ = select.select([self.connection], [], [], 0)
+            if not ready:
+                return False
+            return self.connection.recv(1, socket.MSG_PEEK) == b""
+        except OSError:
+            return True
+
     def _pump_listen_stream(
         self, listener: _ListenStream, backend: BackendProcess
     ) -> None:
@@ -3581,6 +3622,7 @@ class _Handler(BaseHTTPRequestHandler):
         compliant peer. (This supersedes the "emit both signals" reading
         recorded against O17 on #270.)
         """
+        last_keepalive = time.monotonic()
         while True:
             if listener.ending:
                 if listener.graceful:
@@ -3601,15 +3643,16 @@ class _Handler(BaseHTTPRequestHandler):
                 # had nobody to signal.
                 log(f"listen {listener.listen_id!r}: backend gone; closing the stream")
                 return
-            message = listener.next_message(_SSE_KEEPALIVE_SECS)
+            if self._peer_gone():
+                log(f"listen {listener.listen_id!r}: client went away")
+                return
+            message = listener.next_message(_LISTEN_POLL_SECS)
             if message is None:
-                if listener.ending or backend.closed:
-                    # Woken to wind up, not to idle. The top of the loop
-                    # decides which ending this is.
-                    continue
-                # Keep-alive comment, and how a dead peer is noticed.
-                self.wfile.write(b": keepalive\n\n")
-                self.wfile.flush()
+                now = time.monotonic()
+                if now - last_keepalive >= _SSE_KEEPALIVE_SECS:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    last_keepalive = now
                 continue
             stamped = dict(message)
             params = dict(stamped.get("params") or {})

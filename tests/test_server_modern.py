@@ -2444,24 +2444,51 @@ class TestListenEndings:
         assert len(frames) == 1, frames
         assert frames[0]["method"] == ACK_METHOD
 
-    def test_a_client_disconnect_detaches_the_stream(self, gateway):
-        """The write failure IS the signal — on HTTP "closing the SSE
-        response stream is itself the cancellation signal". What matters
-        afterwards is that the listener is gone: a leaked one would keep
-        a bounded queue filling with nobody to drain it."""
+    def test_a_client_disconnect_frees_the_slot_promptly(self, gateway, monkeypatch):
+        """On HTTP "closing the SSE response stream is itself the
+        cancellation signal" — so a disconnect must free what the stream
+        held, and PROMPTLY.
+
+        Asserted through the CAP, because that is the observable a real
+        client hits. An earlier version of this test opened a fresh
+        stream and checked it worked, which a LEAKED listener passes
+        untouched — the assertion and its docstring had drifted apart.
+
+        The number that made this necessary is 30 seconds. Waiting for a
+        write to fail is not enough: the first keepalive after a
+        disconnect lands in the kernel's send buffer and succeeds, so
+        only the SECOND one raises — two full keepalive intervals of a
+        zombie stream holding a cap slot and a pool hold. A client on a
+        flaky network that dropped and re-listened locked ITSELF out with
+        503s. `_peer_gone` is what closes that window.
+
+        Revert-check: delete the `_peer_gone` branch from
+        `_pump_listen_stream` and this fails on 503 — the exact symptom,
+        not a proxy for it.
+        """
+        monkeypatch.setattr(server, "_LISTEN_MAX_STREAMS_PER_CHILD", 1)
         ln = _Listener(gateway, _listen_body(notifications={"toolsListChanged": True}))
         with ln:
             ln.wait_frames(1)
-        # Fire until the (detached) stream can no longer be the reason
-        # anything is retained, then a fresh stream must still work.
-        _fire(gateway, "tools")
-        with _Listener(
-            gateway, _listen_body("after", notifications={"toolsListChanged": True})
-        ) as fresh:
-            fresh.wait_frames(1)
-            _fire(gateway, "tools")
-            event = fresh.wait_frames(2)[1]
-        assert event["params"]["_meta"][SUBSCRIPTION_ID] == "after"
+        # Bounded poll rather than one shot: the detach happens on the
+        # handler thread, so the test OBSERVES it rather than assuming it
+        # already happened. Ten seconds is well inside one keepalive
+        # interval, so a pass here cannot come from the old behaviour.
+        deadline = time.monotonic() + 10
+        last: int | None = None
+        while time.monotonic() < deadline:
+            fresh = _Listener(
+                gateway, _listen_body("after", notifications={"toolsListChanged": True})
+            )
+            with fresh:
+                last = fresh.status
+                if last == 200:
+                    assert fresh.wait_frames(1)[0]["method"] == ACK_METHOD
+                    return
+            time.sleep(0.05)
+        raise AssertionError(
+            f"the slot was still held 10s after the disconnect (status={last})"
+        )
 
 
 class TestListenStreamUnit:
@@ -2536,18 +2563,70 @@ class TestListenStreamUnit:
 class TestListenAndThePool:
     """#374's use of #376's hold seam."""
 
-    def test_an_attached_stream_pins_its_child_against_the_reaper(self):
+    def test_a_live_listen_stream_pins_its_child_against_the_reaper(self, gateway):
         """A held entry is never reaped — `holds` is exactly the seam
-        #376 built for this. A stream whose child was reaped under it
-        would go silent with no ending at all."""
+        #376 built for this, and #374 is its first real user. A stream
+        whose child was reaped under it would simply go silent, with no
+        ending of any kind for the client to react to.
+
+        Driven through a REAL stream over HTTP rather than a bare
+        `get_or_create`: the latter re-tests #376's refcount and says
+        nothing about whether the LISTEN path actually takes the hold and
+        keeps it for the life of the stream. The pool's clock is
+        injectable, so nothing here waits on wall time.
+        """
+        httpd, registry = server.build_server(_BACKEND, host="127.0.0.1", port=0)
+        host, port = httpd.server_address[0], httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://{host}:{port}/mcp"
+        clock = [1000.0]
+        pool = httpd.modern_pool
+        pool._now = lambda: clock[0]
+        pool._idle_ttl = 30.0
+        try:
+            ln = _Listener(url, _listen_body(notifications={"toolsListChanged": True}))
+            with ln:
+                ln.wait_frames(1)
+                clock[0] += 31.0
+                assert pool.reap_idle() == 0, (
+                    "reaped a child out from under a live listen stream"
+                )
+                assert pool.count() == 1
+            # Stream closed: the hold is released on the handler thread,
+            # so observe the reap becoming possible rather than assume it.
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                clock[0] += 31.0
+                if pool.reap_idle() == 1:
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("the hold outlived the stream")
+            assert pool.count() == 0
+        finally:
+            httpd.shutdown()
+            registry.shutdown_all()
+            pool.shutdown_all()
+            httpd.server_close()
+
+    def test_the_hold_is_released_when_the_stream_ends(self):
+        """The other half: a hold kept forever makes the child
+        permanently unreapable, which is a leak rather than a safety
+        margin. Fake clock — the reaper's only time input is `now`."""
         clock = [1000.0]
         pool = server.ModernBackendPool(_BACKEND, idle_ttl=30.0, now=lambda: clock[0])
         try:
-            _, _, entry = pool.get_or_create("held")
+            backend, _, entry = pool.get_or_create("held")
+            stream = server._ListenStream("s", {"toolsListChanged": True})
+            backend.attach_listener(stream)
             assert entry["holds"] == 1
             clock[0] += 31.0
             assert pool.reap_idle() == 0, "reaped a child with a live listen stream"
             assert pool.count() == 1
+            # What `_serve_listen_stream`'s `finally` does when the
+            # stream ends: detach, then release the hold.
+            backend.detach_listener(stream)
             pool.release(entry)
             clock[0] += 31.0
             assert pool.reap_idle() == 1
