@@ -36,6 +36,7 @@ caching is on by default, so each operation is called once.
 from __future__ import annotations
 
 import json
+import time
 
 import httpx
 import pytest
@@ -393,3 +394,123 @@ def test_the_auto_era_sandwich_carries_a_listchanged_end_to_end(
     event = client.expect_notification("notifications/tools/list_changed", timeout=30.0)
     assert event["jsonrpc"] == "2.0"
     assert "id" not in event
+
+
+def _kill_the_pooled_child(gateway) -> None:
+    """Make serve's gateway-owned child exit, without touching serve."""
+    resp = httpx.post(
+        gateway.url,
+        content=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "exit",
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": MODERN_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    }
+                },
+            }
+        ),
+        headers={"MCP-Protocol-Version": MODERN_VERSION},
+        timeout=20,
+    )
+    assert resp.status_code == 202, resp.text
+
+
+@pytest.mark.timeout(120)
+def test_the_relay_reads_serves_graceful_end_and_does_not_reconnect(
+    serve_factory, relay_factory
+):
+    """The one peer where the graceful/lost distinction is a POLICY channel.
+
+    Design amendment L1 settled that the v2 client cannot tell the two
+    endings apart — an abrupt close ends its iterator cleanly, so serve's
+    terminal frame is unobservable there. The RELAY can: its no-reconnect
+    decision keys on a result bearing the listen id (#352), which is
+    exactly the frame `_pump_listen_stream` writes on shutdown. So this
+    is where the frame's *purpose* gets tested rather than its bytes.
+
+    Three things at once, from one positive assertion:
+
+    1. serve emitted the terminal result frame at all;
+    2. it carried the relay's OWN listen id verbatim — serve mints
+       replacement ids for forwarded requests, and listen is intercepted
+       before that, so an id rewritten anywhere along the way would make
+       the relay read a graceful end as an abrupt drop;
+    3. the relay classified it as graceful and STOPPED.
+
+    Point 3 is what a client actually feels. Without it the relay would
+    reconnect-loop at 1 Hz against a gateway that is deliberately going
+    away.
+    """
+    gateway = serve_factory()
+    client = relay_factory(gateway.port, protocol_era="auto")
+    client.initialize(protocol_version=MODERN_VERSION)
+
+    wait_until(
+        lambda: any(": streaming " in line for line in gateway.stderr.lines),
+        timeout=30.0,
+        what="the relay's upstream listen stream to attach at serve",
+        diagnose=gateway.diagnose,
+    )
+
+    # SIGTERM is serve's documented shutdown path, and the path that runs
+    # `modern_pool.shutdown_all()` -> graceful `close_listeners` + drain.
+    gateway.close()
+
+    wait_until(
+        lambda: client.stderr.contains("closed gracefully"),
+        timeout=30.0,
+        what="the relay to classify serve's end as graceful",
+        diagnose=lambda: f"relay stderr:\n{client.stderr.tail()}",
+    )
+    # And it stopped: a reconnect after a graceful end is the failure this
+    # frame exists to prevent, and serve is gone, so any attempt would
+    # log its own failure. Bounded quiescence (conftest rule 5).
+    time.sleep(2.0)
+    assert not client.stderr.contains("reconnecting"), client.stderr.tail()
+
+
+@pytest.mark.timeout(120)
+def test_the_relay_treats_a_dead_child_as_an_ordinary_reconnectable_drop(
+    serve_factory, relay_factory
+):
+    """The other half of the ending table, at the same peer.
+
+    A child dying is NOT graceful: serve stays up, so the contract is
+    that the peer re-listens and refetches. Serve says that by closing
+    with NO terminal frame — the absence is the signal — and the relay
+    must therefore reconnect rather than give up.
+
+    Observed at SERVE, as a second attach: that proves the relay came
+    back AND that serve respawned a child for it, which is the whole
+    recovery path rather than half of it.
+    """
+    gateway = serve_factory()
+    client = relay_factory(gateway.port, protocol_era="auto")
+    client.initialize(protocol_version=MODERN_VERSION)
+
+    def _attaches() -> int:
+        return sum(1 for line in gateway.stderr.lines if ": streaming " in line)
+
+    wait_until(
+        lambda: _attaches() >= 1,
+        timeout=30.0,
+        what="the relay's upstream listen stream to attach at serve",
+        diagnose=gateway.diagnose,
+    )
+
+    _kill_the_pooled_child(gateway)
+
+    wait_until(
+        lambda: _attaches() >= 2,
+        timeout=60.0,
+        what="the relay to re-listen after the abrupt end",
+        diagnose=lambda: f"{gateway.diagnose()}\nrelay stderr:\n{client.stderr.tail()}",
+    )
+    # Recovered for real, not just reconnected: the fresh child serves
+    # the listChanged the reconnected stream subscribed to.
+    _drive_list_changed(gateway)
+    event = client.expect_notification("notifications/tools/list_changed", timeout=30.0)
+    assert event["jsonrpc"] == "2.0"
