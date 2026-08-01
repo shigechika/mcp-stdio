@@ -1450,14 +1450,37 @@ _MRTR_POINTER_TTL_SECS = 300.0
 
 
 def _mrtr_principal_hash(principal: str | None) -> str:
-    """A stable, non-reversible tag for the owning principal.
+    """A stable, HMAC-keyed tag for the owning principal.
 
     The raw value is an OAuth username; it goes nowhere near a blob the
-    client holds and could inspect. A hash binds the pointer to its owner
+    client holds and could inspect. A tag binds the pointer to its owner
     just as well, since the only operation ever performed on it is
     equality against a freshly-resolved principal.
+
+    KEYED with `_MRTR_POINTER_KEY` (#389 review, score 85), not a bare
+    `sha256` of the principal. The payload segment of `requestState` is
+    only integrity-protected — HMAC over the whole blob, never
+    encrypted — and the spec's confidentiality obligation runs the other
+    way ("clients MUST NOT inspect ... its contents"), so nothing stops
+    a proxy log, a client-side debug dump, or a support screenshot from
+    exposing this tag to someone who was never meant to read it. OAuth
+    principals are low-entropy and structurally guessable (usernames,
+    emails), so an UNKEYED hash would let anyone holding a leaked blob
+    run an offline dictionary attack — hash every guessed principal,
+    compare — and learn exactly who opened the round. Confidentiality
+    against that attack comes from the key, not from SHA-256 being
+    "non-reversible": a fast, unsalted, unkeyed hash of a small
+    guessable space is not a secret no matter which hash function it
+    is. Reuses `_MRTR_POINTER_KEY` rather than minting a second secret —
+    the same key already protects the pointer's outer MAC, and both
+    encode (`_mrtr_encode_pointer`) and decode (`_mrtr_decode_pointer`)
+    call this one function, so equality-check semantics are unaffected.
     """
-    return hashlib.sha256(f"mcp-stdio/mrtr/{principal!r}".encode("utf-8")).hexdigest()
+    return hmac.new(
+        _MRTR_POINTER_KEY,
+        f"mcp-stdio/mrtr/{principal!r}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def _mrtr_pointer_payload_bytes(payload: dict[str, Any]) -> bytes:

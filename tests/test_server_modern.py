@@ -3854,6 +3854,35 @@ class TestMrtrPointer:
         state = server._mrtr_encode_pointer("txn-1", "alice@example.com", 1)
         assert "alice" not in server._b64url_decode(state.split(".")[0]).decode()
 
+    def test_the_principal_tag_depends_on_the_key_not_just_the_string(self):
+        """#389 review, score 85: `_mrtr_principal_hash` used to be a bare
+        `sha256` of the principal string — a "non-reversible tag" only in
+        name, since it mixed in no secret. `requestState`'s payload is
+        integrity-protected, not encrypted, and the spec's confidentiality
+        obligation runs the OTHER way ("clients MUST NOT inspect ... its
+        contents", not "servers must keep it secret") — so a proxy log, a
+        client-side debug dump, or a support screenshot can expose this
+        tag. OAuth principals are low-entropy and guessable (usernames,
+        emails), so an UNKEYED hash would let anyone holding a leaked
+        blob run an offline dictionary attack: hash every guessed
+        principal, compare, learn who opened the round.
+
+        Simulates exactly that attacker — someone who can read the tag
+        but does not have `_MRTR_POINTER_KEY` — by recomputing the OLD,
+        unkeyed formula directly and asserting it does NOT match what the
+        real function produces for the same guessable strings.
+
+        Revert-check: swap `_mrtr_principal_hash` back to the bare
+        `hashlib.sha256` call and this assertion flips to a match — the
+        attacker's guess-and-compare would have worked.
+        """
+        for guessable in ("alice@example.com", "bob@example.com"):
+            real_tag = server._mrtr_principal_hash(guessable)
+            attacker_guess = hashlib.sha256(
+                f"mcp-stdio/mrtr/{guessable!r}".encode()
+            ).hexdigest()
+            assert real_tag != attacker_guess, guessable
+
     def test_a_tampered_payload_is_rejected(self):
         """O14: "servers MUST ... reject state that fails verification".
 
