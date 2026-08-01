@@ -62,7 +62,8 @@ general cross-platform coverage, so don't suggest dropping it as redundant.
 
 A separate **integration suite** lives in `tests_integration/` (advisory
 `integration.yml` job, ubuntu-only): real localhost HTTP against a
-python-sdk v2.0.0 reference peer and against `mcp-stdio serve` itself. It
+python-sdk v2.x reference peer (the `integration` extra pins `mcp>=2.0,<3`)
+and against `mcp-stdio serve` itself. It
 is deliberately NOT part of `pytest tests/` — the unit suite forbids real
 network and real sleeps; the integration conftest replaces that rule with
 bounded polls and a per-test timeout. `mcp`/`uvicorn` live only in the
