@@ -86,112 +86,102 @@ You want this mode when:
 
 <a id="protocol-eras"></a>
 
-## Protocol eras (MCP 2026-07-28)
+## Working with MCP 2026-07-28 servers
 
-MCP changed shape in spec revision **2026-07-28**. mcp-stdio calls the two
-shapes *eras*, and both faces of the gateway speak both:
+**Usually you do not have to do anything.** mcp-stdio keeps talking to
+servers the way it always has, so upgrading changes nothing.
 
-| | **legacy** (2025-06-18 and earlier) | **modern** (2026-07-28) |
-|---|---|---|
-| Handshake | `initialize` + `notifications/initialized` | none — the server is asked `server/discover` instead |
-| State | an `Mcp-Session-Id` ties requests together | none; every request stands alone |
-| Per-request metadata | negotiated once at `initialize` | `_meta` in the body plus `Mcp-Method` / `Mcp-Name` headers on every request |
-| Server → client requests | sent directly on the connection | replaced by *multi round-trip requests* (MRTR) |
-
-### Client mode: `--protocol-era`
+If you connect to a server built for the newer MCP spec (2026-07-28), add
+one flag and mcp-stdio figures the rest out:
 
 ```bash
 mcp-stdio --protocol-era auto https://mcp.example.com/mcp
 ```
 
-| Value | What happens |
+Your MCP client — Claude Desktop, Claude Code, anything else — needs no
+changes at all. It keeps speaking the dialect it already knows, and
+mcp-stdio translates.
+
+### Which one am I getting?
+
+mcp-stdio prints the answer to stderr as it starts:
+
+```
+[mcp-stdio] protocol era: modern (auto-detected)
+```
+
+| What you see | What it means |
 |---|---|
-| `legacy` (**default**) | today's behaviour, byte for byte — no probe, no extra request |
-| `auto` | one `server/discover` probe before the stdin loop starts, then whichever era the answer indicates |
-| `modern` | forced; no probe of the answer's era, though the probe still runs to collect the server's capabilities |
+| `protocol era: modern (auto-detected)` | the server is a new one, and mcp-stdio is using the new protocol |
+| `protocol era: legacy (auto-detected)` | the server is an older one — nothing changes |
+| nothing printed | you did not pass `--protocol-era`, so the old protocol is in use |
 
-`legacy` is the default deliberately: an unmodified deployment's wire
-traffic must not change when you upgrade mcp-stdio. `auto` costs exactly
-one extra HTTP request at startup, which is why it is opt-in.
+### The flag
 
-If the probe cannot confirm a modern server, `auto` falls back to
-`legacy` and says so on stderr (`protocol era: legacy (auto-detected)`).
+| Value | When to use it |
+|---|---|
+| `legacy` (**default**) | you don't think about it; behaves exactly as before |
+| `auto` | you don't know what the server is — mcp-stdio asks it once at startup and picks |
+| `modern` | you know the server is a new one and want to skip the extra question |
 
-!!! note "SSE transport ignores this flag"
-    `--protocol-era` applies to Streamable HTTP only. Under
-    `--transport sse` it is ignored with a warning — that transport *is*
-    the pre-Streamable-HTTP legacy one:
+`auto` costs one extra request when mcp-stdio starts. That is the only
+reason it is not the default.
+
+!!! note "Not for the old SSE transport"
+    `--protocol-era` only applies to the default transport. With
+    `--transport sse` it is ignored, and mcp-stdio tells you so:
 
     ```
     warning: --protocol-era auto is ignored on --transport sse
     (always the pre-Streamable-HTTP legacy transport)
     ```
 
-### What the modern client path does for you
+### What mcp-stdio does for you against a new server
 
-Your MCP client keeps speaking its own 2025-06-18 dialect throughout —
-mcp-stdio does the translating. On the modern era it additionally:
+You should not notice any of this — that is the point — but if you are
+wondering what changed under the hood:
 
-- **answers `initialize` locally.** A modern server has no handshake, so
-  the relay synthesises the `InitializeResult` from what `server/discover`
-  reported, and never forwards your client's `initialize` upstream.
-- **stamps every request** with the `_meta` block and the
-  `Mcp-Method` / `Mcp-Name` headers the revision requires, and sends no
-  `Mcp-Session-Id` at all.
-- **holds background `subscriptions/listen` streams** so server
-  notifications still reach your client. A second, dedicated stream
-  carries `resources/subscribe` — your client's `resources/subscribe` and
-  `resources/unsubscribe` calls are answered locally and translated into
-  that stream's filter, because the modern revision removed those methods
-  from the wire.
-- **bridges MRTR.** When a server answers a `tools/call` with
-  "I need input first", the relay turns each request in it back into the
-  `elicitation/create` / `sampling/createMessage` / `roots/list` your
-  client already understands, collects the answers, and retries the
-  original call — so a 2025-era client transparently completes an
-  exchange designed after it. Opt out of *advertising* the capability
-  with `MCP_STDIO_MRTR_STRIP=1`.
-- **honours cancellation for real.** On this transport, closing the
-  response stream *is* the cancel signal — no `notifications/cancelled`
-  is sent upstream. A cancel from your client aborts the matching
-  in-flight request instead of merely suppressing its late answer.
+- **Tools, resources and prompts work as usual.** The newer spec
+  reorganised how a client and server introduce themselves, and mcp-stdio
+  handles both sides of that.
+- **Notifications still arrive.** Newer servers deliver them over a
+  long-lived connection that mcp-stdio holds open for you, including
+  updates for resources you subscribed to.
+- **Prompts back to you still work.** When a server needs to ask you
+  something mid-call — a confirmation, a piece of text, permission to
+  sample — mcp-stdio turns that into the ordinary request your client
+  already knows how to show you, then continues the original call with
+  your answer.
+- **Cancelling actually stops the work.** Pressing escape now aborts the
+  request on the server instead of just hiding the reply. A few cases
+  still cannot be cut short mid-flight — a cancel that arrives in the same
+  instant as the request, a server that does all its work before it starts
+  replying, and long paginated lists — and in those the reply is still
+  discarded, so you never see a result you cancelled.
 
-    There are three windows where a cancel still cannot cut a request
-    short, all of them narrow and none of them a regression (before this,
-    the modern era honoured no cancel at all): a cancel that arrives
-    before the relay has picked the request up; a server that does all its
-    work *before* sending response headers, since there is no open stream
-    to close yet; and a request being auto-paginated. In every case the
-    cancel is still tracked, so a late answer is dropped before it reaches
-    your client.
+### Publishing your own server with `serve`
 
-### Serve mode is dual-era
+`mcp-stdio serve` handles both kinds of client on the same address, and
+your stdio server does not need to know which is which:
 
-`mcp-stdio serve` answers whichever era the caller uses, on the same
-endpoint, and your stdio server never has to know:
+```bash
+mcp-stdio serve -- python -m my_mcp_server
+```
 
-- **A modern client** gets `server/discover` answered by the gateway
-  (from a handshake it performed with your child process on the client's
-  behalf), then dispatches `tools/list`, `tools/call` and the rest
-  statelessly — no session is minted and none is echoed back, even if the
-  caller sends one. Results are **stamped** on the way out with the
-  fields the revision requires: `resultType`, plus `ttlMs` / `cacheScope`
-  caching hints on the six cacheable operations (see
+- **A newer client** connects without a handshake and without a session,
+  and mcp-stdio answers on your server's behalf — including how long
+  results may be cached (tune with
   [`--cache-ttl-ms`](reference.md#modern-era-serve)).
-- **A legacy client** keeps exactly the behaviour it always had:
-  `initialize` mints an `Mcp-Session-Id`, one child process per session,
-  `GET` for the SSE stream, `DELETE` to terminate.
+- **An older client** works exactly as it always has, with its own
+  isolated child process per session.
 
-Modern requests are served from gateway-owned child processes keyed on
-the **authenticated principal** — one shared child with no auth or a
-static token, one per OAuth user — rather than per session, since a
-stateless client has no session to key on.
+For newer clients, mcp-stdio starts one copy of your server per
+authenticated user (or a single shared one if you run without
+authentication), because those clients have no session to tie a process to.
 
-!!! warning "Not served yet: `subscriptions/listen`"
-    Serve does not implement the modern notification stream, so a
-    `subscriptions/listen` request is answered `404` with JSON-RPC
-    `-32601` (method not found) rather than being silently accepted.
-    Tracked in
+!!! note "Not yet supported"
+    Newer clients that ask `serve` for a live notification stream get a
+    clear "not implemented" answer rather than silence. Planned in
     [#374](https://github.com/shigechika/mcp-stdio/issues/374).
 
 ## Both at once

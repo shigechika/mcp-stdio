@@ -174,29 +174,29 @@ See Claude Code [#34498](https://github.com/anthropics/claude-code/issues/34498)
 **Solution:**
 Nothing to configure — mcp-stdio reconnects automatically and synthesizes a JSON-RPC error ("SSE stream disconnected before response arrived; please retry") for every request that was in flight when the stream dropped, instead of leaving your client hanging forever. Just retry the call once you see the error. This mirrors the failure mode reported in Claude Code [#60061](https://github.com/anthropics/claude-code/issues/60061); if possible, prefer upgrading the server to Streamable HTTP (the current MCP spec), which does not have this failure mode at all.
 
-### `400 Bad Request` with JSON-RPC `-32020` from a modern-era server
+### The server rejects requests with `400` and error code `-32020`
 
-`-32020` is `HeaderMismatch`: the request's headers and its body disagree,
-and a 2026-07-28 server must reject that rather than guess which one meant
-it. `mcp-stdio serve` emits it — and a remote modern server may too — for:
+**What it means:** the server thinks the request contradicts itself — the
+headers say one thing and the body says another — so it refuses rather
+than guessing.
 
-- a missing or disagreeing `MCP-Protocol-Version` header (it must equal the
-  `io.modelcontextprotocol/protocolVersion` in the body's `_meta`; an
-  absent header counts as a mismatch);
-- a missing `Mcp-Method`, or one that is not the body's `method`;
-- an `Mcp-Name` that does not match the body's `params.name` (or
-  `params.uri` for `resources/read`) after Base64-sentinel decoding — a
-  malformed sentinel decodes to nothing and lands here too;
-- the same routing header sent more than once.
+**If you are connecting to a remote server with mcp-stdio**, you did not
+cause this: mcp-stdio builds those headers itself and keeps them
+consistent. Something between you and the server is rewriting them —
+usually a proxy or an API gateway. Try connecting without it to confirm.
 
-If you are using mcp-stdio **as a client**, it builds all of these itself,
-so a `-32020` from the remote points at an intermediary rewriting headers
-(a proxy, a gateway) rather than at your configuration.
+**If you are running `mcp-stdio serve`** and a client gets this, that
+client is sending inconsistent requests; the error message names which
+header disagreed.
 
-Two neighbouring codes are worth telling apart: `-32602` means the request
-carried no usable `_meta` at all, and `-32022` means the protocol version
-is well-formed but unsupported — that one's `error.data.supported` lists
-what the server does accept.
+Two similar-looking errors mean different things:
+
+| Code | Meaning | What to do |
+|---|---|---|
+| `-32020` | headers and body disagree | look for something rewriting headers in between |
+| `-32602` | the request is missing information the newer spec requires | usually an incomplete client |
+| `-32022` | the protocol version is not supported | the error lists the versions that are — pick one of those |
+
 
 ## Headless / SSH environment
 

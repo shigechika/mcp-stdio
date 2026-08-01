@@ -41,21 +41,20 @@ Arguments:
 
 <a id="modern-era-client"></a>
 
-### modern era（2026-07-28）
+### 新しい MCP サーバー向け（2026-07-28）
 
-MCP 仕様リビジョン 2026-07-28 は `initialize` ハンドシェイクと
-`Mcp-Session-Id` を、リクエストごとのメタデータに置き換えました。この
-ふたつのフラグがその経路を制御します。ワイヤ上で何が変わるかは
-[プロトコル era](modes.md#protocol-eras) を参照。
+接続先が新しい MCP 仕様で作られたサーバーのときだけ必要です。
+[新しい MCP のサーバーを使う](modes.md#protocol-eras) を参照。
 
 | フラグ | デフォルト | 説明 |
 |------|---------|-------------|
-| `--protocol-era {legacy,modern,auto}` | `legacy` | `--transport streamable-http` で話す era。`legacy` は 2026 以前の `initialize` + `Mcp-Session-Id` 経路で、ワイヤ上の挙動は不変。`modern` は 2026-07-28 経路を強制する（ハンドシェイクなし、セッション id なし、リクエストごとの `_meta` と `Mcp-Method`/`Mcp-Name` ヘッダ）。`auto` は起動時に `server/discover` プローブを 1 回だけ実行し——追加リクエスト 1 回ぶんのコストがあるためデフォルトではない——プローブが示す era を採用する。**`--transport sse` の下では無視され**（そちらは常に Streamable HTTP 以前の legacy トランスポート）、警告を出力する |
-| `--listen-read-timeout SEC` | `300` | modern era の長寿命 `subscriptions/listen` POST ストリームのアイドル読み取りタイムアウト。無言の half-open 接続はハングせず `ReadTimeout` を発生させ、自動再接続を促す。`--sse-read-timeout` と違い **`0` は拒否される**——MCP 仕様がクライアントに「常に最大タイムアウトを課す」SHOULD を定めているため。`--protocol-era modern`/`auto` でのみ意味を持ち、`--transport sse` の下では警告なしに無視される |
+| `--protocol-era {legacy,modern,auto}` | `legacy` | 相手のサーバーとの話し方。`legacy` はこれまでとまったく同じ。`auto` は起動時に一度だけ尋ねて自動判別する。`modern` は新しいサーバーだと分かっているとき、尋ねる手間を省く。`--transport sse` では警告を出して無視される |
+| `--listen-read-timeout SEC` | `300` | 通知用の接続が無言のまま何秒待ったら再接続するか。新しいサーバー相手のときだけ使われる。`--sse-read-timeout` と違い `0`（無効化）は指定できない——この接続には必ずタイムアウトが要るため。`--transport sse` では警告なしに無視される |
 
-!!! note "`--check` は modern era を通らない"
-    `--check` は `--protocol-era` を受け取らない専用の接続確認パスを通り、
-    era 判定より前に終了します。modern era の疎通確認には使えません。
+!!! note "`--check` では確認できません"
+    `--check` は独自の簡単な疎通確認を行うだけで、新しいプロトコルの
+    ネゴシエーションはしません。そちら側の動作確認には使えません。
+
 
 ### ヘッダー & プロキシ
 
@@ -127,15 +126,16 @@ Arguments:
 
 <a id="modern-era-serve"></a>
 
-### modern era（2026-07-28）
+### 新しい MCP クライアント向け（2026-07-28）
+
+有効化の設定は要りません。`serve` は同じアドレスで新旧どちらの
+クライアントにも自動で応答します。このフラグは、新しいクライアントに
+キャッシュの可否をどう伝えるかだけを調整します。
 
 | フラグ | デフォルト | 説明 |
 |------|---------|-------------|
-| `--cache-ttl-ms MS` | `60000` | modern クライアントに返す cacheable な結果に刻印する `ttlMs`。`0` にすればキャッシュを無効化でき、仕様違反にもならない（仕様が要求するのは `>= 0` のみ）。serve は `ttlMs` を `cacheScope: "private"` と一緒に、リビジョンが cacheable と定める 6 つの操作（`server/discover`、`tools/list`、`prompts/list`、`resources/list`、`resources/templates/list`、`resources/read`）にのみ刻印する——`tools/call` には決して付けない。その結果は cacheable ではないため。legacy era のレスポンスには一切刻印しない |
+| `--cache-ttl-ms MS` | `60000` | 新しいクライアントが `tools/list` などの一覧系の結果を何ミリ秒キャッシュしてよいか。`0` にすると「キャッシュしないで」と伝える。結果は常に非共有（ユーザー間で使い回さない）扱い。ツール実行の結果はキャッシュ対象外 |
 
-modern クライアントに応答するために他のフラグは要りません：era は設定では
-なく、クライアント自身のメタデータからリクエストごとに判定されます。
-[プロトコル era](modes.md#protocol-eras) を参照。
 
 ---
 
@@ -146,7 +146,7 @@ mcp-stdio は以下の仕様を実装しています：
 ### MCP（Model Context Protocol）
 
 - Streamable HTTP トランスポート（現行、spec rev 2025-06-18）— `initialize` でネゴシエートされた `MCP-Protocol-Version` を以後のすべてのリクエストに付与
-- Streamable HTTP transport、仕様リビジョン **2026-07-28** —— `server/discover`、リクエストごとの `_meta` + `Mcp-Method`/`Mcp-Name`、セッションレス dispatch、`resultType` と `ttlMs`/`cacheScope` の結果刻印、`subscriptions/listen`（クライアント側）、MRTR bridge。クライアント側は `--protocol-era` でオプトイン、`serve` はひとつのエンドポイントで両 era に応答する。python-sdk v2.0.0 に対して双方向で相互運用性を検証済み
+- Streamable HTTP transport、仕様リビジョン **2026-07-28** —— ケーパビリティの探索、リクエストごとのメタデータとヘッダ、セッション不要のリクエスト、一覧結果のキャッシュ指示、通知用の長時間接続（クライアント側）、処理中のクライアントへの問い合わせ。クライアント側は `--protocol-era` でオプトイン。`serve` はひとつのエンドポイントで両方のリビジョンに応答する。python-sdk v2.0.0 に対して双方向で相互運用性を検証済み
 - SSE トランスポート（レガシー、MCP 2024-11-05）
 - クライアント ID メタデータドキュメント（MCP 2025-11-25 のドラフト拡張）— 詳細は下記 OAuth セクションを参照
 

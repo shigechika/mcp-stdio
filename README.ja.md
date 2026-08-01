@@ -53,11 +53,7 @@ Bearer token、カスタムヘッダー、OAuth 2.1 認証情報をリモート�
     - §2.3.1 `client_secret_basic`：percent-encode した認証情報を `Authorization: Basic` ヘッダーで送信（コード交換・トークンリフレッシュ・Device Authorization Grant ポーリングに適用）
   - [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) Bearer Token の利用
     - §2.1 `Authorization: Bearer <token>` リクエストヘッダー
-- **MCP 2026-07-28 対応** — ゲートウェイの両方の顔がどちらのプロトコル era も話し、あなたの MCP クライアント／サーバー側の変更は不要：
-  - **クライアントとして**（`--protocol-era auto|modern|legacy`、デフォルト `legacy`）：`auto` ならリモートを `server/discover` でプローブし、modern サーバー相手には `initialize` ハンドシェイクとセッション id をやめ、リクエストごとの `_meta` と `Mcp-Method`/`Mcp-Name` ヘッダを付け、通知のために `subscriptions/listen` ストリームを保持し、MRTR を 2025 年世代のクライアントが理解できる `elicitation/create` / `sampling/createMessage` / `roots/list` へ bridge し、キャンセルで進行中リクエストを実際に中断する（クライアント relay は v0.31.0 以降）
-  - **サーバーとして**（`mcp-stdio serve`）：modern クライアントには `server/discover` とステートレス dispatch を、`resultType` / `ttlMs` / `cacheScope` の刻印付きで提供し（`--cache-ttl-ms`）、legacy クライアントには従来どおりのセッションを提供する——エンドポイントひとつで両 era、あなたの stdio サーバーはそのまま
-  - **python-sdk v2.0.0** に対して双方向でエンドツーエンド検証済み：あちらのクライアントが我々の `serve` を、我々の relay があちらのサーバーを駆動する
-  - → 詳細は **[プロトコル era](https://shigechika.github.io/mcp-stdio/ja/modes/#protocol-eras)**
+- **新しい MCP（2026-07-28）のサーバーに対応** — `--protocol-era auto` を付けると、mcp-stdio がサーバーにどちらのプロトコルかを尋ねて自動で合わせます。MCP クライアント側の設定変更は不要です。フラグを付けなければ挙動は変わらないので、バージョンを上げるだけなら安全です。`mcp-stdio serve` は同じアドレスで新旧どちらのクライアントにも自動応答します。python-sdk v2.0.0 に対して双方向でエンドツーエンド検証済み。→ [新しい MCP のサーバーを使う](https://shigechika.github.io/mcp-stdio/ja/modes/#protocol-eras)
 - **バックオフ付きリトライ** — 接続エラー時に最大3回リトライ
 - **HTTP 429 / 503 対応** — `Retry-After`（delta-seconds または HTTP-date）を 60 秒上限で尊重する。対象は仕様上 `Retry-After` を伴う 429（Too Many Requests）と 503（Service Unavailable）の 2 つ（RFC 9110 §10.2.3）。上限超過時はステータスをクライアントに返して判断を委ねる（cf. modelcontextprotocol/typescript-sdk#1892）
 - **自動ページネーション**（Streamable HTTP トランスポート） — `tools/list` / `resources/list` / `resources/templates/list` / `prompts/list` の `nextCursor` を透過的に追従して 1 つのレスポンスにマージ。先頭以降のページを取りこぼすクライアントでも全件を受け取れる（cf. anthropics/claude-code#39586）
