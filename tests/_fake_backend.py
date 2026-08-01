@@ -138,6 +138,18 @@ def main() -> None:
                     "params": {"hello": "world"},
                 }
             )
+        elif method == "trigger_list_changed":  # a notification (no id)
+            # #374: drive the listChanged trio on demand. `params.family`
+            # picks which one, so one arm covers the filter-suppression
+            # tests too (ask for tools, fire prompts, expect silence).
+            family = (msg.get("params") or {}).get("family", "tools")
+            _send(
+                {
+                    "jsonrpc": "2.0",
+                    "method": f"notifications/{family}/list_changed",
+                    "params": {"from": family},
+                }
+            )
         elif method == "exit":
             sys.exit(0)
         elif "id" in msg:

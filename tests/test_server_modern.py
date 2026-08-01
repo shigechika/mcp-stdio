@@ -418,8 +418,7 @@ class TestHeaderRungs:
         ok = _modern_headers("resources/read", name="file:///a.txt")
         # The fake child does not implement `resources/read`, so it
         # answers -32601 and serve maps that to HTTP 404 per the spec's
-        # "MUST respond with 404 Not Found" — the same carve-out
-        # `subscriptions/listen` relies on until 3.5-D.
+        # "MUST respond with 404 Not Found".
         passed = _post(gateway, body, ok)
         assert passed.status_code == 404
         _assert_reached_dispatch(passed)
@@ -615,10 +614,15 @@ class TestModernDispatch:
 
     def test_an_unimplemented_method_comes_back_404(self, gateway):
         """Spec: an unimplemented method "MUST respond with 404 Not Found"
-        and -32601. Also the carve-out `subscriptions/listen` needs until
-        3.5-D — the client must not read it as a malformed 200."""
-        body = _modern_body("subscriptions/listen", meta=_meta())
-        resp = _post(gateway, body, _modern_headers("subscriptions/listen"))
+        and -32601.
+
+        This used to be pinned with `subscriptions/listen`, which #374
+        now intercepts before it can reach a child — so the rule is
+        pinned on a method the fake child genuinely does not implement.
+        The rule itself is unchanged and still general.
+        """
+        body = _modern_body("resources/list", meta=_meta())
+        resp = _post(gateway, body, _modern_headers("resources/list"))
         assert resp.status_code == 404
         assert resp.json()["error"]["code"] == -32601
 
@@ -1290,13 +1294,20 @@ class TestSynthesizeDiscover:
             server._SERVE_IMPLEMENTED_MODERN_VERSIONS
         )
 
-    def test_notification_dependent_flags_are_stripped(self):
-        """#373 review, /code-review score 85: discover cannot honor
-        `tools.listChanged`, `resources.subscribe`, `resources.listChanged`
-        or `prompts.listChanged` until 3.5-D ships `subscriptions/listen` —
-        `_queue_server_initiated`'s modern_owned branch silently discards
-        every notification a pooled child sends today. Echoing these flags
-        verbatim would advertise a promise this endpoint cannot keep.
+    def test_the_listchanged_trio_is_advertised_and_subscribe_is_not(self):
+        """#374's half of the un-strip, and the half that stayed.
+
+        The rule is the relay's C8 principle in reverse — advertise a
+        notification flag only for a kind serve can actually deliver.
+        Before #374 all four flags were stripped, because a pooled
+        child's notifications went nowhere. `subscriptions/listen` now
+        delivers the listChanged trio, so those three flags became true
+        statements and are echoed again.
+
+        `resources.subscribe` stays stripped: it promises per-URI
+        subscription driving, which the listen ack explicitly DECLINES
+        (`resourceSubscriptions: false`) until #381. Advertising it would
+        promise the one thing the ack refuses.
         """
         result = server._synthesize_discover_result(
             {
@@ -1309,20 +1320,30 @@ class TestSynthesizeDiscover:
             }
         )
         caps = result["capabilities"]
-        assert "listChanged" not in caps["tools"]
+        assert caps["tools"] == {"listChanged": True}
+        assert caps["prompts"] == {"listChanged": True}
+        assert caps["resources"] == {"listChanged": True}
         assert "subscribe" not in caps["resources"]
-        assert "listChanged" not in caps["resources"]
-        assert "listChanged" not in caps["prompts"]
-        # The family objects survive — the REQUEST surfaces (tools/list,
-        # resources/read, prompts/get) are served today — just emptied of
-        # the stripped keys, never removed wholesale.
-        assert "tools" in caps
-        assert "resources" in caps
-        assert "prompts" in caps
-        # Control: a non-notification-dependent capability passes through
-        # untouched, proving the filter is scoped to the four flags rather
-        # than over-stripping.
+        # Control: an unrelated capability passes through untouched,
+        # proving the filter is scoped to one key rather than
+        # over-stripping.
         assert caps["completions"] == {}
+
+    def test_the_advertised_trio_matches_what_listen_forwards(self):
+        """The advertisement and the delivery table cannot drift apart.
+
+        `_UNDELIVERABLE_NOTIFICATION_FLAGS` and `_LISTEN_FILTER_METHODS`
+        are two statements of the same fact in different vocabularies
+        (capability flags vs wire method names). Pinning them against
+        each other is what makes "advertise exactly what is forwarded"
+        an enforced invariant rather than a comment.
+        """
+        assert server._UNDELIVERABLE_NOTIFICATION_FLAGS == {"resources": ("subscribe",)}
+        assert set(server._LISTEN_FILTER_METHODS.values()) == {
+            "notifications/tools/list_changed",
+            "notifications/resources/list_changed",
+            "notifications/prompts/list_changed",
+        }
 
     def test_a_non_stripped_key_survives_within_a_stripped_family(self):
         """The filter removes specific KEYS, never the whole family
@@ -1812,3 +1833,1089 @@ def test_restarting_the_reaper_does_not_leave_two_running():
         assert not pool._reaper_stop.is_set()
     finally:
         pool.shutdown_all()
+
+
+# --- subscriptions/listen (#374) -----------------------------------------
+
+LISTEN_METHOD = "subscriptions/listen"
+ACK_METHOD = "notifications/subscriptions/acknowledged"
+SUBSCRIPTION_ID = "io.modelcontextprotocol/subscriptionId"
+INTERNAL_ERROR = -32603
+INVALID_REQUEST = -32600
+TRIO = ("tools", "prompts", "resources")
+
+
+def _listen_body(
+    req_id: object = "listen-1",
+    *,
+    notifications: object = "unset",
+    notification: bool = False,
+) -> dict:
+    params: dict = {"_meta": _meta()}
+    if notifications != "unset":
+        params["notifications"] = notifications
+    body: dict = {"jsonrpc": "2.0", "method": LISTEN_METHOD, "params": params}
+    if not notification:
+        body["id"] = req_id
+    return body
+
+
+def _fire(url: str, family: str = "tools") -> None:
+    """Make the pooled child emit one listChanged notification.
+
+    A modern NOTIFICATION, so it rides the same oneway arm to the same
+    per-principal child the listen stream is attached to — which is the
+    only way to drive a real fan-out from outside the gateway.
+    """
+    resp = _post(
+        url,
+        {
+            "jsonrpc": "2.0",
+            "method": "trigger_list_changed",
+            "params": {"family": family, "_meta": _meta()},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+
+class _Listener:
+    """A `subscriptions/listen` stream read on a daemon thread.
+
+    The read has to be off the test's thread: driving an event means
+    POSTing to the same gateway while the stream is open, and the ack
+    itself arrives before there is anything to POST.
+
+    Frames and keepalive comments are kept separately — several pins
+    turn on "a keepalive arrived and the event did NOT", which is the
+    determinism bound for asserting a NEGATIVE about a stream.
+    """
+
+    def __init__(self, url: str, body: dict, *, accept: str = "text/event-stream"):
+        self.url = url
+        self.body = body
+        self.accept = accept
+        self.frames: list[dict] = []
+        self.comments: list[str] = []
+        self.status: int | None = None
+        self.headers: dict[str, str] = {}
+        self.error_body: bytes = b""
+        self.ended = threading.Event()
+        self.opened = threading.Event()
+        self._lock = threading.Lock()
+        self._response: httpx.Response | None = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def __enter__(self) -> "_Listener":
+        self._thread.start()
+        assert self.opened.wait(timeout=15), "the listen stream never responded"
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.disconnect()
+
+    def _run(self) -> None:
+        headers = {
+            **_modern_headers(LISTEN_METHOD),
+            "Accept": self.accept,
+            "Content-Type": "application/json",
+        }
+        try:
+            with httpx.stream(
+                "POST",
+                self.url,
+                content=json.dumps(self.body),
+                headers=headers,
+                timeout=None,
+            ) as resp:
+                self._response = resp
+                self.status = resp.status_code
+                self.headers = dict(resp.headers)
+                if resp.status_code != 200:
+                    self.error_body = resp.read()
+                    return
+                self.opened.set()
+                for line in resp.iter_lines():
+                    if line.startswith("data: "):
+                        with self._lock:
+                            self.frames.append(json.loads(line[len("data: ") :]))
+                    elif line.startswith(":"):
+                        with self._lock:
+                            self.comments.append(line[1:].strip())
+        except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+            self.error_body = repr(exc).encode()
+        finally:
+            self.opened.set()
+            self.ended.set()
+
+    def disconnect(self) -> None:
+        """Close from the test's side — the client-goes-away path."""
+        resp = self._response
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001 - teardown, best effort
+                pass
+        self._thread.join(timeout=10)
+
+    def snapshot(self) -> tuple[list[dict], list[str]]:
+        with self._lock:
+            return list(self.frames), list(self.comments)
+
+    def wait_frames(self, count: int, timeout: float = 15.0) -> list[dict]:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            frames, _ = self.snapshot()
+            if len(frames) >= count:
+                return frames
+            if self.ended.is_set():
+                break
+            time.sleep(0.01)
+        frames, comments = self.snapshot()
+        raise AssertionError(
+            f"wanted {count} frames, saw {len(frames)}: {frames} (comments={comments})"
+        )
+
+    def wait_comments(self, count: int, timeout: float = 15.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            _, comments = self.snapshot()
+            if len(comments) >= count:
+                return
+            time.sleep(0.01)
+        raise AssertionError(f"no keepalive within {timeout}s")
+
+
+@pytest.fixture()
+def quick_keepalive(monkeypatch):
+    """Shrink the keepalive so a NEGATIVE assertion has a bound.
+
+    "The event did not arrive" is only provable against something that
+    DID: the next keepalive comment. At the production 15 s that is a
+    15 s test, so the interval is shortened rather than the assertion
+    weakened into a sleep.
+    """
+    monkeypatch.setattr(server, "_SSE_KEEPALIVE_SECS", 0.3)
+
+
+class TestListenAck:
+    """The ack is the protocol's first and most load-bearing frame."""
+
+    def test_the_ack_is_frame_one_and_carries_the_honored_subset(self, gateway):
+        """Spec: the server "MUST send
+        `notifications/subscriptions/acknowledged` as the first message
+        ... and MUST NOT send any notification on the subscription
+        before it."
+
+        The A9 nesting is asserted key by key because it is exactly the
+        class of mistake a spec-shaped reading misses: `notifications`
+        and the subscription id live INSIDE `params`, and a top-level
+        echo is silently ignored by a compliant client — which then
+        forwards nothing and reports no error.
+        """
+        with _Listener(
+            gateway, _listen_body(notifications={"toolsListChanged": True})
+        ) as ln:
+            ack = ln.wait_frames(1)[0]
+        assert ack["method"] == ACK_METHOD
+        assert ack["jsonrpc"] == "2.0"
+        # A notification, not a response: an `id` here would make a
+        # client correlate it to the listen request and settle the route.
+        assert "id" not in ack
+        assert ack["params"]["notifications"] == {"toolsListChanged": True}
+        assert ack["params"]["_meta"][SUBSCRIPTION_ID] == "listen-1"
+        # A9, the other direction: nothing at the top level.
+        assert "notifications" not in ack
+        assert "_meta" not in ack
+
+    def test_a_string_listen_id_is_echoed_verbatim(self, gateway):
+        """The v2 client mints ids like `"listen-1"` and routes on the
+        stamp, so any coercion (to int, to str, to a minted id) silently
+        strands every frame."""
+        with _Listener(
+            gateway, _listen_body("sub/42", notifications={"toolsListChanged": True})
+        ) as ln:
+            ack = ln.wait_frames(1)[0]
+        assert ack["params"]["_meta"][SUBSCRIPTION_ID] == "sub/42"
+
+    def test_an_absent_filter_still_acks_with_an_empty_object(self, gateway):
+        """ "Subscribed to nothing" is a valid subscription.
+
+        The `notifications` KEY must be present even when empty: the v2
+        client reads a missing one as malformed and discards the whole
+        ack, which times out the caller rather than failing loudly.
+        """
+        with _Listener(gateway, _listen_body()) as ln:
+            ack = ln.wait_frames(1)[0]
+        assert ack["params"]["notifications"] == {}
+
+    def test_unknown_filter_keys_are_not_echoed_as_honored(self, gateway):
+        """Honor-all applies to the trio, not to anything sent.
+
+        Echoing a key serve cannot deliver would promise forwarding that
+        never happens — the same failure the discover un-strip exists to
+        avoid, one layer down.
+        """
+        with _Listener(
+            gateway,
+            _listen_body(
+                notifications={
+                    "toolsListChanged": True,
+                    "resourceUpdated": True,
+                    "loggingMessage": True,
+                }
+            ),
+        ) as ln:
+            ack = ln.wait_frames(1)[0]
+        assert ack["params"]["notifications"] == {"toolsListChanged": True}
+
+    def test_a_false_flag_is_not_honored(self, gateway):
+        """`False` means "do not send me these", not "the key exists"."""
+        with _Listener(
+            gateway,
+            _listen_body(
+                notifications={"toolsListChanged": False, "promptsListChanged": True}
+            ),
+        ) as ln:
+            ack = ln.wait_frames(1)[0]
+        assert ack["params"]["notifications"] == {"promptsListChanged": True}
+
+    def test_the_stream_mints_no_session(self, gateway):
+        """A modern exchange leaves no session behind — a long-lived one
+        is the most tempting place to reintroduce one."""
+        with _Listener(gateway, _listen_body()) as ln:
+            ln.wait_frames(1)
+            headers = ln.headers
+        assert "mcp-session-id" not in headers, headers
+        assert headers.get("content-type") == "text/event-stream"
+
+
+class TestListenDelivery:
+    """Fan-out from the pooled child to the streams that asked."""
+
+    def test_a_matching_event_reaches_the_stream_stamped(self, gateway):
+        with _Listener(
+            gateway, _listen_body(notifications={"toolsListChanged": True})
+        ) as ln:
+            ln.wait_frames(1)
+            _fire(gateway, "tools")
+            event = ln.wait_frames(2)[1]
+        assert event["method"] == "notifications/tools/list_changed"
+        assert event["params"]["from"] == "tools"
+        # Every frame is stamped, not just the ack: the client routes on
+        # this, so an unstamped frame never reaches the consumer.
+        assert event["params"]["_meta"][SUBSCRIPTION_ID] == "listen-1"
+        assert "id" not in event
+
+    def test_an_event_in_the_attach_to_ack_window_is_buffered_not_lost(
+        self, monkeypatch
+    ):
+        """Why the stream attaches BEFORE the ack is written.
+
+        There is a window between "this stream is committed" and "the
+        client has been acknowledged". A child that fires during it has
+        nowhere to be delivered unless the buffer already exists — and
+        the loss is SILENT: the client sees a healthy stream that simply
+        never mentioned the change it was subscribed to.
+
+        The publish is driven from inside the ack write, so the window is
+        entered deterministically rather than raced into with a sleep.
+
+        Revert-check: move `backend.attach_listener(listener)` below
+        `self._write_sse(...)` in `_serve_listen_stream` and the child's
+        notification lands with zero listeners attached, is discarded,
+        and only the ack ever arrives.
+        """
+        httpd, registry = server.build_server(_BACKEND, host="127.0.0.1", port=0)
+        host, port = httpd.server_address[0], httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://{host}:{port}/mcp"
+
+        original = server._Handler._write_sse
+
+        def _publish_before_the_ack(handler, message):
+            if message.get("method") == ACK_METHOD:
+                for entry in list(httpd.modern_pool._entries.values()):
+                    backend = entry.get("backend")
+                    if backend is not None:
+                        backend._queue_server_initiated(
+                            json.dumps(
+                                {
+                                    "jsonrpc": "2.0",
+                                    "method": "notifications/tools/list_changed",
+                                    "params": {"window": "pre-ack"},
+                                }
+                            )
+                        )
+            return original(handler, message)
+
+        monkeypatch.setattr(server._Handler, "_write_sse", _publish_before_the_ack)
+        try:
+            with _Listener(
+                url, _listen_body(notifications={"toolsListChanged": True})
+            ) as ln:
+                frames = ln.wait_frames(2)
+        finally:
+            httpd.shutdown()
+            registry.shutdown_all()
+            httpd.modern_pool.shutdown_all()
+            httpd.server_close()
+
+        # The ack is still first — buffering must not reorder it.
+        assert frames[0]["method"] == ACK_METHOD
+        assert frames[1]["params"]["window"] == "pre-ack"
+        assert frames[1]["params"]["_meta"][SUBSCRIPTION_ID] == "listen-1"
+
+    def test_each_family_of_the_trio_is_deliverable(self, gateway):
+        """The advertisement the discover un-strip makes, proven one
+        family at a time rather than inferred from the tools case."""
+        with _Listener(
+            gateway,
+            _listen_body(
+                notifications={
+                    "toolsListChanged": True,
+                    "promptsListChanged": True,
+                    "resourcesListChanged": True,
+                }
+            ),
+        ) as ln:
+            ln.wait_frames(1)
+            for family in TRIO:
+                _fire(gateway, family)
+            frames = ln.wait_frames(4)
+        assert [f["method"] for f in frames[1:]] == [
+            f"notifications/{family}/list_changed" for family in TRIO
+        ]
+
+    def test_an_unrequested_family_is_suppressed(self, gateway, quick_keepalive):
+        """Spec: "The server MUST NOT send notification types the client
+        has not explicitly requested."
+
+        Bounded by the keepalive rather than by a sleep: the comment
+        proves the pump ran and chose to send nothing.
+        """
+        with _Listener(
+            gateway, _listen_body(notifications={"toolsListChanged": True})
+        ) as ln:
+            ln.wait_frames(1)
+            _fire(gateway, "prompts")
+            ln.wait_comments(2)
+            frames, _ = ln.snapshot()
+        assert len(frames) == 1, frames
+
+    def test_a_non_trio_notification_is_never_forwarded(self, gateway, quick_keepalive):
+        """`notifications/message` is request-scoped — it belongs to
+        whatever carried the request, not to a broadcast stream (#381).
+        Requesting the whole trio must not turn the stream into a
+        firehose for everything the child says."""
+        with _Listener(
+            gateway,
+            _listen_body(
+                notifications={
+                    "toolsListChanged": True,
+                    "promptsListChanged": True,
+                    "resourcesListChanged": True,
+                }
+            ),
+        ) as ln:
+            ln.wait_frames(1)
+            assert (
+                _post(
+                    gateway,
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "trigger_push",
+                        "params": {"_meta": _meta()},
+                    },
+                ).status_code
+                == 202
+            )
+            ln.wait_comments(2)
+            frames, _ = ln.snapshot()
+        assert len(frames) == 1, frames
+
+    def test_a_malformed_notification_is_stamped_not_fatal(self, monkeypatch):
+        """#382 Copilot review — a misbehaving child must not be able to
+        drop a well-behaved client's subscription.
+
+        A notification whose `params` is not an object (`"params":
+        "oops"`) used to reach `dict(...)` on the handler thread and
+        raise `ValueError` there, killing the stream abruptly — the
+        client would see it as LOST and re-listen, into the same child.
+        It now degrades: the malformed part is forfeited, the connection
+        is not, and the stamp the client routes on still arrives.
+
+        Same posture `_strip_undeliverable_capability_flags` takes for
+        the same reason (#373 review R3F1).
+
+        Revert-check: restore `dict(stamped.get("params") or {})` and the
+        stream ends with only the ack on it.
+        """
+        httpd, registry = server.build_server(_BACKEND, host="127.0.0.1", port=0)
+        host, port = httpd.server_address[0], httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://{host}:{port}/mcp"
+        try:
+            with _Listener(
+                url, _listen_body(notifications={"toolsListChanged": True})
+            ) as ln:
+                ln.wait_frames(1)
+                for entry in list(httpd.modern_pool._entries.values()):
+                    backend = entry.get("backend")
+                    if backend is not None:
+                        backend._queue_server_initiated(
+                            json.dumps(
+                                {
+                                    "jsonrpc": "2.0",
+                                    "method": "notifications/tools/list_changed",
+                                    "params": "oops",
+                                }
+                            )
+                        )
+                event = ln.wait_frames(2)[1]
+        finally:
+            httpd.shutdown()
+            registry.shutdown_all()
+            httpd.modern_pool.shutdown_all()
+            httpd.server_close()
+        assert event["method"] == "notifications/tools/list_changed"
+        assert event["params"]["_meta"][SUBSCRIPTION_ID] == "listen-1"
+
+    def test_two_streams_on_one_child_each_get_their_own_stamp(self, gateway):
+        """Both streams share the pooled child (same principal), so this
+        pins fan-out proper: one parse, two deliveries, two ids."""
+        first = _Listener(
+            gateway, _listen_body("a", notifications={"toolsListChanged": True})
+        )
+        second = _Listener(
+            gateway, _listen_body("b", notifications={"toolsListChanged": True})
+        )
+        with first, second:
+            first.wait_frames(1)
+            second.wait_frames(1)
+            _fire(gateway, "tools")
+            a_event = first.wait_frames(2)[1]
+            b_event = second.wait_frames(2)[1]
+        assert a_event["params"]["_meta"][SUBSCRIPTION_ID] == "a"
+        assert b_event["params"]["_meta"][SUBSCRIPTION_ID] == "b"
+        assert a_event["method"] == b_event["method"]
+
+    def test_fan_out_hands_both_streams_the_same_parsed_object(self):
+        """Why the two-stamp test above is not redundant.
+
+        `_queue_server_initiated` parses ONCE and publishes the same dict
+        to every matching stream — so a pump that stamped IN PLACE would
+        ship the first stream's subscription id on the second stream's
+        frame. This pins the sharing that makes that hazard real; the
+        end-to-end test above pins that the pump copies instead.
+        """
+        message = {
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed",
+            "params": {"_meta": {"childKey": 1}},
+        }
+        a = server._ListenStream("a", {"toolsListChanged": True})
+        b = server._ListenStream("b", {"toolsListChanged": True})
+        a.publish(message)
+        b.publish(message)
+        assert a.next_message(1.0) is b.next_message(1.0) is message
+
+
+@pytest.mark.parametrize(
+    ("accept_header", "expected"),
+    [
+        ("text/event-stream", True),
+        ("Text/Event-Stream", True),
+        ("text/*", True),
+        ("*/*", True),
+        ("application/json, text/event-stream", True),
+        ("text/event-stream;q=0", False),
+        ("text/event-stream;q=0.5", True),
+        ("application/json", False),
+        (None, True),
+        ("", True),
+        ("text/event-stream ; q=0", False),
+        # #382 review R6F1: a positive wildcard must not override a more
+        # specific explicit refusal — RFC 9110 §12.5.1 says the MOST
+        # SPECIFIC matching range decides.
+        ("text/event-stream;q=0, */*", False),
+        ("text/event-stream;q=0, */*;q=1", False),
+        ("text/*;q=0, */*", False),  # subtype wildcard beats full wildcard
+        ("text/event-stream, text/*;q=0", True),  # exact beats subtype wildcard
+        ("text/event-stream;q=0, text/event-stream", True),  # same-tier: max
+    ],
+)
+def test_accepts_sse_matches_media_ranges(accept_header, expected):
+    """#382 review R1F2 remainder — table-driven over the helper directly.
+
+    A prior fix casefolded the old substring check but left two classes
+    of media-range handling wrong in opposite directions: `text/*` is a
+    valid range that MATCHES `text/event-stream` but does not contain
+    that literal substring, so it earned a false 406; `;q=0` is an
+    explicit REFUSAL (RFC 9110 §12.4.2) that the substring check does
+    not parse at all, so it was let through. Absent/empty is RFC
+    9110 §12.5.1's "accept anything", which the substring check also
+    got backwards (`""` contains no substring, so omitting Accept
+    entirely earned a 406).
+
+    The R6F1 rows are precedence, not matching: `_accepts_sse` used to
+    accept if ANY matching range had `q>0`, so a trailing `*/*` could
+    override an explicit `text/event-stream;q=0` refusal earlier in the
+    same header. RFC 9110 §12.5.1 says the MOST SPECIFIC matching range
+    decides — exact beats `text/*` beats `*/*` — and the last row is the
+    documented same-tier tie-break (the range listed twice with
+    different `q` takes the max, leniently).
+    """
+    assert server._accepts_sse(accept_header) is expected
+
+
+class TestListenRejections:
+    """Everything refused BEFORE a stream is committed."""
+
+    def test_a_non_object_filter_is_invalid_params(self, gateway):
+        resp = _post(
+            gateway,
+            _listen_body(notifications=["toolsListChanged"]),
+            {**_modern_headers(LISTEN_METHOD), "Accept": "text/event-stream"},
+        )
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["error"]["code"] == INVALID_PARAMS
+        assert resp.json()["id"] == "listen-1"
+        assert "mcp-session-id" not in resp.headers
+
+    def test_an_id_less_listen_is_rejected_not_forwarded(self, gateway):
+        """A notification-shaped listen has no id for the ack to stamp,
+        so every frame it produced would be unroutable. Rejected at the
+        notification arm rather than forwarded oneway with a 202."""
+        resp = _post(
+            gateway,
+            _listen_body(notification=True, notifications={"toolsListChanged": True}),
+            {**_modern_headers(LISTEN_METHOD), "Accept": "text/event-stream"},
+        )
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["error"]["code"] == INVALID_REQUEST
+
+    def test_a_client_that_cannot_accept_sse_gets_406(self, gateway):
+        resp = _post(
+            gateway,
+            _listen_body(),
+            {**_modern_headers(LISTEN_METHOD), "Accept": "application/json"},
+        )
+        assert resp.status_code == 406, resp.text
+        assert resp.json()["error"]["code"] == INVALID_REQUEST
+
+    def test_a_wildcard_accept_is_enough(self, gateway):
+        with _Listener(gateway, _listen_body(), accept="*/*") as ln:
+            assert ln.wait_frames(1)[0]["method"] == ACK_METHOD
+
+    def test_the_accept_check_is_case_insensitive(self, gateway):
+        """#382 Copilot review. "Media types are case-insensitive"
+        (RFC 9110 §8.3.1), so this is the SAME request as the lowercase
+        one and a 406 here would be rejecting a client over its
+        capitalisation.
+
+        NO `*/*` in the header, deliberately: with a wildcard present the
+        other branch of the check accepts it and the test proves nothing
+        about case at all. (It was written that way first, and the
+        revert-check is what caught it.)
+
+        Revert-check: drop the `.lower()` and this earns a 406.
+        """
+        with _Listener(gateway, _listen_body(), accept="Text/Event-Stream") as ln:
+            assert ln.status == 200, ln.error_body
+            assert ln.wait_frames(1)[0]["method"] == ACK_METHOD
+
+    def test_a_text_star_range_is_enough(self, gateway):
+        """#382 review R1F2 remainder. `text/*` is a valid media RANGE
+        that matches `text/event-stream` (RFC 9110 §12.5.1), but the old
+        substring check missed it — `"text/*"` does not contain the
+        literal substring `"text/event-stream"`.
+
+        Revert-check: swap `_accepts_sse` back for the substring check
+        and this earns a 406.
+        """
+        with _Listener(gateway, _listen_body(), accept="text/*") as ln:
+            assert ln.status == 200, ln.error_body
+            assert ln.wait_frames(1)[0]["method"] == ACK_METHOD
+
+    def test_an_explicit_q_zero_refusal_earns_406(self, gateway):
+        """#382 review R1F2 remainder. `q=0` is an explicit REFUSAL of a
+        media range (RFC 9110 §12.4.2 — "a value of 0 means 'not
+        acceptable'"), but the old substring check does not parse
+        quality parameters at all, so `text/event-stream;q=0` passed it
+        and opened a stream the client had explicitly said it did not
+        want.
+
+        Revert-check: swap `_accepts_sse` back for the substring check
+        and this gets a 200 stream instead of a 406.
+        """
+        resp = _post(
+            gateway,
+            _listen_body(),
+            {**_modern_headers(LISTEN_METHOD), "Accept": "text/event-stream;q=0"},
+        )
+        assert resp.status_code == 406, resp.text
+        assert resp.json()["error"]["code"] == INVALID_REQUEST
+
+    def test_a_positive_wildcard_does_not_override_an_explicit_refusal(self, gateway):
+        """#382 review R6F1. A trailing `*/*;q=1` used to overrule an
+        earlier, more specific `text/event-stream;q=0` refusal — the old
+        logic accepted if ANY matching range had `q>0`. RFC 9110 §12.5.1
+        says the MOST SPECIFIC matching range decides, so the explicit
+        refusal wins regardless of what a wildcard later in the same
+        header says.
+
+        Revert-check: restore the any-match logic and this gets a 200
+        stream instead of a 406.
+        """
+        resp = _post(
+            gateway,
+            _listen_body(),
+            {
+                **_modern_headers(LISTEN_METHOD),
+                "Accept": "text/event-stream;q=0, */*;q=1",
+            },
+        )
+        assert resp.status_code == 406, resp.text
+        assert resp.json()["error"]["code"] == INVALID_REQUEST
+
+    def test_the_per_child_stream_cap_is_refused_pre_ack(self, gateway, monkeypatch):
+        """One client must not be able to pin unbounded handler threads.
+
+        `-32603` rather than a fresh `-32000`-range mint (O18), and
+        BEFORE the ack — a client that got an ack and then a close would
+        have to guess whether it had missed events.
+        """
+        monkeypatch.setattr(server, "_LISTEN_MAX_STREAMS_PER_CHILD", 1)
+        with _Listener(gateway, _listen_body("first")) as ln:
+            ln.wait_frames(1)
+            resp = _post(
+                gateway,
+                _listen_body("second"),
+                {**_modern_headers(LISTEN_METHOD), "Accept": "text/event-stream"},
+            )
+        assert resp.status_code == 503, resp.text
+        assert resp.json()["error"]["code"] == INTERNAL_ERROR
+        assert resp.json()["id"] == "second"
+
+    def test_attach_listener_is_atomic_under_a_synchronized_burst(self):
+        """#382 review R1F1 — the cap must survive a synchronized burst.
+
+        Before this fix the caller checked `len(backend._snapshot_listeners())
+        >= cap` and called `attach_listener` as two SEPARATE steps. Under
+        a burst of simultaneous listens, every racer reads the count
+        before ANY of them has attached, so every one of them sees a
+        free slot and all attach — the cap bypassed by an arbitrary
+        amount, and each attached stream pins a handler thread, which is
+        exactly the DoS the cap exists to stop.
+
+        `attach_listener` now does the check-and-attach as ONE atomic
+        step under its own lock, so no matter how many callers race it
+        concurrently, at most `cap` of them can ever succeed.
+
+        A bare barrier before the call does NOT reproduce the old bug:
+        measured directly, the reverted shape's check-to-attach window
+        is a few bytecodes wide and never overshot in 20 trials at 200
+        threads, nor in 10 trials at 300 threads with
+        `sys.setswitchinterval(0.00001)` — CPython's GIL just does not
+        preempt a window that small on its own. So the window is
+        widened DELIBERATELY, the same seam idiom the spawn-race pool
+        tests use (`_spawn_and_handshake` there, `_snapshot_listeners`
+        here): every racer is parked, with its count already read,
+        until all of them have read it — recreating "every racer sees a
+        free slot" on demand instead of hoping the scheduler does.
+
+        This seam belongs to the shape being reverted TO: the current,
+        atomic `attach_listener` does not call `_snapshot_listeners` at
+        all, so against the fix this patch is inert and the test is
+        exercising the real lock, not the widening.
+
+        Revert-check: restore the non-atomic check-then-attach shape and
+        more than `cap` attach.
+        """
+        backend = server.BackendProcess(_BACKEND)
+        try:
+            cap = 4
+            extra = 6
+            total = cap + extra
+            real_snapshot = backend._snapshot_listeners
+            all_counted = threading.Barrier(total)
+
+            def _widened_snapshot():
+                # Only the reverted (non-atomic) `attach_listener` calls
+                # this. Read the real count, then park every racer here
+                # until all `total` of them have — the check-to-attach
+                # window held open on purpose.
+                result = real_snapshot()
+                all_counted.wait(timeout=15)
+                return result
+
+            backend._snapshot_listeners = _widened_snapshot
+
+            results: list[bool | None] = [None] * total
+
+            def _attach(i):
+                listener = server._ListenStream(f"burst-{i}", {})
+                results[i] = backend.attach_listener(listener, cap)
+
+            threads = [
+                threading.Thread(target=_attach, args=(i,), daemon=True)
+                for i in range(total)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+
+            assert all(r is not None for r in results), "a racer never finished"
+            assert results.count(True) == cap, results
+            assert results.count(False) == extra, results
+            assert len(backend._listeners) == cap
+        finally:
+            backend._snapshot_listeners = real_snapshot
+            backend.shutdown()
+
+    def test_the_ladder_still_runs_before_the_stream(self, gateway):
+        """Listen is intercepted inside `_dispatch_modern`, which is
+        downstream of the O6-O10 ladder — so a malformed modern listen
+        earns its ladder code, not a stream."""
+        body = _listen_body()
+        resp = _post(
+            gateway,
+            body,
+            {
+                **_modern_headers(LISTEN_METHOD, version="2025-06-18"),
+                "Accept": "text/event-stream",
+            },
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"]["code"] == HEADER_MISMATCH
+
+
+class TestListenEndings:
+    """How a stream ends tells the peer what to do next (§3.6)."""
+
+    def test_gateway_shutdown_ends_with_a_terminal_result(self):
+        """The spec's own graceful example: an empty `resultType:
+        "complete"` result, stamped, then close. It tells a compliant
+        peer the subscription is over rather than lost — the v2 client
+        settles a route with no terminal frame as an ERROR.
+        """
+        httpd, registry = server.build_server(_BACKEND, host="127.0.0.1", port=0)
+        host, port = httpd.server_address[0], httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://{host}:{port}/mcp"
+        try:
+            ln = _Listener(url, _listen_body(notifications={"toolsListChanged": True}))
+            with ln:
+                ln.wait_frames(1)
+                # The MODERN pool, not the session registry: a listen
+                # stream is attached to a gateway-owned pooled child,
+                # which the registry knows nothing about.
+                httpd.modern_pool.shutdown_all()
+                frames = ln.wait_frames(2)
+                assert ln.ended.wait(timeout=15)
+        finally:
+            httpd.shutdown()
+            registry.shutdown_all()
+            httpd.server_close()
+        terminal = frames[1]
+        assert terminal["id"] == "listen-1"
+        assert terminal["result"]["resultType"] == "complete"
+        assert terminal["result"]["_meta"][SUBSCRIPTION_ID] == "listen-1"
+        # NEVER a server-sent notifications/cancelled: the v2 client
+        # settles a route naming it as LOST, which would turn every
+        # graceful teardown into a failure at a compliant peer.
+        assert all(f.get("method") != "notifications/cancelled" for f in frames)
+
+    def test_a_shutdown_stays_graceful_even_when_the_drain_times_out(self, monkeypatch):
+        """Why the ENDING is classified by its caller, not inferred.
+
+        The drain is bounded. A slow client can outlast it, and then the
+        children are torn down while the pump is still working — so a
+        pump that read `backend.closed` would see a dead child and
+        silently downgrade an orderly shutdown to LOST, telling a
+        compliant peer to reconnect to a gateway that is going away.
+
+        A zero-length drain forces exactly that ordering. The terminal
+        frame must still be written, because `close_listeners` already
+        said what kind of ending this is.
+
+        Revert-check: replace `if listener.graceful:` in
+        `_pump_listen_stream` with `if not listener.overflowed and not
+        backend.closed:` and the terminal frame disappears here — while
+        the ordinary shutdown test above still passes, which is why this
+        one exists.
+        """
+        monkeypatch.setattr(server, "_LISTEN_DRAIN_SECS", 0.0)
+        httpd, registry = server.build_server(_BACKEND, host="127.0.0.1", port=0)
+        host, port = httpd.server_address[0], httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://{host}:{port}/mcp"
+        try:
+            ln = _Listener(url, _listen_body(notifications={"toolsListChanged": True}))
+            with ln:
+                ln.wait_frames(1)
+                httpd.modern_pool.shutdown_all()
+                frames = ln.wait_frames(2)
+        finally:
+            httpd.shutdown()
+            registry.shutdown_all()
+            httpd.server_close()
+        assert frames[1]["result"]["resultType"] == "complete"
+        assert frames[1]["id"] == "listen-1"
+
+    def test_a_dead_child_ends_the_stream_with_no_terminal_frame(self, gateway):
+        """Abrupt, deliberately. Serve is still alive and the contract is
+        that the peer re-listens and refetches — a terminal `complete`
+        would tell it the opposite, that the subscription finished
+        normally and there is nothing to recover."""
+        with _Listener(
+            gateway, _listen_body(notifications={"toolsListChanged": True})
+        ) as ln:
+            ln.wait_frames(1)
+            # `exit` makes the child leave; the reader thread notices EOF
+            # and fails the backend, which wakes the stream.
+            _post(
+                gateway,
+                {"jsonrpc": "2.0", "method": "exit", "params": {"_meta": _meta()}},
+            )
+            assert ln.ended.wait(timeout=20), "the stream never noticed the dead child"
+            frames, _ = ln.snapshot()
+        assert len(frames) == 1, frames
+        assert frames[0]["method"] == ACK_METHOD
+
+    def test_a_client_disconnect_frees_the_slot_promptly(self, gateway, monkeypatch):
+        """On HTTP "closing the SSE response stream is itself the
+        cancellation signal" — so a disconnect must free what the stream
+        held, and PROMPTLY.
+
+        Asserted through the CAP, because that is the observable a real
+        client hits. An earlier version of this test opened a fresh
+        stream and checked it worked, which a LEAKED listener passes
+        untouched — the assertion and its docstring had drifted apart.
+
+        The number that made this necessary is 30 seconds. Waiting for a
+        write to fail is not enough: the first keepalive after a
+        disconnect lands in the kernel's send buffer and succeeds, so
+        only the SECOND one raises — two full keepalive intervals of a
+        zombie stream holding a cap slot and a pool hold. A client on a
+        flaky network that dropped and re-listened locked ITSELF out with
+        503s. `_peer_gone` is what closes that window.
+
+        Revert-check: delete the `_peer_gone` branch from
+        `_pump_listen_stream` and this fails on 503 — the exact symptom,
+        not a proxy for it.
+        """
+        monkeypatch.setattr(server, "_LISTEN_MAX_STREAMS_PER_CHILD", 1)
+        ln = _Listener(gateway, _listen_body(notifications={"toolsListChanged": True}))
+        with ln:
+            ln.wait_frames(1)
+        # Bounded poll rather than one shot: the detach happens on the
+        # handler thread, so the test OBSERVES it rather than assuming it
+        # already happened. Ten seconds is well inside one keepalive
+        # interval, so a pass here cannot come from the old behaviour.
+        deadline = time.monotonic() + 10
+        last: int | None = None
+        while time.monotonic() < deadline:
+            fresh = _Listener(
+                gateway, _listen_body("after", notifications={"toolsListChanged": True})
+            )
+            with fresh:
+                last = fresh.status
+                if last == 200:
+                    assert fresh.wait_frames(1)[0]["method"] == ACK_METHOD
+                    return
+            time.sleep(0.05)
+        raise AssertionError(
+            f"the slot was still held 10s after the disconnect (status={last})"
+        )
+
+
+class TestListenStreamUnit:
+    """The buffer itself, away from HTTP."""
+
+    def test_a_full_backlog_ends_the_stream_rather_than_dropping_a_frame(
+        self, monkeypatch
+    ):
+        """A gap is undetectable to the client; a lost stream is
+        re-established with fresh state. And `publish` must NEVER block:
+        it runs on the child's reader thread, which serves every other
+        consumer of that child."""
+        monkeypatch.setattr(server, "_LISTEN_QUEUE_MAX", 2)
+        stream = server._ListenStream("x", {"toolsListChanged": True})
+        for i in range(5):
+            stream.publish({"jsonrpc": "2.0", "method": "n", "params": {"i": i}})
+        assert stream.overflowed is True
+        assert stream.ending is True
+        # LOST, not graceful: the client has a hole in its event history
+        # and a terminal `complete` would say it does not.
+        assert stream.graceful is False
+
+    def test_wants_matches_only_the_honored_flags(self):
+        stream = server._ListenStream("x", {"toolsListChanged": True})
+        assert stream.wants("notifications/tools/list_changed") is True
+        assert stream.wants("notifications/prompts/list_changed") is False
+        assert stream.wants("notifications/message") is False
+
+    def test_signal_end_wakes_a_waiting_stream_promptly(self):
+        """A blocked `queue.get` cannot be woken by an Event, so the wait
+        is sliced. Without that, a shutdown or a dead child would take a
+        full keepalive interval to be noticed.
+
+        Revert-check: a single `self._queue.get(timeout=timeout)` makes
+        this take the full timeout.
+        """
+        stream = server._ListenStream("x", {})
+        started = threading.Event()
+        elapsed: list[float] = []
+
+        def _wait():
+            started.set()
+            begin = time.monotonic()
+            assert stream.next_message(30.0) is None
+            elapsed.append(time.monotonic() - begin)
+
+        worker = threading.Thread(target=_wait, daemon=True)
+        worker.start()
+        assert started.wait(timeout=5)
+        time.sleep(0.05)
+        stream.signal_end(graceful=True)
+        worker.join(timeout=10)
+        assert elapsed and elapsed[0] < 5.0, elapsed
+
+    def test_the_first_ending_wins(self):
+        """A shutdown followed by the child's death is ONE ending with two
+        symptoms. Letting the later symptom rewrite the classification
+        would downgrade a graceful teardown the client may already have
+        been told about — and would reintroduce, one layer down, exactly
+        the race that moved this decision out of the pump."""
+        stream = server._ListenStream("x", {})
+        stream.signal_end(graceful=True)
+        stream.signal_end(graceful=False)
+        assert stream.graceful is True
+
+        other = server._ListenStream("y", {})
+        other.signal_end(graceful=False)
+        other.signal_end(graceful=True)
+        assert other.graceful is False
+
+
+class TestListenAndThePool:
+    """#374's use of #376's hold seam."""
+
+    def test_a_live_listen_stream_pins_its_child_against_the_reaper(self, gateway):
+        """A held entry is never reaped — `holds` is exactly the seam
+        #376 built for this, and #374 is its first real user. A stream
+        whose child was reaped under it would simply go silent, with no
+        ending of any kind for the client to react to.
+
+        Driven through a REAL stream over HTTP rather than a bare
+        `get_or_create`: the latter re-tests #376's refcount and says
+        nothing about whether the LISTEN path actually takes the hold and
+        keeps it for the life of the stream. The pool's clock is
+        injectable, so nothing here waits on wall time.
+        """
+        httpd, registry = server.build_server(_BACKEND, host="127.0.0.1", port=0)
+        host, port = httpd.server_address[0], httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://{host}:{port}/mcp"
+        clock = [1000.0]
+        pool = httpd.modern_pool
+        pool._now = lambda: clock[0]
+        pool._idle_ttl = 30.0
+        try:
+            ln = _Listener(url, _listen_body(notifications={"toolsListChanged": True}))
+            with ln:
+                ln.wait_frames(1)
+                clock[0] += 31.0
+                assert pool.reap_idle() == 0, (
+                    "reaped a child out from under a live listen stream"
+                )
+                assert pool.count() == 1
+            # Stream closed: the hold is released on the handler thread,
+            # so observe the reap becoming possible rather than assume it.
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                clock[0] += 31.0
+                if pool.reap_idle() == 1:
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("the hold outlived the stream")
+            assert pool.count() == 0
+        finally:
+            httpd.shutdown()
+            registry.shutdown_all()
+            pool.shutdown_all()
+            httpd.server_close()
+
+    def test_the_hold_is_released_when_the_stream_ends(self):
+        """The other half: a hold kept forever makes the child
+        permanently unreapable, which is a leak rather than a safety
+        margin. Fake clock — the reaper's only time input is `now`."""
+        clock = [1000.0]
+        pool = server.ModernBackendPool(_BACKEND, idle_ttl=30.0, now=lambda: clock[0])
+        try:
+            backend, _, entry = pool.get_or_create("held")
+            stream = server._ListenStream("s", {"toolsListChanged": True})
+            assert backend.attach_listener(stream, server._LISTEN_MAX_STREAMS_PER_CHILD)
+            assert entry["holds"] == 1
+            clock[0] += 31.0
+            assert pool.reap_idle() == 0, "reaped a child with a live listen stream"
+            assert pool.count() == 1
+            # What `_serve_listen_stream`'s `finally` does when the
+            # stream ends: detach, then release the hold.
+            backend.detach_listener(stream)
+            pool.release(entry)
+            clock[0] += 31.0
+            assert pool.reap_idle() == 1
+        finally:
+            pool.shutdown_all()
+
+    def test_shutdown_signals_every_attached_stream(self):
+        """`shutdown_all` wakes listeners BEFORE tearing children down,
+        so a graceful ending is still classifiable as graceful."""
+        pool = server.ModernBackendPool(_BACKEND)
+        try:
+            backend, _, entry = pool.get_or_create("p")
+            stream = server._ListenStream("s", {"toolsListChanged": True})
+            assert backend.attach_listener(stream, server._LISTEN_MAX_STREAMS_PER_CHILD)
+            pool.release(entry)
+            pool.shutdown_all()
+            assert stream.ending is True
+        finally:
+            pool.shutdown_all()
+
+
+def test_a_pooled_child_discards_deliver_and_discard_again(gateway, quick_keepalive):
+    """The flip, in both directions (#373 R1F2 <-> #374).
+
+    Before a stream attaches, a pooled child's notifications are shed
+    (there is no consumer, so anything queued is retained for the life of
+    the process). While one is attached they are DELIVERED. After it
+    detaches the shedding must resume — this is the assertion that
+    notices if the fan-out ever leaves the queue re-armed.
+    """
+    _fire(gateway, "tools")  # discarded: nothing attached
+    with _Listener(
+        gateway, _listen_body(notifications={"toolsListChanged": True})
+    ) as ln:
+        ln.wait_frames(1)
+        _fire(gateway, "tools")  # delivered
+        assert ln.wait_frames(2)[1]["method"] == "notifications/tools/list_changed"
+    _fire(gateway, "tools")  # discarded again
+    # The gateway is still serving, which is the observable half: a
+    # retained queue would be invisible here, so the pin is that the
+    # NEXT stream still starts clean rather than replaying the shed one.
+    with _Listener(
+        gateway, _listen_body("next", notifications={"toolsListChanged": True})
+    ) as ln:
+        frames = ln.wait_frames(1)
+        ln.wait_comments(2)
+        frames, _ = ln.snapshot()
+    assert len(frames) == 1, frames

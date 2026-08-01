@@ -41,7 +41,9 @@ import os
 import queue
 import re
 import secrets
+import select
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -54,6 +56,7 @@ from .relay import (
     _META_CLIENT_CAPABILITIES,
     _META_PROTOCOL_VERSION,
     _META_SERVER_INFO,
+    _META_SUBSCRIPTION_ID,
     _NAME_BEARING_METHODS,
     _decode_mcp_name,
     log,
@@ -169,6 +172,24 @@ _MCP_UNSUPPORTED_PROTOCOL_VERSION = -32022
 # folded `headers.get()` silently returns the first — so they are checked
 # for duplication before anything reads them.
 _MODERN_ROUTING_HEADERS = ("MCP-Protocol-Version", "Mcp-Method", "Mcp-Name")
+
+# The listen filter's boolean fields, and the notification method each
+# one opts into. Mirrors relay's `_LISTEN_FORWARDED_NOTIFICATIONS` on the
+# other side of the wire. Spec: exactly these may ride the stream —
+# "Request-scoped notifications like notifications/progress and
+# notifications/message are not delivered on the listen stream", so the
+# table is a whitelist and everything absent from it is dropped. #374 is
+# the listChanged trio only; `resourceSubscriptions` is declined in the
+# ack until #381.
+_LISTEN_FILTER_METHODS = {
+    "toolsListChanged": "notifications/tools/list_changed",
+    "promptsListChanged": "notifications/prompts/list_changed",
+    "resourcesListChanged": "notifications/resources/list_changed",
+}
+_LISTEN_FORWARDED_METHODS = frozenset(_LISTEN_FILTER_METHODS.values())
+
+_LISTEN_METHOD = "subscriptions/listen"
+_LISTEN_ACK_METHOD = "notifications/subscriptions/acknowledged"
 
 _MODERN_DISCOVER_METHOD = "server/discover"
 
@@ -426,6 +447,193 @@ _CACHEABLE_METHODS = frozenset(
         "resources/read",
     }
 )
+
+
+# Per-stream backlog. A full queue ends the stream rather than dropping a
+# frame in the middle: a gap is undetectable to the client, whereas a lost
+# stream is re-established with fresh state.
+_LISTEN_QUEUE_MAX = 1024
+
+# Concurrent listen streams one principal may hold on its pooled child.
+# The relay peer opens at most two; the SDK's global limit is far higher.
+# A cap exists so one client cannot pin unbounded handler threads.
+_LISTEN_MAX_STREAMS_PER_CHILD = 4
+
+
+def _accepts_sse(accept_header: str | None) -> bool:
+    """Whether an `Accept` header (RFC 9110 §12) permits `text/event-stream`.
+
+    #382 review R1F2 remainder. A prior fix casefolded the comparison but
+    kept it a bare substring check, which gets two cases wrong in
+    opposite directions:
+
+    - `Accept: text/*` is a valid media RANGE that matches
+      `text/event-stream` and must be honored, but does not contain the
+      substring `"text/event-stream"`, so it earned a 406.
+    - `Accept: text/event-stream;q=0` is an explicit REFUSAL of that
+      type (RFC 9110 §12.4.2: q=0 means "not acceptable"), but the
+      substring IS present, so it passed.
+
+    Missing or empty is `True`: RFC 9110 §12.5.1 — "A request without
+    any Accept header field implies that the user agent will accept any
+    media type in response." Absent means accept anything, not accept
+    nothing; the substring check used to get this backwards too (`""`
+    contains no substring, so a client that omits Accept entirely was
+    406'd).
+
+    Each comma-separated range is matched by exact media type or by the
+    `text/*` / `*/*` wildcards, case-insensitively (media types are
+    case-insensitive, RFC 9110 §8.3.1). An unparsable `q` parameter is
+    treated as `q=1` — lenient parsing, consistent with the rest of this
+    header's handling — rather than rejected outright.
+
+    A POSITIVE wildcard does not override a more specific explicit
+    REFUSAL (#382 review R6F1). `text/event-stream;q=0, */*` used to
+    accept — some matching range had `q>0` — but RFC 9110 §12.5.1 says
+    the MOST SPECIFIC matching range decides a media type's quality:
+    exact `text/event-stream` beats `text/*`, which beats `*/*`. So the
+    effective q is looked up by specificity tier, not "any match with
+    q>0": if the header explicitly refuses `text/event-stream`, a
+    trailing `*/*` cannot undo that. Within one tier, the SAME range
+    listed twice with different q (self-contradictory, but headers are
+    attacker- or bug-supplied) takes the MAX — lenient toward
+    acceptance, matching this function's other leniencies (an
+    unparsable `q`, an absent header).
+    """
+    if not accept_header:
+        return True
+    tier_q: dict[str, float] = {}
+    for range_spec in accept_header.split(","):
+        params = range_spec.split(";")
+        media_range = params[0].strip().casefold()
+        if media_range not in ("text/event-stream", "text/*", "*/*"):
+            continue
+        q = 1.0
+        for param in params[1:]:
+            name, _, value = param.strip().partition("=")
+            if name.strip().casefold() == "q":
+                try:
+                    q = float(value.strip())
+                except ValueError:
+                    q = 1.0
+        tier_q[media_range] = max(q, tier_q.get(media_range, 0.0))
+    for media_range in ("text/event-stream", "text/*", "*/*"):
+        if media_range in tier_q:
+            return tier_q[media_range] > 0
+    return False
+
+
+# How often a stream waiting for its next notification re-checks whether
+# it has been told to end. A `queue.Queue` and a `threading.Event` cannot
+# be waited on jointly, and BOTH endings (gateway shutdown, child death)
+# are signalled from another thread — so the wait is sliced rather than
+# held for the whole keepalive interval, which would otherwise delay a
+# teardown by up to 15 seconds.
+_LISTEN_POLL_SECS = 0.25
+
+# How long gateway shutdown waits for the streams it just ended to flush
+# their terminal frames and detach. Generous enough for a local socket
+# write, short enough that a wedged client cannot hold shutdown hostage.
+_LISTEN_DRAIN_SECS = 2.0
+
+
+class _ListenStream:
+    """One attached `subscriptions/listen` stream (#374).
+
+    Owns the honored filter, the listen request's id (echoed verbatim as
+    the subscription id — the v2 client mints strings like `"listen-1"`,
+    so nothing coerces types), and a BOUNDED queue the child's reader
+    thread publishes into.
+
+    Filtering happens here, on the reader thread, so a stream's backlog
+    never holds traffic that stream would refuse: "The server MUST NOT
+    send notification types the client has not explicitly requested."
+    Stamping happens on the handler thread instead, because each stream
+    stamps its OWN id and would need its own copy regardless.
+    """
+
+    __slots__ = (
+        "listen_id",
+        "honored",
+        "_queue",
+        "_ended",
+        "_end_lock",
+        "_graceful",
+        "overflowed",
+    )
+
+    def __init__(self, listen_id: Any, honored: dict[str, bool]) -> None:
+        self.listen_id = listen_id
+        self.honored = honored
+        self._queue: "queue.Queue[dict[str, Any]]" = queue.Queue(_LISTEN_QUEUE_MAX)
+        # Set to end the stream: "graceful" emits the terminal result
+        # first, "lost" closes abruptly.
+        self._ended = threading.Event()
+        self._end_lock = threading.Lock()
+        self._graceful = False
+        self.overflowed = False
+
+    def wants(self, method: str) -> bool:
+        flag = next((k for k, v in _LISTEN_FILTER_METHODS.items() if v == method), None)
+        return flag is not None and bool(self.honored.get(flag))
+
+    def publish(self, message: dict[str, Any]) -> None:
+        """Enqueue a matching notification; never block the reader thread."""
+        try:
+            self._queue.put_nowait(message)
+        except queue.Full:
+            # Backlog overflow ends the stream (lost). Blocking here would
+            # stall the child's reader for every other consumer, and
+            # dropping one frame would leave an undetectable gap.
+            self.overflowed = True
+            self.signal_end(graceful=False)
+
+    def signal_end(self, *, graceful: bool) -> None:
+        """Wind the stream up, recording WHICH ending this is.
+
+        The caller states the intent rather than the pump inferring it
+        from surrounding state, because inference races: `shutdown_all`
+        signals its streams and then immediately tears the children down,
+        so a pump that read `backend.closed` would see a dead child and
+        call an orderly shutdown "lost" — telling a compliant peer to
+        reconnect to a gateway that is going away.
+
+        THE FIRST ENDING WINS. A shutdown followed by the child's death
+        is one ending with two symptoms, and the later symptom must not
+        downgrade a graceful teardown the client may already have been
+        told about.
+        """
+        with self._end_lock:
+            if self._ended.is_set():
+                return
+            self._graceful = graceful
+            self._ended.set()
+
+    @property
+    def ending(self) -> bool:
+        return self._ended.is_set()
+
+    @property
+    def graceful(self) -> bool:
+        """True if the ending earns a terminal result frame."""
+        return self._graceful
+
+    def next_message(self, timeout: float) -> dict[str, Any] | None:
+        """The next notification, or None on ending / keepalive expiry.
+
+        The caller re-checks `ending` — None means "nothing to write",
+        not "keep waiting".
+        """
+        deadline = time.monotonic() + timeout
+        while not self._ended.is_set():
+            remaining = min(_LISTEN_POLL_SECS, deadline - time.monotonic())
+            if remaining <= 0:
+                return None
+            try:
+                return self._queue.get(timeout=remaining)
+            except queue.Empty:
+                continue
+        return None
 
 
 class ModernBackendPool:
@@ -898,6 +1106,25 @@ class ModernBackendPool:
         # overrides a checkout, and an in-flight caller gets the same
         # failure the legacy path already produces at shutdown.
         self.stop_reaper()
+        # #374 §3.5: end every attached listen stream FIRST, so a stream
+        # emits its graceful terminal result before its child dies under
+        # it. The drain is what makes that promise real rather than
+        # aspirational: handler threads are daemons, so without it the
+        # process can exit between the signal and the flush and a
+        # compliant peer sees a stream that just stopped — which it reads
+        # as LOST and reconnects to a gateway that is going away.
+        # BOUNDED, so a wedged stream delays shutdown by at most
+        # `_LISTEN_DRAIN_SECS` instead of deadlocking it.
+        with self._lock:
+            entries = list(self._entries.values())
+        for entry in entries:
+            backend = entry.get("backend")
+            if backend is not None:
+                backend.close_listeners()
+        for entry in entries:
+            backend = entry.get("backend")
+            if backend is not None:
+                backend.drain_listeners(_LISTEN_DRAIN_SECS)
         with self._lock:
             entries = list(self._entries.values())
             self._entries.clear()
@@ -1012,10 +1239,13 @@ def _modern_response_status(msg: dict[str, Any]) -> int:
     Found` and ... `-32601`". Everything else keeps 200 and lets the
     JSON-RPC error speak — the client parses an error body at any status.
 
-    This is also the carve-out `subscriptions/listen` needs until 3.5-D
-    implements it: a legacy child answers it `-32601`, and that must
-    reach the client as 404 rather than as a 200 the client would treat
-    as a malformed success.
+    This used to double as the carve-out `subscriptions/listen` needed
+    while serve did not implement it (a legacy child answers it `-32601`,
+    which had to reach the client as 404 rather than as a 200 the client
+    would read as a malformed success). #374 removed that path by
+    intercepting the method in `_dispatch_modern` before it can reach a
+    child, so what remains here is only the general unknown-method rule
+    it always was.
     """
     error = msg.get("error")
     if isinstance(error, dict) and error.get("code") == _JSONRPC_METHOD_NOT_FOUND:
@@ -1023,32 +1253,39 @@ def _modern_response_status(msg: dict[str, Any]) -> int:
     return 200
 
 
-# The four notification-dependent capability flags discover cannot honor
-# YET (#373 review, /code-review score 85): each one promises a
-# notification kind that a gateway-owned child's real traffic never
-# reaches the client for. `_queue_server_initiated`'s modern_owned branch
-# silently discards every notification a pooled child emits — no SSE
-# stream, no consumer — until 3.5-D ships `subscriptions/listen`. This is
-# the relay's C8 principle (relay.py: "advertise exactly what is
-# forwarded") applied in reverse: C8 forwards a notification kind only for
-# a family the relay advertised; here the matching rule is to advertise a
-# family's notification flag only for a kind serve can actually forward.
+# The capability flags discover still cannot honor. The rule (#373
+# review, /code-review score 85) is the relay's C8 principle (relay.py:
+# "advertise exactly what is forwarded") applied in reverse: advertise a
+# family's notification flag only for a kind serve can actually deliver.
+#
+# #374 made three of the original four deliverable. `subscriptions/listen`
+# now attaches a live stream to the pooled child and
+# `_queue_server_initiated` fans the listChanged trio out to it, so
+# `tools.listChanged`, `resources.listChanged` and `prompts.listChanged`
+# are honest promises and were removed from this table.
+#
+# `resources.subscribe` stays stripped: it promises PER-URI subscription
+# driving (`resources/subscribe` + `notifications/resources/updated`),
+# which serve does not do yet — the listen ack explicitly declines
+# `resourceSubscriptions`, so advertising the flag would promise the one
+# thing the ack refuses. Tracked in #381; the fix there is to make this
+# conditional on the child's own advertised `resources.subscribe` inside
+# `_synthesize_discover_result` (which already holds `init_result`)
+# rather than a static table.
+#
 # Keyed by family -> the KEYS to strip, never the whole family object:
-# spec capability semantics are presence-based, and the REQUEST surfaces
-# in every one of these families (tools/list, resources/read,
-# prompts/get) are served today — only the notification promise is
-# undeliverable. `logging` is deliberately NOT in this table: whether its
-# `notifications/message` promise belongs in the same boat is 3.5-D
-# territory, not this fix's scope.
+# spec capability semantics are presence-based, and the REQUEST surface
+# of the family (`resources/read`, `resources/list`) is served today —
+# only that one promise is undeliverable. `logging` is deliberately NOT
+# in this table: `notifications/message` is request-scoped, so it belongs
+# to whatever carries the request, not to a broadcast stream (#381).
 _UNDELIVERABLE_NOTIFICATION_FLAGS: dict[str, tuple[str, ...]] = {
-    "tools": ("listChanged",),
-    "resources": ("subscribe", "listChanged"),
-    "prompts": ("listChanged",),
+    "resources": ("subscribe",),
 }
 
 
 def _strip_undeliverable_capability_flags(capabilities: Any) -> dict[str, Any]:
-    """Drop the notification flags discover cannot honor yet (see above).
+    """Drop the capability flags discover still cannot honor (see above).
 
     A non-dict `capabilities` value degrades to `{}` rather than raising
     (#373 review R3F1): `.items()` on it would otherwise crash with an
@@ -1067,6 +1304,8 @@ def _strip_undeliverable_capability_flags(capabilities: Any) -> dict[str, Any]:
     Non-dict FAMILY values (inside an otherwise well-formed top-level
     dict) likewise pass through un-stripped rather than crash — e.g.
     `"tools": true` — since only a dict family has keys to strip from.
+    A family absent from the table passes through whole, which is what
+    makes the post-#374 one-entry table work unchanged.
     """
     if not isinstance(capabilities, dict):
         return {}
@@ -1091,12 +1330,13 @@ def _synthesize_discover_result(
     `supportedVersions` is SERVE's own implemented set, never the
     child's: the child speaks 2025-06-18 and the question being asked is
     what the ENDPOINT supports. `capabilities` is the child's, echoed
-    almost verbatim — `_strip_undeliverable_capability_flags` removes the
-    four notification-dependent flags first (`tools.listChanged`,
-    `resources.subscribe`, `resources.listChanged`,
-    `prompts.listChanged`; see that function's comment), because those
-    are not what the endpoint can actually do until 3.5-D. Every other
-    flag, and the family objects themselves, pass through untouched.
+    almost verbatim — `_strip_undeliverable_capability_flags` removes
+    `resources.subscribe` first, the one flag serve still cannot honor
+    (see that function's comment). The three listChanged flags used to
+    be stripped alongside it and are advertised again since #374, which
+    is what makes them true: `subscriptions/listen` delivers exactly
+    that trio. Every other flag, and the family objects themselves, pass
+    through untouched.
 
     BOTH FIELDS ARE LOAD-BEARING FOR INTEROP, not decoration. The v2
     client validates this result as a `DiscoverResult` whose required
@@ -1205,6 +1445,13 @@ class BackendProcess:
         # consumer. Unbounded queue is acceptable for one client per session;
         # a later change can bound + shed.
         self.server_initiated: "queue.Queue[str]" = queue.Queue()
+        # Attached `subscriptions/listen` streams (#374). A modern child is
+        # SHARED, and the spec allows several concurrent streams over it,
+        # so the single-consumer `server_initiated` queue above cannot
+        # serve them — each listener gets its own bounded queue instead.
+        # Empty is the steady state and restores the discard behaviour by
+        # construction.
+        self._listeners: list[Any] = []
         self._closed = threading.Event()
         self._reader = threading.Thread(
             target=self._read_loop, name="backend-reader", daemon=True
@@ -1256,12 +1503,100 @@ class BackendProcess:
         if not self._modern_owned:
             self.server_initiated.put(line)
             return
+        # #374: with listen streams attached, a child notification is
+        # FANNED OUT to every stream whose filter asked for it. Parsed
+        # once here on the reader thread and matched per stream, so a
+        # bounded queue never holds traffic its own stream would drop —
+        # the spec's "MUST NOT send notification types the client has not
+        # explicitly requested" is enforced at enqueue, not at emit.
+        listeners = self._snapshot_listeners()
+        if listeners:
+            try:
+                parsed = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                parsed = None
+            method = parsed.get("method") if isinstance(parsed, dict) else None
+            if isinstance(method, str) and method in _LISTEN_FORWARDED_METHODS:
+                delivered = False
+                for listener in listeners:
+                    if listener.wants(method):
+                        listener.publish(parsed)
+                        delivered = True
+                if delivered:
+                    return
+        # No listener wanted it (or none is attached): today's bounded
+        # discard, byte-identical.
         self._discarded += 1
         if self._discarded == 1:
             log(
-                "modern backend produced traffic with no modern channel to "
-                "carry it; discarding (3.5-D adds the listen stream)"
+                "modern backend produced traffic no listen stream asked for; discarding"
             )
+
+    def attach_listener(self, listener: Any, cap: int) -> bool:
+        """Atomically check the stream cap and register, or refuse (#382 review R1F1).
+
+        #374 §3.2. Called BEFORE the ack is written, deliberately: an
+        event published while the ack write is in flight has to be
+        buffered rather than lost, which is the server-side form of the
+        ack-first invariant.
+
+        The count-then-attach used to be two separate steps — a caller
+        checked `len(self._snapshot_listeners())` against the cap, then
+        called this method separately. That is bypassable by a
+        synchronized burst: N simultaneous listens each see `cap - 1`
+        free slots (nobody has attached yet) and all attach, exceeding
+        the cap by an arbitrary amount and pinning N handler threads —
+        exactly the DoS the cap exists to stop. The check and the
+        append now happen under ONE lock hold, so only `cap` streams can
+        ever win the race; everyone else is told False before touching
+        anything.
+
+        This does not reintroduce the false dilemma the old comment
+        posed (atomic check vs. a lock spanning the SSE headers and the
+        ack write): both the count and the append here are pure
+        in-memory list operations, so the lock's hold time is
+        unaffected by socket I/O — the caller still does the send under
+        no lock at all.
+        """
+        with self._lock:
+            if len(self._listeners) >= cap:
+                return False
+            self._listeners.append(listener)
+            return True
+
+    def detach_listener(self, listener: Any) -> None:
+        """Unregister a stream. Idempotent — teardown paths may overlap."""
+        with self._lock:
+            if listener in self._listeners:
+                self._listeners.remove(listener)
+
+    def close_listeners(self) -> None:
+        """End every attached stream gracefully (gateway shutdown)."""
+        for listener in self._snapshot_listeners():
+            listener.signal_end(graceful=True)
+
+    def drain_listeners(self, timeout: float) -> bool:
+        """Wait (bounded) for every stream to finish writing and detach.
+
+        A stream detaches in its handler's `finally`, AFTER the terminal
+        frame is flushed, so an empty listener list is the observable
+        proof that the graceful ending actually reached the wire. Returns
+        False if the timeout won instead — the caller carries on either
+        way, because a shutdown that can be stalled by one wedged client
+        is a worse failure than a truncated stream.
+        """
+        deadline = time.monotonic() + timeout
+        while self._snapshot_listeners():
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+        return True
+
+    def _snapshot_listeners(self) -> list[Any]:
+        """The attached streams, copied so the reader never holds the lock
+        while a listener's bounded queue is being written."""
+        with self._lock:
+            return list(self._listeners)
 
     def _route(self, line: str) -> None:
         try:
@@ -1451,6 +1786,13 @@ class BackendProcess:
             self._pending.clear()
         for slot in waiters:
             slot["event"].set()  # line stays None -> caller emits error
+        # #374: a listen stream is a waiter too. Without this it would sit
+        # on its queue until the next keepalive tick before noticing the
+        # child is gone. LOST, not graceful: serve itself is still up, so
+        # the contract is that the peer re-listens and refetches — and a
+        # terminal `complete` would tell it the opposite.
+        for listener in self._snapshot_listeners():
+            listener.signal_end(graceful=False)
 
     @property
     def closed(self) -> bool:
@@ -3165,6 +3507,278 @@ class _Handler(BaseHTTPRequestHandler):
         self._session_id = sid
         return backend
 
+    def _serve_listen_stream(
+        self, msg: dict[str, Any], req_id: Any, backend: BackendProcess
+    ) -> None:
+        """Answer `subscriptions/listen` with a long-lived SSE stream (#374).
+
+        Serve owns this method — it is never forwarded, the same posture
+        `server/discover` takes, and it replaces the carve-out that used
+        to let a legacy child answer `-32601` and turn it into a 404.
+
+        SCOPE: the listChanged trio only. `resourceSubscriptions` is
+        DECLINED by omitting it from the ack, which is spec-legal —
+        "Notification types the server does not support are omitted" —
+        and honest, since serve does not drive `resources/subscribe`
+        against the child yet (#381).
+
+        Order is the contract. Attach BEFORE the ack, so an event
+        published while the ack write is in flight is buffered rather
+        than lost; then the ack as the FIRST frame — "The server MUST
+        send `notifications/subscriptions/acknowledged` as the first
+        message ... and MUST NOT send any notification on the
+        subscription before it."
+
+        The honored subset is echoed at exactly `params.notifications`
+        and the id at exactly `params._meta[subscriptionId]`. That
+        nesting is load-bearing in both directions: a top-level echo is
+        silently ignored by a compliant client, which then forwards
+        nothing and reports no error. The `notifications` key is emitted
+        even when empty — the v2 client reads a missing one as malformed
+        and discards the whole ack.
+
+        All three requested booleans are honored unconditionally. A
+        subscription that never fires is still honored, and narrowing the
+        echo to what the child advertises would make a compliant peer
+        suppress events that do in fact arrive.
+        """
+        # Filter shape. Absent means "subscribed to nothing", which is a
+        # valid ack; present-but-not-an-object is malformed and rejected
+        # BEFORE the stream is committed, as a single JSON error.
+        params = msg.get("params")
+        requested = params.get("notifications") if isinstance(params, dict) else None
+        if requested is None:
+            requested = {}
+        if not isinstance(requested, dict):
+            self._send_json(
+                400,
+                _error_body(
+                    "params.notifications must be an object",
+                    req_id,
+                    code=_JSONRPC_INVALID_PARAMS,
+                ),
+            )
+            return
+
+        # The success path is an SSE stream, so a client that cannot
+        # accept one gets 406 rather than a stream it will not read.
+        # MEDIA-RANGE MATCHED, not a substring check (#382 review R1F2):
+        # `_accepts_sse` honors `text/*`/`*/*` ranges, an explicit `q=0`
+        # refusal, and an absent header (RFC 9110 says that means accept
+        # anything) — see its docstring for what a substring check got
+        # wrong in both directions.
+        if not _accepts_sse(self.headers.get("Accept")):
+            self._send_json(
+                406,
+                _error_body(
+                    "subscriptions/listen responds with an SSE stream; "
+                    "Accept must include text/event-stream",
+                    req_id,
+                    code=_JSONRPC_INVALID_REQUEST,
+                ),
+            )
+            return
+
+        honored = {
+            flag: True for flag in _LISTEN_FILTER_METHODS if requested.get(flag) is True
+        }
+        listener = _ListenStream(req_id, honored)
+
+        # The check and the attach are ONE atomic step (#382 review
+        # R1F1): `attach_listener` takes the cap and does both under its
+        # own lock, so a synchronized burst of simultaneous listens
+        # cannot each see a free slot and all squeeze past — the cap is
+        # HARD, not advisory. On success the buffer exists before
+        # anything is written to the socket (see the docstring's
+        # attach-before-ack ordering).
+        if not backend.attach_listener(listener, _LISTEN_MAX_STREAMS_PER_CHILD):
+            # Pre-ack rejection, single JSON: -32603 rather than a fresh
+            # -32000-range mint (O18).
+            self._send_json(
+                503,
+                _error_body(
+                    "too many concurrent subscription streams for this client",
+                    req_id,
+                    code=_JSONRPC_INTERNAL_ERROR,
+                ),
+            )
+            return
+        # Logged unconditionally: a subscription opening is a fact an
+        # operator wants in the log ("who is listening, and to what"),
+        # alongside the access line the response itself produces. It is
+        # also the only externally visible moment at which this stream
+        # exists — the ack has not been written yet and the connection
+        # stays open — which is what lets a test wait for the attach
+        # rather than race it.
+        log(f"listen {req_id!r}: streaming {sorted(honored) or 'nothing'}")
+        unhonored = sorted(set(requested) - set(honored))
+        if unhonored:
+            log(f"listen {req_id!r}: not honoring {unhonored} (#374 serves the trio)")
+        try:
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            # RE-ASSERTED, and this line is load-bearing:
+            # `BaseHTTPRequestHandler.send_header` treats `Connection` as
+            # a COMMAND, not a string — the `keep-alive` above silently
+            # set `close_connection` back to False.
+            #
+            # The general rule, which is what to carry away: any
+            # close-delimited SSE response that can end SERVER-side must
+            # keep `close_connection` true after sending the header. An
+            # SSE body has neither Content-Length nor chunked framing, so
+            # the close IS its delimiter — leave this off and a stream
+            # that ends normally (graceful shutdown, dead child) leaves
+            # the client blocked on a socket nobody will ever write to
+            # again.
+            #
+            # NB the legacy GET stream (`do_GET`) has the same shape and
+            # the same omission: its `while not backend.closed` loop can
+            # also end server-side, on child death. Not touched here —
+            # AC2 keeps the legacy path byte-identical in this PR — but
+            # it is a real defect, filed as #383 rather than fixed in
+            # passing.
+            self.close_connection = True
+            self._write_sse(
+                {
+                    "jsonrpc": "2.0",
+                    "method": _LISTEN_ACK_METHOD,
+                    "params": {
+                        "notifications": honored,
+                        "_meta": {_META_SUBSCRIPTION_ID: req_id},
+                    },
+                }
+            )
+            self._pump_listen_stream(listener, backend)
+        except (BrokenPipeError, ConnectionResetError, ValueError, OSError):
+            # The client went away. On HTTP "closing the SSE response
+            # stream is itself the cancellation signal and no
+            # notifications/cancelled message is expected", so this is an
+            # ordinary ending, not an error.
+            log(f"listen {req_id!r}: client disconnected")
+        finally:
+            backend.detach_listener(listener)
+
+    def _write_sse(self, message: dict[str, Any]) -> None:
+        self.wfile.write(f"data: {json.dumps(message)}\n\n".encode("utf-8"))
+        self.wfile.flush()
+
+    def _peer_gone(self) -> bool:
+        """Has the client closed its end of this stream?
+
+        Waiting for a WRITE to fail is not good enough, and the number
+        that proves it is 30 SECONDS: the first keepalive after a
+        disconnect lands in the kernel's send buffer and succeeds, so
+        only the SECOND one raises — two full keepalive intervals during
+        which the stream still holds a slot against
+        `_LISTEN_MAX_STREAMS_PER_CHILD` and a hold against the idle
+        reaper. A client on a flaky network that drops and re-listens
+        locks ITSELF out with 503s for half a minute.
+
+        A committed SSE response has nothing left to read from the peer,
+        so readable-and-empty is unambiguously EOF. Readable-with-DATA is
+        a client pipelining onto a response whose framing is
+        close-delimited; that is its own protocol error, but not this
+        method's to answer, so it reports "still here" and the stream
+        carries on.
+
+        Fails SAFE in the other direction too: any socket error here
+        means the connection is unusable, which is the same conclusion.
+        """
+        try:
+            ready, _, _ = select.select([self.connection], [], [], 0)
+            if not ready:
+                return False
+            return self.connection.recv(1, socket.MSG_PEEK) == b""
+        except OSError:
+            return True
+
+    def _pump_listen_stream(
+        self, listener: _ListenStream, backend: BackendProcess
+    ) -> None:
+        """Deliver matching notifications until the stream ends (#374 §3.6).
+
+        Every frame carries the subscription id in `_meta` — the stamp is
+        transport-unconditional, and the v2 client routes by it, so an
+        unstamped frame never reaches the consumer.
+
+        How a stream ends decides what the peer should do next:
+
+        - gateway shutdown -> the empty `resultType: "complete"` result,
+          stamped, then close. That is the spec's own graceful example,
+          and it tells a peer not to come back.
+        - child death or backlog overflow -> close with NO terminal
+          frame. Serve is still alive; the contract is that the peer
+          re-listens and refetches.
+        - client disconnect -> nothing to send; the write failure above
+          is the signal.
+
+        NEVER a server-sent `notifications/cancelled`. The spec assigns
+        that message to the client->server, stdio-only direction, and the
+        v2 client settles a listen route naming it as LOST — so emitting
+        it would turn every graceful teardown into a failure at a
+        compliant peer. (This supersedes the "emit both signals" reading
+        recorded against O17 on #270.)
+        """
+        last_keepalive = time.monotonic()
+        while True:
+            if listener.ending:
+                if listener.graceful:
+                    self._write_sse(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": listener.listen_id,
+                            "result": {
+                                "resultType": "complete",
+                                "_meta": {_META_SUBSCRIPTION_ID: listener.listen_id},
+                            },
+                        }
+                    )
+                return
+            if backend.closed:
+                # Abrupt: no terminal frame. Reachable when the child was
+                # already gone before this stream attached, so `_fail_all`
+                # had nobody to signal.
+                log(f"listen {listener.listen_id!r}: backend gone; closing the stream")
+                return
+            if self._peer_gone():
+                log(f"listen {listener.listen_id!r}: client went away")
+                return
+            message = listener.next_message(_LISTEN_POLL_SECS)
+            if message is None:
+                now = time.monotonic()
+                if now - last_keepalive >= _SSE_KEEPALIVE_SECS:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    last_keepalive = now
+                continue
+            # Copied, never mutated in place: `_queue_server_initiated`
+            # parses ONCE and hands the same dict to every matching
+            # stream, so stamping in place would put one stream's
+            # subscription id on another's frame.
+            #
+            # A non-dict `params` or `_meta` DEGRADES to `{}` rather than
+            # raising. `dict("oops")` is a `ValueError` on the handler
+            # thread, which would kill the stream abruptly — a
+            # misbehaving child must not be able to drop a well-behaved
+            # client's subscription. Same posture
+            # `_strip_undeliverable_capability_flags` takes for the same
+            # reason (#373 review R3F1): the malformed part is forfeited,
+            # never the connection. The stamp is what the client routes
+            # on, so it has to survive whatever the child sent.
+            stamped = dict(message)
+            raw_params = stamped.get("params")
+            params = dict(raw_params) if isinstance(raw_params, dict) else {}
+            raw_meta = params.get("_meta")
+            meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+            meta[_META_SUBSCRIPTION_ID] = listener.listen_id
+            params["_meta"] = meta
+            stamped["params"] = params
+            self._write_sse(stamped)
+
     def _reject_legacy_transport(self) -> None:
         """Answer 405 on a transport verb a modern-only deployment drops.
 
@@ -3255,12 +3869,36 @@ class _Handler(BaseHTTPRequestHandler):
             # liveness — but leaving modern-classified traffic to fall onto a
             # legacy session error would be a worse answer than 202.
             if kind == "notification":
+                if method == _LISTEN_METHOD:
+                    # #374 §3.9. `subscriptions/listen` is a REQUEST: its
+                    # id is what the ack stamps every frame with, so an
+                    # id-less one has nowhere to route. Rejected rather
+                    # than forwarded, matching the SDK's own
+                    # "subscriptions/listen requires a request id".
+                    self._send_json(
+                        400,
+                        _error_body(
+                            "subscriptions/listen requires a request id",
+                            code=_JSONRPC_INVALID_REQUEST,
+                        ),
+                    )
+                    return
                 backend.send_oneway(json.dumps(msg))
                 self._send_empty(202)
                 return
 
             # `server/discover` is answered HERE, never forwarded: a legacy
             # child has never heard of it and would answer -32601.
+            # `subscriptions/listen` is served HERE, never forwarded —
+            # the same posture discover takes, and what replaces the old
+            # carve-out (child -32601 -> 404). The pool hold taken above
+            # is deliberately kept for the whole stream: the `finally`
+            # below releases it only when the stream ends, which is what
+            # keeps the child unreapable while a client is listening.
+            if method == _LISTEN_METHOD:
+                self._serve_listen_stream(msg, req_id, backend)
+                return
+
             if method == _MODERN_DISCOVER_METHOD:
                 self._send_json(
                     200,

@@ -51,7 +51,19 @@ SERVER_VERSION = "1.2.3"
 # exactly the drift AC2 exists to catch (#370 review R1F1).
 INITIALIZE_RESULT: dict = {
     "protocolVersion": LEGACY_PROTOCOL_VERSION,
-    "capabilities": {"tools": {"listChanged": False}},
+    # #374 widened these from a lone `tools.listChanged: False`. The
+    # discover un-strip is a statement ABOUT capability flags, so a child
+    # advertising none of them proves nothing either way:
+    # `resources.subscribe` has to be PRESENT for "still stripped" to be
+    # observable, and the three listChanged flags have to be TRUE for
+    # "advertised again" to be. Both pin files compare against this
+    # object rather than restating it, so widening it leaves them green —
+    # which is the property the comment above is describing.
+    "capabilities": {
+        "tools": {"listChanged": True},
+        "prompts": {"listChanged": True},
+        "resources": {"subscribe": True, "listChanged": True},
+    },
     "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
 }
 
@@ -82,6 +94,17 @@ PUSH_NOTIFICATION = {
     "jsonrpc": "2.0",
     "method": "notifications/message",
     "params": {"level": "info", "data": "hello from the legacy child"},
+}
+
+# Emitted on `notifications/list_changed_push` (#374), which is how a test
+# drives a listChanged event out of the child and onto a
+# `subscriptions/listen` stream. Separate from `notifications/push` on
+# purpose: the same test needs to fire a NON-trio notification and watch
+# the stream refuse it.
+LIST_CHANGED_NOTIFICATION = {
+    "jsonrpc": "2.0",
+    "method": "notifications/tools/list_changed",
+    "params": {},
 }
 
 
@@ -161,6 +184,8 @@ def main() -> None:
             _handle_tools_call(req_id, msg.get("params") or {})
         elif method == "notifications/push":  # a notification (no id)
             _send(PUSH_NOTIFICATION)
+        elif method == "notifications/list_changed_push":  # a notification
+            _send(LIST_CHANGED_NOTIFICATION)
         elif method == "exit":
             sys.exit(0)
         elif has_id:
