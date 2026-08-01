@@ -2397,6 +2397,83 @@ class TestListenRejections:
         assert resp.json()["error"]["code"] == INTERNAL_ERROR
         assert resp.json()["id"] == "second"
 
+    def test_attach_listener_is_atomic_under_a_synchronized_burst(self):
+        """#382 review R1F1 — the cap must survive a synchronized burst.
+
+        Before this fix the caller checked `len(backend._snapshot_listeners())
+        >= cap` and called `attach_listener` as two SEPARATE steps. Under
+        a burst of simultaneous listens, every racer reads the count
+        before ANY of them has attached, so every one of them sees a
+        free slot and all attach — the cap bypassed by an arbitrary
+        amount, and each attached stream pins a handler thread, which is
+        exactly the DoS the cap exists to stop.
+
+        `attach_listener` now does the check-and-attach as ONE atomic
+        step under its own lock, so no matter how many callers race it
+        concurrently, at most `cap` of them can ever succeed.
+
+        A bare barrier before the call does NOT reproduce the old bug:
+        measured directly, the reverted shape's check-to-attach window
+        is a few bytecodes wide and never overshot in 20 trials at 200
+        threads, nor in 10 trials at 300 threads with
+        `sys.setswitchinterval(0.00001)` — CPython's GIL just does not
+        preempt a window that small on its own. So the window is
+        widened DELIBERATELY, the same seam idiom the spawn-race pool
+        tests use (`_spawn_and_handshake` there, `_snapshot_listeners`
+        here): every racer is parked, with its count already read,
+        until all of them have read it — recreating "every racer sees a
+        free slot" on demand instead of hoping the scheduler does.
+
+        This seam belongs to the shape being reverted TO: the current,
+        atomic `attach_listener` does not call `_snapshot_listeners` at
+        all, so against the fix this patch is inert and the test is
+        exercising the real lock, not the widening.
+
+        Revert-check: restore the non-atomic check-then-attach shape and
+        more than `cap` attach.
+        """
+        backend = server.BackendProcess(_BACKEND)
+        try:
+            cap = 4
+            extra = 6
+            total = cap + extra
+            real_snapshot = backend._snapshot_listeners
+            all_counted = threading.Barrier(total)
+
+            def _widened_snapshot():
+                # Only the reverted (non-atomic) `attach_listener` calls
+                # this. Read the real count, then park every racer here
+                # until all `total` of them have — the check-to-attach
+                # window held open on purpose.
+                result = real_snapshot()
+                all_counted.wait(timeout=15)
+                return result
+
+            backend._snapshot_listeners = _widened_snapshot
+
+            results: list[bool | None] = [None] * total
+
+            def _attach(i):
+                listener = server._ListenStream(f"burst-{i}", {})
+                results[i] = backend.attach_listener(listener, cap)
+
+            threads = [
+                threading.Thread(target=_attach, args=(i,), daemon=True)
+                for i in range(total)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+
+            assert all(r is not None for r in results), "a racer never finished"
+            assert results.count(True) == cap, results
+            assert results.count(False) == extra, results
+            assert len(backend._listeners) == cap
+        finally:
+            backend._snapshot_listeners = real_snapshot
+            backend.shutdown()
+
     def test_the_ladder_still_runs_before_the_stream(self, gateway):
         """Listen is intercepted inside `_dispatch_modern`, which is
         downstream of the O6-O10 ladder — so a malformed modern listen
@@ -2684,7 +2761,7 @@ class TestListenAndThePool:
         try:
             backend, _, entry = pool.get_or_create("held")
             stream = server._ListenStream("s", {"toolsListChanged": True})
-            backend.attach_listener(stream)
+            assert backend.attach_listener(stream, server._LISTEN_MAX_STREAMS_PER_CHILD)
             assert entry["holds"] == 1
             clock[0] += 31.0
             assert pool.reap_idle() == 0, "reaped a child with a live listen stream"
@@ -2705,7 +2782,7 @@ class TestListenAndThePool:
         try:
             backend, _, entry = pool.get_or_create("p")
             stream = server._ListenStream("s", {"toolsListChanged": True})
-            backend.attach_listener(stream)
+            assert backend.attach_listener(stream, server._LISTEN_MAX_STREAMS_PER_CHILD)
             pool.release(entry)
             pool.shutdown_all()
             assert stream.ending is True

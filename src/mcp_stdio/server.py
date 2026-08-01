@@ -1468,16 +1468,37 @@ class BackendProcess:
                 "modern backend produced traffic no listen stream asked for; discarding"
             )
 
-    def attach_listener(self, listener: Any) -> None:
-        """Register a listen stream to receive matching child notifications.
+    def attach_listener(self, listener: Any, cap: int) -> bool:
+        """Atomically check the stream cap and register, or refuse (#382 review R1F1).
 
         #374 §3.2. Called BEFORE the ack is written, deliberately: an
         event published while the ack write is in flight has to be
         buffered rather than lost, which is the server-side form of the
         ack-first invariant.
+
+        The count-then-attach used to be two separate steps — a caller
+        checked `len(self._snapshot_listeners())` against the cap, then
+        called this method separately. That is bypassable by a
+        synchronized burst: N simultaneous listens each see `cap - 1`
+        free slots (nobody has attached yet) and all attach, exceeding
+        the cap by an arbitrary amount and pinning N handler threads —
+        exactly the DoS the cap exists to stop. The check and the
+        append now happen under ONE lock hold, so only `cap` streams can
+        ever win the race; everyone else is told False before touching
+        anything.
+
+        This does not reintroduce the false dilemma the old comment
+        posed (atomic check vs. a lock spanning the SSE headers and the
+        ack write): both the count and the append here are pure
+        in-memory list operations, so the lock's hold time is
+        unaffected by socket I/O — the caller still does the send under
+        no lock at all.
         """
         with self._lock:
+            if len(self._listeners) >= cap:
+                return False
             self._listeners.append(listener)
+            return True
 
     def detach_listener(self, listener: Any) -> None:
         """Unregister a stream. Idempotent — teardown paths may overlap."""
@@ -3498,16 +3519,14 @@ class _Handler(BaseHTTPRequestHandler):
         }
         listener = _ListenStream(req_id, honored)
 
-        if len(backend._snapshot_listeners()) >= _LISTEN_MAX_STREAMS_PER_CHILD:
-            # ADVISORY under concurrency, and deliberately so: the count
-            # and the attach below are not one atomic step, so N
-            # simultaneous listens can each see N-1 and all attach. That
-            # is acceptable for what the cap is FOR — stopping one client
-            # from pinning unbounded handler threads over time — while a
-            # lock spanning the check, the SSE headers and the ack write
-            # would serialise every listen on that child behind a socket
-            # write.
-            #
+        # The check and the attach are ONE atomic step (#382 review
+        # R1F1): `attach_listener` takes the cap and does both under its
+        # own lock, so a synchronized burst of simultaneous listens
+        # cannot each see a free slot and all squeeze past — the cap is
+        # HARD, not advisory. On success the buffer exists before
+        # anything is written to the socket (see the docstring's
+        # attach-before-ack ordering).
+        if not backend.attach_listener(listener, _LISTEN_MAX_STREAMS_PER_CHILD):
             # Pre-ack rejection, single JSON: -32603 rather than a fresh
             # -32000-range mint (O18).
             self._send_json(
@@ -3519,10 +3538,6 @@ class _Handler(BaseHTTPRequestHandler):
                 ),
             )
             return
-
-        # Attach first (see the docstring): the buffer has to exist before
-        # anything can be published against it.
-        backend.attach_listener(listener)
         # Logged unconditionally: a subscription opening is a fact an
         # operator wants in the log ("who is listening, and to what"),
         # alongside the access line the response itself produces. It is
