@@ -39,6 +39,24 @@ Arguments:
 | `--sse-read-timeout SEC` | 300 | SSE GET ストリームのアイドル読み取りタイムアウト（SSE トランスポートのみ; 0 で無効化） |
 | `--no-tcp-keepalive` | — | HTTP ソケット上の TCP キープアライブを無効化 |
 
+<a id="modern-era-2026-07-28"></a>
+
+### modern era（2026-07-28）
+
+MCP 仕様リビジョン 2026-07-28 は `initialize` ハンドシェイクと
+`Mcp-Session-Id` を、リクエストごとのメタデータに置き換えました。この
+ふたつのフラグがその経路を制御します。ワイヤ上で何が変わるかは
+[プロトコル era](modes.md#protocol-eras) を参照。
+
+| フラグ | デフォルト | 説明 |
+|------|---------|-------------|
+| `--protocol-era {legacy,modern,auto}` | `legacy` | `--transport streamable-http` で話す era。`legacy` は 2026 以前の `initialize` + `Mcp-Session-Id` 経路で、ワイヤ上の挙動は不変。`modern` は 2026-07-28 経路を強制する（ハンドシェイクなし、セッション id なし、リクエストごとの `_meta` と `Mcp-Method`/`Mcp-Name` ヘッダ）。`auto` は起動時に `server/discover` プローブを 1 回だけ実行し——追加リクエスト 1 回ぶんのコストがあるためデフォルトではない——プローブが示す era を採用する。**`--transport sse` の下では無視され**（そちらは常に Streamable HTTP 以前の legacy トランスポート）、警告を出力する |
+| `--listen-read-timeout SEC` | `300` | modern era の長寿命 `subscriptions/listen` POST ストリームのアイドル読み取りタイムアウト。無言の half-open 接続はハングせず `ReadTimeout` を発生させ、自動再接続を促す。`--sse-read-timeout` と違い **`0` は拒否される**——MCP 仕様がクライアントに「常に最大タイムアウトを課す」SHOULD を定めているため。`--protocol-era modern`/`auto` でのみ意味を持ち、`--transport sse` の下では警告なしに無視される |
+
+!!! note "`--check` は modern era を通らない"
+    `--check` は `--protocol-era` を受け取らない専用の接続確認パスを通り、
+    era 判定より前に終了します。modern era の疎通確認には使えません。
+
 ### ヘッダー & プロキシ
 
 | フラグ | 説明 |
@@ -92,7 +110,7 @@ Arguments:
 |--------|---------|------|
 | `--auth-token TOKEN` | `MCP_STDIO_SERVE_TOKEN` | 静的ベアラートークン（OAuth リソースサーバーとして機能；オプション） |
 | `--enable-oauth` | — | 組み込み OAuth 2.1 認可サーバーを有効化（PKCE auth-code、DCR、リフレッシュ） |
-| `--public-url URL` | — | issuer と well-known ドキュメントをピンするパブリック HTTPS URL（リバースプロキシの背後にある場合は必須） |
+| `--public-url URL` | — | issuer と well-known ドキュメントをピンするパブリック HTTPS URL（リバースプロキシの背後では強く推奨。省略しても serve は起動する） |
 | `--trusted-user-header HEADER` | — | 認証済みユーザーを含む HTTP ヘッダー名（フロントプロキシがクライアント提供のコピーをストリップするため信頼） |
 | `--dev-user USER` | — | **非セキュア、テスト用のみ。** 実際の SSO なしでループバックテスト用のスタンドイン user identity |
 | `--access-token-ttl SECONDS` | `3600` | アクセストークンライフタイム（秒） |
@@ -107,6 +125,18 @@ Arguments:
 | `--session-idle-ttl SECONDS` | `0`（無効） | アイドルタイムアウト；非アクティブ後にセッションと子を削除。DELETE なしで接続を切ったクライアントがスロットをピンしない |
 | `--max-sessions-per-owner N` | `0`（無効） | 新しい initialize 時に、その OAuth ユーザーの古いセッションを `N` 件まで LRU で削除し、DELETE せず再接続するクライアントが残したゴーストを回収。static-token と open-gateway のセッションは対象外 |
 
+<a id="modern-era-2026-07-28"></a>
+
+### modern era（2026-07-28）
+
+| フラグ | デフォルト | 説明 |
+|------|---------|-------------|
+| `--cache-ttl-ms MS` | `60000` | modern クライアントに返す cacheable な結果に刻印する `ttlMs`。`0` にすればキャッシュを無効化でき、仕様違反にもならない（仕様が要求するのは `>= 0` のみ）。serve は `ttlMs` を `cacheScope: "private"` と一緒に、リビジョンが cacheable と定める 6 つの操作（`server/discover`、`tools/list`、`prompts/list`、`resources/list`、`resources/templates/list`、`resources/read`）にのみ刻印する——`tools/call` には決して付けない。その結果は cacheable ではないため。legacy era のレスポンスには一切刻印しない |
+
+modern クライアントに応答するために他のフラグは要りません：era は設定では
+なく、クライアント自身のメタデータからリクエストごとに判定されます。
+[プロトコル era](modes.md#protocol-eras) を参照。
+
 ---
 
 ## 標準準拠
@@ -116,6 +146,7 @@ mcp-stdio は以下の仕様を実装しています：
 ### MCP（Model Context Protocol）
 
 - Streamable HTTP トランスポート（現行、spec rev 2025-06-18）— `initialize` でネゴシエートされた `MCP-Protocol-Version` を以後のすべてのリクエストに付与
+- Streamable HTTP transport、仕様リビジョン **2026-07-28** —— `server/discover`、リクエストごとの `_meta` + `Mcp-Method`/`Mcp-Name`、セッションレス dispatch、`resultType` と `ttlMs`/`cacheScope` の結果刻印、`subscriptions/listen`（クライアント側）、MRTR bridge。クライアント側は `--protocol-era` でオプトイン、`serve` はひとつのエンドポイントで両 era に応答する。python-sdk v2.0.0 に対して双方向で相互運用性を検証済み
 - SSE トランスポート（レガシー、MCP 2024-11-05）
 - クライアント ID メタデータドキュメント（MCP 2025-11-25 のドラフト拡張）— 詳細は下記 OAuth セクションを参照
 

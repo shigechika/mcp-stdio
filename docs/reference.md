@@ -39,6 +39,23 @@ Arguments:
 | `--sse-read-timeout SEC` | 300 | Idle read timeout on the SSE GET stream (SSE transport only; 0 disables) |
 | `--no-tcp-keepalive` | — | Disable TCP keepalive on the HTTP socket |
 
+### Modern era (2026-07-28)
+
+MCP spec revision 2026-07-28 replaced the `initialize` handshake and
+`Mcp-Session-Id` with per-request metadata. These two flags control that
+path; see [Protocol eras](modes.md#protocol-eras) for what
+changes on the wire.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--protocol-era {legacy,modern,auto}` | `legacy` | Era to speak over `--transport streamable-http`. `legacy` is the pre-2026 `initialize` + `Mcp-Session-Id` path with unchanged wire behaviour; `modern` forces the 2026-07-28 path (no handshake, no session id, per-request `_meta` and `Mcp-Method`/`Mcp-Name` headers); `auto` runs a one-shot `server/discover` probe at startup — one extra request, which is why it is not the default — and picks whichever era the probe indicates. **Ignored under `--transport sse`** (always the pre-Streamable-HTTP legacy transport), with a warning |
+| `--listen-read-timeout SEC` | `300` | Idle read timeout on the modern era's long-lived `subscriptions/listen` POST stream. A silent half-open connection raises `ReadTimeout` and triggers auto-reconnect instead of hanging. Unlike `--sse-read-timeout`, **`0` is rejected** — the MCP spec says clients SHOULD always enforce a maximum timeout. Only meaningful with `--protocol-era modern`/`auto` ; silently ignored (no warning) under `--transport sse` |
+
+!!! note "`--check` does not exercise the modern era"
+    `--check` runs a dedicated connection probe that takes no
+    `--protocol-era` and exits before the era is resolved, so it cannot be
+    used to verify a modern-era connection.
+
 ### Headers & Proxies
 
 | Flag | Description |
@@ -92,7 +109,7 @@ Arguments:
 |------|----------------------|-------------|
 | `--auth-token TOKEN` | `MCP_STDIO_SERVE_TOKEN` | Static bearer token (acts as OAuth Resource Server; optional) |
 | `--enable-oauth` | — | Enable embedded OAuth 2.1 Authorization Server (PKCE auth-code, DCR, refresh) |
-| `--public-url URL` | — | Public HTTPS URL pinning the issuer and well-known documents (required when behind a reverse proxy) |
+| `--public-url URL` | — | Public HTTPS URL pinning the issuer and well-known documents (strongly recommended behind a reverse proxy; serve still starts without it) |
 | `--trusted-user-header HEADER` | — | HTTP header name containing the authenticated user (trusted only because the fronting proxy strips client-supplied copies) |
 | `--dev-user USER` | — | **Insecure, testing only.** Stand-in user identity for loopback testing without real SSO |
 | `--access-token-ttl SECONDS` | `3600` | Access token lifetime in seconds |
@@ -107,6 +124,16 @@ Arguments:
 | `--session-idle-ttl SECONDS` | `0` (disabled) | Idle timeout; evict a session and its child after this much inactivity so a client that disconnects without DELETE does not pin a slot |
 | `--max-sessions-per-owner N` | `0` (disabled) | On a new initialize, LRU-evict that OAuth user's older sessions down to `N`, reclaiming ghosts left by a client that reconnects without DELETE; static-token and open-gateway sessions are exempt |
 
+### Modern era (2026-07-28)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--cache-ttl-ms MS` | `60000` | `ttlMs` stamped on cacheable results served to a modern client. `0` disables caching without violating the spec, which only requires a value `>= 0`; negative values are rejected. Serve stamps `ttlMs` together with `cacheScope: "private"` on the six operations the revision marks cacheable (`server/discover`, `tools/list`, `prompts/list`, `resources/list`, `resources/templates/list`, `resources/read`) — never on `tools/call`, whose result is not a cacheable one. Legacy-era responses are never stamped |
+
+Serving a modern client needs no other flag: the era is chosen per request
+from the client's own metadata, not configured. See
+[Protocol eras](modes.md#protocol-eras).
+
 ---
 
 ## Standards Conformance
@@ -116,6 +143,7 @@ mcp-stdio implements the following specifications:
 ### MCP (Model Context Protocol)
 
 - Streamable HTTP transport (current, spec rev 2025-06-18) — negotiated `MCP-Protocol-Version` is captured from `initialize` and sent on every subsequent request
+- Streamable HTTP transport, spec rev **2026-07-28** — `server/discover`, per-request `_meta` + `Mcp-Method`/`Mcp-Name`, sessionless dispatch, `resultType` and `ttlMs`/`cacheScope` result stamping, `subscriptions/listen` (client side), and the MRTR bridge. Client side opt-in via `--protocol-era`; `serve` answers both eras on one endpoint. Interoperability verified against python-sdk v2.0.0 in both directions
 - SSE transport (legacy, MCP 2024-11-05)
 - Client ID Metadata Documents (MCP 2025-11-25 draft extension) — see the OAuth section below
 
