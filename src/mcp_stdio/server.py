@@ -3635,12 +3635,12 @@ class _Handler(BaseHTTPRequestHandler):
             # the client blocked on a socket nobody will ever write to
             # again.
             #
-            # NB the legacy GET stream (`do_GET`) has the same shape and
-            # the same omission: its `while not backend.closed` loop can
-            # also end server-side, on child death. Not touched here —
-            # AC2 keeps the legacy path byte-identical in this PR — but
-            # it is a real defect, filed as #383 rather than fixed in
-            # passing.
+            # The legacy GET stream (`do_GET`) had the same shape and the
+            # same omission — its `while not backend.closed` loop also
+            # ends server-side on child death. #382 could not touch it
+            # (AC2 kept the legacy path byte-identical there), so it was
+            # filed as #383 and fixed separately; both sites now carry
+            # this re-assertion.
             self.close_connection = True
             self._write_sse(
                 {
@@ -4199,6 +4199,18 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.send_header("Mcp-Session-Id", self._session_id)
         self.end_headers()
+        # RE-ASSERTED (#383, closing the gap #382 left open — see the
+        # matching comment in `_serve_listen_stream`): the
+        # `send_header("Connection", "keep-alive")` above is a COMMAND,
+        # not a string, and silently reset `close_connection` to False —
+        # undoing the intent stated four lines earlier. This stream is
+        # close-delimited (no Content-Length, not chunked), so the general
+        # rule applies: any close-delimited SSE response that can end
+        # SERVER-side (here: `while not backend.closed`, on child death)
+        # must keep `close_connection` True after `end_headers()`, or a
+        # stream that ends normally leaves the client blocked on a socket
+        # nobody will ever write to again.
+        self.close_connection = True
         q = backend.server_initiated
         keepalive = self.registry.keepalive_interval()
         try:
