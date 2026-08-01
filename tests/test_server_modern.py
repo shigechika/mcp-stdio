@@ -4821,3 +4821,165 @@ def test_a_no_auth_gateway_publishes_no_bridging_context(gateway_with_pool):
         assert backend.mrtr_has_pending() is False
     finally:
         pool.release(entry)
+
+
+class TestMrtrRetryFailurePaths:
+    """After the round is consumed, the child is owed a reply on EVERY exit.
+
+    #390's review found two paths that answered only the client, leaving
+    the subprocess blocked forever — the round was already gone from the
+    table, so nothing else could ever reply to it. Every test here asserts
+    WIRE EVIDENCE that the child got an error for its own id, not merely
+    that the client got one.
+    """
+
+    def _park(self, backend, *, declared=None, round_no=1):
+        """Park a round the way a real mint would, and return its pointer."""
+        txn = backend.mrtr_round_open(
+            "U1",
+            method="tools/call",
+            child_request_id="child-7",
+            declared_caps=declared if declared is not None else {"sampling": {}},
+            # The `gateway_with_pool` fixture is NO-AUTH, so the live
+            # principal is None. The pointer's principal binding compares
+            # against whatever the CURRENT request resolves to, so a round
+            # parked under any other value would be rejected before these
+            # failure paths could be reached at all — which is itself the
+            # binding working, just not what these tests are about.
+            principal=None,
+            round_no=round_no,
+        )
+        return server._mrtr_encode_pointer(txn, None, round_no)
+
+    def _retry(self, url, state, responses="default", meta=None):
+        params = {"_meta": meta if meta is not None else _meta()}
+        params["requestState"] = state
+        if responses != "omit":
+            params["inputResponses"] = (
+                {"child-7": {"result": {"ok": True}}}
+                if responses == "default"
+                else responses
+            )
+        return _post(
+            url,
+            {
+                "jsonrpc": "2.0",
+                "id": "retry-1",
+                "method": "tools/call",
+                "params": params,
+            },
+            _modern_headers("tools/call"),
+        )
+
+    def test_a_stale_pointer_unblocks_the_child_before_erroring(
+        self, gateway_with_pool
+    ):
+        """Finding B, half one. Revert-check: drop the `_fail_retry` call
+        here and the child never hears back."""
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        state = self._park(backend, round_no=1)
+        # Corrupt the parked entry's round so the pointer reads stale.
+        with backend._mrtr_lock:
+            next(iter(backend._mrtr_pending.values()))["round"] = 9
+        sent: list[str] = []
+        backend.send_oneway = lambda line: sent.append(line) or True  # type: ignore
+        resp = self._retry(url, state)
+        assert resp.status_code == 400, resp.text
+        assert "stale" in resp.json()["error"]["message"]
+        assert sent, "the child was never unblocked"
+        assert json.loads(sent[0])["id"] == "child-7"
+        assert "error" in json.loads(sent[0])
+
+    def test_missing_input_responses_unblocks_the_child_before_erroring(
+        self, gateway_with_pool
+    ):
+        """Finding B, half two."""
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        state = self._park(backend)
+        sent: list[str] = []
+        backend.send_oneway = lambda line: sent.append(line) or True  # type: ignore
+        resp = self._retry(url, state, responses="omit")
+        assert resp.status_code == 400, resp.text
+        assert "inputResponses" in resp.json()["error"]["message"]
+        assert sent and json.loads(sent[0])["id"] == "child-7"
+
+    def test_a_lost_claim_aborts_instead_of_resuming_the_child(self, gateway_with_pool):
+        """Finding A, the blocking one.
+
+        Consuming the round leaves the child momentarily unclaimed, and a
+        brand-new eligible request can win the claim in that window.
+        Resuming anyway would put the child back to work while someone
+        else holds the dispatch claim — and a second question would
+        bridge into the wrong context.
+
+        The race is FORCED rather than hoped for: the claim is taken by a
+        stand-in before the retry runs, which is exactly the state the
+        window produces.
+
+        Revert-check: call `resume_request` regardless of `claimed` and
+        this returns 200 with the child resumed.
+        """
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        state = self._park(backend)
+        resumed: list[str] = []
+        backend.resume_request = (  # type: ignore[method-assign]
+            lambda reply, rid, timeout: resumed.append(reply) or None
+        )
+        sent: list[str] = []
+        backend.send_oneway = lambda line: sent.append(line) or True  # type: ignore
+
+        # A concurrent claimant wins the window.
+        def _steal():
+            with backend._mrtr_lock:
+                if not backend._mrtr_pending:
+                    backend._mrtr_inflight = True
+
+        original_consume = backend.mrtr_round_consume
+
+        def _consume_then_steal(txn):
+            out = original_consume(txn)
+            _steal()
+            return out
+
+        backend.mrtr_round_consume = _consume_then_steal  # type: ignore
+        resp = self._retry(url, state)
+
+        assert resp.status_code == 503, resp.text
+        assert "concurrent" in resp.json()["error"]["message"]
+        assert resumed == [], "the child was resumed despite a lost claim"
+        assert sent and json.loads(sent[0])["id"] == "child-7"
+
+    def test_the_next_round_uses_the_retrys_own_capabilities(self, gateway_with_pool):
+        """Finding C. O5 makes `clientCapabilities` PER REQUEST, and the
+        retry is a fresh, separately-validated one — so a second
+        `input_required` mint must gate against what THIS request
+        declared, not what the original did.
+
+        Revert-check: pass `entry["declared_caps"]` and the context shows
+        the original's capabilities instead.
+        """
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        # Original round declared sampling only.
+        state = self._park(backend, declared={"sampling": {}})
+        seen: list[dict] = []
+
+        def _capture(reply, rid, timeout):
+            ctx = backend.mrtr_context()
+            seen.append(dict(ctx) if ctx else {})
+            return json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"ok": True}})
+
+        backend.resume_request = _capture  # type: ignore[method-assign]
+        # The RETRY declares elicitation instead.
+        retry_meta = {**_meta(), META_CAPS: {"elicitation": {}}}
+        resp = self._retry(url, state, meta=retry_meta)
+        assert resp.status_code == 200, resp.text
+        assert seen and seen[0]["declared_caps"] == {"elicitation": {}}, seen
+        assert seen[0]["round"] == 2

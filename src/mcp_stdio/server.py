@@ -1686,8 +1686,10 @@ def _mrtr_request_to_input_entry(msg: dict[str, Any]) -> tuple[str | None, Any]:
     Here the CHILD is the legacy (2025-06-18) side and structurally
     cannot emit either — both are 2025-11-25+ additions. Confirmed
     against the actual fixture set as well as by construction (#375 §4
-    Q6): the only child-initiated request any fixture raises is a bare
-    `elicitation/create`. Adding arms for shapes a legacy child cannot
+    Q6): the fixtures raise a bare `elicitation/create` (the unit fake
+    child's `ask_client`) and a bare `sampling/createMessage` (the
+    integration child's `ask` tool) — neither carries `mode` or `tools`,
+    and neither could. Adding arms for shapes a legacy child cannot
     produce would be dead code pretending to be symmetry.
     """
     method = msg.get("method")
@@ -5017,21 +5019,29 @@ class _Handler(BaseHTTPRequestHandler):
             # neither earns anything louder than an honest error.
             self._send_json(400, _error_body("unknown or expired requestState", req_id))
             return
+        # PAST THIS POINT THE ROUND IS GONE FROM THE TABLE, so nothing
+        # else will ever answer the child's own request id. Every exit
+        # below therefore owes the child a reply as well as the client
+        # one, and `_fail_retry` is the single call that discharges both
+        # — #390's review found two paths that had discharged only the
+        # client's half, leaving the subprocess blocked forever.
+        child_request_id = entry["child_request_id"]
         if entry["round"] != payload["round"] or entry["principal"] != principal:
-            self._send_json(400, _error_body("stale requestState", req_id))
+            self._fail_retry(
+                backend, child_request_id, req_id, "stale requestState", 400
+            )
             return
         responses = params.get("inputResponses")
         if not isinstance(responses, dict) or not responses:
-            self._send_json(
+            self._fail_retry(
+                backend,
+                child_request_id,
+                req_id,
+                "inputResponses is required on a retry",
                 400,
-                _error_body(
-                    "inputResponses is required on a retry",
-                    req_id,
-                    code=_JSONRPC_INVALID_PARAMS,
-                ),
+                code=_JSONRPC_INVALID_PARAMS,
             )
             return
-        child_request_id = entry["child_request_id"]
         # The gateway invented this key from the child's own id, so that
         # is what the client echoes back.
         answer = responses.get(str(child_request_id))
@@ -5044,31 +5054,68 @@ class _Handler(BaseHTTPRequestHandler):
             answer, child_request_id
         )
         if reply_line is None:
-            self._unblock_child(backend, child_request_id, translate_why)
-            self._send_json(
+            self._fail_retry(
+                backend,
+                child_request_id,
+                req_id,
+                translate_why,
                 400,
-                _error_body(translate_why, req_id, code=_JSONRPC_INVALID_PARAMS),
+                code=_JSONRPC_INVALID_PARAMS,
             )
             return
         # The next round, if the child asks again, is this one plus one.
         # Published with the claim so no window exists where a bridge
         # could see a half-built context.
         next_round = int(entry["round"]) + 1
+        # #390 review, finding C: the next round's capabilities come from
+        # THIS retry's own `_meta`, never from the entry. O5 makes
+        # `clientCapabilities` per-request, and the retry IS a fresh,
+        # separately-validated request — carrying the original's forward
+        # would gate a second `input_required` mint against capabilities
+        # this client may no longer (or may newly) declare, wrong in both
+        # directions.
+        retry_meta = params.get("_meta")
+        retry_caps = (
+            retry_meta.get(_META_CLIENT_CAPABILITIES)
+            if isinstance(retry_meta, dict)
+            else None
+        )
         claimed = backend.mrtr_begin_dispatch(
             {
                 "upstream_id": entry["upstream_id"],
-                "declared_caps": entry["declared_caps"],
+                "declared_caps": retry_caps if isinstance(retry_caps, dict) else {},
                 "principal": principal,
                 "round": next_round,
             }
         )
+        if not claimed:
+            # #390 review, finding A. Consuming the round left the child
+            # momentarily unclaimed, and a brand-new eligible request on
+            # another thread can win the claim in that window. Resuming
+            # anyway would put the child back to work while someone else
+            # holds the dispatch claim — and a second question from it
+            # would bridge into the wrong context, which is precisely the
+            # ambiguous correlation the invariant exists to forbid.
+            #
+            # Clean abort, matching §4 Q2's reject-don't-queue posture.
+            # The original call is lost either way (both claimants cannot
+            # win), so it is reported honestly rather than misrouted.
+            self._fail_retry(
+                backend,
+                child_request_id,
+                req_id,
+                "the backend was claimed by a concurrent request; this "
+                "retry could not be delivered",
+                503,
+                code=_JSONRPC_INTERNAL_ERROR,
+            )
+            return
         try:
             line = backend.resume_request(
                 reply_line, entry["upstream_id"], _BACKEND_RESPONSE_TIMEOUT_SECS
             )
         finally:
-            if claimed:
-                backend.mrtr_end_dispatch()
+            backend.mrtr_end_dispatch()
         if line is None:
             self._send_json(
                 504,
@@ -5101,6 +5148,28 @@ class _Handler(BaseHTTPRequestHandler):
             cache_ttl_ms=self.cache_ttl_ms,
         )
         self._send_json(_modern_response_status(parsed), json.dumps(parsed))
+
+    def _fail_retry(
+        self,
+        backend: BackendProcess,
+        child_request_id: Any,
+        req_id: Any,
+        reason: str,
+        status: int,
+        *,
+        code: int = -32000,
+    ) -> None:
+        """Fail a retry after its round was consumed — answering BOTH peers.
+
+        One call, two obligations, deliberately fused (#390 review). Once
+        `mrtr_round_consume` has popped the entry, nothing else can ever
+        reply to the child's own request id, so a path that tells only
+        the client leaves a subprocess blocked forever. Two such paths
+        existed before this helper did; making the pair a single call is
+        what stops a third appearing.
+        """
+        self._unblock_child(backend, child_request_id, reason)
+        self._send_json(status, _error_body(reason, req_id, code=code))
 
     def _unblock_child(
         self, backend: BackendProcess, child_request_id: Any, reason: str
