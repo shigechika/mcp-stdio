@@ -1967,6 +1967,18 @@ class BackendProcess:
         # correlation and eligibility need it.
         self._mrtr_lock = threading.Lock()
         self._mrtr_pending: dict[Any, dict[str, Any]] = {}
+        # IN FLIGHT is not the same state as PARKED, and conflating them
+        # was a real hole (#389 /code-review). A round only becomes
+        # visible in `_mrtr_pending` once the child has actually asked
+        # something; between "an eligible request was forwarded" and
+        # that moment, the table says nothing. Two handler threads for
+        # one principal could therefore both look, both see an empty
+        # table, and both forward — leaving exactly the two-eligible-
+        # calls-on-one-child state the invariant exists to forbid.
+        #
+        # So the claim is taken BEFORE the send and held until the
+        # dispatch returns, under the same lock as the table.
+        self._mrtr_inflight = False
         self._closed = threading.Event()
         self._reader = threading.Thread(
             target=self._read_loop, name="backend-reader", daemon=True
@@ -2375,18 +2387,58 @@ class BackendProcess:
         return None
 
     def mrtr_has_pending(self) -> bool:
-        """Whether any round is parked — the concurrency invariant's read.
+        """Whether any round is currently PARKED on this child.
 
-        #375 §1.2. A pooled child answers several callers, and
-        `send_request` allows several ids in flight on it at once. A bare
-        legacy out-of-band request carries NO field linking it back to
-        whichever call provoked it, so with two eligible calls in flight
-        the correlation is genuinely ambiguous — not hard, ambiguous.
-        The invariant is therefore "at most one MRTR-eligible request in
-        flight per child", enforced rather than assumed.
+        Narrower than the concurrency invariant, deliberately: this
+        answers "is a round waiting for a client retry", which is only
+        half of "may another eligible request be dispatched". Use
+        `mrtr_begin_dispatch` for the latter — reading this alone at a
+        dispatch site is the exact hole #389's review found.
         """
         with self._mrtr_lock:
             return bool(self._mrtr_pending)
+
+    def mrtr_begin_dispatch(self) -> bool:
+        """Claim this child for one MRTR-eligible request, or refuse.
+
+        THE concurrency invariant (#375 §1.2), and it has to be a single
+        atomic check-and-set rather than a read followed by a separate
+        act — the same lesson #382's review taught for the listen-stream
+        cap, where a check-then-attach let a synchronized burst all
+        squeeze past a cap each of them had seen as free.
+
+        Why the invariant exists: a pooled child answers several callers,
+        and `send_request` allows several ids in flight on it at once. A
+        legacy child's out-of-band request carries NO field linking it
+        back to whichever call provoked it, so with two eligible calls
+        outstanding the correlation is genuinely ambiguous — not hard,
+        ambiguous. Guessing would attach a user's prompt to the wrong
+        request.
+
+        REFUSES ON EITHER STATE — a claim already held, or a round
+        already parked. Those are different points in one lifecycle:
+        a request is claimed from just before it is forwarded until its
+        dispatch returns, and if it parked a round on the way then
+        `_mrtr_pending` carries the exclusion onward after the claim is
+        released. Checking both is what makes the handover seamless, so
+        no window opens between the two.
+        """
+        with self._mrtr_lock:
+            if self._mrtr_inflight or self._mrtr_pending:
+                return False
+            self._mrtr_inflight = True
+            return True
+
+    def mrtr_end_dispatch(self) -> None:
+        """Release the claim; idempotent.
+
+        Clears ONLY the in-flight marker. If the dispatch parked a round,
+        `_mrtr_pending` is already populated and keeps excluding new
+        dispatches — which is why this can run unconditionally in a
+        `finally` without reopening the gap.
+        """
+        with self._mrtr_lock:
+            self._mrtr_inflight = False
 
     def mrtr_expire_parked(self, *, now: float | None = None) -> list[dict[str, Any]]:
         """Drop rounds past their park deadline; return what was dropped.
@@ -4815,6 +4867,14 @@ class _Handler(BaseHTTPRequestHandler):
         # permanently unevictable and unreapable. Releasing here rather
         # than at each arm keeps that true for the early returns too —
         # and for anything the never-crash net catches on the way out.
+        #
+        # Initialised BEFORE the try, not at the point it is set: the
+        # `finally` reads it on every exit path, including the arms that
+        # return long before an MRTR claim could be taken (notifications,
+        # listen, discover). Setting it only where it becomes true left
+        # those paths raising `UnboundLocalError` out of the `finally` —
+        # caught immediately by the listen suite's hold test.
+        mrtr_claimed = False
         try:
             # Notifications: forward and acknowledge. The v2 client sends none
             # in the discover flow (no `initialize` means no
@@ -4871,32 +4931,44 @@ class _Handler(BaseHTTPRequestHandler):
                 )
                 return
 
-            # #375 PR 1 §3.4: the one-MRTR-eligible-in-flight-per-child
-            # invariant, wired here and INERT until PR 2.
+            # #375 §3.4: the one-MRTR-eligible-request-per-child
+            # invariant.
             #
-            # Nothing in PR 1 parks a round, so `mrtr_has_pending()` is
-            # always False on every live path and this guard never fires
-            # — which is what keeps this PR to zero observable behaviour
-            # change. PR 2 adds the registration and the guard starts
-            # meaning something, with no further change to this call
-            # site. (Its test seeds the table directly.)
+            # CLAIMED, not merely checked. An earlier version read
+            # `mrtr_has_pending()` here and forwarded if it was False,
+            # which #389's review showed is not the invariant at all:
+            # a round only appears in `_mrtr_pending` once the child has
+            # actually asked something, so two handler threads for one
+            # principal could both read an empty table and both forward.
+            # The claim closes that by being a single atomic
+            # check-and-set — the same shape #382's review required for
+            # the listen-stream cap after a check-then-attach let a
+            # synchronized burst all past it.
             #
-            # REJECT rather than queue (§4 Q2). Queuing would reintroduce
-            # exactly the stall vector D4 exists to prevent, and would
-            # narrow perceived concurrency silently — an explicit busy
-            # error is far easier to diagnose than a request that simply
-            # takes longer for reasons nothing reports.
-            if method in _MRTR_ELIGIBLE_METHODS and backend.mrtr_has_pending():
-                self._send_json(
-                    503,
-                    _error_body(
-                        "this backend is busy with a pending input-required "
-                        "round; retry once it completes",
-                        req_id,
-                        code=_JSONRPC_INTERNAL_ERROR,
-                    ),
-                )
-                return
+            # This is NOT inert, and that is the one deliberate
+            # behavioural difference in PR 1: two genuinely concurrent
+            # eligible calls on one child now get a 503 for the second.
+            # Reaching it requires the same principal AND real overlap,
+            # and it is the state PR 2 could not disambiguate anyway —
+            # shipping the guard late would mean shipping the race.
+            #
+            # REJECT rather than queue (§4 Q2): queuing reintroduces the
+            # stall vector D4 exists to prevent, and narrows perceived
+            # concurrency in a way far harder to diagnose than an error.
+            if method in _MRTR_ELIGIBLE_METHODS:
+                if not backend.mrtr_begin_dispatch():
+                    self._send_json(
+                        503,
+                        _error_body(
+                            "this backend is already handling an "
+                            "input-required-capable request; retry once it "
+                            "completes",
+                            req_id,
+                            code=_JSONRPC_INTERNAL_ERROR,
+                        ),
+                    )
+                    return
+                mrtr_claimed = True
 
             upstream_id = _mint_modern_id()
             outbound = dict(msg)
@@ -4938,6 +5010,14 @@ class _Handler(BaseHTTPRequestHandler):
             )
             self._send_json(_modern_response_status(parsed), json.dumps(parsed))
         finally:
+            if mrtr_claimed:
+                # Unconditional, and safe to be: if this dispatch parked a
+                # round on its way out, `_mrtr_pending` is already
+                # populated and keeps excluding new dispatches after the
+                # claim drops. The two states hand over with no window
+                # between them, which is why `mrtr_begin_dispatch` checks
+                # both.
+                backend.mrtr_end_dispatch()
             self.modern_pool.release(pool_entry)
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API

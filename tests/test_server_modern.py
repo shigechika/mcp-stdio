@@ -4385,3 +4385,144 @@ def test_pr1_opens_no_rounds_on_any_live_path(gateway_with_pool):
         assert backend.mrtr_has_pending() is False
     finally:
         pool.release(entry)
+
+
+class TestMrtrDispatchClaim:
+    """The invariant is a CLAIM, not a read of the parked table.
+
+    #389's review found the difference the hard way: a round only enters
+    `_mrtr_pending` once the child has actually asked something, so
+    between "an eligible request was forwarded" and that moment the table
+    says nothing at all. Two handler threads for one principal could both
+    read it empty and both forward — the exact two-eligible-calls-on-one-
+    child state the invariant exists to forbid.
+    """
+
+    def _backend(self):
+        return server.BackendProcess([*_BACKEND], modern_owned=True)
+
+    def test_only_one_of_many_racing_claims_wins(self):
+        """Barrier-synchronized, because a check-then-act hole only shows
+        up under real simultaneity — the same idiom the pool tests use,
+        and the same lesson #382's review taught for the listen cap.
+
+        Revert-check: split `mrtr_begin_dispatch` into a read followed by
+        a separate set and this reports several winners.
+        """
+        backend = self._backend()
+        try:
+            wins: list[bool] = []
+            lock = threading.Lock()
+            barrier = threading.Barrier(16)
+
+            def _race():
+                barrier.wait()
+                got = backend.mrtr_begin_dispatch()
+                with lock:
+                    wins.append(got)
+
+            threads = [threading.Thread(target=_race) for _ in range(16)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+            assert sum(wins) == 1, wins
+        finally:
+            backend.shutdown()
+
+    def test_the_claim_is_released_and_reusable(self):
+        backend = self._backend()
+        try:
+            assert backend.mrtr_begin_dispatch() is True
+            assert backend.mrtr_begin_dispatch() is False
+            backend.mrtr_end_dispatch()
+            assert backend.mrtr_begin_dispatch() is True
+        finally:
+            backend.shutdown()
+
+    def test_a_parked_round_keeps_excluding_after_the_claim_drops(self):
+        """The handover, and why `mrtr_begin_dispatch` checks BOTH states.
+
+        A dispatch that parks a round returns — dropping its claim — while
+        the round is still outstanding. If the claim were the only gate,
+        that release would reopen the child to a second eligible call
+        with a prompt still pending. `_mrtr_pending` carries the
+        exclusion onward, so no window opens between the two.
+        """
+        backend = self._backend()
+        try:
+            assert backend.mrtr_begin_dispatch() is True
+            txn = backend.mrtr_round_open(
+                "u1",
+                method="tools/call",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+            )
+            backend.mrtr_end_dispatch()  # the dispatch returned
+            assert backend.mrtr_begin_dispatch() is False, (
+                "the parked round stopped excluding once the claim dropped"
+            )
+            backend.mrtr_round_consume(txn)
+            assert backend.mrtr_begin_dispatch() is True
+        finally:
+            backend.shutdown()
+
+    def test_two_concurrent_eligible_calls_race_over_http(self, gateway_with_pool):
+        """The finding's own scenario, end to end.
+
+        Two handler threads, one principal, one child, both dispatching
+        an eligible method with genuine overlap — held open by blocking
+        the child's reply until both are inside. Exactly one must be
+        served; the other gets the busy error.
+
+        Overlap is FORCED rather than hoped for: without the gate the two
+        would simply both succeed, which is the bug, so a test that
+        merely fired two requests and happened not to overlap would pass
+        against the broken code.
+        """
+        url, pool = gateway_with_pool
+        release = threading.Event()
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        original = backend.send_request
+
+        def _blocking(line, req_id, timeout):
+            release.wait(timeout=15)
+            return original(line, req_id, timeout)
+
+        backend.send_request = _blocking  # type: ignore[method-assign]
+        statuses: list[int] = []
+        lock = threading.Lock()
+        started = threading.Barrier(2)
+
+        def _call():
+            started.wait(timeout=10)
+            resp = _post(
+                url,
+                _modern_body(
+                    "tools/call",
+                    params={"name": "echo_tool", "arguments": {}},
+                    meta=_meta(),
+                ),
+                _modern_headers("tools/call", name="echo_tool"),
+            )
+            with lock:
+                statuses.append(resp.status_code)
+
+        threads = [threading.Thread(target=_call, daemon=True) for _ in range(2)]
+        for t in threads:
+            t.start()
+        # Let the loser reach its 503 before unblocking the winner, so the
+        # two genuinely overlap rather than serialising.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            with lock:
+                if statuses:
+                    break
+            time.sleep(0.02)
+        release.set()
+        for t in threads:
+            t.join(timeout=20)
+
+        assert sorted(statuses) == [200, 503], statuses
