@@ -47,6 +47,7 @@ import socket
 import subprocess
 import threading
 import time
+from collections.abc import Iterable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -653,6 +654,7 @@ class _ListenStream:
         "_end_lock",
         "_graceful",
         "overflowed",
+        "torn_down",
     )
 
     def __init__(
@@ -680,6 +682,17 @@ class _ListenStream:
         self._end_lock = threading.Lock()
         self._graceful = False
         self.overflowed = False
+        # #381. Set by the handler's `finally` BEFORE it releases the URI
+        # refs, and read by the background subscribe thread under the same
+        # `_sub_lock` the refs use. That pairing is what makes the two
+        # orderings both correct for a stream that dies before its
+        # subscriptions land: teardown-first leaves this True so the drive
+        # is skipped entirely, and drive-first sees False and subscribes,
+        # with teardown's release then unsubscribing normally. Without it
+        # a client that disconnects immediately after the ack could have
+        # its subscribe arrive AFTER its unsubscribe, leaving the child
+        # subscribed forever with no stream to deliver to.
+        self.torn_down = False
 
     def wants(self, method: str) -> bool:
         flag = next((k for k, v in _LISTEN_FILTER_METHODS.items() if v == method), None)
@@ -1584,6 +1597,25 @@ class BackendProcess:
         # Empty is the steady state and restores the discard behaviour by
         # construction.
         self._listeners: list[Any] = []
+        # #381: resource URI -> how many attached listen streams honored
+        # it. Sited HERE rather than on the pool entry so it dies with the
+        # child: `ModernBackendPool.get_or_create`'s died-child arm drops
+        # the whole `BackendProcess`, and a respawn gets an empty map for
+        # free. No explicit "clear subscriptions on death" step exists on
+        # purpose — object lifetime already guarantees it, and a separate
+        # step is one more thing a future edit can get out of sync.
+        #
+        # ITS OWN LOCK, not `self._lock`. `send_request` takes `_lock`
+        # internally, and this lock is deliberately HELD ACROSS that call
+        # — the one place in this file where a lock spans I/O. That is
+        # what keeps the refcount decision and the resulting
+        # subscribe/unsubscribe in the same order on the wire: releasing
+        # to do the I/O would let two streams racing on one URI invert
+        # them and leave the child subscribed to nothing, or subscribed
+        # forever. Acquisition order is `_sub_lock` -> `_lock`, never the
+        # reverse.
+        self._sub_lock = threading.Lock()
+        self._resource_refs: dict[str, int] = {}
         self._closed = threading.Event()
         self._reader = threading.Thread(
             target=self._read_loop, name="backend-reader", daemon=True
@@ -1748,6 +1780,114 @@ class BackendProcess:
         while a listener's bounded queue is being written."""
         with self._lock:
             return list(self._listeners)
+
+    def add_resource_subscriptions(
+        self, uris: Iterable[str], listen_id: Any, listener: Any = None
+    ) -> None:
+        """Take a reference on each URI, subscribing the child on the first.
+
+        #381 §3.1/§3.3. A modern child is SHARED, so N listen streams can
+        name the same URI; the child must be told once and untold once.
+        The refcount is what makes that true, and it is why the first
+        `add` for a URI drives `resources/subscribe` while later ones only
+        increment.
+
+        Runs on a BACKGROUND thread, after the ack is already on the wire
+        — see `_serve_listen_stream`. Nothing here can delay the ack or
+        the start of pumping, which is the whole point: legacy
+        `resources/subscribe` answers with an empty result carrying no
+        per-URI confirmation, so blocking on it would buy a hang vector
+        and no information.
+
+        ON FAILURE — an error response, or `None` from a timeout or a
+        dead child — the URI KEEPS its reference and stays in the ack's
+        already-sent honored set. There is no unwind: the ack has shipped,
+        a timeout does not say whether the child processed the request,
+        and #374's own precedent is that "a subscription that never fires
+        is still honored". Logged once per URI instead.
+
+        `listener.torn_down` is checked under the SAME lock the refs use,
+        which is what makes a stream that dies before its subscriptions
+        land come out right in both orderings — see that attribute.
+        """
+        with self._sub_lock:
+            if listener is not None and listener.torn_down:
+                # Teardown already ran and found nothing to release.
+                # Taking references now would strand them: the child would
+                # stay subscribed with no stream left to deliver to.
+                return
+            for uri in uris:
+                count = self._resource_refs.get(uri, 0)
+                self._resource_refs[uri] = count + 1
+                if count:
+                    continue
+                if not self._drive_resource_subscription("resources/subscribe", uri):
+                    log(
+                        f"listen {listen_id!r}: the child did not confirm "
+                        f"resources/subscribe for {uri!r}; keeping it honored"
+                    )
+
+    def release_resource_subscriptions(self, uris: Iterable[str]) -> None:
+        """Drop a reference on each URI, unsubscribing on the last.
+
+        The mirror of `add_resource_subscriptions`, called from the listen
+        handler's `finally`. Unsubscribing a child that is already gone is
+        a safe no-op — `send_request` returns `None` immediately once
+        closed — so this needs no liveness check of its own.
+
+        A URI with NO reference is skipped rather than unsubscribed. That
+        is the teardown-before-subscribe ordering (see
+        `_ListenStream.torn_down`): the drive never ran, so there is
+        nothing to undo, and sending an unsubscribe the child never had a
+        subscribe for would be serve inventing traffic.
+        """
+        with self._sub_lock:
+            for uri in uris:
+                count = self._resource_refs.get(uri, 0)
+                if count == 0:
+                    continue
+                if count > 1:
+                    self._resource_refs[uri] = count - 1
+                    continue
+                self._resource_refs.pop(uri, None)
+                self._drive_resource_subscription("resources/unsubscribe", uri)
+
+    def _drive_resource_subscription(self, method: str, uri: str) -> bool:
+        """Send one `resources/subscribe`/`unsubscribe` to the child.
+
+        `_mint_modern_id()` supplies the id, and reusing it is deliberate
+        rather than convenient: it is ALREADY the reserved namespace for
+        requests serve issues on its own behalf (the same minting that
+        keeps forwarded calls from colliding with a concurrent client's
+        ids on this shared child). A fresh scheme here would be a second
+        answer to a question that already has one.
+
+        A REQUEST, not a oneway send: a oneway leaves the child's eventual
+        response with no `_pending` waiter, so it lands in
+        `_queue_server_initiated`'s unsolicited-traffic discard and logs a
+        warning about traffic serve itself asked for.
+
+        Caller holds `_sub_lock`; `send_request` takes `_lock` inside.
+        """
+        req_id = _mint_modern_id()
+        line = self.send_request(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "method": method,
+                    "params": {"uri": uri},
+                }
+            ),
+            req_id,
+            _BACKEND_RESPONSE_TIMEOUT_SECS,
+        )
+        if line is None:
+            return False
+        try:
+            return "error" not in json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            return False
 
     def _route(self, line: str) -> None:
         try:
@@ -3839,6 +3979,19 @@ class _Handler(BaseHTTPRequestHandler):
                     },
                 }
             )
+            # #381 §3.3: AFTER the ack, on a background thread, and the
+            # stream starts pumping without waiting for it. The honored
+            # set was decided locally, so the client already has its
+            # answer; driving the child is bookkeeping that must not be
+            # able to delay — or fail — the stream it belongs to. A
+            # daemon thread so a wedged child cannot hold up shutdown.
+            if resource_uris:
+                threading.Thread(
+                    target=backend.add_resource_subscriptions,
+                    args=(resource_uris, req_id, listener),
+                    name="listen-subscribe",
+                    daemon=True,
+                ).start()
             self._pump_listen_stream(listener, backend)
         except (BrokenPipeError, ConnectionResetError, ValueError, OSError):
             # The client went away. On HTTP "closing the SSE response
@@ -3848,6 +4001,20 @@ class _Handler(BaseHTTPRequestHandler):
             log(f"listen {req_id!r}: client disconnected")
         finally:
             backend.detach_listener(listener)
+            # Ordered BEFORE the release, and read by the background
+            # subscribe thread under the refs' own lock: whichever of the
+            # two runs first, the child ends up with no orphaned
+            # subscription. See `_ListenStream.torn_down`.
+            listener.torn_down = True
+            if resource_uris:
+                try:
+                    backend.release_resource_subscriptions(resource_uris)
+                except Exception as exc:  # noqa: BLE001 — teardown boundary
+                    # This `finally` may already be unwinding from a client
+                    # disconnect or a dead child. Raising here would replace
+                    # the real ending with a bookkeeping error, and the refs
+                    # die with the child anyway.
+                    log(f"listen {req_id!r}: unsubscribe on teardown failed: {exc!r}")
 
     def _write_sse(self, message: dict[str, Any]) -> None:
         self.wfile.write(f"data: {json.dumps(message)}\n\n".encode("utf-8"))

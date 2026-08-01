@@ -3226,3 +3226,175 @@ class TestResourceSubscriptionUnits:
         assert stream.wants_resource_update("RES://A") is False
         assert stream.wants_resource_update(None) is False
         assert stream.wants_resource_update(7) is False
+
+
+class TestResourceSubscriptionRefcounts:
+    """The child is told once and untold once, however many streams ask.
+
+    Every assertion here reads the child's own subscribe/unsubscribe call
+    log. Absence-of-updates would pass just as happily when routing is
+    broken or the feature is missing entirely, which is the vacuous
+    observation this project keeps catching; a call log distinguishes
+    "nothing was sent" from "nothing happened".
+    """
+
+    def _wait_calls(self, url, count, timeout=10.0):
+        """The child's call log once it has at least `count` entries.
+
+        Driving is asynchronous by design, so the log is polled to a bound
+        rather than read once — but the assertion is still on the exact
+        contents, never on "at least something arrived".
+        """
+        deadline = time.monotonic() + timeout
+        calls: list = []
+        while time.monotonic() < deadline:
+            calls = _subscribe_calls(url)
+            if len(calls) >= count:
+                return calls
+            time.sleep(0.02)
+        return calls
+
+    def test_the_full_lifecycle_across_two_streams(self, gateway):
+        """§3.10's sequence, end to end: subscribe once, dedup, fan out,
+        no early unsubscribe, unsubscribe exactly once at zero."""
+        uri = "res://shared"
+        first = _Listener(
+            gateway, _listen_body("a", notifications={RESOURCE_FIELD: [uri]})
+        )
+        second = _Listener(
+            gateway, _listen_body("b", notifications={RESOURCE_FIELD: [uri]})
+        )
+
+        with first:
+            first.wait_frames(1)
+            # (2) exactly one subscribe reached the child.
+            assert self._wait_calls(gateway, 1) == [["resources/subscribe", uri]]
+
+            with second:
+                second.wait_frames(1)
+                # (3) STILL exactly one: the second stream deduped. A
+                # positive count, not "no new call was detected".
+                time.sleep(0.3)
+                assert _subscribe_calls(gateway) == [["resources/subscribe", uri]]
+
+                # (4) one update, both streams, each with its own stamp.
+                _fire_resource_update(gateway, uri)
+                a_event = first.wait_frames(2)[1]
+                b_event = second.wait_frames(2)[1]
+                assert a_event["params"]["_meta"][SUBSCRIPTION_ID] == "a"
+                assert b_event["params"]["_meta"][SUBSCRIPTION_ID] == "b"
+
+            # (5)/(6) second stream gone, refcount 1: no unsubscribe yet,
+            # and the survivor still receives.
+            time.sleep(0.3)
+            assert _subscribe_calls(gateway) == [["resources/subscribe", uri]]
+            _fire_resource_update(gateway, uri)
+            assert first.wait_frames(3)[2]["params"]["uri"] == uri
+
+        # (7) last stream gone -> exactly one unsubscribe.
+        calls = self._wait_calls(gateway, 2)
+        assert calls == [
+            ["resources/subscribe", uri],
+            ["resources/unsubscribe", uri],
+        ], calls
+
+    def test_distinct_uris_are_refcounted_independently(self, gateway):
+        with _Listener(
+            gateway,
+            _listen_body(notifications={RESOURCE_FIELD: ["res://x", "res://y"]}),
+        ) as ln:
+            ln.wait_frames(1)
+            calls = self._wait_calls(gateway, 2)
+        assert calls[:2] == [
+            ["resources/subscribe", "res://x"],
+            ["resources/subscribe", "res://y"],
+        ]
+        after = self._wait_calls(gateway, 4)
+        assert sorted(c[1] for c in after if c[0] == "resources/unsubscribe") == [
+            "res://x",
+            "res://y",
+        ]
+
+    def test_an_abrupt_disconnect_still_unsubscribes(self, gateway):
+        """Companion to the clean-detach path (§3.10 item 8): the same
+        zero-refcount unsubscribe must fire when the client vanishes
+        rather than closing politely."""
+        uri = "res://abrupt"
+        ln = _Listener(gateway, _listen_body(notifications={RESOURCE_FIELD: [uri]}))
+        with ln:
+            ln.wait_frames(1)
+            assert self._wait_calls(gateway, 1) == [["resources/subscribe", uri]]
+        calls = self._wait_calls(gateway, 2)
+        assert ["resources/unsubscribe", uri] in calls, calls
+
+    def test_a_failing_subscribe_keeps_the_uri_honored(self, gateway, monkeypatch):
+        """Reply-then-degrade: the ack has already shipped, and a timeout
+        does not say whether the child processed the request. The URI
+        keeps its refcount so the matching unsubscribe still fires."""
+        monkeypatch.setattr(server, "_BACKEND_RESPONSE_TIMEOUT_SECS", 0.3)
+        uri = "res://noreply"
+        # `noreply` is the fake child's documented silent method; routing
+        # the subscribe at it makes the drive time out for real.
+        original = server.BackendProcess._drive_resource_subscription
+
+        def _timing_out(self, method, u):
+            if method == "resources/subscribe":
+                return False
+            return original(self, method, u)
+
+        monkeypatch.setattr(
+            server.BackendProcess, "_drive_resource_subscription", _timing_out
+        )
+        with _Listener(
+            gateway, _listen_body(notifications={RESOURCE_FIELD: [uri]})
+        ) as ln:
+            ack = ln.wait_frames(1)[0]
+            # Still honored in the ack despite the failed drive.
+            assert ack["params"]["notifications"][RESOURCE_FIELD] == [uri]
+            _fire_resource_update(gateway, uri)
+            # And still ROUTED — honoring is what routing reads, not
+            # whether the child confirmed.
+            assert ln.wait_frames(2)[1]["params"]["uri"] == uri
+
+    def test_the_refs_die_with_the_child(self, gateway):
+        """No explicit clear-on-death step exists, deliberately: the map
+        lives on the `BackendProcess`, so a respawn gets an empty one for
+        free. Pinned so a future edit cannot quietly add a second source
+        of truth."""
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            backend.add_resource_subscriptions(["res://a"], "l1")
+            assert backend._resource_refs == {"res://a": 1}
+        finally:
+            backend.shutdown()
+        # A fresh child starts clean — the state is object-scoped.
+        replacement = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            assert replacement._resource_refs == {}
+        finally:
+            replacement.shutdown()
+
+
+def test_a_stream_torn_down_before_its_subscribe_lands_leaves_nothing_behind():
+    """The ordering race between the async drive and the sync release.
+
+    Driving is asynchronous, so a client that disconnects immediately
+    after the ack can have its teardown run BEFORE its subscribe. Without
+    the `torn_down` handshake the two invert: release finds no reference
+    and does nothing, then the drive subscribes — and the child stays
+    subscribed forever with no stream to deliver to.
+
+    Revert-check: drop the `torn_down` guard from
+    `add_resource_subscriptions` and this leaves `res://late` refcounted
+    with a live subscribe on the child.
+    """
+    backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+    try:
+        listener = server._ListenStream("late", {}, frozenset({"res://late"}))
+        # Teardown wins the race.
+        listener.torn_down = True
+        backend.release_resource_subscriptions(["res://late"])
+        backend.add_resource_subscriptions(["res://late"], "late", listener)
+        assert backend._resource_refs == {}
+    finally:
+        backend.shutdown()
