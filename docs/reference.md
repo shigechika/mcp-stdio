@@ -51,9 +51,12 @@ spec. See [Working with MCP 2026-07-28 servers](modes.md#protocol-eras).
 | `--protocol-era {legacy,modern,auto}` | `legacy` | How to talk to the remote server. `legacy` behaves exactly as before; `auto` asks the server once at startup and picks for you; `modern` skips the question when you already know it is a newer server. Ignored (with a warning) on `--transport sse` |
 | `--listen-read-timeout SEC` | `300` | How long to wait on a quiet notification connection before reconnecting. Only used against newer servers. Unlike `--sse-read-timeout`, `0` is not allowed — the connection always needs a timeout. Silently ignored on `--transport sse` |
 
-!!! note "`--check` does not test this"
-    `--check` uses its own simple connection probe and never negotiates
-    the newer protocol, so it cannot confirm that side works.
+!!! note "What `--check` does and does not cover"
+    `--check` confirms the server is reachable either way — if the older
+    handshake is refused it retries the way a newer server expects, so a
+    newer-only server still reports ✓. It is a connectivity check, though:
+    it does not exercise the rest of the newer behaviour, such as the
+    long-lived notification connection.
 
 
 ### Headers & Proxies

@@ -38,8 +38,9 @@ mcp-stdio serve --enable-oauth \
   -- python -m my_mcp_server
 ```
 
-- `--public-url` pins the OAuth issuer to your public address (required
-  behind a proxy).
+- `--public-url` pins the OAuth issuer to your public address (strongly
+  recommended behind a proxy — it starts without one, but clients then
+  see the internal address).
 - `--trusted-user-header` names the header your proxy sets **and strips
   from client requests** — that stripping is what makes it trustworthy.
 - `--token-store` persists issued tokens, registrations, and replay
