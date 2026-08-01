@@ -201,6 +201,28 @@ _LISTEN_FORWARDED_METHODS = frozenset(_LISTEN_FILTER_METHODS.values())
 _RESOURCE_UPDATED_METHOD = "notifications/resources/updated"
 _LISTEN_RESOURCE_FIELD = "resourceSubscriptions"
 
+# O16 (#270) is CLOSED BY CONSTRUCTION, and this comment is the whole
+# implementation (#381 §3.7). The open question was whether serve needs a
+# `io.modelcontextprotocol/logLevel` gate before emitting
+# `notifications/message`. It does not, on three independent grounds:
+#
+# 1. Suppression on this stream is a hard MUST NOT — "notifications/
+#    message is request-scoped: the server MUST NOT deliver it on a
+#    subscriptions/listen stream" — and the sets above are a WHITELIST.
+#    That method is not a member and never becomes one, so the rule
+#    holds without any runtime check to forget or get wrong.
+# 2. There is no other streaming channel on serve's modern face for it
+#    to attach to even if one were wanted: modern requests are answered
+#    as single JSON objects, and the legacy GET SSE stream carries no
+#    per-request `_meta` to read a log level out of.
+# 3. Nothing obliges a server to declare `logging` or to emit
+#    `notifications/message` at all, and SEP-2577 DEPRECATED the feature
+#    in 2026-07-28 ("New implementations SHOULD NOT adopt it"), so a
+#    permanent decline is fully spec-legal rather than a shortfall.
+#
+# Revisit only if some future change introduces a genuinely new
+# server->client streaming channel (#375's reverse-MRTR bridge is the
+# only candidate). The legacy GET SSE path is untouched and out of scope.
 _LISTEN_METHOD = "subscriptions/listen"
 _LISTEN_ACK_METHOD = "notifications/subscriptions/acknowledged"
 
@@ -4099,6 +4121,18 @@ class _Handler(BaseHTTPRequestHandler):
         it would turn every graceful teardown into a failure at a
         compliant peer. (This supersedes the "emit both signals" reading
         recorded against O17 on #270.)
+
+        RECORDED SO IT IS NOT REDISCOVERED (#381 §4 Q4): the spec is not
+        self-consistent here. The subscriptions page describes the empty
+        result as the graceful-close signal, which is what this code
+        emits; the cancellation page is read as requiring
+        `notifications/cancelled`. The two cannot both be satisfied
+        toward a compliant peer, because the reference client treats that
+        message as LOST. This resolution therefore favours SDK
+        compatibility over one page's literal reading — a deliberate
+        spec-vs-spec conflict resolution, not a corrected misreading, and
+        worth filing upstream rather than quietly re-deciding next time
+        someone reads the cancellation page.
         """
         last_keepalive = time.monotonic()
         while True:

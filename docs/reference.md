@@ -142,14 +142,17 @@ and (if you want) drop older clients entirely.
 | `--modern-only` | off | Serve **only** newer clients. Older ones are turned away instead of being given a session: `GET` and `DELETE` answer `405`, and an older client's `initialize` gets an error naming the version this endpoint does serve. OAuth discovery endpoints keep working, so login still bootstraps |
 
 Newer clients can also open a long-lived connection to hear when your
-server's tool, prompt or resource lists change — see
+server's tool, prompt or resource lists change, or when a specific
+resource they named is updated — see
 [Telling clients your lists changed](modes.md#listchanged-serve).
-There is no flag for it. A client may hold up to **four** such
+There is no flag for either. A client may hold up to **four** such
 connections per backend — with `--enable-oauth`, that means per
 authenticated user. Without auth, or with a shared `--auth-token`,
 every client shares one backend, so the four connections are a
 gateway-wide total: a fifth connection from any client is refused
-rather than queued. Each one sends a comment every 15 seconds so
+rather than queued. Each connection may watch up to **256** individual
+resource URIs; beyond that the extras are dropped and the client is told
+which ones it actually got. Each one sends a comment every 15 seconds so
 proxies do not time it out, and a backend with a connection attached is
 never reclaimed by `--modern-idle-ttl`.
 
@@ -167,7 +170,7 @@ mcp-stdio implements the following specifications:
 ### MCP (Model Context Protocol)
 
 - Streamable HTTP transport (current, spec rev 2025-06-18) — negotiated `MCP-Protocol-Version` is captured from `initialize` and sent on every subsequent request
-- Streamable HTTP transport, spec rev **2026-07-28** — capability discovery, per-request metadata and headers, session-less requests, cache hints on list results, the long-lived notification connection (both as a client and, for the listChanged notifications, in `serve`), and mid-call requests back to the client. Opt in with `--protocol-era`; `serve` answers both revisions on one endpoint. Interoperability verified against python-sdk v2.0.0 in both directions
+- Streamable HTTP transport, spec rev **2026-07-28** — capability discovery, per-request metadata and headers, session-less requests, cache hints on list results, the long-lived notification connection (both as a client and, in `serve`, for the listChanged trio and per-URI resource subscriptions), and mid-call requests back to the client. Opt in with `--protocol-era`; `serve` answers both revisions on one endpoint. Interoperability verified against python-sdk v2.0.0 in both directions
 - SSE transport (legacy, MCP 2024-11-05)
 - Client ID Metadata Documents (MCP 2025-11-25 draft extension) — see the OAuth section below
 

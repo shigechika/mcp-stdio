@@ -190,13 +190,14 @@ mcp-stdio pushes your server's announcements down it as they happen —
 your stdio server keeps sending the same notifications it always did, and
 nothing about it changes.
 
-Three announcements travel this way:
+Four announcements travel this way:
 
 | What your server sends | What the client does |
 |---|---|
 | `notifications/tools/list_changed` | re-fetches your tool list |
 | `notifications/prompts/list_changed` | re-fetches your prompt list |
 | `notifications/resources/list_changed` | re-fetches your resource list |
+| `notifications/resources/updated` | re-reads that one resource |
 
 A client asks for the ones it cares about and gets only those. It may
 keep up to four such connections open at once; a fifth is refused rather
@@ -207,11 +208,40 @@ not try to reconnect. If your server process dies instead, the stream
 just drops — which tells the client to reconnect and re-fetch, because
 mcp-stdio itself is still there.
 
-!!! note "Not yet supported"
-    Watching a **single resource** for changes (`resources/subscribe`)
-    does not work yet — a client that asks is told so, and mcp-stdio does
-    not advertise the capability. Planned in
-    [#381](https://github.com/shigechika/mcp-stdio/issues/381).
+#### Watching individual resources
+
+The last row works a little differently, because the client names
+*which* resources it wants to watch rather than just switching a
+notification on.
+
+**Your server needs to declare `resources.subscribe`.** If it does,
+mcp-stdio subscribes on the client's behalf — it sends your server the
+ordinary `resources/subscribe` it already understands, and forwards the
+resulting `notifications/resources/updated` to whichever clients asked
+for that URI. If your server does *not* declare it, mcp-stdio says so
+in its reply and never sends a subscription your server cannot serve.
+
+Worth knowing:
+
+- **Your server is told once per resource, however many clients are
+  watching it.** mcp-stdio counts the watchers and unsubscribes only
+  when the last one goes away.
+- **URIs are matched exactly.** `file:///a` and `file:///a/` are two
+  different subscriptions, because there is no way to ask your server
+  which spelling it means.
+- **Up to 256 resources per connection.** Ask for more and mcp-stdio
+  keeps the first 256 and tells the client exactly which ones it got.
+- **The reply does not wait for your server.** mcp-stdio answers the
+  client immediately and subscribes in the background, so a slow server
+  cannot stall the connection. The trade-off is that a subscription your
+  server rejects is logged rather than reported back — the client is
+  told it is watching, and simply never sees an update.
+
+!!! note "Not supported: log messages"
+    mcp-stdio never sends `notifications/message` on these connections.
+    The spec forbids it there, and the logging feature is deprecated as
+    of MCP 2026-07-28, so this is a permanent decision rather than a
+    gap.
 
 ## Both at once
 
