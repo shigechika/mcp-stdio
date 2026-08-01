@@ -462,10 +462,23 @@ class ModernBackendPool:
     unrelated principal behind it.
     """
 
-    def __init__(self, command: list[str], *, max_children: int = 0) -> None:
+    def __init__(
+        self,
+        command: list[str],
+        *,
+        max_children: int = 0,
+        idle_ttl: float = 0.0,
+        now: Any = time.monotonic,
+    ) -> None:
         if not command:
             raise ValueError("backend command is empty")
         self._command = command
+        # `now` is injectable so the reaper's TTL arithmetic can be driven
+        # by a fake clock in tests, the way `SessionRegistry` already is.
+        self._now = now
+        self._idle_ttl = idle_ttl
+        self._reaper: threading.Thread | None = None
+        self._reaper_stop = threading.Event()
         self._lock = threading.Lock()
         # principal -> entry. An entry is either READY (`backend` set) or
         # PENDING (a placeholder another thread is filling, `event` unset).
@@ -480,7 +493,83 @@ class ModernBackendPool:
             self._seq += 1
             return f"{_SERVE_ID_NAMESPACE}init/{self._seq}"
 
-    def _evict_if_at_cap_locked(self) -> None:
+    def _reapable_locked(self, entry: dict[str, Any]) -> bool:
+        """READY, quiet and unheld — the only entries anything may drop.
+
+        #376 §2.3. ONE predicate shared by cap-eviction and the idle
+        reaper, because two copies of this rule would drift and the
+        consequences differ only in which of them kills a live request.
+
+        The three conditions, and why each is separate:
+
+        - a PENDING placeholder has no backend yet. Dropping it detaches
+          the entry the spawning thread is about to fill, and that child
+          then belongs to nobody — `shutdown_all` cannot reach it, so the
+          cap would leak processes rather than bound them.
+        - `has_pending` is work already on the wire. Killing it fails an
+          ordinary request to make room for one that has not started.
+        - `holds` is a handler that has CHECKED THE CHILD OUT but has not
+          sent yet (#376 §3.1). `has_pending` alone does not cover it:
+          `get_or_create` returns with the pool lock released, and the
+          request only becomes pending later, inside the backend's own
+          lock. In that window the child looks perfectly idle.
+
+        `holds` is also the seam #374 plugs into: a listen stream takes a
+        hold for as long as it is subscribed, so a subscribed child is
+        never reaped no matter how old its `used` timestamp is — which is
+        exactly why this is a refcount and not another timestamp.
+        """
+        backend = entry.get("backend")
+        return (
+            backend is not None
+            and not backend.has_pending
+            and entry.get("holds", 0) == 0
+        )
+
+    def release(self, entry: dict[str, Any]) -> None:
+        """Give back a checkout taken by `get_or_create` (#376 §3.1).
+
+        Decrements on the entry dict the caller was handed, not on
+        whatever `_entries` holds now: if the entry was replaced or
+        reaped meanwhile, the decrement lands on an object nobody
+        consults again, which is inert and exactly what we want. Chasing
+        identity here would buy nothing and could double-decrement a
+        successor.
+
+        RE-SWEEPS the cap when this release leaves the pool over it
+        (#379 review, /code-review score 100). A spawn race under
+        `max_children` — two principals' FIRST requests each insert a
+        PENDING placeholder before either publishes — can settle the
+        pool ABOVE the cap: neither publish-time sweep (#376 §3.2) can
+        evict the other, still PENDING or still held. This release is
+        the THIRD moment (after the pre-insert check and the post-spawn
+        re-check) a child can become evictable — the instant a handler
+        that was holding it lets go — and without a sweep here that
+        overshoot is PERMANENT in a fixed-principal deployment: no new
+        principal ever arrives to trigger the pre-insert check, and the
+        idle reaper does not save it at the default `--modern-idle-ttl
+        0`. Gated on actually being over cap so the common path (pool
+        within cap) costs a single integer compare, never a scan.
+
+        The sweep is allowed to pick THIS entry, the one just released —
+        there is no "exclude myself" special case, unlike the post-spawn
+        re-check's (that one excludes itself for free, since its own
+        hold is still 1 when it runs). Excluding the just-released entry
+        here would look safer but is not: a principal holding a
+        long-lived subscription (#374's hold seam) would then pin an
+        overshoot forever, since its release is the only event left that
+        could ever trim it.
+        """
+        with self._lock:
+            entry["holds"] = max(0, entry.get("holds", 0) - 1)
+            if (
+                entry["holds"] == 0
+                and self._max_children > 0
+                and len(self._entries) > self._max_children
+            ):
+                self._evict_if_at_cap_locked(reserve=0)
+
+    def _evict_if_at_cap_locked(self, *, reserve: int = 1) -> None:
         """Make room by dropping the idlest child (§4 Q3).
 
         Evicting beats refusing here in a way it does not for legacy
@@ -493,7 +582,13 @@ class ModernBackendPool:
         """
         if self._max_children <= 0:
             return
-        while len(self._entries) >= self._max_children:
+        # `reserve` is how many slots the caller still needs. The
+        # PRE-insert callers need one (the entry they are about to add),
+        # which is the default and the original behaviour. The post-spawn
+        # re-check (#376 §3.2) has ALREADY inserted, so it needs none —
+        # passing `reserve=1` there would evict a child every time the
+        # pool merely reached the cap, rather than exceeded it.
+        while len(self._entries) + reserve > self._max_children:
             # ONLY a ready, quiet child may be evicted (review R1F1):
             #
             # - a PENDING entry (another thread mid-spawn) has no backend
@@ -515,7 +610,7 @@ class ModernBackendPool:
             evictable = [
                 (key, entry)
                 for key, entry in self._entries.items()
-                if entry.get("backend") is not None and not entry["backend"].has_pending
+                if self._reapable_locked(entry)
             ]
             if not evictable:
                 log(
@@ -528,8 +623,16 @@ class ModernBackendPool:
             log(f"modern pool at cap; evicting the idlest child for {key!r}")
             threading.Thread(target=entry["backend"].shutdown, daemon=True).start()
 
-    def get_or_create(self, principal: Any) -> tuple[BackendProcess, dict[str, Any]]:
-        """The child for ``principal``, plus its cached InitializeResult.
+    def get_or_create(
+        self, principal: Any
+    ) -> tuple[BackendProcess, dict[str, Any], dict[str, Any]]:
+        """The child for ``principal``, its InitializeResult, and its entry.
+
+        THE RETURNED CHILD IS CHECKED OUT: the entry's `holds` refcount is
+        incremented before this returns, and the caller MUST hand it back
+        with `release(entry)` — a try/finally, since a leaked hold makes
+        that child permanently unevictable and unreapable. The entry is
+        returned for exactly that purpose (#376 §3.1).
 
         Raises ``RuntimeError`` when the child cannot be spawned or does
         not complete the handshake; the caller turns that into a JSON-RPC
@@ -540,15 +643,25 @@ class ModernBackendPool:
                 entry = self._entries.get(principal)
                 if entry is None:
                     self._evict_if_at_cap_locked()
-                    entry = {"event": threading.Event(), "backend": None, "error": None}
+                    entry = {
+                        "event": threading.Event(),
+                        "backend": None,
+                        "error": None,
+                        # Checkout refcount (#376 §3.1). Non-zero means a
+                        # handler is holding this child right now, which
+                        # makes it untouchable by eviction and by the
+                        # reaper — see `_reapable_locked`.
+                        "holds": 0,
+                    }
                     self._entries[principal] = entry
                     mine = True
                 else:
                     mine = False
                     backend = entry.get("backend")
                     if backend is not None and not backend.closed:
-                        entry["used"] = time.monotonic()
-                        return backend, entry["init_result"]
+                        entry["used"] = self._now()
+                        entry["holds"] = entry.get("holds", 0) + 1
+                        return backend, entry["init_result"], entry
                     if backend is not None:
                         # Child died. Reap it, then drop the entry and loop
                         # to respawn — the mirror of the legacy path's
@@ -573,8 +686,9 @@ class ModernBackendPool:
                 if entry.get("backend") is not None and entry.get("error") is None:
                     with self._lock:
                         if self._entries.get(principal) is entry:
-                            entry["used"] = time.monotonic()
-                            return entry["backend"], entry["init_result"]
+                            entry["used"] = self._now()
+                            entry["holds"] = entry.get("holds", 0) + 1
+                            return entry["backend"], entry["init_result"], entry
                     continue
                 raise RuntimeError(entry.get("error") or "backend handshake failed")
             try:
@@ -586,11 +700,157 @@ class ModernBackendPool:
                 entry["error"] = str(exc)
                 entry["event"].set()
                 raise RuntimeError(str(exc)) from exc
-            entry["backend"] = backend
-            entry["init_result"] = init_result
-            entry["used"] = time.monotonic()
+            # PUBLICATION IS ATOMIC (#379 review R1F1). Backend, `used`
+            # and the initial hold all land in ONE lock hold, because any
+            # gap between them is a window where the entry looks READY,
+            # quiet and unheld — exactly what `_reapable_locked` accepts.
+            #
+            # The sharp version: `backend` used to be assigned before
+            # `used`, so a reaper landing in between read
+            # `entry.get("used", 0.0)` and saw a child that was
+            # apparently idle since the epoch. It would pop and shut down
+            # a backend this call was about to return, and the caller's
+            # first request then failed with a 504 against a corpse.
+            # Taking the hold last does not help if the publication
+            # itself is visible first.
+            with self._lock:
+                entry["backend"] = backend
+                entry["init_result"] = init_result
+                entry["used"] = self._now()
+                entry["holds"] = entry.get("holds", 0) + 1
+                # Re-bound the cap after the spawn race (#376 §3.2).
+                # Racing first-requests each insert a PENDING placeholder
+                # under the lock, and a placeholder is not evictable — so
+                # once the ready-quiet victims run out, every racer logs
+                # "exceeding the cap" and inserts anyway. Nothing
+                # re-bounded that afterwards: the overshoot persisted
+                # until the next NEW principal arrived, which in a
+                # two-principal deployment is never.
+                #
+                # Re-checking here reclaims children that went quiet
+                # while we were spawning. It is safe ONLY because the
+                # hold above is already taken: the newborn this call is
+                # about to return has `holds == 1`, so the sweep cannot
+                # choose it — no "exclude my own key" special case
+                # needed. That ordering is the reason this commit follows
+                # the refcount one.
+                #
+                # If nothing qualifies the cap stays soft-exceeded, which
+                # is the documented posture: every alternative kills work
+                # already in flight. The reaper makes that exceedance
+                # time-bounded rather than permanent.
+                #
+                # `reserve=0`: this entry is already IN the map, so the
+                # sweep must trim down to the cap, not below it.
+                #
+                # Since `release()` grew its own sweep (#379 review), this
+                # one is defense-in-depth rather than the sole backstop:
+                # it only still matters for a sequence where some entry
+                # became reapable with NO intervening release call to
+                # have already caught it. We could not construct such a
+                # sequence, but do not claim one is impossible — the cost
+                # here is one locked check per spawn, not per request, so
+                # it stays.
+                self._evict_if_at_cap_locked(reserve=0)
             entry["event"].set()
-            return backend, init_result
+            return backend, init_result, entry
+
+    def reap_idle(self) -> int:
+        """Drop children idle past the TTL — or already dead — and return the count.
+
+        #376 §2.3. Two independent reasons to drop, and only one of them
+        is about time:
+
+        - `backend.closed`: reaped UNCONDITIONALLY, TTL or not, mirroring
+          the legacy reaper. Without it a dead child belonging to a
+          principal who never comes back pins a map slot and an unwaited
+          zombie for the life of the process — the lazy cleanup in
+          `get_or_create` only fires on that principal's NEXT request.
+        - idle past the TTL, and `_reapable_locked` — so a child with a
+          request on the wire, or one checked out but not yet sending, or
+          a PENDING placeholder, is never taken. `used` is last-ACQUIRED
+          time, which is why the refcount rather than the timestamp is
+          what protects a long-lived hold (#374's seam).
+
+        Selection and removal happen in ONE lock hold, so a concurrent
+        re-acquire either lands first (refreshing `used`, so we skip it)
+        or after the pop (finding nothing, and respawning cleanly).
+
+        Shutdown then happens OUTSIDE the lock, and deliberately
+        DIFFERENTLY from the legacy reaper's synchronous call: a live
+        victim is torn down on a daemon thread, because `shutdown()`
+        waits up to 5 s for a child to terminate and one wedged child
+        would otherwise stall the whole sweep and delay the next tick. A
+        child that is already `closed` is shut down directly — `poll()`
+        sees it dead and returns at once, so a thread would be pure
+        overhead.
+        """
+        ttl = self._idle_ttl
+        now = self._now()
+        dead: list[tuple[Any, BackendProcess]] = []
+        idle: list[tuple[Any, BackendProcess]] = []
+        with self._lock:
+            for key, entry in list(self._entries.items()):
+                backend = entry.get("backend")
+                if backend is None:
+                    continue
+                if backend.closed:
+                    self._entries.pop(key, None)
+                    dead.append((key, backend))
+                    continue
+                if (
+                    ttl > 0
+                    and now - entry.get("used", 0.0) > ttl
+                    and self._reapable_locked(entry)
+                ):
+                    self._entries.pop(key, None)
+                    idle.append((key, backend))
+        for key, backend in dead:
+            backend.shutdown()
+            log(f"reaped dead modern child for {key!r}")
+        for key, backend in idle:
+            log(f"reaped idle modern child for {key!r}")
+            threading.Thread(target=backend.shutdown, daemon=True).start()
+        return len(dead) + len(idle)
+
+    def start_reaper(self) -> None:
+        """Start the idle-eviction thread (no-op when the TTL is disabled).
+
+        A thread of its own rather than a tick on the legacy session
+        reaper: that one does not exist when `--session-idle-ttl` is 0,
+        and coupling the pool into `SessionRegistry` to borrow it would
+        buy nothing.
+        """
+        if self._idle_ttl <= 0 or self._reaper is not None:
+            return
+        interval = max(1.0, min(self._idle_ttl, _MAX_REAP_INTERVAL_SECS))
+        # A FRESH stop event per thread (#379 Copilot review), not a
+        # shared one cleared on restart: `stop_reaper` does not join —
+        # the thread is a daemon parked in `wait(interval)` — so a
+        # restart that CLEARED a shared event could un-stop a predecessor
+        # that had not yet observed the set, leaving two reapers sweeping
+        # the same pool. Each loop closes over the event it was born
+        # with, so a stop is permanent for that thread whatever happens
+        # afterwards.
+        stop = threading.Event()
+        self._reaper_stop = stop
+
+        def _loop() -> None:
+            while not stop.wait(interval):
+                try:
+                    self.reap_idle()
+                except Exception as e:  # pragma: no cover - defensive
+                    log(f"modern pool reaper error: {e}")
+
+        self._reaper = threading.Thread(
+            target=_loop, name="modern-pool-reaper", daemon=True
+        )
+        self._reaper.start()
+
+    def stop_reaper(self) -> None:
+        """Signal the reaper thread to exit; it is a daemon, so no join."""
+        self._reaper_stop.set()
+        self._reaper = None
 
     def _spawn_and_handshake(self) -> tuple[BackendProcess, dict[str, Any]]:
         """Spawn a child and drive the handshake the modern wire omits."""
@@ -632,6 +892,12 @@ class ModernBackendPool:
             raise
 
     def shutdown_all(self) -> None:
+        # Stop the reaper first, mirroring `SessionRegistry.shutdown_all`:
+        # a sweep racing the teardown would shut children down twice.
+        # `holds` is deliberately IGNORED here — gateway shutdown
+        # overrides a checkout, and an in-flight caller gets the same
+        # failure the legacy path already produces at shutdown.
+        self.stop_reaper()
         with self._lock:
             entries = list(self._entries.values())
             self._entries.clear()
@@ -2598,11 +2864,18 @@ class _Handler(BaseHTTPRequestHandler):
 
     protocol_version = "HTTP/1.1"
 
-    def _send_json(self, status: int, body: str) -> None:
+    def _send_json(
+        self, status: int, body: str, *, extra_headers: dict[str, str] | None = None
+    ) -> None:
         data = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        # Only `--modern-only`'s 405s pass anything here, and RFC 9110
+        # §15.5.6 makes one of them mandatory: "the origin server MUST
+        # generate an Allow header field in a 405 response".
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         sid = getattr(self, "_session_id", None)
         if sid is not None:
             self.send_header("Mcp-Session-Id", sid)
@@ -2892,6 +3165,35 @@ class _Handler(BaseHTTPRequestHandler):
         self._session_id = sid
         return backend
 
+    def _reject_legacy_transport(self) -> None:
+        """Answer 405 on a transport verb a modern-only deployment drops.
+
+        #376 §4.1. `--modern-only` says this endpoint serves the
+        2026-07-28 revision and nothing else, and that revision has no
+        session transport: no `GET` for a stream to resume, no `DELETE`
+        for a session to end. The spec's own guidance to "a server that
+        supports only this revision" is to answer 405 on those verbs.
+
+        `Allow: POST` is not decoration — RFC 9110 §15.5.6 requires a 405
+        to name the methods that ARE allowed, and that requirement comes
+        from HTTP rather than from MCP, so it holds whatever the body
+        looks like. A small JSON-RPC error body rides along so a client
+        that only reads bodies still gets a reason.
+
+        Placed after the auth gate on purpose (§6 Q3): an unauthenticated
+        probe sees exactly what it saw before, so the flag does not
+        change the endpoint's unauthenticated fingerprint.
+        """
+        self._send_json(
+            405,
+            _error_body(
+                "this endpoint serves only MCP 2026-07-28, which has no "
+                "session transport; use POST",
+                code=_JSONRPC_INVALID_REQUEST,
+            ),
+            extra_headers={"Allow": "POST"},
+        )
+
     def _dispatch_modern(self, kind: str, msg: dict[str, Any], req_id: Any) -> None:
         """Serve one validated modern request from a gateway-owned child.
 
@@ -2928,7 +3230,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            backend, init_result = self.modern_pool.get_or_create(self._current_user())
+            backend, init_result, pool_entry = self.modern_pool.get_or_create(
+                self._current_user()
+            )
         except RuntimeError as exc:
             log(f"modern dispatch: backend unavailable: {exc}")
             self._send_json(
@@ -2939,72 +3243,80 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
 
-        # Notifications: forward and acknowledge. The v2 client sends none
-        # in the discover flow (no `initialize` means no
-        # `notifications/initialized`), so this is consistency rather than
-        # liveness — but leaving modern-classified traffic to fall onto a
-        # legacy session error would be a worse answer than 202.
-        if kind == "notification":
-            backend.send_oneway(json.dumps(msg))
-            self._send_empty(202)
-            return
-
-        # `server/discover` is answered HERE, never forwarded: a legacy
-        # child has never heard of it and would answer -32601.
-        if method == _MODERN_DISCOVER_METHOD:
-            self._send_json(
-                200,
-                json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": _synthesize_discover_result(
-                            init_result, cache_ttl_ms=self.cache_ttl_ms
-                        ),
-                    }
-                ),
-            )
-            return
-
-        upstream_id = _mint_modern_id()
-        outbound = dict(msg)
-        outbound["id"] = upstream_id
-        line = backend.send_request(
-            json.dumps(outbound), upstream_id, _BACKEND_RESPONSE_TIMEOUT_SECS
-        )
-        if line is None:
-            self._send_json(
-                504,
-                _error_body(
-                    "no response from backend", req_id, code=_JSONRPC_INTERNAL_ERROR
-                ),
-            )
-            return
+        # Everything past the checkout runs under try/finally: the child
+        # is CHECKED OUT (#376 §3.1) and a leaked hold would make it
+        # permanently unevictable and unreapable. Releasing here rather
+        # than at each arm keeps that true for the early returns too —
+        # and for anything the never-crash net catches on the way out.
         try:
-            parsed = json.loads(line)
-        except (json.JSONDecodeError, TypeError):
-            log("modern dispatch: backend returned unparseable JSON")
-            self._send_json(
-                502,
-                _error_body(
-                    "malformed response from backend",
-                    req_id,
-                    code=_JSONRPC_INTERNAL_ERROR,
-                ),
-            )
-            return
+            # Notifications: forward and acknowledge. The v2 client sends none
+            # in the discover flow (no `initialize` means no
+            # `notifications/initialized`), so this is consistency rather than
+            # liveness — but leaving modern-classified traffic to fall onto a
+            # legacy session error would be a worse answer than 202.
+            if kind == "notification":
+                backend.send_oneway(json.dumps(msg))
+                self._send_empty(202)
+                return
 
-        # Rekey minted -> client id. One parse total: the same dict is
-        # rekeyed and stamped, so relay's `_mrtr_rekey` (which re-parses a
-        # string) would be strictly more work for the same result here.
-        parsed["id"] = req_id
-        _stamp_modern_result(
-            parsed,
-            method,
-            server_info=init_result.get("serverInfo"),
-            cache_ttl_ms=self.cache_ttl_ms,
-        )
-        self._send_json(_modern_response_status(parsed), json.dumps(parsed))
+            # `server/discover` is answered HERE, never forwarded: a legacy
+            # child has never heard of it and would answer -32601.
+            if method == _MODERN_DISCOVER_METHOD:
+                self._send_json(
+                    200,
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "result": _synthesize_discover_result(
+                                init_result, cache_ttl_ms=self.cache_ttl_ms
+                            ),
+                        }
+                    ),
+                )
+                return
+
+            upstream_id = _mint_modern_id()
+            outbound = dict(msg)
+            outbound["id"] = upstream_id
+            line = backend.send_request(
+                json.dumps(outbound), upstream_id, _BACKEND_RESPONSE_TIMEOUT_SECS
+            )
+            if line is None:
+                self._send_json(
+                    504,
+                    _error_body(
+                        "no response from backend", req_id, code=_JSONRPC_INTERNAL_ERROR
+                    ),
+                )
+                return
+            try:
+                parsed = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                log("modern dispatch: backend returned unparseable JSON")
+                self._send_json(
+                    502,
+                    _error_body(
+                        "malformed response from backend",
+                        req_id,
+                        code=_JSONRPC_INTERNAL_ERROR,
+                    ),
+                )
+                return
+
+            # Rekey minted -> client id. One parse total: the same dict is
+            # rekeyed and stamped, so relay's `_mrtr_rekey` (which re-parses a
+            # string) would be strictly more work for the same result here.
+            parsed["id"] = req_id
+            _stamp_modern_result(
+                parsed,
+                method,
+                server_info=init_result.get("serverInfo"),
+                cache_ttl_ms=self.cache_ttl_ms,
+            )
+            self._send_json(_modern_response_status(parsed), json.dumps(parsed))
+        finally:
+            self.modern_pool.release(pool_entry)
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         # Reset the per-request session id (the handler instance is reused
@@ -3095,6 +3407,31 @@ class _Handler(BaseHTTPRequestHandler):
         # torn down by, a different principal.
         user = self._current_user()
         is_init = kind == "request" and msg.get("method") == "initialize"
+        if is_init and self.modern_only:
+            # --modern-only (#376 §4.1). A legacy `initialize` literally
+            # presents a `params.protocolVersion` this posture does not
+            # serve, and -32022 is the spec's own shape for exactly that
+            # — actionable, because an auto-negotiating client reads
+            # `data.supported` and retries at a version we do name.
+            #
+            # Only `initialize` is intercepted. With it refused no
+            # session can ever exist, so every other legacy POST already
+            # dies on the untouched sessionless-400 path below; rejecting
+            # them again would duplicate an existing rejection for no
+            # behavioural gain.
+            log("modern-only: refusing a legacy initialize")
+            self._send_json(
+                400,
+                _error_body(
+                    "this endpoint serves only MCP 2026-07-28; send "
+                    "per-request _meta instead of an initialize handshake",
+                    req_id,
+                    code=_MCP_UNSUPPORTED_PROTOCOL_VERSION,
+                    data={"supported": sorted(_SERVE_IMPLEMENTED_MODERN_VERSIONS)},
+                ),
+            )
+            return
+
         if is_init:
             # `initialize` starts a session (MCP spec item 1): spawn a fresh
             # child and mint an id, returned via the Mcp-Session-Id response
@@ -3198,6 +3535,13 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if not self._require_auth():
             return
+        # --modern-only: the session SSE stream is legacy transport.
+        # Everything above stays reachable — PRM/AS metadata and the
+        # auth gate are HTTP plumbing a modern-only deployment still
+        # needs to bootstrap OAuth.
+        if self.modern_only:
+            self._reject_legacy_transport()
+            return
         # The SSE stream carries a session's server-initiated messages, so it
         # must name an existing session: sessionless -> 400, unknown/terminated
         # (or another user's) -> 404 (drives the client's re-initialize), as on
@@ -3247,6 +3591,11 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if not self._require_auth():
             return
+        # --modern-only: DELETE ends a session, and this posture mints
+        # none. Rejected after the auth gate, like GET.
+        if self.modern_only:
+            self._reject_legacy_transport()
+            return
         sid_header = self.headers.get("Mcp-Session-Id")
         if not sid_header:
             self._send_json(400, _error_body("Mcp-Session-Id required"))
@@ -3275,6 +3624,8 @@ def build_server(
     idle_ttl: float = 0.0,
     max_sessions_per_owner: int = 0,
     cache_ttl_ms: int = _DEFAULT_CACHE_TTL_MS,
+    modern_idle_ttl: float = 0.0,
+    modern_only: bool = False,
 ) -> tuple[ThreadingHTTPServer, SessionRegistry]:
     """Construct the HTTP server and session registry without running the loop.
 
@@ -3301,7 +3652,11 @@ def build_server(
     # pays a dict and a lock. The per-principal cap reuses the session
     # registry's per-owner value: the same operator knob answers the same
     # question ("how many children may one principal hold?") on both eras.
-    modern_pool = ModernBackendPool(command, max_children=max_sessions_per_owner)
+    modern_pool = ModernBackendPool(
+        command,
+        max_children=max_sessions_per_owner,
+        idle_ttl=modern_idle_ttl,
+    )
     handler = type(
         "_BoundHandler",
         (_Handler,),
@@ -3312,6 +3667,7 @@ def build_server(
             "auth_token": auth_token,
             "oauth": oauth,
             "cache_ttl_ms": cache_ttl_ms,
+            "modern_only": modern_only,
         },
     )
     httpd = ThreadingHTTPServer((host, port), handler)
@@ -3337,6 +3693,8 @@ def serve(
     idle_ttl: float = 0.0,
     max_sessions_per_owner: int = 0,
     cache_ttl_ms: int = _DEFAULT_CACHE_TTL_MS,
+    modern_idle_ttl: float = 0.0,
+    modern_only: bool = False,
 ) -> None:
     """Run the reverse gateway until interrupted.
 
@@ -3357,8 +3715,13 @@ def serve(
         idle_ttl=idle_ttl,
         max_sessions_per_owner=max_sessions_per_owner,
         cache_ttl_ms=cache_ttl_ms,
+        modern_idle_ttl=modern_idle_ttl,
+        modern_only=modern_only,
     )
     registry.start_reaper()
+    # Its own thread, gated on its own TTL — the legacy reaper may well
+    # be disabled while this one runs, and vice versa.
+    httpd.modern_pool.start_reaper()
 
     stopping = threading.Event()
 
@@ -3379,14 +3742,21 @@ def serve(
     if oauth is not None:
         modes.append("embedded OAuth AS")
     auth_state = " + ".join(modes) if modes else "no auth"
+    posture = "modern-only" if modern_only else "dual-era"
     ttl_state = f"idle-ttl {idle_ttl:g}s" if idle_ttl > 0 else "no idle eviction"
+    modern_ttl_state = (
+        f", modern idle-ttl {modern_idle_ttl:g}s"
+        if modern_idle_ttl > 0
+        else ", no modern idle eviction"
+    )
     per_owner_state = (
         f", max {max_sessions_per_owner}/owner" if max_sessions_per_owner > 0 else ""
     )
     log(
         f"serving {' '.join(command)} at "
         f"http://{host}:{port}{mcp_path} ({auth_state}; "
-        f"max {max_sessions} sessions{per_owner_state}, {ttl_state})"
+        f"max {max_sessions} sessions{per_owner_state}, "
+        f"{ttl_state}{modern_ttl_state}, {posture})"
     )
     try:
         httpd.serve_forever()
@@ -3563,6 +3933,33 @@ def serve_main(argv: list[str]) -> None:
         ),
     )
     parser.add_argument(
+        "--modern-only",
+        action="store_true",
+        help=(
+            "Serve ONLY MCP 2026-07-28 clients. Legacy clients are turned "
+            "away instead of being given a session: GET and DELETE answer "
+            "405, and a legacy initialize gets -32022 naming the versions "
+            "this endpoint does serve. Off by default, and off is "
+            "byte-identical to not having the flag."
+        ),
+    )
+    parser.add_argument(
+        "--modern-idle-ttl",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help=(
+            "Shut down a pooled backend for a modern (2026-07-28) client "
+            "after this many seconds with no request, reclaiming the "
+            "process. 0 (default) disables it. Separate from "
+            "--session-idle-ttl on purpose: evicting a modern child costs "
+            "only its warm-up, because those clients keep no session "
+            "state, so this can be far more aggressive than the legacy "
+            "one. A child serving a request, or handed to a request that "
+            "has not sent yet, is never reaped."
+        ),
+    )
+    parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
         help="backend stdio MCP server command (after the options)",
@@ -3612,6 +4009,8 @@ def serve_main(argv: list[str]) -> None:
         parser.error("--trusted-user-header must be a valid header name")
     if args.access_token_ttl <= 0:
         parser.error("--access-token-ttl must be > 0")
+    if args.modern_idle_ttl < 0 or not math.isfinite(args.modern_idle_ttl):
+        parser.error("--modern-idle-ttl must be a non-negative, finite number")
     if args.cache_ttl_ms < 0:
         # The spec's only constraint on the value: "Servers MUST provide a
         # ttlMs value that is >= 0."
@@ -3704,4 +4103,6 @@ def serve_main(argv: list[str]) -> None:
         idle_ttl=args.session_idle_ttl,
         max_sessions_per_owner=args.max_sessions_per_owner,
         cache_ttl_ms=args.cache_ttl_ms,
+        modern_idle_ttl=args.modern_idle_ttl,
+        modern_only=args.modern_only,
     )

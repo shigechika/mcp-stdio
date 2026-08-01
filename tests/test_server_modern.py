@@ -710,6 +710,21 @@ def test_encoded_name_round_trips_through_the_real_decoder():
 # --- the modern backend pool (#270 Phase 3 P3-B) -------------------------
 
 
+def _checkout_and_release(pool, principal=None):
+    """Acquire a pooled child the way a handler does, then hand it back.
+
+    `get_or_create` returns a CHECKED-OUT child (#376 §3.1) whose hold
+    must be released, or it stays permanently unevictable. Tests that
+    only want "the child for this principal" go through here so they
+    exercise the same acquire/release pair `_dispatch_modern` does;
+    tests that specifically want a HELD child call `get_or_create`
+    directly and keep the entry.
+    """
+    backend, init_result, entry = pool.get_or_create(principal)
+    pool.release(entry)
+    return backend, init_result
+
+
 class TestModernBackendPool:
     """Gateway-owned children for the session-less modern path (D1)."""
 
@@ -725,11 +740,11 @@ class TestModernBackendPool:
         """
         pool = server.ModernBackendPool(_BACKEND)
         try:
-            backend, init_result = pool.get_or_create(None)
+            backend, init_result = _checkout_and_release(pool, None)
             assert init_result["protocolVersion"] == "2025-06-18"
             assert init_result["serverInfo"]["name"] == "fake"
             # A second call reuses the same child rather than respawning.
-            again, cached = pool.get_or_create(None)
+            again, cached = _checkout_and_release(pool, None)
             assert again is backend
             assert cached is init_result
             assert pool.count() == 1
@@ -745,8 +760,8 @@ class TestModernBackendPool:
         """
         pool = server.ModernBackendPool(_BACKEND)
         try:
-            alice, _ = pool.get_or_create("alice")
-            bob, _ = pool.get_or_create("bob")
+            alice, _ = _checkout_and_release(pool, "alice")
+            bob, _ = _checkout_and_release(pool, "bob")
             assert alice is not bob
             assert pool.count() == 2
         finally:
@@ -765,7 +780,7 @@ class TestModernBackendPool:
 
         def _race():
             barrier.wait(timeout=10)
-            got.append(pool.get_or_create("shared")[0])
+            got.append(_checkout_and_release(pool, "shared")[0])
 
         threads = [threading.Thread(target=_race) for _ in range(4)]
         try:
@@ -783,10 +798,10 @@ class TestModernBackendPool:
         """Mirror of the legacy drop-then-reinit: death is not terminal."""
         pool = server.ModernBackendPool(_BACKEND)
         try:
-            first, _ = pool.get_or_create(None)
+            first, _ = _checkout_and_release(pool, None)
             first.shutdown()
             assert first.closed
-            second, _ = pool.get_or_create(None)
+            second, _ = _checkout_and_release(pool, None)
             assert second is not first
             assert not second.closed
         finally:
@@ -807,7 +822,7 @@ class TestModernBackendPool:
         """
         pool = server.ModernBackendPool(_BACKEND)
         try:
-            first, _ = pool.get_or_create(None)
+            first, _ = _checkout_and_release(pool, None)
             first.send_oneway(json.dumps({"jsonrpc": "2.0", "method": "exit"}))
             deadline = time.monotonic() + 10
             while not first.closed and time.monotonic() < deadline:
@@ -819,7 +834,7 @@ class TestModernBackendPool:
                 "the child was reaped before get_or_create() ever ran"
             )
 
-            second, _ = pool.get_or_create(None)
+            second, _ = _checkout_and_release(pool, None)
 
             assert second is not first
             assert first._proc.returncode is not None, (
@@ -839,10 +854,10 @@ class TestModernBackendPool:
         """
         pool = server.ModernBackendPool(_BACKEND, max_children=2)
         try:
-            pool.get_or_create("a")
-            pool.get_or_create("b")
+            _checkout_and_release(pool, "a")
+            _checkout_and_release(pool, "b")
             assert pool.count() == 2
-            pool.get_or_create("c")
+            _checkout_and_release(pool, "c")
             assert pool.count() == 2, "the cap did not hold"
         finally:
             pool.shutdown_all()
@@ -864,10 +879,17 @@ class TestModernBackendPool:
         When nothing qualifies the cap is EXCEEDED rather than enforced —
         the right way to fail for a soft resource policy whose only
         alternative is breaking work already in flight.
+
+        The newcomer itself does not survive the checkout, though (#379
+        review): `busy` stays not-reapable (a request is still on the
+        wire), so once `other` is released it is the ONLY reapable
+        entry, and `release()`'s own sweep reclaims it right away —
+        trimming the pool back to the cap rather than leaving the
+        overshoot to sit there.
         """
         pool = server.ModernBackendPool(_BACKEND, max_children=1)
         try:
-            busy, _ = pool.get_or_create("busy")
+            busy, _ = _checkout_and_release(pool, "busy")
             # Park a request on the child so it is provably not idle.
             started = threading.Event()
             done = threading.Event()
@@ -898,11 +920,251 @@ class TestModernBackendPool:
 
             # At cap, with the only child busy: the newcomer is served and
             # the busy child is NOT killed.
-            other, _ = pool.get_or_create("other")
+            other, _ = _checkout_and_release(pool, "other")
             assert other is not busy
             assert not busy.closed, "eviction killed a child mid-request"
-            assert pool.count() == 2, "the cap was enforced by breaking live work"
+            # `other`'s own release leaves it the only reapable entry
+            # (busy is still mid-request), so release()'s sweep (#379
+            # review) reclaims `other` immediately rather than letting
+            # the overshoot persist.
+            assert pool.count() == 1, (
+                "release() should have reclaimed the transient newcomer"
+            )
             assert done.wait(timeout=30)
+        finally:
+            pool.shutdown_all()
+
+    def test_a_checked_out_child_is_not_evicted_at_cap(self):
+        """#376 §3.1 — the eviction-vs-send race, closed by refcount.
+
+        `get_or_create` returns with the pool lock released, and the
+        request only becomes `has_pending` later, inside the BACKEND's
+        lock. In that window the child looks perfectly idle, so another
+        principal's first request at cap could evict a child that was
+        already handed to a handler — which shut it down under the
+        caller and produced a spurious 504.
+
+        The checkout refcount closes it by construction: the child is
+        held from the moment it is returned. Reverting the `holds` clause
+        of `_reapable_locked` makes this evict.
+
+        The newcomer itself does not survive the checkout, though (#379
+        review): `held` stays unevictable (still checked out), so once
+        `other` is released it is the ONLY reapable entry, and
+        `release()`'s own sweep reclaims it right away — trimming the
+        pool back to the cap rather than leaving the overshoot to sit
+        there.
+        """
+        pool = server.ModernBackendPool(_BACKEND, max_children=1)
+        try:
+            held, _, entry = pool.get_or_create("first")
+            assert entry["holds"] == 1
+            # Not yet sending: the window the race lives in.
+            assert not held.has_pending
+
+            other, _ = _checkout_and_release(pool, "second")
+            assert other is not held
+            assert not held.closed, "a checked-out child was evicted mid-window"
+            # `other`'s own release leaves it the only reapable entry
+            # (`held`/"first" is still checked out), so release()'s
+            # sweep (#379 review) reclaims `other` immediately.
+            assert pool.count() == 1, (
+                "release() should have reclaimed the transient newcomer"
+            )
+        finally:
+            pool.shutdown_all()
+
+    def test_releasing_makes_the_child_evictable_again(self):
+        """A hold is a loan, not a pin — the other half of the contract."""
+        pool = server.ModernBackendPool(_BACKEND, max_children=1)
+        try:
+            held, _, entry = pool.get_or_create("first")
+            pool.release(entry)
+            assert entry["holds"] == 0
+            _checkout_and_release(pool, "second")
+            assert pool.count() == 1, "a released child stayed unevictable"
+            assert held.closed
+        finally:
+            pool.shutdown_all()
+
+    def test_release_never_drives_the_count_negative(self):
+        """An extra release must not lend the next caller a free pass."""
+        pool = server.ModernBackendPool(_BACKEND)
+        try:
+            _, _, entry = pool.get_or_create(None)
+            pool.release(entry)
+            pool.release(entry)
+            assert entry["holds"] == 0
+        finally:
+            pool.shutdown_all()
+
+    def test_the_cap_is_rebounded_after_a_spawn_race(self):
+        """#376 §3.2 / #379 review — an overshoot that used to be permanent.
+
+        Racing first-requests each insert a PENDING placeholder, and a
+        placeholder is not evictable, so once the ready-quiet victims run
+        out every racer logs "exceeding the cap" and inserts anyway. That
+        is the overshoot this test provokes: both racers park with their
+        placeholders in the map before either publishes.
+
+        What resolves it, today, is `release()`'s own sweep (#379
+        review), not the post-spawn re-check this test originally
+        targeted: releasing alice makes her the ONLY reapable entry (bob
+        is still PENDING, not evictable), so her own release-sweep evicts
+        her immediately — the post-spawn sweep never gets a chance to act
+        first. This test now pins the OUTCOME (the pool re-bounds to the
+        cap once the race resolves), not a specific mechanism; the
+        release-sweep's own mechanism-level revert-check lives in
+        `test_release_re_sweeps_an_overshoot_left_by_a_spawn_race`.
+
+        Both racers are still released ONE AT A TIME, and that ordering
+        is still deliberate: it is what makes alice reapable-but-bob-not
+        at her release, so the outcome is deterministic rather than a
+        race the CI host wins or loses (it lost on Windows, where the
+        slower spawn let both children be held at once — see
+        `test_release_re_sweeps_...` for that simultaneous-hold shape).
+        """
+        pool = server.ModernBackendPool(_BACKEND, max_children=1)
+        both_pending = threading.Barrier(3)
+        gates = {"alice": threading.Event(), "bob": threading.Event()}
+        done = {"alice": threading.Event(), "bob": threading.Event()}
+        current = threading.local()
+        real_spawn = pool._spawn_and_handshake
+
+        def _gated_spawn():
+            # Both racers park here, so both placeholders coexist — the
+            # state that produces the overshoot.
+            both_pending.wait(timeout=15)
+            assert gates[current.principal].wait(timeout=15)
+            return real_spawn()
+
+        pool._spawn_and_handshake = _gated_spawn
+
+        def _racer(principal):
+            current.principal = principal
+            backend, _, entry = pool.get_or_create(principal)
+            pool.release(entry)
+            done[principal].set()
+
+        threads = [
+            threading.Thread(target=_racer, args=(name,), daemon=True)
+            for name in ("alice", "bob")
+        ]
+        try:
+            for t in threads:
+                t.start()
+            both_pending.wait(timeout=15)
+            assert pool.count() == 2, "the racers did not both hold a placeholder"
+
+            # Alice finishes and releases. Bob is still PENDING (no
+            # backend yet), so he is not a candidate — alice is the ONLY
+            # reapable entry, and her own release-sweep (#379 review)
+            # reclaims her immediately.
+            gates["alice"].set()
+            assert done["alice"].wait(timeout=30)
+            assert pool.count() == 1, (
+                "alice's own release-sweep should have reclaimed her"
+            )
+
+            # Bob finishes and releases. The pool is already back at cap,
+            # so this is a no-op sweep — the outcome (re-bounded to cap)
+            # was already reached by alice's release.
+            gates["bob"].set()
+            assert done["bob"].wait(timeout=30)
+            assert pool.count() == 1, "the spawn-race overshoot was never re-bounded"
+        finally:
+            pool._spawn_and_handshake = real_spawn
+            for gate in gates.values():
+                gate.set()
+            for t in threads:
+                t.join(timeout=30)
+            pool.shutdown_all()
+
+    def test_release_re_sweeps_an_overshoot_left_by_a_spawn_race(self):
+        """#379 review, /code-review score 100: with `max_children=1`, two
+        principals racing their FIRST requests each insert a PENDING
+        placeholder, each spawns, each publishes — and unlike the
+        one-at-a-time release above, HERE both are released with the
+        OTHER still held throughout its own publish, so neither
+        publish-time sweep (#376 §3.2) can ever evict the other: the
+        pool settles at 2, BOTH held simultaneously. This is the
+        documented transient overshoot.
+
+        Before this fix, `release()` only decremented `holds` — nothing
+        re-swept afterward, so this overshoot was PERMANENT in a
+        fixed-principal deployment: no new principal ever arrives to
+        trigger the pre-insert sweep, and the idle reaper does not save
+        it at the default `--modern-idle-ttl 0`.
+        """
+        pool = server.ModernBackendPool(_BACKEND, max_children=1)
+        both_pending = threading.Barrier(3)
+        gates = {"alice": threading.Event(), "bob": threading.Event()}
+        published = {"alice": threading.Event(), "bob": threading.Event()}
+        entries: dict[str, dict] = {}
+        current = threading.local()
+        real_spawn = pool._spawn_and_handshake
+
+        def _gated_spawn():
+            both_pending.wait(timeout=15)
+            assert gates[current.principal].wait(timeout=15)
+            return real_spawn()
+
+        pool._spawn_and_handshake = _gated_spawn
+
+        def _racer(principal):
+            current.principal = principal
+            _, _, entry = pool.get_or_create(principal)
+            entries[principal] = entry
+            published[principal].set()
+            # Deliberately does NOT release — the main thread holds both
+            # checkouts open until it has proven the overshoot, then
+            # releases both itself (release() does not care which thread
+            # calls it).
+
+        threads = [
+            threading.Thread(target=_racer, args=(name,), daemon=True)
+            for name in ("alice", "bob")
+        ]
+        try:
+            for t in threads:
+                t.start()
+            both_pending.wait(timeout=15)
+            assert pool.count() == 2, "the racers did not both hold a placeholder"
+
+            gates["alice"].set()
+            gates["bob"].set()
+            assert published["alice"].wait(timeout=30)
+            assert published["bob"].wait(timeout=30)
+            # Both children are READY and HELD at once — the state that
+            # makes this a real overshoot, not merely two placeholders.
+            assert pool.count() == 2, "both children should still be held"
+
+            pool.release(entries["alice"])
+            pool.release(entries["bob"])
+            assert pool.count() == 1, "release() never re-swept the cap overshoot"
+        finally:
+            pool._spawn_and_handshake = real_spawn
+            for gate in gates.values():
+                gate.set()
+            for t in threads:
+                t.join(timeout=30)
+            pool.shutdown_all()
+
+    def test_reaching_the_cap_does_not_evict(self):
+        """At the cap is not over it — the off-by-one guard.
+
+        `_evict_if_at_cap_locked` means "make room for one more", so the
+        pre-insert callers pass `reserve=1`. The post-spawn re-check
+        (#376 §3.2) has already inserted; with the same reserve it would
+        evict a child every time the pool merely REACHED the cap. With
+        `max_children=2`, two principals must both survive.
+        """
+        pool = server.ModernBackendPool(_BACKEND, max_children=2)
+        try:
+            first, _ = _checkout_and_release(pool, "a")
+            second, _ = _checkout_and_release(pool, "b")
+            assert pool.count() == 2, "reaching the cap evicted a child"
+            assert not first.closed and not second.closed
         finally:
             pool.shutdown_all()
 
@@ -1145,7 +1407,7 @@ def test_a_pooled_child_never_fills_the_unread_sse_queue():
     """
     pool = server.ModernBackendPool(_BACKEND)
     try:
-        backend, _ = pool.get_or_create(None)
+        backend, _ = _checkout_and_release(pool, None)
         assert backend.server_initiated.qsize() == 0
         backend._route('{"jsonrpc":"2.0","id":"nobody-waits","result":{}}')
         backend._route('{"jsonrpc":"2.0","method":"notifications/message"}')
@@ -1168,3 +1430,385 @@ def test_a_legacy_child_still_queues_server_initiated_traffic():
         assert backend.server_initiated.qsize() == 2
     finally:
         backend.shutdown()
+
+
+class TestModernPoolReaper:
+    """Idle eviction for pooled children (#376 §2).
+
+    A fake clock throughout — the reaper's only time input is the
+    injected `now`, so nothing here waits on wall time.
+    """
+
+    def _pool(self, clock, **kw):
+        return server.ModernBackendPool(
+            _BACKEND, idle_ttl=kw.pop("idle_ttl", 30.0), now=lambda: clock[0], **kw
+        )
+
+    def test_a_child_is_kept_until_the_ttl_elapses(self):
+        clock = [1000.0]
+        pool = self._pool(clock)
+        try:
+            _checkout_and_release(pool)
+            clock[0] += 29.0
+            assert pool.reap_idle() == 0
+            assert pool.count() == 1
+        finally:
+            pool.shutdown_all()
+
+    def test_a_child_idle_past_the_ttl_is_reaped(self):
+        clock = [1000.0]
+        pool = self._pool(clock)
+        try:
+            backend, _ = _checkout_and_release(pool)
+            clock[0] += 31.0
+            assert pool.reap_idle() == 1
+            assert pool.count() == 0
+            # Shutdown runs on a daemon thread, so observe the outcome
+            # rather than assuming it already happened.
+            deadline = time.monotonic() + 10
+            while not backend.closed and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert backend.closed
+        finally:
+            pool.shutdown_all()
+
+    def test_a_request_on_the_wire_protects_an_old_child(self):
+        """`used` is last-ACQUIRED time, so a long call looks idle by it."""
+        clock = [1000.0]
+        pool = self._pool(clock)
+        try:
+            backend, _ = _checkout_and_release(pool)
+            started = threading.Event()
+
+            def _occupy():
+                started.set()
+                backend.send_request(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": "slow",
+                            "method": "slow_echo",
+                            "params": {"delay": 2.0},
+                        }
+                    ),
+                    "slow",
+                    30.0,
+                )
+
+            worker = threading.Thread(target=_occupy, daemon=True)
+            worker.start()
+            assert started.wait(timeout=10)
+            deadline = time.monotonic() + 10
+            while not backend.has_pending and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert backend.has_pending
+
+            clock[0] += 31.0
+            assert pool.reap_idle() == 0, "reaped a child with a request on the wire"
+            worker.join(timeout=30)
+        finally:
+            pool.shutdown_all()
+
+    def test_a_held_child_is_never_reaped(self):
+        """The #374 seam: a hold outranks any timestamp.
+
+        This is the case a TTL alone cannot express — a listen stream may
+        sit subscribed for hours without the child being 'used'.
+        """
+        clock = [1000.0]
+        pool = self._pool(clock)
+        try:
+            _, _, entry = pool.get_or_create(None)  # held, never released
+            clock[0] += 3600.0
+            assert pool.reap_idle() == 0, "reaped a child that was checked out"
+            assert pool.count() == 1
+            pool.release(entry)
+            assert pool.reap_idle() == 1
+        finally:
+            pool.shutdown_all()
+
+    def test_a_pending_placeholder_is_never_reaped(self):
+        clock = [1000.0]
+        pool = self._pool(clock)
+        try:
+            with pool._lock:
+                pool._entries["ghost"] = {
+                    "event": threading.Event(),
+                    "backend": None,
+                    "error": None,
+                    "holds": 0,
+                }
+            clock[0] += 3600.0
+            assert pool.reap_idle() == 0
+            assert pool.count() == 1
+        finally:
+            with pool._lock:
+                pool._entries.pop("ghost", None)
+            pool.shutdown_all()
+
+    def test_a_dead_child_is_reaped_even_with_the_ttl_disabled(self):
+        """Otherwise a departed principal's zombie pins a slot forever —
+        the lazy cleanup only fires on that principal's next request."""
+        clock = [1000.0]
+        pool = self._pool(clock, idle_ttl=0.0)
+        try:
+            backend, _ = _checkout_and_release(pool)
+            backend.shutdown()
+            assert backend.closed
+            assert pool.reap_idle() == 1
+            assert pool.count() == 0
+        finally:
+            pool.shutdown_all()
+
+    def test_the_reaper_thread_only_starts_when_the_ttl_is_set(self):
+        clock = [1000.0]
+        off = self._pool(clock, idle_ttl=0.0)
+        try:
+            off.start_reaper()
+            assert not any(
+                t.name == "modern-pool-reaper" for t in threading.enumerate()
+            )
+        finally:
+            off.shutdown_all()
+
+        on = self._pool(clock, idle_ttl=30.0)
+        try:
+            on.start_reaper()
+            assert any(t.name == "modern-pool-reaper" for t in threading.enumerate())
+        finally:
+            on.shutdown_all()
+        # shutdown_all stops it; the daemon exits on its next tick.
+        assert on._reaper is None
+
+
+def test_build_server_threads_the_modern_idle_ttl_through():
+    httpd, registry = server.build_server(
+        _BACKEND, host="127.0.0.1", port=0, modern_idle_ttl=45.0
+    )
+    try:
+        assert httpd.modern_pool._idle_ttl == 45.0
+    finally:
+        registry.shutdown_all()
+        httpd.modern_pool.shutdown_all()
+        httpd.server_close()
+
+
+class TestModernOnly:
+    """The `--modern-only` posture (#376 §4).
+
+    The era predicate is untouched — the flag acts AFTER classification,
+    so modern traffic is byte-identical with it on or off.
+    """
+
+    @pytest.fixture()
+    def strict(self):
+        httpd, registry = server.build_server(
+            _BACKEND, host="127.0.0.1", port=0, modern_only=True
+        )
+        host, port = httpd.server_address[0], httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield f"http://{host}:{port}/mcp"
+        finally:
+            httpd.shutdown()
+            registry.shutdown_all()
+            httpd.modern_pool.shutdown_all()
+            httpd.server_close()
+
+    def test_get_is_405_with_an_allow_header(self, strict):
+        """RFC 9110 §15.5.6 requires `Allow` on a 405 — that requirement
+        is HTTP's, not MCP's, so it holds whatever the body says."""
+        resp = httpx.get(strict, timeout=10)
+        assert resp.status_code == 405
+        assert resp.headers["allow"] == "POST"
+        assert resp.json()["error"]["code"] == -32600
+
+    def test_delete_is_405_with_an_allow_header(self, strict):
+        resp = httpx.request("DELETE", strict, timeout=10)
+        assert resp.status_code == 405
+        assert resp.headers["allow"] == "POST"
+
+    def test_a_legacy_initialize_is_refused_with_the_supported_versions(self, strict):
+        """-32022 is actionable where a bare 400 is not: an
+        auto-negotiating client reads `data.supported` and retries."""
+        resp = _post(strict, {"jsonrpc": "2.0", "id": "init", "method": "initialize"})
+        assert resp.status_code == 400
+        error = resp.json()["error"]
+        assert error["code"] == -32022
+        assert error["data"]["supported"] == [MODERN_VERSION]
+        assert resp.json()["id"] == "init"
+        assert "mcp-session-id" not in resp.headers
+
+    def test_other_legacy_posts_take_the_untouched_sessionless_path(self, strict):
+        """With initialize refused no session can exist, so everything
+        else already dies on the existing path — the flag adds no second
+        rejection for it."""
+        resp = _post(strict, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        assert resp.status_code == 400
+        assert resp.json()["error"]["code"] == LEGACY_ERROR
+
+    def test_modern_traffic_is_unaffected(self, strict):
+        discover = _post(
+            strict,
+            _modern_body("server/discover", meta=_meta()),
+            _modern_headers("server/discover"),
+        )
+        assert discover.status_code == 200
+        assert discover.json()["result"]["supportedVersions"] == [MODERN_VERSION]
+
+        listed = _post(strict, _modern_body(meta=_meta()), _modern_headers())
+        assert listed.status_code == 200
+        assert listed.json()["result"]["resultType"] == "complete"
+
+    def test_the_flag_defaults_off(self, gateway):
+        """The unit-level twin of the pin suite — NOT an edit to it.
+
+        With the flag unset, GET and DELETE behave exactly as they always
+        have: a sessionless GET is 400 (not 405), and DELETE likewise.
+        """
+        get = httpx.get(gateway, timeout=10)
+        assert get.status_code == 400
+        assert "allow" not in get.headers
+        delete = httpx.request("DELETE", gateway, timeout=10)
+        assert delete.status_code == 400
+
+        init = _post(gateway, {"jsonrpc": "2.0", "id": "i", "method": "initialize"})
+        assert init.status_code == 200
+        assert init.headers.get("mcp-session-id")
+
+
+def test_modern_only_keeps_the_oauth_discovery_endpoints_reachable():
+    """The carve-out: PRM and AS metadata are HTTP plumbing, not MCP
+    transport, and a modern-only deployment still needs them to bootstrap
+    OAuth. They are routed before the 405."""
+    provider = server._OAuthProvider(
+        public_url=None, trusted_user_header=None, dev_user="alice"
+    )
+    httpd, registry = server.build_server(
+        _BACKEND, host="127.0.0.1", port=0, modern_only=True, oauth=provider
+    )
+    host, port = httpd.server_address[0], httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://{host}:{port}"
+    try:
+        prm = httpx.get(f"{base}/.well-known/oauth-protected-resource/mcp", timeout=10)
+        assert prm.status_code == 200, prm.text
+        as_meta = httpx.get(
+            f"{base}/.well-known/oauth-authorization-server", timeout=10
+        )
+        assert as_meta.status_code == 200, as_meta.text
+    finally:
+        httpd.shutdown()
+        registry.shutdown_all()
+        httpd.modern_pool.shutdown_all()
+        httpd.server_close()
+
+
+def test_serve_main_threads_both_new_flags_through():
+    """Both knobs have to survive `serve_main` -> `serve`, and neither has
+    a runtime effect a parse test would otherwise notice."""
+    seen: dict = {}
+
+    def _fake_serve(command, **kwargs):
+        seen.update(kwargs)
+
+    with patch.object(server, "serve", _fake_serve):
+        server.serve_main(
+            ["--modern-only", "--modern-idle-ttl", "45", "--", "python", "-c", "pass"]
+        )
+    assert seen["modern_only"] is True
+    assert seen["modern_idle_ttl"] == 45.0
+
+    seen.clear()
+    with patch.object(server, "serve", _fake_serve):
+        server.serve_main(["--", "python", "-c", "pass"])
+    assert seen["modern_only"] is False
+    assert seen["modern_idle_ttl"] == 0.0
+
+
+def test_a_negative_modern_idle_ttl_is_rejected():
+    with pytest.raises(SystemExit):
+        server.serve_main(["--modern-idle-ttl", "-1", "--", "python", "-c", "pass"])
+
+
+def test_a_newborn_child_is_published_atomically():
+    """#379 review R1F1 — a newborn must never be visible unheld.
+
+    Publication used to assign `entry["backend"]` before `entry["used"]`
+    and take the hold later still. A reaper landing in that gap saw a
+    READY, quiet, unheld entry whose `used` defaulted to 0.0 — a child
+    apparently idle since the epoch — popped it, and shut down the very
+    backend `get_or_create` was about to return. The caller's first
+    request then hit a corpse and came back 504.
+
+    Asserted structurally rather than by winning a race: the pool lock is
+    not reentrant, so `acquire(blocking=False)` from the publishing
+    thread tells us whether that thread already holds it. `_now()` is
+    called exactly where `used` is set, so probing there answers "was
+    publication inside the lock?" deterministically.
+
+    Revert-check: move the assignments back outside the `with` and the
+    probe records False.
+    """
+    observations: list[bool] = []
+    clock = [1000.0]
+
+    pool = server.ModernBackendPool(_BACKEND, idle_ttl=30.0, now=lambda: clock[0])
+
+    def _probing_now():
+        # False from a non-blocking acquire means this thread is already
+        # inside the lock — i.e. publication is atomic.
+        got = pool._lock.acquire(blocking=False)
+        if got:
+            pool._lock.release()
+        observations.append(not got)
+        return clock[0]
+
+    pool._now = _probing_now
+    try:
+        _, _, entry = pool.get_or_create("newborn")
+        assert observations, "the publication path never stamped `used`"
+        assert observations[-1] is True, (
+            "the newborn was published outside the pool lock — a reaper "
+            "could take it before its hold existed"
+        )
+        assert entry["holds"] == 1
+        assert entry["used"] == clock[0]
+        pool.release(entry)
+    finally:
+        pool.shutdown_all()
+
+
+def test_restarting_the_reaper_does_not_leave_two_running():
+    """#379 Copilot review — a restart must not un-stop its predecessor.
+
+    `stop_reaper` does not join: the thread is a daemon parked in
+    `wait(interval)`. With a SHARED stop event, a restart that cleared it
+    could revive a predecessor that had not yet observed the set, leaving
+    two reapers sweeping the same pool. Each loop now closes over the
+    event it was born with, so a stop is permanent for that thread.
+
+    Revert-check: sharing one event and clearing it on start leaves the
+    first thread alive.
+    """
+    pool = server.ModernBackendPool(_BACKEND, idle_ttl=30.0)
+    try:
+        pool.start_reaper()
+        first = pool._reaper
+        assert first is not None and first.is_alive()
+        first_stop = pool._reaper_stop
+
+        pool.stop_reaper()
+        pool.start_reaper()
+        second = pool._reaper
+        assert second is not None and second is not first
+
+        # The first thread's own event stays set no matter what the
+        # restart did to the pool's current one.
+        assert first_stop.is_set()
+        assert pool._reaper_stop is not first_stop
+        assert not pool._reaper_stop.is_set()
+    finally:
+        pool.shutdown_all()

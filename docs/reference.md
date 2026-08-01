@@ -124,7 +124,7 @@ Arguments:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--max-sessions N` | `100` | Maximum concurrent sessions; an initialize past the cap gets `503` |
-| `--session-idle-ttl SECONDS` | `0` (disabled) | Idle timeout; evict a session and its child after this much inactivity so a client that disconnects without DELETE does not pin a slot |
+| `--session-idle-ttl SECONDS` | `0` (disabled) | Idle timeout for OLDER clients' sessions (newer clients have `--modern-idle-ttl`); evict a session and its child after this much inactivity so a client that disconnects without DELETE does not pin a slot |
 | `--max-sessions-per-owner N` | `0` (disabled) | On a new initialize, LRU-evict that OAuth user's older sessions down to `N`, reclaiming ghosts left by a client that reconnects without DELETE; static-token and open-gateway sessions are exempt |
 
 <a id="modern-era-serve"></a>
@@ -132,12 +132,14 @@ Arguments:
 ### Newer MCP clients (2026-07-28)
 
 Nothing to turn on — `serve` answers newer and older clients on the same
-address automatically. This flag only tunes what it tells newer clients
-about caching.
+address automatically. These flags tune caching, tidy up idle backends,
+and (if you want) drop older clients entirely.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--cache-ttl-ms MS` | `60000` | How long (in milliseconds) a newer client may cache list-style results such as `tools/list`. `0` tells clients not to cache at all. Results are always marked private, never shared between users. Tool call results are never cached |
+| `--modern-idle-ttl SECONDS` | `0` (off) | Shut down a backend serving newer clients after this long with no request, freeing the process. Safe to set aggressively — those clients keep no state, so they just get a fresh backend next time. A backend that is mid-request is never shut down. Separate from `--session-idle-ttl`, which governs older clients |
+| `--modern-only` | off | Serve **only** newer clients. Older ones are turned away instead of being given a session: `GET` and `DELETE` answer `405`, and an older client's `initialize` gets an error naming the version this endpoint does serve. OAuth discovery endpoints keep working, so login still bootstraps |
 
 
 ---
