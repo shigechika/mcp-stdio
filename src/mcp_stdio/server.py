@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -523,6 +524,32 @@ _LISTEN_MAX_RESOURCE_SUBSCRIPTIONS = 256
 # The batch ALSO short-circuits — see `_drive_resource_subscription`'s
 # callers — so the real worst case is one timeout, not one per URI.
 _RESOURCE_SUBSCRIBE_TIMEOUT_SECS = 5.0
+
+# How long a reverse-MRTR round may stay PARKED before serve gives up on
+# the client retrying, unblocks the child and drops the txn (#375 §3.8).
+#
+# This is a genuine gap rather than an already-covered case, and the
+# comment exists so nobody "simplifies" it away on the reasoning that the
+# dispatch timeout already handles it. It does not: the 120 s
+# `send_request` wait belongs to the ORIGINAL handler thread. The moment
+# a round parks, that HTTP request completes and its `_pending` slot
+# detaches, so the 120 s clock stops governing anything. The child is
+# left blocked on a reply to its OWN minted request id, which nothing
+# else tracks a deadline for.
+#
+# Expressed as a RELATIONSHIP to the dispatch timeout, never a literal —
+# #388's review round found exactly this class of ratio silently rotting
+# once the general constant is bumped. A test pins the inequality.
+#
+# DELIBERATE POLICY INVERSION FROM RELAY'S PR C, named here because a
+# reviewer who knows that code would otherwise read this as a
+# contradiction: PR C refuses a TTL on its round because "a transaction
+# waits on a human at an elicitation dialog, so a TTL races the user".
+# Here the waiter is a POOLED SUBPROCESS holding a resource slot, not a
+# human, and Server Requirements item 8 licenses abandoning it outright.
+# Bounding this side is correct precisely because bounding the
+# human-facing side is not.
+_MRTR_PARK_TIMEOUT_SECS = _BACKEND_RESPONSE_TIMEOUT_SECS / 2
 
 
 def _child_supports_resource_subscribe(init_result: Any) -> bool:
@@ -1368,6 +1395,235 @@ def _is_reserved_client_id(req_id: Any) -> bool:
     return isinstance(req_id, str) and req_id.startswith(_SERVE_ID_NAMESPACE)
 
 
+# --- reverse MRTR: the signed pointer (#375 PR 1, design §3.2) -----------
+#
+# WHAT THIS IS NOT. The issue's original framing was that serve is
+# stateless, so a round's state must live entirely inside `requestState`.
+# That framing is wrong, and following it literally would misdirect the
+# whole implementation: what a client's retry resumes is not a
+# serializable computation but a LIVE SUBPROCESS blocked on its own stdin
+# read. No amount of state in `requestState` lets a different process — or
+# the same process after a restart — un-block that particular child. The
+# retry MUST land back on the instance holding it. That is an affinity
+# requirement inherent to the child being a real OS process, not a design
+# choice this code can dissolve.
+#
+# So `requestState` is a signed POINTER, never a container: just enough to
+# find an entry in `BackendProcess._mrtr_pending` and prove the finder is
+# entitled to it. The round's real state lives in that table, which dies
+# with the child for free — the same lifetime discipline `_resource_refs`
+# uses (#381/#388).
+#
+# O5/statelessness licenses this: it forbids relying on prior CLIENT
+# requests to reconstruct context (capabilities, protocol version,
+# identity), and an MRTR retry carries its own full `_meta` and its own
+# auth, so every piece of context is still derived fresh. Nothing in the
+# spec forbids a server from keeping its own bookkeeping.
+#
+# O14 is what forces the signature: "servers MUST treat `requestState` as
+# an attacker-controlled input ... MUST protect its integrity (e.g. HMAC
+# or AEAD) and MUST reject state that fails verification". `(e.g. ...)` is
+# illustrative — the spec mandates no algorithm, library or format, and
+# its own worked example uses the placeholder string "AEAD-protected
+# blob" — so stdlib HMAC-SHA256 satisfies it with no new dependency.
+_MRTR_POINTER_VERSION = 1
+
+# Process-lifetime only, never persisted, and that is CORRECT rather than
+# a shortcut. A restart loses every in-flight round — but the alternative
+# is worse: a persisted key would let a client present a perfectly-signed
+# pointer to a txn that provably cannot exist any more, turning an honest
+# "unknown or expired requestState" into a silent misroute. Server
+# Requirements item 8 licenses the loss outright: "Servers MUST NOT assume
+# that clients will fulfill the inputRequests or retry the original
+# request."
+_MRTR_POINTER_KEY = secrets.token_bytes(32)
+
+# Mirrors relay's own `_MRTR_MAX_ROUNDS`; nothing in the spec constrains
+# the value. It rides INSIDE the signed payload because serve keeps no
+# per-client counter across requests — signing it is what stops a client
+# resetting its own round count by hand-crafting `round: 1`.
+_MRTR_MAX_ROUNDS = 32
+
+# How long a signed pointer stays acceptable. Bounds how long a captured
+# blob is worth replaying, independently of single-use consumption.
+_MRTR_POINTER_TTL_SECS = 300.0
+
+
+def _mrtr_principal_hash(principal: str | None) -> str:
+    """A stable, HMAC-keyed tag for the owning principal.
+
+    The raw value is an OAuth username; it goes nowhere near a blob the
+    client holds and could inspect. A tag binds the pointer to its owner
+    just as well, since the only operation ever performed on it is
+    equality against a freshly-resolved principal.
+
+    KEYED with `_MRTR_POINTER_KEY` (#389 review, score 85), not a bare
+    `sha256` of the principal. The payload segment of `requestState` is
+    only integrity-protected — HMAC over the whole blob, never
+    encrypted — and the spec's confidentiality obligation runs the other
+    way ("clients MUST NOT inspect ... its contents"), so nothing stops
+    a proxy log, a client-side debug dump, or a support screenshot from
+    exposing this tag to someone who was never meant to read it. OAuth
+    principals are low-entropy and structurally guessable (usernames,
+    emails), so an UNKEYED hash would let anyone holding a leaked blob
+    run an offline dictionary attack — hash every guessed principal,
+    compare — and learn exactly who opened the round. Confidentiality
+    against that attack comes from the key, not from SHA-256 being
+    "non-reversible": a fast, unsalted, unkeyed hash of a small
+    guessable space is not a secret no matter which hash function it
+    is. Reuses `_MRTR_POINTER_KEY` rather than minting a second secret —
+    the same key already protects the pointer's outer MAC, and both
+    encode (`_mrtr_encode_pointer`) and decode (`_mrtr_decode_pointer`)
+    call this one function, so equality-check semantics are unaffected.
+    """
+    return hmac.new(
+        _MRTR_POINTER_KEY,
+        f"mcp-stdio/mrtr/{principal!r}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _mrtr_pointer_payload_bytes(payload: dict[str, Any]) -> bytes:
+    """The exact bytes that get signed, and later re-signed to verify.
+
+    Canonical: sorted keys, no incidental whitespace. The verifier never
+    re-serializes a parsed payload to check the MAC — it MACs the bytes it
+    received — so canonicality is about the ISSUER producing a stable
+    encoding, not about the verifier trusting a round-trip.
+    """
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _mrtr_encode_pointer(
+    txn_id: str, principal: str | None, round_no: int, *, now: float | None = None
+) -> str:
+    """Mint one `requestState` value.
+
+    Spec: "An opaque string meaningful only to the server. Clients MUST
+    NOT inspect, parse, modify, or make any assumptions about its
+    contents." Opaque is exactly what this is — the client's only
+    obligation is to echo it back byte-for-byte.
+    """
+    issued = time.time() if now is None else now
+    payload = {
+        "v": _MRTR_POINTER_VERSION,
+        "txn_id": txn_id,
+        "principal": _mrtr_principal_hash(principal),
+        "round": round_no,
+        "issued_at": issued,
+        "expires_at": issued + _MRTR_POINTER_TTL_SECS,
+    }
+    raw = _mrtr_pointer_payload_bytes(payload)
+    mac = hmac.new(_MRTR_POINTER_KEY, raw, hashlib.sha256).digest()
+    return f"{_b64url(raw)}.{_b64url(mac)}"
+
+
+def _mrtr_decode_pointer(
+    state: Any, principal: str | None, *, now: float | None = None
+) -> tuple[dict[str, Any] | None, str]:
+    """Verify and unpack a `requestState`; `(payload, "")` or `(None, why)`.
+
+    ORDER IS THE SECURITY PROPERTY. The MAC is checked against the exact
+    bytes received, with `hmac.compare_digest`, BEFORE the payload is
+    parsed as JSON — never parse-then-trust. A caller that read fields out
+    first and verified afterwards would already have acted on
+    attacker-chosen data.
+
+    Integrity is only ONE THIRD of the closure, and saying "HMAC prevents
+    this" alone would be an incomplete claim:
+
+    - HMAC stops FORGERY — a client cannot invent a pointer.
+    - SINGLE-USE consumption (the caller pops the txn entry) stops REPLAY
+      — a captured, still-validly-signed blob is worthless once used.
+    - PRINCIPAL BINDING, checked here, stops CROSS-USER use of a genuine
+      pointer that leaked.
+
+    Never raises. Every malformed shape returns a reason string, because
+    this parses attacker-controlled input on a request-handling path.
+    """
+    if not isinstance(state, str) or state.count(".") != 1:
+        return None, "malformed requestState"
+    raw_b64, mac_b64 = state.split(".", 1)
+    try:
+        raw = _b64url_decode(raw_b64)
+        mac = _b64url_decode(mac_b64)
+    except (ValueError, binascii.Error):
+        return None, "malformed requestState encoding"
+    expected = hmac.new(_MRTR_POINTER_KEY, raw, hashlib.sha256).digest()
+    if not hmac.compare_digest(mac, expected):
+        return None, "requestState failed integrity verification"
+    # Only now is the payload trustworthy enough to parse.
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None, "malformed requestState payload"
+    if not isinstance(payload, dict) or payload.get("v") != _MRTR_POINTER_VERSION:
+        return None, "unsupported requestState version"
+    if payload.get("principal") != _mrtr_principal_hash(principal):
+        # Defense in depth beyond the pool's own per-principal keying:
+        # O14 says to treat this value as attacker-controlled, and a
+        # genuine pointer that leaked between users is exactly the case
+        # pool keying alone does not cover.
+        return None, "requestState belongs to a different principal"
+    expires = payload.get("expires_at")
+    if not isinstance(expires, (int, float)) or (
+        (time.time() if now is None else now) > expires
+    ):
+        return None, "requestState expired"
+    round_no = payload.get("round")
+    if not isinstance(round_no, int) or isinstance(round_no, bool) or round_no < 1:
+        return None, "malformed requestState round"
+    if round_no > _MRTR_MAX_ROUNDS:
+        # Enforced HERE, at the trust boundary, as well as wherever the
+        # next round is opened (#389 review). The retry handler is the
+        # natural place to refuse to go further, but this decoder is what
+        # decides a pointer is valid at all — so a mint-side regression
+        # cannot hand out a pointer that outlives the cap. A round beyond
+        # it is not a pointer worth honouring, whoever produced it.
+        return None, "requestState exceeded the maximum round count"
+    if not isinstance(payload.get("txn_id"), str):
+        return None, "malformed requestState txn"
+    return payload, ""
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+# The only methods a reverse-MRTR round may ever open under. O14 scopes
+# MRTR to requests that can legitimately need more input mid-flight, and
+# this mirrors relay's equivalent restriction on the forward side.
+_MRTR_ELIGIBLE_METHODS = frozenset({"tools/call", "resources/read", "prompts/get"})
+
+
+def _mrtr_principal_is_eligible(principal: str | None) -> bool:
+    """Whether this caller may open a reverse-MRTR round at all (§4 Q1).
+
+    **OAUTH ONLY, and this is a scope boundary rather than a TODO.**
+
+    Principal binding is what stops one caller answering another's
+    prompt, and it buys exactly nothing when the principal is a shared
+    constant. Under no-auth the pool hands ONE child to every caller
+    (decision D1), and a static token does the same — so a prompt raised
+    by caller A's `tools/call` could be answered by whoever's retry
+    happens to land next. That is a cross-caller leak, not merely a
+    degraded experience.
+
+    Both of those postures therefore keep today's behaviour exactly: a
+    clean `-32601`, no bridging, nothing to leak. Only a genuine OAuth
+    user — a principal that actually distinguishes callers — is eligible.
+
+    `None` is the open gateway and `_STATIC_PRINCIPAL` the shared
+    static-token constant; `_authorized` derives both, and this reads the
+    same value rather than re-deriving it.
+    """
+    return principal is not None and principal != _STATIC_PRINCIPAL
+
+
 def _stamp_modern_result(
     msg: dict[str, Any],
     method: str | None,
@@ -1696,6 +1952,33 @@ class BackendProcess:
         # reverse.
         self._sub_lock = threading.Lock()
         self._resource_refs: dict[str, tuple[int, bool]] = {}
+        # #375 PR 1: reverse-MRTR rounds parked on THIS child, keyed by
+        # the `tools/call`'s own minted upstream id. Sited here for the
+        # same reason `_resource_refs` is — the state dies with the child
+        # for free, so a respawn starts clean and no separate
+        # clear-on-death path exists to drift out of sync.
+        #
+        # This table, not `requestState`, is the single source of truth
+        # for a round. The client-held blob is only a signed pointer into
+        # it (see `_mrtr_encode_pointer`): duplicating the round state
+        # into a wire-visible value would leak the child's own internal
+        # request id to the client and enlarge what a captured blob can
+        # carry, for no gain — the table has to exist regardless, because
+        # correlation and eligibility need it.
+        self._mrtr_lock = threading.Lock()
+        self._mrtr_pending: dict[Any, dict[str, Any]] = {}
+        # IN FLIGHT is not the same state as PARKED, and conflating them
+        # was a real hole (#389 /code-review). A round only becomes
+        # visible in `_mrtr_pending` once the child has actually asked
+        # something; between "an eligible request was forwarded" and
+        # that moment, the table says nothing. Two handler threads for
+        # one principal could therefore both look, both see an empty
+        # table, and both forward — leaving exactly the two-eligible-
+        # calls-on-one-child state the invariant exists to forbid.
+        #
+        # So the claim is taken BEFORE the send and held until the
+        # dispatch returns, under the same lock as the table.
+        self._mrtr_inflight = False
         self._closed = threading.Event()
         self._reader = threading.Thread(
             target=self._read_loop, name="backend-reader", daemon=True
@@ -2028,6 +2311,176 @@ class BackendProcess:
                     is None
                 ):
                     responsive = False
+
+    # --- reverse MRTR: the parked-round table (#375 PR 1, §3.1) --------
+    #
+    # NOTHING IN PR 1 OPENS A ROUND. Every method below is exercised
+    # directly by unit tests and by nothing else, so the table is
+    # permanently empty on every live code path and this whole seam is
+    # behaviour-inert — the same discipline P3-A used to ship the modern
+    # validation ladder ahead of P3-B's dispatch.
+
+    def mrtr_round_open(
+        self,
+        upstream_id: Any,
+        *,
+        method: str,
+        child_request_id: Any,
+        declared_caps: dict[str, Any],
+        principal: str | None,
+        round_no: int = 1,
+        now: float | None = None,
+    ) -> str:
+        """Park a round on this child and return its txn id.
+
+        The txn id is random rather than derived: it appears inside a
+        client-held blob, so a guessable value would let a client name
+        another round it never opened. Guessing is not sufficient to USE
+        one — the pointer still has to carry a valid MAC — but there is
+        no reason to hand out the first factor for free.
+        """
+        txn_id = secrets.token_urlsafe(16)
+        deadline = (time.monotonic() if now is None else now) + _MRTR_PARK_TIMEOUT_SECS
+        with self._mrtr_lock:
+            self._mrtr_pending[upstream_id] = {
+                "txn_id": txn_id,
+                "method": method,
+                "child_request_id": child_request_id,
+                "declared_caps": declared_caps,
+                "principal": principal,
+                "round": round_no,
+                "park_deadline": deadline,
+            }
+        return txn_id
+
+    def mrtr_round_for_txn(self, txn_id: str) -> tuple[Any, dict[str, Any]] | None:
+        """The `(upstream_id, entry)` a verified pointer names, or None.
+
+        Verification of the pointer itself happens in
+        `_mrtr_decode_pointer`; this only resolves it. A caller must do
+        both — a well-signed pointer to a txn that no longer exists is
+        the ordinary post-restart / post-timeout case, not an attack, and
+        earns a clean "unknown or expired" rather than anything louder.
+        """
+        with self._mrtr_lock:
+            for upstream_id, entry in self._mrtr_pending.items():
+                if hmac.compare_digest(str(entry["txn_id"]), str(txn_id)):
+                    return upstream_id, dict(entry)
+        return None
+
+    def mrtr_round_consume(self, txn_id: str) -> dict[str, Any] | None:
+        """Atomically take a round out of the table — SINGLE USE.
+
+        This is what actually closes the replay hole. HMAC alone stops
+        forgery but not the re-sending of a genuine, still-validly-signed
+        blob after its round already completed; removing the entry makes
+        the second attempt find nothing. Pop and read under ONE lock hold,
+        so two concurrent retries cannot both observe it.
+        """
+        with self._mrtr_lock:
+            for upstream_id, entry in list(self._mrtr_pending.items()):
+                if hmac.compare_digest(str(entry["txn_id"]), str(txn_id)):
+                    return {
+                        **self._mrtr_pending.pop(upstream_id),
+                        "upstream_id": upstream_id,
+                    }
+        return None
+
+    def mrtr_has_pending(self) -> bool:
+        """Whether any round is currently PARKED on this child.
+
+        Narrower than the concurrency invariant, deliberately: this
+        answers "is a round waiting for a client retry", which is only
+        half of "may another eligible request be dispatched". Use
+        `mrtr_begin_dispatch` for the latter — reading this alone at a
+        dispatch site is the exact hole #389's review found.
+        """
+        with self._mrtr_lock:
+            return bool(self._mrtr_pending)
+
+    def mrtr_begin_dispatch(self) -> bool:
+        """Claim this child for one MRTR-eligible request, or refuse.
+
+        THE concurrency invariant (#375 §1.2), and it has to be a single
+        atomic check-and-set rather than a read followed by a separate
+        act — the same lesson #382's review taught for the listen-stream
+        cap, where a check-then-attach let a synchronized burst all
+        squeeze past a cap each of them had seen as free.
+
+        Why the invariant exists: a pooled child answers several callers,
+        and `send_request` allows several ids in flight on it at once. A
+        legacy child's out-of-band request carries NO field linking it
+        back to whichever call provoked it, so with two eligible calls
+        outstanding the correlation is genuinely ambiguous — not hard,
+        ambiguous. Guessing would attach a user's prompt to the wrong
+        request.
+
+        REFUSES ON EITHER STATE — a claim already held, or a round
+        already parked. Those are different points in one lifecycle:
+        a request is claimed from just before it is forwarded until its
+        dispatch returns, and if it parked a round on the way then
+        `_mrtr_pending` carries the exclusion onward after the claim is
+        released. Checking both is what makes the handover seamless, so
+        no window opens between the two.
+        """
+        with self._mrtr_lock:
+            if self._mrtr_inflight or self._mrtr_pending:
+                return False
+            self._mrtr_inflight = True
+            return True
+
+    def mrtr_end_dispatch(self) -> None:
+        """Release the claim; idempotent.
+
+        Clears ONLY the in-flight marker. If the dispatch parked a round,
+        `_mrtr_pending` is already populated and keeps excluding new
+        dispatches — which is why this can run unconditionally in a
+        `finally` without reopening the gap.
+        """
+        with self._mrtr_lock:
+            self._mrtr_inflight = False
+
+    def mrtr_expire_parked(self, *, now: float | None = None) -> list[dict[str, Any]]:
+        """Drop rounds past their park deadline; return what was dropped.
+
+        Returning the entries rather than acting on them keeps this
+        callable from a sweep without deciding policy: PR 2 writes a
+        JSON-RPC error back to the child under its own
+        `child_request_id`, which unblocks it and returns it to the pool.
+        No client-facing action is owed — Server Requirements item 8
+        licenses giving up on a retry that never came.
+        """
+        stamp = time.monotonic() if now is None else now
+        expired: list[dict[str, Any]] = []
+        with self._mrtr_lock:
+            for upstream_id, entry in list(self._mrtr_pending.items()):
+                if stamp <= entry["park_deadline"]:
+                    continue
+                # ONCE PER TRANSACTION, and the mechanism is the pop on
+                # the next line rather than a latch flag (#375 §4 Q7,
+                # trap 3). Expiry is checked on a POLL, so a log emitted
+                # while the entry SURVIVES would repeat once per tick for
+                # as long as it lasted — the flood #388's own
+                # failure-logged latch exists to prevent. Here the entry
+                # is removed in the same lock hold that logs it, so the
+                # second sweep finds nothing to say.
+                #
+                # A latch was written first and deleted: with an
+                # unconditional pop it could never fire twice, so it was
+                # dead code AND made the guarding test vacuous — the test
+                # passed with the latch removed. The test now pins the
+                # property (repeated sweeps => exactly one line), which
+                # catches the real regression: making expiry non-popping
+                # or retry-on-failure.
+                log(
+                    f"mrtr: txn {entry['txn_id']!r} (round {entry['round']}) "
+                    f"abandoned after {_MRTR_PARK_TIMEOUT_SECS:g}s with no "
+                    "client retry; unblocking the child"
+                )
+                expired.append(
+                    {**self._mrtr_pending.pop(upstream_id), "upstream_id": upstream_id}
+                )
+        return expired
 
     def _drive_resource_subscription(self, method: str, uri: str) -> bool | None:
         """Send one `resources/subscribe`/`unsubscribe` to the child.
@@ -4414,6 +4867,14 @@ class _Handler(BaseHTTPRequestHandler):
         # permanently unevictable and unreapable. Releasing here rather
         # than at each arm keeps that true for the early returns too —
         # and for anything the never-crash net catches on the way out.
+        #
+        # Initialised BEFORE the try, not at the point it is set: the
+        # `finally` reads it on every exit path, including the arms that
+        # return long before an MRTR claim could be taken (notifications,
+        # listen, discover). Setting it only where it becomes true left
+        # those paths raising `UnboundLocalError` out of the `finally` —
+        # caught immediately by the listen suite's hold test.
+        mrtr_claimed = False
         try:
             # Notifications: forward and acknowledge. The v2 client sends none
             # in the discover flow (no `initialize` means no
@@ -4470,6 +4931,45 @@ class _Handler(BaseHTTPRequestHandler):
                 )
                 return
 
+            # #375 §3.4: the one-MRTR-eligible-request-per-child
+            # invariant.
+            #
+            # CLAIMED, not merely checked. An earlier version read
+            # `mrtr_has_pending()` here and forwarded if it was False,
+            # which #389's review showed is not the invariant at all:
+            # a round only appears in `_mrtr_pending` once the child has
+            # actually asked something, so two handler threads for one
+            # principal could both read an empty table and both forward.
+            # The claim closes that by being a single atomic
+            # check-and-set — the same shape #382's review required for
+            # the listen-stream cap after a check-then-attach let a
+            # synchronized burst all past it.
+            #
+            # This is NOT inert, and that is the one deliberate
+            # behavioural difference in PR 1: two genuinely concurrent
+            # eligible calls on one child now get a 503 for the second.
+            # Reaching it requires the same principal AND real overlap,
+            # and it is the state PR 2 could not disambiguate anyway —
+            # shipping the guard late would mean shipping the race.
+            #
+            # REJECT rather than queue (§4 Q2): queuing reintroduces the
+            # stall vector D4 exists to prevent, and narrows perceived
+            # concurrency in a way far harder to diagnose than an error.
+            if method in _MRTR_ELIGIBLE_METHODS:
+                if not backend.mrtr_begin_dispatch():
+                    self._send_json(
+                        503,
+                        _error_body(
+                            "this backend is already handling an "
+                            "input-required-capable request; retry once it "
+                            "completes",
+                            req_id,
+                            code=_JSONRPC_INTERNAL_ERROR,
+                        ),
+                    )
+                    return
+                mrtr_claimed = True
+
             upstream_id = _mint_modern_id()
             outbound = dict(msg)
             outbound["id"] = upstream_id
@@ -4510,6 +5010,14 @@ class _Handler(BaseHTTPRequestHandler):
             )
             self._send_json(_modern_response_status(parsed), json.dumps(parsed))
         finally:
+            if mrtr_claimed:
+                # Unconditional, and safe to be: if this dispatch parked a
+                # round on its way out, `_mrtr_pending` is already
+                # populated and keeps excluding new dispatches after the
+                # claim drops. The two states hand over with no window
+                # between them, which is why `mrtr_begin_dispatch` checks
+                # both.
+                backend.mrtr_end_dispatch()
             self.modern_pool.release(pool_entry)
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API

@@ -30,6 +30,8 @@ from __future__ import annotations
 import ast
 import base64
 import json
+import hmac
+import hashlib
 import os
 import re
 import socket
@@ -3821,3 +3823,706 @@ class TestResourceSubscribeFailureLogThrottle:
             }
         finally:
             backend.shutdown()
+
+
+# --- reverse MRTR: the signed pointer (#375 PR 1) -------------------------
+
+
+class TestMrtrPointer:
+    """`requestState` is a signed POINTER, not a state container.
+
+    The distinction is the design's central correction and worth stating
+    in a test file too: what a retry resumes is a live subprocess blocked
+    on its own stdin read, which no amount of embedded state can
+    un-block from another process. So this blob carries only enough to
+    find an entry in the child's own table and prove entitlement to it.
+    """
+
+    def test_a_minted_pointer_round_trips(self):
+        state = server._mrtr_encode_pointer("txn-1", "alice", 1)
+        payload, why = server._mrtr_decode_pointer(state, "alice")
+        assert why == ""
+        assert payload["txn_id"] == "txn-1"
+        assert payload["round"] == 1
+        assert payload["v"] == server._MRTR_POINTER_VERSION
+
+    def test_the_raw_principal_never_appears_in_the_blob(self):
+        """The client holds this value and the spec only forbids it from
+        PARSING it — which is not a security control. A hash binds the
+        pointer just as well, since the only operation ever performed on
+        it is equality against a freshly-resolved principal."""
+        state = server._mrtr_encode_pointer("txn-1", "alice@example.com", 1)
+        assert "alice" not in server._b64url_decode(state.split(".")[0]).decode()
+
+    def test_the_principal_tag_depends_on_the_key_not_just_the_string(self):
+        """#389 review, score 85: `_mrtr_principal_hash` used to be a bare
+        `sha256` of the principal string — a "non-reversible tag" only in
+        name, since it mixed in no secret. `requestState`'s payload is
+        integrity-protected, not encrypted, and the spec's confidentiality
+        obligation runs the OTHER way ("clients MUST NOT inspect ... its
+        contents", not "servers must keep it secret") — so a proxy log, a
+        client-side debug dump, or a support screenshot can expose this
+        tag. OAuth principals are low-entropy and guessable (usernames,
+        emails), so an UNKEYED hash would let anyone holding a leaked
+        blob run an offline dictionary attack: hash every guessed
+        principal, compare, learn who opened the round.
+
+        Simulates exactly that attacker — someone who can read the tag
+        but does not have `_MRTR_POINTER_KEY` — by recomputing the OLD,
+        unkeyed formula directly and asserting it does NOT match what the
+        real function produces for the same guessable strings.
+
+        Revert-check: swap `_mrtr_principal_hash` back to the bare
+        `hashlib.sha256` call and this assertion flips to a match — the
+        attacker's guess-and-compare would have worked.
+        """
+        for guessable in ("alice@example.com", "bob@example.com"):
+            real_tag = server._mrtr_principal_hash(guessable)
+            attacker_guess = hashlib.sha256(
+                f"mcp-stdio/mrtr/{guessable!r}".encode()
+            ).hexdigest()
+            assert real_tag != attacker_guess, guessable
+
+    def test_a_tampered_payload_is_rejected(self):
+        """O14: "servers MUST ... reject state that fails verification".
+
+        Every byte of the payload is flipped in turn, so this cannot pass
+        by happening to mutate a field nothing reads.
+
+        Mutating the DECODED BYTES and re-encoding, not the base64 text
+        (#389 review): unpadded base64's final character carries unused
+        bits, so a text-level flip there can decode to the identical
+        bytes, verify fine, and make this assertion wrong for reasons
+        that have nothing to do with the property under test.
+
+        Revert-check: drop the `compare_digest` check and this fails.
+        """
+        state = server._mrtr_encode_pointer("txn-1", "alice", 1)
+        raw_b64, mac_b64 = state.split(".")
+        raw = server._b64url_decode(raw_b64)
+        for i in range(len(raw)):
+            mutated = bytearray(raw)
+            mutated[i] ^= 0x01
+            tampered = f"{server._b64url(bytes(mutated))}.{mac_b64}"
+            payload, why = server._mrtr_decode_pointer(tampered, "alice")
+            assert payload is None, (i, tampered)
+            assert why, i
+
+    def test_a_tampered_mac_is_rejected(self):
+        state = server._mrtr_encode_pointer("txn-1", "alice", 1)
+        raw_b64, mac_b64 = state.split(".")
+        flipped = ("A" if mac_b64[0] != "A" else "B") + mac_b64[1:]
+        assert server._mrtr_decode_pointer(f"{raw_b64}.{flipped}", "alice")[0] is None
+
+    def test_a_pointer_for_another_principal_is_rejected(self):
+        """Defense in depth beyond the pool's per-principal keying: a
+        GENUINE pointer that leaked between users is exactly the case
+        pool keying alone does not cover."""
+        state = server._mrtr_encode_pointer("txn-1", "alice", 1)
+        payload, why = server._mrtr_decode_pointer(state, "bob")
+        assert payload is None
+        assert "principal" in why
+
+    def test_an_expired_pointer_is_rejected(self):
+        state = server._mrtr_encode_pointer("txn-1", "alice", 1, now=1000.0)
+        assert server._mrtr_decode_pointer(state, "alice", now=1000.0)[0] is not None
+        payload, why = server._mrtr_decode_pointer(
+            state, "alice", now=1000.0 + server._MRTR_POINTER_TTL_SECS + 1
+        )
+        assert payload is None and "expired" in why
+
+    def test_every_malformed_shape_returns_a_reason_rather_than_raising(self):
+        """This parses attacker-controlled input on a request-handling
+        path, so a raise here is a crash in a handler thread."""
+        for bad in (
+            None,
+            7,
+            "",
+            "no-dot",
+            "a.b.c",
+            "!!!.!!!",
+            "....",
+            f"{server._b64url(b'not json')}.{server._b64url(b'x')}",
+        ):
+            payload, why = server._mrtr_decode_pointer(bad, "alice")
+            assert payload is None, bad
+            assert why, bad
+
+    def test_a_forged_payload_cannot_be_signed_without_the_key(self):
+        """The whole point of the MAC: a client that understands the
+        format still cannot mint one."""
+        forged = server._mrtr_pointer_payload_bytes(
+            {
+                "v": 1,
+                "txn_id": "attacker",
+                "principal": server._mrtr_principal_hash("alice"),
+                "round": 1,
+                "issued_at": 0.0,
+                "expires_at": 1e12,
+            }
+        )
+        state = f"{server._b64url(forged)}.{server._b64url(b'whatever')}"
+        assert server._mrtr_decode_pointer(state, "alice")[0] is None
+
+    def test_the_round_rides_inside_the_signature(self):
+        """Serve keeps no per-client round counter across requests, so
+        the count is only trustworthy because it is signed — otherwise a
+        client resets its own cap by hand-crafting `round: 1`."""
+        state = server._mrtr_encode_pointer("txn-1", "alice", 5)
+        assert server._mrtr_decode_pointer(state, "alice")[0]["round"] == 5
+        raw = json.loads(server._b64url_decode(state.split(".")[0]))
+        raw["round"] = 1
+        rewritten = server._mrtr_pointer_payload_bytes(raw)
+        forged = f"{server._b64url(rewritten)}.{state.split('.')[1]}"
+        assert server._mrtr_decode_pointer(forged, "alice")[0] is None
+
+    def test_a_round_beyond_the_cap_is_rejected(self):
+        """Enforced at the DECODER, not only wherever the next round is
+        opened (#389 review). The decoder is what decides a pointer is
+        valid at all, so a mint-side regression cannot hand out one that
+        outlives the cap.
+
+        Revert-check: drop the `> _MRTR_MAX_ROUNDS` check and this
+        returns a valid payload.
+        """
+        ok = server._mrtr_encode_pointer("t", "alice", server._MRTR_MAX_ROUNDS)
+        assert server._mrtr_decode_pointer(ok, "alice")[0] is not None
+        too_far = server._mrtr_encode_pointer("t", "alice", server._MRTR_MAX_ROUNDS + 1)
+        payload, why = server._mrtr_decode_pointer(too_far, "alice")
+        assert payload is None
+        assert "round" in why
+
+    def test_a_bogus_round_value_is_rejected(self):
+        for bad_round in (0, -1, "1", True, None):
+            payload = {
+                "v": 1,
+                "txn_id": "t",
+                "principal": server._mrtr_principal_hash("alice"),
+                "round": bad_round,
+                "issued_at": 0.0,
+                "expires_at": 1e12,
+            }
+            raw = server._mrtr_pointer_payload_bytes(payload)
+            mac = hmac.new(server._MRTR_POINTER_KEY, raw, hashlib.sha256).digest()
+            state = f"{server._b64url(raw)}.{server._b64url(mac)}"
+            assert server._mrtr_decode_pointer(state, "alice")[0] is None, bad_round
+
+    def test_the_key_is_process_lifetime_and_never_persisted(self):
+        """A restart losing in-flight rounds is CORRECT, not a shortcut:
+        a persisted key would let a client present a perfectly-signed
+        pointer to a txn that provably cannot exist any more, turning an
+        honest "unknown or expired" error into a silent misroute."""
+        assert isinstance(server._MRTR_POINTER_KEY, bytes)
+        assert len(server._MRTR_POINTER_KEY) == 32
+        # A source-text scan used to stand in for "never persisted"
+        # (#389 review): it was brittle against any refactor and did not
+        # actually prove the property, since a key can be written out
+        # from anywhere. The real guarantee is structural — the key is a
+        # module-level `secrets.token_bytes` with no writer — and the
+        # observable consequence is pinned by the round-trip tests, which
+        # would fail if the key were ever reloaded rather than kept.
+
+
+class TestMrtrParkedRoundTable:
+    """The per-child table that is the single source of truth for a round.
+
+    Nothing in PR 1 opens a round on a live path, so every method here is
+    exercised directly and the table stays permanently empty in
+    production — which is what makes this PR behaviour-inert.
+    """
+
+    def _backend(self):
+        return server.BackendProcess([*_BACKEND], modern_owned=True)
+
+    def test_a_parked_round_is_findable_by_its_txn_id(self):
+        backend = self._backend()
+        try:
+            txn = backend.mrtr_round_open(
+                "mcp-stdio/serve/1",
+                method="elicitation/create",
+                child_request_id="child-1",
+                declared_caps={"elicitation": {}},
+                principal="alice",
+            )
+            found = backend.mrtr_round_for_txn(txn)
+            assert found is not None
+            upstream_id, entry = found
+            assert upstream_id == "mcp-stdio/serve/1"
+            assert entry["child_request_id"] == "child-1"
+            assert entry["round"] == 1
+        finally:
+            backend.shutdown()
+
+    def test_the_txn_id_is_not_guessable(self):
+        """It rides inside a client-held blob. Guessing is not sufficient
+        to USE a round — the pointer still needs a valid MAC — but there
+        is no reason to hand out the first factor for free."""
+        backend = self._backend()
+        try:
+            seen = {
+                backend.mrtr_round_open(
+                    f"u{i}",
+                    method="roots/list",
+                    child_request_id=i,
+                    declared_caps={},
+                    principal="alice",
+                )
+                for i in range(50)
+            }
+            assert len(seen) == 50
+            assert all(len(t) >= 16 for t in seen)
+        finally:
+            backend.shutdown()
+
+    def test_consume_is_single_use(self):
+        """The replay closure. HMAC stops forgery but not the re-sending
+        of a genuine, still-validly-signed blob after its round finished;
+        removing the entry is what makes the second attempt find nothing.
+
+        Revert-check: make `mrtr_round_consume` a lookup that does not
+        pop, and the second call starts succeeding.
+        """
+        backend = self._backend()
+        try:
+            txn = backend.mrtr_round_open(
+                "u1",
+                method="sampling/createMessage",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+            )
+            first = backend.mrtr_round_consume(txn)
+            assert first is not None and first["upstream_id"] == "u1"
+            assert backend.mrtr_round_consume(txn) is None
+            assert backend.mrtr_round_for_txn(txn) is None
+        finally:
+            backend.shutdown()
+
+    def test_two_concurrent_consumers_cannot_both_win(self):
+        """Pop-and-read under one lock hold, so a racing pair of retries
+        resolves to exactly one winner rather than both proceeding."""
+        backend = self._backend()
+        try:
+            txn = backend.mrtr_round_open(
+                "u1",
+                method="roots/list",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+            )
+            results: list = []
+            barrier = threading.Barrier(8)
+
+            def _race():
+                barrier.wait()
+                results.append(backend.mrtr_round_consume(txn))
+
+            threads = [threading.Thread(target=_race) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+            assert sum(1 for r in results if r is not None) == 1, results
+        finally:
+            backend.shutdown()
+
+    def test_has_pending_is_the_concurrency_invariant_read(self):
+        backend = self._backend()
+        try:
+            assert backend.mrtr_has_pending() is False
+            txn = backend.mrtr_round_open(
+                "u1",
+                method="roots/list",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+            )
+            assert backend.mrtr_has_pending() is True
+            backend.mrtr_round_consume(txn)
+            assert backend.mrtr_has_pending() is False
+        finally:
+            backend.shutdown()
+
+    def test_a_round_past_its_deadline_expires(self):
+        backend = self._backend()
+        try:
+            backend.mrtr_round_open(
+                "u1",
+                method="roots/list",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+                now=1000.0,
+            )
+            # Still inside the window.
+            assert backend.mrtr_expire_parked(now=1000.0) == []
+            assert backend.mrtr_has_pending() is True
+            expired = backend.mrtr_expire_parked(
+                now=1000.0 + server._MRTR_PARK_TIMEOUT_SECS + 1
+            )
+            assert [e["child_request_id"] for e in expired] == ["c1"]
+            assert backend.mrtr_has_pending() is False
+        finally:
+            backend.shutdown()
+
+    def test_abandonment_is_logged_once_per_transaction_not_per_poll(self, capsys):
+        """#375 §4 Q7 trap 3 — the log-flood class.
+
+        Expiry is checked on a POLL, so a line emitted while the entry
+        SURVIVES would repeat once per tick for as long as it lasted.
+        Here the entry is removed in the same lock hold that logs it, so
+        the second sweep finds nothing to say.
+
+        Asserted as a COUNT, since "the log looked fine" is exactly the
+        observation this class of finding hides behind.
+
+        Revert-check that BITES: make expiry non-popping (leave the entry
+        in place) and this floods. A revert-check on the latch flag that
+        was originally written here did NOT bite — the unconditional pop
+        already guaranteed once-per-txn, so the flag was dead code and
+        this test could not tell the difference. The flag is gone; the
+        property it was supposed to protect is what is pinned.
+        """
+        backend = self._backend()
+        try:
+            backend.mrtr_round_open(
+                "u1",
+                method="roots/list",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+                now=1000.0,
+            )
+            capsys.readouterr()
+            late = 1000.0 + server._MRTR_PARK_TIMEOUT_SECS + 1
+            for _ in range(5):
+                backend.mrtr_expire_parked(now=late)
+            assert capsys.readouterr().err.count("abandoned after") == 1
+        finally:
+            backend.shutdown()
+
+    def test_the_park_timeout_is_a_ratio_not_a_literal(self):
+        """#388's review found this exact class of ratio silently rotting
+        when the general constant is bumped, so the RELATIONSHIP is what
+        gets pinned.
+
+        And the relationship is the load-bearing one: the dispatch
+        timeout belongs to the original handler thread, which is already
+        gone by the time a round is parked — so a park timeout at or
+        above it would never fire before the child was abandoned anyway.
+        """
+        assert server._MRTR_PARK_TIMEOUT_SECS < server._BACKEND_RESPONSE_TIMEOUT_SECS
+        assert server._MRTR_PARK_TIMEOUT_SECS > 0
+
+    def test_the_table_dies_with_the_child(self):
+        """No clear-on-death path exists, deliberately: the table lives on
+        the `BackendProcess`, so a respawn gets an empty one for free —
+        the same lifetime discipline `_resource_refs` established."""
+        backend = self._backend()
+        try:
+            backend.mrtr_round_open(
+                "u1",
+                method="roots/list",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+            )
+            assert backend.mrtr_has_pending() is True
+        finally:
+            backend.shutdown()
+        replacement = self._backend()
+        try:
+            assert replacement.mrtr_has_pending() is False
+        finally:
+            replacement.shutdown()
+
+
+@pytest.fixture()
+def gateway_with_pool():
+    """A gateway that also hands back its `ModernBackendPool`.
+
+    These tests must SEED a parked round, because PR 1 has nothing that
+    opens one — that is the point of the PR. The ordinary `gateway`
+    fixture yields only a URL, and reaching the pool by scanning live
+    objects would be non-deterministic the moment another test's gateway
+    exists, so the handle is passed explicitly.
+    """
+    httpd, registry = server.build_server(_BACKEND, host="127.0.0.1", port=0)
+    host, port = httpd.server_address[0], httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://{host}:{port}/mcp", httpd.modern_pool
+    finally:
+        httpd.shutdown()
+        registry.shutdown_all()
+        httpd.modern_pool.shutdown_all()
+        httpd.server_close()
+
+
+class TestMrtrEligibility:
+    """Who may open a round, and the invariant that keeps it correlatable."""
+
+    def test_only_a_genuine_oauth_principal_is_eligible(self):
+        """#375 §4 Q1 — a SCOPE BOUNDARY, not a TODO.
+
+        Principal binding is what stops one caller answering another's
+        prompt, and it buys nothing when the principal is a shared
+        constant: under no-auth the pool hands ONE child to every caller,
+        and a static token does the same, so a prompt raised by caller
+        A's request could be answered by whoever's retry lands next.
+        """
+        assert server._mrtr_principal_is_eligible("alice@example.com") is True
+        # The open gateway.
+        assert server._mrtr_principal_is_eligible(None) is False
+        # The shared static-token constant — read from serve's own
+        # definition rather than restated, so a rename cannot leave this
+        # test asserting against a string nothing produces any more.
+        assert server._mrtr_principal_is_eligible(server._STATIC_PRINCIPAL) is False
+
+    def test_only_the_o14_methods_can_open_a_round(self):
+        assert server._MRTR_ELIGIBLE_METHODS == {
+            "tools/call",
+            "resources/read",
+            "prompts/get",
+        }
+        for never in ("tools/list", "server/discover", "subscriptions/listen"):
+            assert never not in server._MRTR_ELIGIBLE_METHODS
+
+    def test_a_busy_child_rejects_a_second_eligible_call(self, gateway_with_pool):
+        """§1.2's invariant, driven through the real dispatch path.
+
+        A bare legacy out-of-band request carries NO field linking it
+        back to whichever in-flight call provoked it, so with two
+        eligible calls on one shared child the correlation is genuinely
+        ambiguous. The table is seeded directly because PR 1 opens no
+        rounds — that is the point of the PR — and seeding is what lets
+        the guard be tested before the thing that populates it exists.
+
+        Revert-check: drop the `mrtr_has_pending()` guard from
+        `_dispatch_modern` and this returns 200.
+        """
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        try:
+            txn = backend.mrtr_round_open(
+                "u1",
+                method="tools/call",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+            )
+            resp = _post(
+                url,
+                _modern_body(
+                    "tools/call",
+                    params={"name": "echo_tool", "arguments": {}},
+                    meta=_meta(),
+                ),
+                _modern_headers("tools/call", name="echo_tool"),
+            )
+            assert resp.status_code == 503, resp.text
+            assert resp.json()["error"]["code"] == -32603
+            assert "input-required" in resp.json()["error"]["message"]
+        finally:
+            backend.mrtr_round_consume(txn)
+            pool.release(entry)
+
+    def test_a_non_eligible_method_is_unaffected_by_a_parked_round(
+        self, gateway_with_pool
+    ):
+        """The guard is scoped to the three O14 methods: a parked round
+        must not stall `tools/list` for everyone on that child."""
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        try:
+            txn = backend.mrtr_round_open(
+                "u1",
+                method="tools/call",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+            )
+            resp = _post(
+                url, _modern_body("tools/list", meta=_meta()), _modern_headers()
+            )
+            assert resp.status_code == 200, resp.text
+        finally:
+            backend.mrtr_round_consume(txn)
+            pool.release(entry)
+
+
+def test_pr1_opens_no_rounds_on_any_live_path(gateway_with_pool):
+    """The zero-behaviour-change claim, asserted rather than argued.
+
+    PR 1 builds the envelope, the table and the invariant; PR 2 wires
+    them to actual traffic. If any live path started parking a round, the
+    concurrency guard above would begin rejecting ordinary concurrent
+    calls — an observable change this PR promises not to make.
+
+    Drives one of each eligible method plus a child-initiated request
+    (`ask_client`, which still earns today's D4 `-32601`) and asserts the
+    table is EMPTY afterwards — a positive check on state, not an
+    absence-of-symptoms observation.
+    """
+    url, pool = gateway_with_pool
+    for body, headers in (
+        (
+            _modern_body(
+                "tools/call",
+                params={"name": "echo_tool", "arguments": {}},
+                meta=_meta(),
+            ),
+            _modern_headers("tools/call", name="echo_tool"),
+        ),
+        (_modern_body("tools/list", meta=_meta()), _modern_headers()),
+        (_modern_body("ask_client", meta=_meta()), _modern_headers("ask_client")),
+    ):
+        _post(url, body, headers)
+    backend, _, entry = pool.get_or_create(None)
+    try:
+        assert backend._mrtr_pending == {}
+        assert backend.mrtr_has_pending() is False
+    finally:
+        pool.release(entry)
+
+
+class TestMrtrDispatchClaim:
+    """The invariant is a CLAIM, not a read of the parked table.
+
+    #389's review found the difference the hard way: a round only enters
+    `_mrtr_pending` once the child has actually asked something, so
+    between "an eligible request was forwarded" and that moment the table
+    says nothing at all. Two handler threads for one principal could both
+    read it empty and both forward — the exact two-eligible-calls-on-one-
+    child state the invariant exists to forbid.
+    """
+
+    def _backend(self):
+        return server.BackendProcess([*_BACKEND], modern_owned=True)
+
+    def test_only_one_of_many_racing_claims_wins(self):
+        """Barrier-synchronized, because a check-then-act hole only shows
+        up under real simultaneity — the same idiom the pool tests use,
+        and the same lesson #382's review taught for the listen cap.
+
+        Revert-check: split `mrtr_begin_dispatch` into a read followed by
+        a separate set and this reports several winners.
+        """
+        backend = self._backend()
+        try:
+            wins: list[bool] = []
+            lock = threading.Lock()
+            barrier = threading.Barrier(16)
+
+            def _race():
+                barrier.wait()
+                got = backend.mrtr_begin_dispatch()
+                with lock:
+                    wins.append(got)
+
+            threads = [threading.Thread(target=_race) for _ in range(16)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+            assert sum(wins) == 1, wins
+        finally:
+            backend.shutdown()
+
+    def test_the_claim_is_released_and_reusable(self):
+        backend = self._backend()
+        try:
+            assert backend.mrtr_begin_dispatch() is True
+            assert backend.mrtr_begin_dispatch() is False
+            backend.mrtr_end_dispatch()
+            assert backend.mrtr_begin_dispatch() is True
+        finally:
+            backend.shutdown()
+
+    def test_a_parked_round_keeps_excluding_after_the_claim_drops(self):
+        """The handover, and why `mrtr_begin_dispatch` checks BOTH states.
+
+        A dispatch that parks a round returns — dropping its claim — while
+        the round is still outstanding. If the claim were the only gate,
+        that release would reopen the child to a second eligible call
+        with a prompt still pending. `_mrtr_pending` carries the
+        exclusion onward, so no window opens between the two.
+        """
+        backend = self._backend()
+        try:
+            assert backend.mrtr_begin_dispatch() is True
+            txn = backend.mrtr_round_open(
+                "u1",
+                method="tools/call",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+            )
+            backend.mrtr_end_dispatch()  # the dispatch returned
+            assert backend.mrtr_begin_dispatch() is False, (
+                "the parked round stopped excluding once the claim dropped"
+            )
+            backend.mrtr_round_consume(txn)
+            assert backend.mrtr_begin_dispatch() is True
+        finally:
+            backend.shutdown()
+
+    def test_two_concurrent_eligible_calls_race_over_http(self, gateway_with_pool):
+        """The finding's own scenario, end to end.
+
+        Two handler threads, one principal, one child, both dispatching
+        an eligible method with genuine overlap — held open by blocking
+        the child's reply until both are inside. Exactly one must be
+        served; the other gets the busy error.
+
+        Overlap is FORCED rather than hoped for: without the gate the two
+        would simply both succeed, which is the bug, so a test that
+        merely fired two requests and happened not to overlap would pass
+        against the broken code.
+        """
+        url, pool = gateway_with_pool
+        release = threading.Event()
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        original = backend.send_request
+
+        def _blocking(line, req_id, timeout):
+            release.wait(timeout=15)
+            return original(line, req_id, timeout)
+
+        backend.send_request = _blocking  # type: ignore[method-assign]
+        statuses: list[int] = []
+        lock = threading.Lock()
+        started = threading.Barrier(2)
+
+        def _call():
+            started.wait(timeout=10)
+            resp = _post(
+                url,
+                _modern_body(
+                    "tools/call",
+                    params={"name": "echo_tool", "arguments": {}},
+                    meta=_meta(),
+                ),
+                _modern_headers("tools/call", name="echo_tool"),
+            )
+            with lock:
+                statuses.append(resp.status_code)
+
+        threads = [threading.Thread(target=_call, daemon=True) for _ in range(2)]
+        for t in threads:
+            t.start()
+        # Let the loser reach its 503 before unblocking the winner, so the
+        # two genuinely overlap rather than serialising.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            with lock:
+                if statuses:
+                    break
+            time.sleep(0.02)
+        release.set()
+        for t in threads:
+            t.join(timeout=20)
+
+        assert sorted(statuses) == [200, 503], statuses
