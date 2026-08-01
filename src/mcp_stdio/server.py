@@ -178,15 +178,27 @@ _MODERN_ROUTING_HEADERS = ("MCP-Protocol-Version", "Mcp-Method", "Mcp-Name")
 # other side of the wire. Spec: exactly these may ride the stream —
 # "Request-scoped notifications like notifications/progress and
 # notifications/message are not delivered on the listen stream", so the
-# table is a whitelist and everything absent from it is dropped. #374 is
-# the listChanged trio only; `resourceSubscriptions` is declined in the
-# ack until #381.
+# table is a whitelist and everything absent from it is dropped.
 _LISTEN_FILTER_METHODS = {
     "toolsListChanged": "notifications/tools/list_changed",
     "promptsListChanged": "notifications/prompts/list_changed",
     "resourcesListChanged": "notifications/resources/list_changed",
 }
 _LISTEN_FORWARDED_METHODS = frozenset(_LISTEN_FILTER_METHODS.values())
+
+# The fourth filter field, and deliberately NOT a member of the table
+# above (#381 §3.4). The trio's fields are booleans, so membership in
+# `_LISTEN_FORWARDED_METHODS` is the whole test; `resourceSubscriptions`
+# carries a URI LIST, so a stream wants this method only for the specific
+# URIs it asked for. Folding it into the boolean table would make
+# `wants()` true for any non-empty list and deliver every URI's update to
+# every subscriber — which is exactly the "MUST NOT send notification
+# types the client has not explicitly requested" violation the table
+# exists to prevent, and across streams a cross-subscription leak.
+# Relay hit the identical fork and resolved it the same way: its own
+# `_RESOURCE_UPDATED_METHOD` gets a dedicated branch with its own gates.
+_RESOURCE_UPDATED_METHOD = "notifications/resources/updated"
+_LISTEN_RESOURCE_FIELD = "resourceSubscriptions"
 
 _LISTEN_METHOD = "subscriptions/listen"
 _LISTEN_ACK_METHOD = "notifications/subscriptions/acknowledged"
@@ -459,6 +471,86 @@ _LISTEN_QUEUE_MAX = 1024
 # A cap exists so one client cannot pin unbounded handler threads.
 _LISTEN_MAX_STREAMS_PER_CHILD = 4
 
+# Resource URIs one listen stream may subscribe to (#381 §3.12, owner
+# default confirmed). Mirrors relay's own `_LISTEN_MAX_SUBSCRIPTIONS`, and
+# a cap rather than a TTL for the same reason: it bounds both the request
+# body and the per-child state a hostile client can pin. PER STREAM, not
+# per child — an aggregate cap across concurrent streams is deliberately
+# left out until operational data says it matters (§4 Q2).
+#
+# Over the cap serve TRUNCATES and honors the subset rather than
+# refusing: the ack echoes exactly what is honored, so a client that
+# checks it (the spec's own SHOULD) sees precisely which URIs it got, and
+# a partial subscription is strictly more useful than an error the legacy
+# `resources/subscribe` never had a shape for.
+_LISTEN_MAX_RESOURCE_SUBSCRIPTIONS = 256
+
+
+def _child_supports_resource_subscribe(init_result: Any) -> bool:
+    """Does the pooled child advertise `resources.subscribe`? (#381 §3.2)
+
+    ONE predicate, two call sites — the listen ack's honoring gate and
+    discover's capability echo (§3.6). Keeping them on the same function
+    is what stops serve advertising a flag it will then decline in the
+    ack, or declining one it advertised: the two answers cannot drift
+    because there is only one answer.
+
+    Presence-based and truthiness-based both: an absent `resources`
+    family, an absent `subscribe` key and an explicit `subscribe: false`
+    all mean the same thing to a client, so they mean the same thing
+    here. Every lookup degrades on a non-dict rather than raising — a
+    misbehaving child forfeits the capability, never the request.
+    """
+    if not isinstance(init_result, dict):
+        return False
+    capabilities = init_result.get("capabilities")
+    if not isinstance(capabilities, dict):
+        return False
+    resources = capabilities.get("resources")
+    if not isinstance(resources, dict):
+        return False
+    return bool(resources.get("subscribe"))
+
+
+def _honored_resource_uris(
+    requested: Any, *, supported: bool
+) -> tuple[list[str], bool]:
+    """The URI subset this stream may subscribe to, and whether it was cut.
+
+    Entirely LOCAL — no child round-trip — which is what makes the ack
+    fire-and-forget (§3.3) correct rather than a compromise: the honored
+    set is fully decided before anything is driven against the child.
+
+    Three layers, in order:
+
+    1. Capability gate. A child that does not advertise
+       `resources.subscribe` honors nothing, and the ack OMITS the field
+       rather than echoing `[]` — see the caller.
+    2. Sanitize. A non-list is treated as absent; non-string elements are
+       dropped silently. Relay hardened the identical read after a real
+       incident: an unsanitized list containing a nested list raised
+       `TypeError: unhashable type` inside a daemon thread and killed it
+       (#358 review R2F1). Duplicates are collapsed, preserving first-seen
+       order, so a repeated URI cannot inflate the refcount.
+    3. Cap. Over `_LISTEN_MAX_RESOURCE_SUBSCRIPTIONS`, keep the first N.
+
+    NO per-URI accept/reject. There is no servability probe to base one
+    on, the reference implementation has none, and inventing one would be
+    an undocumented departure — the SDK's own words are that "a
+    subscription to a nonexistent resource URI is honored and never
+    fires".
+    """
+    if not supported or not isinstance(requested, list):
+        return [], False
+    seen: dict[str, None] = {}
+    for uri in requested:
+        if isinstance(uri, str):
+            seen.setdefault(uri, None)
+    uris = list(seen)
+    if len(uris) > _LISTEN_MAX_RESOURCE_SUBSCRIPTIONS:
+        return uris[:_LISTEN_MAX_RESOURCE_SUBSCRIPTIONS], True
+    return uris, False
+
 
 def _accepts_sse(accept_header: str | None) -> bool:
     """Whether an `Accept` header (RFC 9110 §12) permits `text/event-stream`.
@@ -555,6 +647,7 @@ class _ListenStream:
     __slots__ = (
         "listen_id",
         "honored",
+        "honored_resource_uris",
         "_queue",
         "_ended",
         "_end_lock",
@@ -562,9 +655,24 @@ class _ListenStream:
         "overflowed",
     )
 
-    def __init__(self, listen_id: Any, honored: dict[str, bool]) -> None:
+    def __init__(
+        self,
+        listen_id: Any,
+        # The ack's `notifications` object verbatim, so the values are
+        # mixed by design: `True` for the trio's booleans, a URI list for
+        # `resourceSubscriptions` (#381). One dict, because it IS the
+        # wire shape rather than a model of it.
+        honored: dict[str, Any],
+        honored_resource_uris: frozenset[str] = frozenset(),
+    ) -> None:
         self.listen_id = listen_id
         self.honored = honored
+        # #381. The SAME value the ack echoed and the refcounts were taken
+        # for — computed once per stream and handed to all three, because
+        # a divergence between them is invisible on the wire: the ack
+        # would promise a URI nothing routes to, and the client would just
+        # never see an update it was told it would get.
+        self.honored_resource_uris = honored_resource_uris
         self._queue: "queue.Queue[dict[str, Any]]" = queue.Queue(_LISTEN_QUEUE_MAX)
         # Set to end the stream: "graceful" emits the terminal result
         # first, "lost" closes abruptly.
@@ -576,6 +684,30 @@ class _ListenStream:
     def wants(self, method: str) -> bool:
         flag = next((k for k, v in _LISTEN_FILTER_METHODS.items() if v == method), None)
         return flag is not None and bool(self.honored.get(flag))
+
+    def wants_resource_update(self, uri: Any) -> bool:
+        """Whether `notifications/resources/updated` for `uri` rides this
+        stream (#381 §3.4).
+
+        EXACT string equality, no normalization. There is no child-side
+        echo to normalize against — legacy `resources/subscribe` returns
+        an empty result — so any rule beyond equality would be serve
+        inventing wire behaviour, which this project has declined before
+        for the same reason. The consequence is documented rather than
+        hidden: URI variants a child might consider the same (trailing
+        slash, case, percent-encoding) are separate subscriptions here,
+        with separate refcounts and separate drive calls.
+
+        Note the reference CLIENT is deliberately more lenient — it
+        admits any `ResourceUpdated` once any URI was honored, since it
+        cannot attribute a sub-resource URI to a subscription. Serve
+        cannot copy that: it multiplexes several streams over one child,
+        so "admit anything" would hand stream A the updates only stream B
+        subscribed to. Exact match is also what the shared `event_matches`
+        predicate uses on the SDK's own SERVER side, and what relay uses
+        in this same gateway role.
+        """
+        return isinstance(uri, str) and uri in self.honored_resource_uris
 
     def publish(self, message: dict[str, Any]) -> None:
         """Enqueue a matching notification; never block the reader thread."""
@@ -1520,6 +1652,25 @@ class BackendProcess:
                 delivered = False
                 for listener in listeners:
                     if listener.wants(method):
+                        listener.publish(parsed)
+                        delivered = True
+                if delivered:
+                    return
+            elif method == _RESOURCE_UPDATED_METHOD:
+                # #381 §3.4: its own branch, UNIONED with the trio's
+                # whitelist rather than merged into it. The trio matches
+                # on the method alone; this one has to match on the URI
+                # inside `params`, so one update fans out only to the
+                # streams that named that exact URI.
+                #
+                # A malformed `params` degrades to no delivery rather than
+                # raising: this runs on the child's READER thread, which
+                # every other consumer of that child depends on.
+                params = parsed.get("params") if isinstance(parsed, dict) else None
+                uri = params.get("uri") if isinstance(params, dict) else None
+                delivered = False
+                for listener in listeners:
+                    if listener.wants_resource_update(uri):
                         listener.publish(parsed)
                         delivered = True
                 if delivered:
@@ -3508,7 +3659,11 @@ class _Handler(BaseHTTPRequestHandler):
         return backend
 
     def _serve_listen_stream(
-        self, msg: dict[str, Any], req_id: Any, backend: BackendProcess
+        self,
+        msg: dict[str, Any],
+        req_id: Any,
+        backend: BackendProcess,
+        init_result: dict[str, Any],
     ) -> None:
         """Answer `subscriptions/listen` with a long-lived SSE stream (#374).
 
@@ -3516,11 +3671,14 @@ class _Handler(BaseHTTPRequestHandler):
         `server/discover` takes, and it replaces the carve-out that used
         to let a legacy child answer `-32601` and turn it into a 404.
 
-        SCOPE: the listChanged trio only. `resourceSubscriptions` is
-        DECLINED by omitting it from the ack, which is spec-legal —
-        "Notification types the server does not support are omitted" —
-        and honest, since serve does not drive `resources/subscribe`
-        against the child yet (#381).
+        SCOPE: the listChanged trio (#374) plus `resourceSubscriptions`
+        (#381). The fourth field is honored only when the child
+        ADVERTISES `resources.subscribe` — otherwise it is omitted from
+        the ack entirely, which is spec-legal ("Notification types the
+        server does not support are omitted") and honest, since serve
+        would have nothing to drive the subscription against. Omitted,
+        never echoed as `[]`: an empty list would claim the feature works
+        and then deliver nothing.
 
         Order is the contract. Attach BEFORE the ack, so an event
         published while the ack write is in flight is buffered rather
@@ -3541,6 +3699,13 @@ class _Handler(BaseHTTPRequestHandler):
         subscription that never fires is still honored, and narrowing the
         echo to what the child advertises would make a compliant peer
         suppress events that do in fact arrive.
+
+        URIs are honored the same way once the capability gate passes:
+        all of them, up to a cap, with no per-URI accept/reject — there
+        is no servability probe to base one on, and the reference
+        implementation has none. The ENTIRE honored decision is local,
+        which is what lets the ack go out before anything is driven
+        against the child (§3.3).
         """
         # Filter shape. Absent means "subscribed to nothing", which is a
         # valid ack; present-but-not-an-object is malformed and rejected
@@ -3582,7 +3747,17 @@ class _Handler(BaseHTTPRequestHandler):
         honored = {
             flag: True for flag in _LISTEN_FILTER_METHODS if requested.get(flag) is True
         }
-        listener = _ListenStream(req_id, honored)
+        # #381. Computed ONCE, here, and fed to all three consumers: the
+        # ack echo below, the listener's routing set, and the refcounted
+        # drive against the child. Any two of those disagreeing is a
+        # silent failure — the ack would promise a URI nothing routes to.
+        supported = _child_supports_resource_subscribe(init_result)
+        resource_uris, truncated = _honored_resource_uris(
+            requested.get(_LISTEN_RESOURCE_FIELD), supported=supported
+        )
+        if resource_uris:
+            honored[_LISTEN_RESOURCE_FIELD] = resource_uris
+        listener = _ListenStream(req_id, honored, frozenset(resource_uris))
 
         # The check and the attach are ONE atomic step (#382 review
         # R1F1): `attach_listener` takes the cap and does both under its
@@ -3610,10 +3785,22 @@ class _Handler(BaseHTTPRequestHandler):
         # exists — the ack has not been written yet and the connection
         # stays open — which is what lets a test wait for the attach
         # rather than race it.
-        log(f"listen {req_id!r}: streaming {sorted(honored) or 'nothing'}")
+        log(
+            f"listen {req_id!r}: streaming {sorted(honored) or 'nothing'}"
+            + (f" ({len(resource_uris)} uris)" if resource_uris else "")
+        )
         unhonored = sorted(set(requested) - set(honored))
         if unhonored:
-            log(f"listen {req_id!r}: not honoring {unhonored} (#374 serves the trio)")
+            log(f"listen {req_id!r}: not honoring {unhonored}")
+        if truncated:
+            # Once per stream, mirroring relay's own once-latch: a client
+            # that blew the cap will blow it on every reconnect, and one
+            # line per URI per attempt would bury the log.
+            log(
+                f"listen {req_id!r}: capped resource subscriptions at "
+                f"{_LISTEN_MAX_RESOURCE_SUBSCRIPTIONS}; the ack echoes the "
+                "honored subset"
+            )
         try:
             self.close_connection = True
             self.send_response(200)
@@ -3898,7 +4085,11 @@ class _Handler(BaseHTTPRequestHandler):
             # below releases it only when the stream ends, which is what
             # keeps the child unreapable while a client is listening.
             if method == _LISTEN_METHOD:
-                self._serve_listen_stream(msg, req_id, backend)
+                # `init_result` rides along for #381's capability gate:
+                # whether `resourceSubscriptions` can be honored is the
+                # child's own advertised `resources.subscribe`, and the
+                # pool already cached the handshake that carries it.
+                self._serve_listen_stream(msg, req_id, backend, init_result)
                 return
 
             if method == _MODERN_DISCOVER_METHOD:

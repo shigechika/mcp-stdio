@@ -11,7 +11,19 @@ Reads newline-delimited JSON-RPC from stdin and reacts:
   many copies of the request reached the backend.
 - ``noreply`` (request)         -> never responds (drives the timeout path)
 - ``trigger_push`` (notification) -> emits a server-initiated notification
+- ``resources/subscribe`` / ``resources/unsubscribe`` (request) -> the legacy
+  empty result, and RECORDED (see ``subscribe_log``)
+- ``subscribe_log`` (request)   -> the recorded subscribe/unsubscribe calls, in
+  order. #381's refcount tests assert on THIS — wire evidence that a call did
+  or did not reach the child — rather than on the absence of updates, which
+  passes just as happily when the whole feature is broken.
+- ``trigger_resource_update`` (notification) -> emits
+  ``notifications/resources/updated`` for ``params.uri``
 - ``exit`` (any)                -> the process exits
+
+``--no-resource-subscribe`` in argv drops ``resources.subscribe`` from the
+advertised capabilities, so a test can drive serve's capability gate with a
+child that genuinely lacks the feature rather than by monkeypatching serve.
 
 Run as: ``python -m tests._fake_backend`` is not needed — it is launched as a
 script path by the tests.
@@ -21,6 +33,11 @@ import json
 import os
 import sys
 import time
+
+# Off by default would make every existing caller opt IN to the common case;
+# the flag instead removes the capability, so the fake child looks like a
+# normal modern-capable server unless a test says otherwise.
+_ADVERTISES_RESOURCE_SUBSCRIBE = "--no-resource-subscribe" not in sys.argv
 
 
 FAKE_TOOLS = [
@@ -39,6 +56,10 @@ def _send(obj: dict) -> None:
 
 def main() -> None:
     slow_echo_calls = 0
+    # Every `resources/subscribe` / `resources/unsubscribe` this child has
+    # received, in order, as (method, uri) pairs. #381's refcount lifecycle
+    # is asserted against this log.
+    subscribe_log: list[list[str]] = []
     while True:
         line = sys.stdin.readline()
         if line == "":
@@ -60,7 +81,11 @@ def main() -> None:
                     "result": {
                         "protocolVersion": "2025-06-18",
                         "serverInfo": {"name": "fake", "version": "0"},
-                        "capabilities": {},
+                        "capabilities": (
+                            {"resources": {"subscribe": True}}
+                            if _ADVERTISES_RESOURCE_SUBSCRIBE
+                            else {}
+                        ),
                     },
                 }
             )
@@ -136,6 +161,22 @@ def main() -> None:
                     "jsonrpc": "2.0",
                     "method": "notifications/message",
                     "params": {"hello": "world"},
+                }
+            )
+        elif method in ("resources/subscribe", "resources/unsubscribe") and "id" in msg:
+            # The legacy wire shape: an EMPTY result, carrying no per-URI
+            # confirmation of any kind — which is exactly why serve drives
+            # these fire-and-forget rather than blocking its ack on them.
+            subscribe_log.append([method, (msg.get("params") or {}).get("uri")])
+            _send({"jsonrpc": "2.0", "id": mid, "result": {}})
+        elif method == "subscribe_log" and "id" in msg:
+            _send({"jsonrpc": "2.0", "id": mid, "result": {"calls": subscribe_log}})
+        elif method == "trigger_resource_update":  # a notification (no id)
+            _send(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/resources/updated",
+                    "params": {"uri": (msg.get("params") or {}).get("uri")},
                 }
             )
         elif method == "trigger_list_changed":  # a notification (no id)

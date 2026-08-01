@@ -2919,3 +2919,310 @@ def test_a_pooled_child_discards_deliver_and_discard_again(gateway, quick_keepal
         ln.wait_comments(2)
         frames, _ = ln.snapshot()
     assert len(frames) == 1, frames
+
+
+# --- resourceSubscriptions (#381) ----------------------------------------
+
+RESOURCE_FIELD = "resourceSubscriptions"
+RESOURCE_UPDATED = "notifications/resources/updated"
+_BACKEND_NO_SUBSCRIBE = [*_BACKEND, "--no-resource-subscribe"]
+
+
+def _fire_resource_update(url: str, uri: str) -> None:
+    """Make the pooled child emit one `notifications/resources/updated`."""
+    resp = _post(
+        url,
+        {
+            "jsonrpc": "2.0",
+            "method": "trigger_resource_update",
+            "params": {"uri": uri, "_meta": _meta()},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+
+def _subscribe_calls(url: str) -> list[list]:
+    """The child's own record of every subscribe/unsubscribe it received.
+
+    WIRE EVIDENCE. Every refcount assertion in this file reads this rather
+    than inferring from whether updates arrived: "no update showed up" is
+    equally true when the subscription worked and nothing changed, when
+    routing is broken, and when the whole feature is missing. A call log
+    distinguishes them.
+    """
+    resp = _post(
+        url,
+        _modern_body("subscribe_log", meta=_meta()),
+        _modern_headers("subscribe_log"),
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()["result"]["calls"]
+
+
+@pytest.fixture()
+def gateway_no_subscribe():
+    """A gateway whose child does NOT advertise `resources.subscribe`."""
+    httpd, registry = server.build_server(
+        _BACKEND_NO_SUBSCRIBE, host="127.0.0.1", port=0
+    )
+    host, port = httpd.server_address[0], httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://{host}:{port}/mcp"
+    finally:
+        httpd.shutdown()
+        registry.shutdown_all()
+        httpd.modern_pool.shutdown_all()
+        httpd.server_close()
+
+
+class TestResourceSubscriptionAck:
+    """What the ack promises, and what gates it."""
+
+    def test_requested_uris_are_echoed_when_the_child_supports_subscribe(self, gateway):
+        """Honor-all above the capability gate: no per-URI accept/reject.
+
+        There is no servability probe to base one on and the reference
+        implementation has none — its own words are that "a subscription
+        to a nonexistent resource URI is honored and never fires".
+        """
+        uris = ["res://a", "res://b"]
+        with _Listener(
+            gateway, _listen_body(notifications={RESOURCE_FIELD: uris})
+        ) as ln:
+            ack = ln.wait_frames(1)[0]
+        assert ack["params"]["notifications"][RESOURCE_FIELD] == uris
+
+    def test_a_child_without_the_capability_gets_the_field_omitted(
+        self, gateway_no_subscribe
+    ):
+        """Omitted, NEVER `[]`.
+
+        An empty list would claim the feature works and then deliver
+        nothing; omission is the spec's own "notification types the
+        server does not support are omitted", and it is what a client
+        checking the ack (the spec's SHOULD) can act on.
+        """
+        with _Listener(
+            gateway_no_subscribe,
+            _listen_body(notifications={RESOURCE_FIELD: ["res://a"]}),
+        ) as ln:
+            ack = ln.wait_frames(1)[0]
+        notifications = ack["params"]["notifications"]
+        assert RESOURCE_FIELD not in notifications, notifications
+        # The object itself is still present — a MISSING `notifications`
+        # key makes the v2 client discard the whole ack and time out.
+        assert notifications == {}
+
+    def test_nothing_is_driven_against_a_child_without_the_capability(
+        self, gateway_no_subscribe
+    ):
+        """The gate is not cosmetic: it must also stop the drive.
+
+        Asserted on the child's own call log — a capability-lacking child
+        has no documented error for an unsolicited `resources/subscribe`,
+        so serve simply must never send one.
+        """
+        with _Listener(
+            gateway_no_subscribe,
+            _listen_body(notifications={RESOURCE_FIELD: ["res://a"]}),
+        ) as ln:
+            ln.wait_frames(1)
+            time.sleep(0.3)  # let any (incorrect) background drive land
+            assert _subscribe_calls(gateway_no_subscribe) == []
+
+    def test_an_empty_or_absent_list_omits_the_field(self, gateway):
+        for requested in ({RESOURCE_FIELD: []}, {"toolsListChanged": True}):
+            with _Listener(gateway, _listen_body(notifications=requested)) as ln:
+                ack = ln.wait_frames(1)[0]
+            assert RESOURCE_FIELD not in ack["params"]["notifications"]
+
+    def test_a_malformed_list_degrades_instead_of_crashing(self, gateway):
+        """Relay hardened this exact read after a real incident: a nested
+        list inside the URI array raised `TypeError: unhashable type` in a
+        daemon thread and killed it (#358 review R2F1). Non-strings are
+        dropped; a non-list is treated as absent."""
+        with _Listener(
+            gateway,
+            _listen_body(
+                notifications={RESOURCE_FIELD: ["res://a", ["nested"], 7, None]}
+            ),
+        ) as ln:
+            ack = ln.wait_frames(1)[0]
+        assert ack["params"]["notifications"][RESOURCE_FIELD] == ["res://a"]
+
+        with _Listener(
+            gateway, _listen_body("l2", notifications={RESOURCE_FIELD: "res://a"})
+        ) as ln:
+            ack = ln.wait_frames(1)[0]
+        assert RESOURCE_FIELD not in ack["params"]["notifications"]
+
+    def test_duplicate_uris_collapse(self, gateway):
+        """Otherwise one stream could inflate a URI's refcount by
+        repeating it, and the matching unsubscribe would never fire."""
+        with _Listener(
+            gateway,
+            _listen_body(notifications={RESOURCE_FIELD: ["res://a", "res://a"]}),
+        ) as ln:
+            ack = ln.wait_frames(1)[0]
+        assert ack["params"]["notifications"][RESOURCE_FIELD] == ["res://a"]
+
+    def test_over_the_cap_truncates_and_honors_the_subset(self, gateway, monkeypatch):
+        """Truncate-and-honor rather than refuse: the ack echoes exactly
+        what is honored, so a client that checks it sees precisely which
+        URIs it got — strictly more useful than an error the legacy
+        `resources/subscribe` never had a shape for."""
+        monkeypatch.setattr(server, "_LISTEN_MAX_RESOURCE_SUBSCRIPTIONS", 3)
+        uris = [f"res://{i}" for i in range(10)]
+        with _Listener(
+            gateway, _listen_body(notifications={RESOURCE_FIELD: uris})
+        ) as ln:
+            ack = ln.wait_frames(1)[0]
+        assert ack["params"]["notifications"][RESOURCE_FIELD] == uris[:3]
+
+    def test_the_trio_and_uris_coexist_in_one_ack(self, gateway):
+        """One `notifications` object carrying both shapes — booleans and
+        a URI list — because that IS the wire shape the spec shows."""
+        with _Listener(
+            gateway,
+            _listen_body(
+                notifications={"toolsListChanged": True, RESOURCE_FIELD: ["res://a"]}
+            ),
+        ) as ln:
+            ack = ln.wait_frames(1)[0]
+        assert ack["params"]["notifications"] == {
+            "toolsListChanged": True,
+            RESOURCE_FIELD: ["res://a"],
+        }
+
+
+class TestResourceUpdateRouting:
+    """One update, only to the streams that named that exact URI."""
+
+    def test_an_update_reaches_the_subscribing_stream_stamped(self, gateway):
+        with _Listener(
+            gateway, _listen_body(notifications={RESOURCE_FIELD: ["res://a"]})
+        ) as ln:
+            ln.wait_frames(1)
+            _fire_resource_update(gateway, "res://a")
+            event = ln.wait_frames(2)[1]
+        assert event["method"] == RESOURCE_UPDATED
+        assert event["params"]["uri"] == "res://a"
+        assert event["params"]["_meta"][SUBSCRIPTION_ID] == "listen-1"
+
+    def test_an_unsubscribed_uri_is_not_delivered(self, gateway, quick_keepalive):
+        """Per-URI, not per-field. Folding `resourceSubscriptions` into
+        the boolean whitelist would make ANY non-empty list match every
+        URI — the exact "MUST NOT send notification types the client has
+        not explicitly requested" violation the whitelist exists for.
+
+        Bounded by a keepalive, which proves the pump ran and chose to
+        send nothing, rather than by a sleep.
+        """
+        with _Listener(
+            gateway, _listen_body(notifications={RESOURCE_FIELD: ["res://a"]})
+        ) as ln:
+            ln.wait_frames(1)
+            _fire_resource_update(gateway, "res://other")
+            ln.wait_comments(2)
+            frames, _ = ln.snapshot()
+        assert len(frames) == 1, frames
+
+    def test_two_streams_split_by_uri_not_by_field(self, gateway):
+        """The cross-stream leak this branch exists to prevent, pinned
+        directly: A and B share one pooled child, each subscribed to a
+        different URI, and each must see only its own."""
+        a = _Listener(
+            gateway, _listen_body("a", notifications={RESOURCE_FIELD: ["res://a"]})
+        )
+        b = _Listener(
+            gateway, _listen_body("b", notifications={RESOURCE_FIELD: ["res://b"]})
+        )
+        with a, b:
+            a.wait_frames(1)
+            b.wait_frames(1)
+            _fire_resource_update(gateway, "res://a")
+            event = a.wait_frames(2)[1]
+            assert event["params"]["uri"] == "res://a"
+            _fire_resource_update(gateway, "res://b")
+            b_event = b.wait_frames(2)[1]
+        assert b_event["params"]["uri"] == "res://b"
+        # A never saw B's URI: exactly two frames, ack + its own update.
+        a_frames, _ = a.snapshot()
+        assert len(a_frames) == 2, a_frames
+
+    def test_the_same_uri_fans_out_to_both_streams(self, gateway):
+        """Multicast at the fan-out layer, N unicast frames at the wire —
+        each carrying its OWN subscriptionId."""
+        a = _Listener(
+            gateway, _listen_body("a", notifications={RESOURCE_FIELD: ["res://s"]})
+        )
+        b = _Listener(
+            gateway, _listen_body("b", notifications={RESOURCE_FIELD: ["res://s"]})
+        )
+        with a, b:
+            a.wait_frames(1)
+            b.wait_frames(1)
+            _fire_resource_update(gateway, "res://s")
+            a_event = a.wait_frames(2)[1]
+            b_event = b.wait_frames(2)[1]
+        assert a_event["params"]["_meta"][SUBSCRIPTION_ID] == "a"
+        assert b_event["params"]["_meta"][SUBSCRIPTION_ID] == "b"
+
+    def test_a_trio_only_stream_gets_no_resource_updates(
+        self, gateway, quick_keepalive
+    ):
+        with _Listener(
+            gateway, _listen_body(notifications={"toolsListChanged": True})
+        ) as ln:
+            ln.wait_frames(1)
+            _fire_resource_update(gateway, "res://a")
+            ln.wait_comments(2)
+            frames, _ = ln.snapshot()
+        assert len(frames) == 1, frames
+
+
+class TestResourceSubscriptionUnits:
+    """The honored-set computation, away from HTTP."""
+
+    def test_the_capability_predicate_reads_presence_and_truthiness(self):
+        supports = server._child_supports_resource_subscribe
+        assert supports({"capabilities": {"resources": {"subscribe": True}}}) is True
+        assert supports({"capabilities": {"resources": {"subscribe": False}}}) is False
+        assert supports({"capabilities": {"resources": {}}}) is False
+        assert supports({"capabilities": {}}) is False
+        assert supports({}) is False
+        # Degrades on malformed shapes rather than raising — a
+        # misbehaving child forfeits the capability, never the request.
+        assert supports({"capabilities": {"resources": True}}) is False
+        assert supports({"capabilities": "nope"}) is False
+        assert supports(None) is False
+
+    def test_the_capability_gate_short_circuits_the_whole_computation(self):
+        uris, truncated = server._honored_resource_uris(["res://a"], supported=False)
+        assert uris == [] and truncated is False
+
+    def test_first_seen_order_is_preserved(self):
+        uris, _ = server._honored_resource_uris(
+            ["res://b", "res://a", "res://b"], supported=True
+        )
+        assert uris == ["res://b", "res://a"]
+
+    def test_truncation_is_reported_so_it_can_be_logged_once(self, monkeypatch):
+        monkeypatch.setattr(server, "_LISTEN_MAX_RESOURCE_SUBSCRIPTIONS", 2)
+        uris, truncated = server._honored_resource_uris(["a", "b", "c"], supported=True)
+        assert uris == ["a", "b"] and truncated is True
+        uris, truncated = server._honored_resource_uris(["a", "b"], supported=True)
+        assert truncated is False
+
+    def test_wants_resource_update_is_exact(self):
+        """No normalization: trailing slash, case and percent-encoding are
+        DIFFERENT subscriptions, deliberately (there is no child-side echo
+        to normalize against)."""
+        stream = server._ListenStream("x", {}, frozenset({"res://a"}))
+        assert stream.wants_resource_update("res://a") is True
+        assert stream.wants_resource_update("res://a/") is False
+        assert stream.wants_resource_update("RES://A") is False
+        assert stream.wants_resource_update(None) is False
+        assert stream.wants_resource_update(7) is False
