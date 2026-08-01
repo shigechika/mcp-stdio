@@ -508,6 +508,22 @@ _LISTEN_MAX_STREAMS_PER_CHILD = 4
 # `resources/subscribe` never had a shape for.
 _LISTEN_MAX_RESOURCE_SUBSCRIPTIONS = 256
 
+# How long one driven `resources/subscribe`/`unsubscribe` waits, and
+# deliberately NOT `_BACKEND_RESPONSE_TIMEOUT_SECS` (#388 review).
+#
+# These drives run under `_sub_lock`, which is held across the I/O so
+# subscribe and unsubscribe cannot invert on the wire — and that same
+# lock is what a DIFFERENT stream's teardown blocks on. At the ordinary
+# 120 s backend timeout a hung child could pin it for 256 x 120 s, so a
+# single unresponsive child would stall every other stream's teardown on
+# it for hours. The reply carries no information (legacy answers an empty
+# result), so waiting long buys nothing: this is bookkeeping whose
+# outcome is logged, never surfaced.
+#
+# The batch ALSO short-circuits — see `_drive_resource_subscription`'s
+# callers — so the real worst case is one timeout, not one per URI.
+_RESOURCE_SUBSCRIBE_TIMEOUT_SECS = 5.0
+
 
 def _child_supports_resource_subscribe(init_result: Any) -> bool:
     """Does the pooled child advertise `resources.subscribe`? (#381 §3.2)
@@ -1859,12 +1875,23 @@ class BackendProcess:
                 # Taking references now would strand them: the child would
                 # stay subscribed with no stream left to deliver to.
                 return
+            responsive = True
             for uri in uris:
                 count = self._resource_refs.get(uri, 0)
                 self._resource_refs[uri] = count + 1
                 if count:
                     continue
-                if not self._drive_resource_subscription("resources/subscribe", uri):
+                if not responsive:
+                    # The child stopped answering; the refcount is still
+                    # taken (the ack promised this URI) but hammering an
+                    # unresponsive child 255 more times only holds
+                    # `_sub_lock` — and every other stream's teardown —
+                    # for longer. See `_RESOURCE_SUBSCRIBE_TIMEOUT_SECS`.
+                    continue
+                outcome = self._drive_resource_subscription("resources/subscribe", uri)
+                if outcome is None:
+                    responsive = False
+                if not outcome:
                     log(
                         f"listen {listen_id!r}: the child did not confirm "
                         f"resources/subscribe for {uri!r}; keeping it honored"
@@ -1885,6 +1912,7 @@ class BackendProcess:
         subscribe for would be serve inventing traffic.
         """
         with self._sub_lock:
+            responsive = True
             for uri in uris:
                 count = self._resource_refs.get(uri, 0)
                 if count == 0:
@@ -1893,9 +1921,19 @@ class BackendProcess:
                     self._resource_refs[uri] = count - 1
                     continue
                 self._resource_refs.pop(uri, None)
-                self._drive_resource_subscription("resources/unsubscribe", uri)
+                if not responsive:
+                    # Same short-circuit as `add`, and it matters more
+                    # here: this runs in the handler's `finally`, so a
+                    # hung child would otherwise hold the handler thread
+                    # AND `_sub_lock` once per URI.
+                    continue
+                if (
+                    self._drive_resource_subscription("resources/unsubscribe", uri)
+                    is None
+                ):
+                    responsive = False
 
-    def _drive_resource_subscription(self, method: str, uri: str) -> bool:
+    def _drive_resource_subscription(self, method: str, uri: str) -> bool | None:
         """Send one `resources/subscribe`/`unsubscribe` to the child.
 
         `_mint_modern_id()` supplies the id, and reusing it is deliberate
@@ -1910,6 +1948,13 @@ class BackendProcess:
         `_queue_server_initiated`'s unsolicited-traffic discard and logs a
         warning about traffic serve itself asked for.
 
+        Returns True on a real reply, False on an error reply, and NONE
+        when the child did not answer at all — a timeout or a closed
+        child. The caller uses that third state to stop driving the rest
+        of the batch, because an unresponsive child will not answer the
+        next URI either and every extra attempt is `_sub_lock` held for
+        another timeout.
+
         Caller holds `_sub_lock`; `send_request` takes `_lock` inside.
         """
         req_id = _mint_modern_id()
@@ -1923,10 +1968,10 @@ class BackendProcess:
                 }
             ),
             req_id,
-            _BACKEND_RESPONSE_TIMEOUT_SECS,
+            _RESOURCE_SUBSCRIBE_TIMEOUT_SECS,
         )
         if line is None:
-            return False
+            return None
         try:
             return "error" not in json.loads(line)
         except (json.JSONDecodeError, TypeError):

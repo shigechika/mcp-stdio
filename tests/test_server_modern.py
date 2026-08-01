@@ -3434,3 +3434,110 @@ def test_a_stream_torn_down_before_its_subscribe_lands_leaves_nothing_behind():
         assert backend._resource_refs == {}
     finally:
         backend.shutdown()
+
+
+class TestResourceSubscribeDriveIsBounded:
+    """A hung child must not hold `_sub_lock` for hours (#388 review).
+
+    The lock is held across the drive on purpose — it is what keeps
+    subscribe and unsubscribe from inverting on the wire — but that same
+    lock is what every OTHER stream's teardown blocks on. At the ordinary
+    120 s backend timeout, 256 URIs against an unresponsive child would
+    pin it for 8.5 hours.
+    """
+
+    def test_the_drive_uses_its_own_short_timeout(self):
+        """Pinned as a RELATIONSHIP, not a literal: what matters is that
+        this path is bounded far below the general backend timeout, so a
+        later bump of that constant cannot silently re-create the stall.
+
+        Revert-check: pass `_BACKEND_RESPONSE_TIMEOUT_SECS` here again and
+        this fails.
+        """
+        assert server._RESOURCE_SUBSCRIBE_TIMEOUT_SECS < (
+            server._BACKEND_RESPONSE_TIMEOUT_SECS / 10
+        )
+        seen: list[float] = []
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        original = backend.send_request
+
+        def _record(line, req_id, timeout):
+            seen.append(timeout)
+            return original(line, req_id, timeout)
+
+        backend.send_request = _record  # type: ignore[method-assign]
+        try:
+            backend.add_resource_subscriptions(["res://a"], "l1")
+        finally:
+            backend.shutdown()
+        assert seen == [server._RESOURCE_SUBSCRIBE_TIMEOUT_SECS]
+
+    def test_an_unresponsive_child_is_not_hammered_once_per_uri(self, monkeypatch):
+        """One timeout for the batch, not one per URI — the difference
+        between seconds and hours of held lock.
+
+        Every URI still keeps its reference: the ack already promised
+        them, and reply-then-degrade says a subscription that never fires
+        is still honored.
+        """
+        calls: list[str] = []
+
+        def _never_answers(self, method, uri):
+            calls.append(uri)
+            return None
+
+        monkeypatch.setattr(
+            server.BackendProcess, "_drive_resource_subscription", _never_answers
+        )
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            uris = [f"res://{i}" for i in range(10)]
+            backend.add_resource_subscriptions(uris, "l1")
+            assert calls == ["res://0"], calls
+            assert len(backend._resource_refs) == 10
+        finally:
+            backend.shutdown()
+
+    def test_the_teardown_path_short_circuits_too(self, monkeypatch):
+        """This one matters more: `release` runs in the handler's
+        `finally`, so an unbounded loop there holds the handler THREAD as
+        well as the lock."""
+        calls: list[str] = []
+
+        def _never_answers(self, method, uri):
+            calls.append(f"{method}:{uri}")
+            return None
+
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            uris = [f"res://{i}" for i in range(10)]
+            backend.add_resource_subscriptions(uris, "l1")
+            monkeypatch.setattr(
+                server.BackendProcess, "_drive_resource_subscription", _never_answers
+            )
+            backend.release_resource_subscriptions(uris)
+            assert calls == ["resources/unsubscribe:res://0"], calls
+            # The refs are dropped regardless — they die with the child
+            # anyway, and keeping them would leak across a respawn.
+            assert backend._resource_refs == {}
+        finally:
+            backend.shutdown()
+
+    def test_an_error_reply_does_not_stop_the_batch(self):
+        """Only silence short-circuits. An error means the child is ALIVE
+        and answered about that URI, which says nothing about the next
+        one — treating it as unresponsive would silently skip
+        subscriptions a healthy child would have accepted."""
+        seen: list[str] = []
+
+        class _Erroring(server.BackendProcess):
+            def _drive_resource_subscription(self, method, uri):
+                seen.append(uri)
+                return False
+
+        backend = _Erroring([*_BACKEND], modern_owned=True)
+        try:
+            backend.add_resource_subscriptions(["res://a", "res://b"], "l1")
+            assert seen == ["res://a", "res://b"]
+        finally:
+            backend.shutdown()
