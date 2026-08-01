@@ -1187,32 +1187,39 @@ def _modern_response_status(msg: dict[str, Any]) -> int:
     return 200
 
 
-# The four notification-dependent capability flags discover cannot honor
-# YET (#373 review, /code-review score 85): each one promises a
-# notification kind that a gateway-owned child's real traffic never
-# reaches the client for. `_queue_server_initiated`'s modern_owned branch
-# silently discards every notification a pooled child emits — no SSE
-# stream, no consumer — until 3.5-D ships `subscriptions/listen`. This is
-# the relay's C8 principle (relay.py: "advertise exactly what is
-# forwarded") applied in reverse: C8 forwards a notification kind only for
-# a family the relay advertised; here the matching rule is to advertise a
-# family's notification flag only for a kind serve can actually forward.
+# The capability flags discover still cannot honor. The rule (#373
+# review, /code-review score 85) is the relay's C8 principle (relay.py:
+# "advertise exactly what is forwarded") applied in reverse: advertise a
+# family's notification flag only for a kind serve can actually deliver.
+#
+# #374 made three of the original four deliverable. `subscriptions/listen`
+# now attaches a live stream to the pooled child and
+# `_queue_server_initiated` fans the listChanged trio out to it, so
+# `tools.listChanged`, `resources.listChanged` and `prompts.listChanged`
+# are honest promises and were removed from this table.
+#
+# `resources.subscribe` stays stripped: it promises PER-URI subscription
+# driving (`resources/subscribe` + `notifications/resources/updated`),
+# which serve does not do yet — the listen ack explicitly declines
+# `resourceSubscriptions`, so advertising the flag would promise the one
+# thing the ack refuses. Tracked in #381; the fix there is to make this
+# conditional on the child's own advertised `resources.subscribe` inside
+# `_synthesize_discover_result` (which already holds `init_result`)
+# rather than a static table.
+#
 # Keyed by family -> the KEYS to strip, never the whole family object:
-# spec capability semantics are presence-based, and the REQUEST surfaces
-# in every one of these families (tools/list, resources/read,
-# prompts/get) are served today — only the notification promise is
-# undeliverable. `logging` is deliberately NOT in this table: whether its
-# `notifications/message` promise belongs in the same boat is 3.5-D
-# territory, not this fix's scope.
+# spec capability semantics are presence-based, and the REQUEST surface
+# of the family (`resources/read`, `resources/list`) is served today —
+# only that one promise is undeliverable. `logging` is deliberately NOT
+# in this table: `notifications/message` is request-scoped, so it belongs
+# to whatever carries the request, not to a broadcast stream (#381).
 _UNDELIVERABLE_NOTIFICATION_FLAGS: dict[str, tuple[str, ...]] = {
-    "tools": ("listChanged",),
-    "resources": ("subscribe", "listChanged"),
-    "prompts": ("listChanged",),
+    "resources": ("subscribe",),
 }
 
 
 def _strip_undeliverable_capability_flags(capabilities: Any) -> dict[str, Any]:
-    """Drop the notification flags discover cannot honor yet (see above).
+    """Drop the capability flags discover still cannot honor (see above).
 
     A non-dict `capabilities` value degrades to `{}` rather than raising
     (#373 review R3F1): `.items()` on it would otherwise crash with an
@@ -1231,6 +1238,8 @@ def _strip_undeliverable_capability_flags(capabilities: Any) -> dict[str, Any]:
     Non-dict FAMILY values (inside an otherwise well-formed top-level
     dict) likewise pass through un-stripped rather than crash — e.g.
     `"tools": true` — since only a dict family has keys to strip from.
+    A family absent from the table passes through whole, which is what
+    makes the post-#374 one-entry table work unchanged.
     """
     if not isinstance(capabilities, dict):
         return {}
@@ -1255,12 +1264,13 @@ def _synthesize_discover_result(
     `supportedVersions` is SERVE's own implemented set, never the
     child's: the child speaks 2025-06-18 and the question being asked is
     what the ENDPOINT supports. `capabilities` is the child's, echoed
-    almost verbatim — `_strip_undeliverable_capability_flags` removes the
-    four notification-dependent flags first (`tools.listChanged`,
-    `resources.subscribe`, `resources.listChanged`,
-    `prompts.listChanged`; see that function's comment), because those
-    are not what the endpoint can actually do until 3.5-D. Every other
-    flag, and the family objects themselves, pass through untouched.
+    almost verbatim — `_strip_undeliverable_capability_flags` removes
+    `resources.subscribe` first, the one flag serve still cannot honor
+    (see that function's comment). The three listChanged flags used to
+    be stripped alongside it and are advertised again since #374, which
+    is what makes them true: `subscriptions/listen` delivers exactly
+    that trio. Every other flag, and the family objects themselves, pass
+    through untouched.
 
     BOTH FIELDS ARE LOAD-BEARING FOR INTEROP, not decoration. The v2
     client validates this result as a `DiscoverResult` whose required

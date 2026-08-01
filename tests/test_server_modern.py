@@ -1294,13 +1294,20 @@ class TestSynthesizeDiscover:
             server._SERVE_IMPLEMENTED_MODERN_VERSIONS
         )
 
-    def test_notification_dependent_flags_are_stripped(self):
-        """#373 review, /code-review score 85: discover cannot honor
-        `tools.listChanged`, `resources.subscribe`, `resources.listChanged`
-        or `prompts.listChanged` until 3.5-D ships `subscriptions/listen` —
-        `_queue_server_initiated`'s modern_owned branch silently discards
-        every notification a pooled child sends today. Echoing these flags
-        verbatim would advertise a promise this endpoint cannot keep.
+    def test_the_listchanged_trio_is_advertised_and_subscribe_is_not(self):
+        """#374's half of the un-strip, and the half that stayed.
+
+        The rule is the relay's C8 principle in reverse — advertise a
+        notification flag only for a kind serve can actually deliver.
+        Before #374 all four flags were stripped, because a pooled
+        child's notifications went nowhere. `subscriptions/listen` now
+        delivers the listChanged trio, so those three flags became true
+        statements and are echoed again.
+
+        `resources.subscribe` stays stripped: it promises per-URI
+        subscription driving, which the listen ack explicitly DECLINES
+        (`resourceSubscriptions: false`) until #381. Advertising it would
+        promise the one thing the ack refuses.
         """
         result = server._synthesize_discover_result(
             {
@@ -1313,20 +1320,30 @@ class TestSynthesizeDiscover:
             }
         )
         caps = result["capabilities"]
-        assert "listChanged" not in caps["tools"]
+        assert caps["tools"] == {"listChanged": True}
+        assert caps["prompts"] == {"listChanged": True}
+        assert caps["resources"] == {"listChanged": True}
         assert "subscribe" not in caps["resources"]
-        assert "listChanged" not in caps["resources"]
-        assert "listChanged" not in caps["prompts"]
-        # The family objects survive — the REQUEST surfaces (tools/list,
-        # resources/read, prompts/get) are served today — just emptied of
-        # the stripped keys, never removed wholesale.
-        assert "tools" in caps
-        assert "resources" in caps
-        assert "prompts" in caps
-        # Control: a non-notification-dependent capability passes through
-        # untouched, proving the filter is scoped to the four flags rather
-        # than over-stripping.
+        # Control: an unrelated capability passes through untouched,
+        # proving the filter is scoped to one key rather than
+        # over-stripping.
         assert caps["completions"] == {}
+
+    def test_the_advertised_trio_matches_what_listen_forwards(self):
+        """The advertisement and the delivery table cannot drift apart.
+
+        `_UNDELIVERABLE_NOTIFICATION_FLAGS` and `_LISTEN_FILTER_METHODS`
+        are two statements of the same fact in different vocabularies
+        (capability flags vs wire method names). Pinning them against
+        each other is what makes "advertise exactly what is forwarded"
+        an enforced invariant rather than a comment.
+        """
+        assert server._UNDELIVERABLE_NOTIFICATION_FLAGS == {"resources": ("subscribe",)}
+        assert set(server._LISTEN_FILTER_METHODS.values()) == {
+            "notifications/tools/list_changed",
+            "notifications/resources/list_changed",
+            "notifications/prompts/list_changed",
+        }
 
     def test_a_non_stripped_key_survives_within_a_stripped_family(self):
         """The filter removes specific KEYS, never the whole family

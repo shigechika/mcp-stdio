@@ -177,3 +177,192 @@ def test_the_modern_flow_mints_no_session(serve_gateway):
     )
     assert resp.status_code == 200
     assert "mcp-session-id" not in resp.headers, dict(resp.headers)
+
+
+# --- subscriptions/listen (#374) -----------------------------------------
+
+SUBSCRIPTION_ID_KEY = "io.modelcontextprotocol/subscriptionId"
+
+
+def _drive_list_changed(gateway) -> None:
+    """Make the pooled child emit `notifications/tools/list_changed`.
+
+    A MODERN notification, so it rides serve's oneway arm to the same
+    per-principal pooled child every modern request in this module shares
+    — which is the only way to trigger a real fan-out from outside.
+    """
+    resp = httpx.post(
+        gateway.url,
+        content=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/list_changed_push",
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": MODERN_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    }
+                },
+            }
+        ),
+        headers={"MCP-Protocol-Version": MODERN_VERSION},
+        timeout=20,
+    )
+    assert resp.status_code == 202, resp.text
+
+
+@pytest.mark.timeout(90)
+def test_v2_client_listen_acks_and_delivers_a_real_event(serve_gateway):
+    """**#374's acceptance test.** The reference peer's own listen API.
+
+    Entering `client.listen(...)` IS the ack assertion: it blocks until
+    the ack arrives and raises if the ack is malformed. That is the
+    B1-class oracle at work again — our unit tests measure the ack
+    against our reading of the spec, this measures it against the first
+    official implementation of the revision.
+
+    `sub.honored` then proves the honored subset survived the A9 nesting:
+    a top-level echo would leave this empty (and the client forwarding
+    nothing) with no error anywhere.
+    """
+    import anyio
+
+    from mcp.client import Client
+
+    async def _drive():
+        async with Client(serve_gateway.url, mode="auto") as client:
+            async with client.listen(tools_list_changed=True) as sub:
+                honored = dict(sub.honored) if hasattr(sub, "honored") else None
+                async with anyio.create_task_group() as tg:
+
+                    async def _fire():
+                        await anyio.to_thread.run_sync(
+                            _drive_list_changed, serve_gateway
+                        )
+
+                    tg.start_soon(_fire)
+                    with anyio.fail_after(30):
+                        async for event in sub:
+                            first = event
+                            break
+                return {
+                    "honored": honored,
+                    "event": type(first).__name__,
+                    "discovered": client.session.discover_result is not None,
+                    "initialized": client.session.initialize_result is not None,
+                }
+
+    out = anyio.run(_drive)
+
+    # Without this the whole test can pass on a silent legacy fallback.
+    assert out["discovered"] and not out["initialized"]
+    assert out["honored"], "the client saw no honored subset; the ack nested it wrong"
+    assert out["event"], out
+
+
+@pytest.mark.timeout(90)
+def test_a_gateway_shutdown_ends_the_stream_without_losing_it(serve_factory):
+    """Graceful, at the peer that decides what graceful means.
+
+    The v2 client raises `SubscriptionLost` when a stream drops without a
+    terminal frame — so "the async-for loop simply ended" is the only
+    assertion that distinguishes serve's graceful teardown from an abrupt
+    one, and it is the reason the terminal `resultType: "complete"` frame
+    exists at all.
+
+    A dedicated gateway: this test stops it.
+    """
+    import anyio
+
+    from mcp.client import Client
+
+    gateway = serve_factory()
+
+    async def _drive():
+        async with Client(gateway.url, mode="auto") as client:
+            async with client.listen(tools_list_changed=True) as sub:
+                async with anyio.create_task_group() as tg:
+
+                    async def _stop():
+                        await anyio.sleep(0.5)
+                        await anyio.to_thread.run_sync(gateway.close)
+
+                    tg.start_soon(_stop)
+                    events = []
+                    with anyio.fail_after(45):
+                        async for event in sub:
+                            events.append(event)
+                    return len(events)
+
+    # No exception escaping IS the assertion — `SubscriptionLost` here
+    # would mean serve dropped the stream instead of ending it.
+    assert anyio.run(_drive) == 0
+
+
+@pytest.mark.timeout(60)
+def test_discover_advertises_the_trio_and_still_withholds_subscribe(serve_gateway):
+    """The un-strip, on raw bytes, against the child's real capabilities.
+
+    The child advertises all four flags. Three are now promises serve can
+    keep — `subscriptions/listen` delivers them — and one is not:
+    per-URI subscription driving is #381, and the listen ack declines it,
+    so advertising it here would promise exactly what the ack refuses.
+    """
+    resp = httpx.post(
+        serve_gateway.url,
+        content=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "server/discover",
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": MODERN_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    }
+                },
+            }
+        ),
+        headers={
+            "MCP-Protocol-Version": MODERN_VERSION,
+            "Mcp-Method": "server/discover",
+        },
+        timeout=20,
+    )
+    caps = resp.json()["result"]["capabilities"]
+    assert caps["tools"]["listChanged"] is True
+    assert caps["prompts"]["listChanged"] is True
+    assert caps["resources"]["listChanged"] is True
+    assert "subscribe" not in caps["resources"], caps["resources"]
+
+
+@pytest.mark.timeout(120)
+def test_the_auto_era_sandwich_carries_a_listchanged_end_to_end(
+    serve_gateway, relay_factory
+):
+    """Both halves of this project, pointed at each other, over listen.
+
+    stdio client -> relay (auto era) -> serve (modern) -> legacy child.
+    The relay classifies our own serve as modern, opens its own
+    `subscriptions/listen` upstream, and translates what arrives back
+    into the plain stdio notification its client already understands.
+
+    This is the strictest available check on the ack's wire shape: the
+    relay's own C7 validation refuses a frame that is not
+    `jsonrpc: "2.0"`, is not id-less, or whose `params.notifications` is
+    not an object — so a shape our unit tests merely believe is right has
+    to satisfy an independent implementation before this passes.
+
+    It also proves the un-strip END TO END: the relay only forwards a
+    notification kind for a family it advertised to ITS client, and what
+    it advertises comes from serve's discover. A still-stripped
+    `tools.listChanged` would make the relay drop this silently.
+    """
+    client = relay_factory(serve_gateway.port, protocol_era="auto")
+    client.initialize(protocol_version=MODERN_VERSION)
+
+    _drive_list_changed(serve_gateway)
+
+    event = client.expect_notification("notifications/tools/list_changed", timeout=30.0)
+    assert event["jsonrpc"] == "2.0"
+    assert "id" not in event
