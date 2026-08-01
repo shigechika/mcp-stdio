@@ -4,11 +4,20 @@
 
 `mcp-stdio` is a **stdio-to-HTTP/SSE gateway/relay** for the Model Context
 Protocol. It translates between the stdio JSON-RPC framing that MCP hosts
-(Claude Code, Claude Desktop, etc.) speak and the two MCP HTTP transports
+(Claude Code, Claude Desktop, etc.) speak and the MCP HTTP transports
 that remote servers expose:
 
-- Streamable HTTP (current spec) — `run()` in `src/mcp_stdio/relay.py`
+- Streamable HTTP — `run()` in `src/mcp_stdio/relay.py`, speaking **two
+  protocol eras**: 2025-06-18 (legacy, the default) and 2026-07-28
+  (modern, opt-in via `--protocol-era modern|auto`; era detected by a
+  `server/discover` probe). The modern era adds per-request `_meta` +
+  `Mcp-Method`/`Mcp-Name` headers, no sessions, background
+  `subscriptions/listen` streams (including `resources/subscribe`
+  interception), an MRTR bridge translating `input_required` results into
+  legacy `elicitation`/`sampling`/`roots` round-trips, and a stdin reader
+  thread that aborts the in-flight POST on `notifications/cancelled`.
 - Legacy SSE (2024-11-05) — `run_sse()` in `src/mcp_stdio/relay.py`
+  (`--protocol-era` is ignored there, with a warning)
 
 **This repo implements zero MCP tools of its own.** There is no FastMCP, no
 `@mcp.tool()` decorator, nothing that "wraps a tool return value" — do not
@@ -20,11 +29,17 @@ directions**:
   plus a full OAuth 2.1 client (`oauth.py`) and on-disk token cache
   (`token_store.py`) to authenticate against that endpoint.
 - **serve** (`server.py`, `mcp-stdio serve`) — the mirror image (server side:
-  HTTP in, stdio out): spawns a local stdio MCP server as a child process per
-  session and publishes it as a Streamable HTTP endpoint so clients that
-  can't spawn the server locally can reach it over the network. Stdlib-only
+  HTTP in, stdio out): spawns a local stdio MCP server as a child process
+  and publishes it as a Streamable HTTP endpoint so clients that
+  can't spawn the server locally can reach it over the network. **Dual-era
+  on one endpoint**: `_request_era()` classifies each POST conservatively
+  (modern only on positive evidence — `params._meta` carries the
+  protocolVersion key, or the method is `server/discover`); legacy clients
+  keep the sessioned per-child model unchanged, modern clients are served
+  statelessly from a principal-keyed `ModernBackendPool` behind a
+  request-validation ladder. Stdlib-only
   (`http.server` + `subprocess`); optional layered auth (open / static bearer
-  / embedded OAuth 2.1 authorization server). See Review focus §5.
+  / embedded OAuth 2.1 authorization server). See Review focus §5 and §6.
 
 Other modules: `cli.py` (argparse entry point, `mcp-stdio` →
 `mcp_stdio.cli:main`; also dispatches `serve` to `server.py`).
@@ -44,6 +59,19 @@ on `ubuntu-latest`, plus a dedicated `windows-latest` / Python 3.12 job. The
 Windows job exists specifically to smoke-test the stdio newline handling
 (see the "## Windows" section in `WORKAROUNDS.md`) — it is not there for
 general cross-platform coverage, so don't suggest dropping it as redundant.
+
+A separate **integration suite** lives in `tests_integration/` (advisory
+`integration.yml` job, ubuntu-only): real localhost HTTP against a
+python-sdk v2.x reference peer (the `integration` extra pins `mcp>=2.0,<3`)
+and against `mcp-stdio serve` itself. It
+is deliberately NOT part of `pytest tests/` — the unit suite's working
+convention (not an enforced rule; there is no socket-blocking plugin) is
+mocked HTTP via pytest-httpx and patched sleeps throughout, and a diff
+adding a real socket or a bare `time.sleep` to `tests/` deserves a
+comment; the integration conftest works differently, with bounded polls
+and a per-test timeout. `mcp`/`uvicorn` live only in the
+`integration` optional-dependency extra and must never appear in
+`[project.dependencies]`.
 
 ## Review focus
 
@@ -170,6 +198,100 @@ targets:
   `WWW-Authenticate` challenge or the Protected Resource Metadata JSON, to
   block header injection. Flag a diff that uses a raw/unsanitized Host value
   in those responses.
+- **Modern pool isolation.** Modern-era requests are served from
+  `ModernBackendPool`, keyed on the **authenticated principal** (one shared
+  child under no-auth/static-token, one per OAuth user) — never on a
+  session. Flag a diff that lets one principal's child serve another
+  principal's request, evicts a pending/busy child (the eviction guard
+  exists because both cases were review findings), or drops a dead child
+  without reaping it (`backend.shutdown()` — skipping it leaks an OS
+  zombie per respawn).
+
+### 6. Protocol-era invariants (the #270 migration rules)
+
+The 2026-07-28 support was built under two hard rules that remain binding
+for every future diff:
+
+- **The legacy paths are byte-frozen.** On the relay, a legacy-era session
+  must produce wire bytes identical to pre-#270 releases; on serve, legacy
+  clients keep the exact sessioned behavior. The pinned evidence is
+  `tests_integration/test_serve_legacy_pin.py` — a **zero-diff file**: a
+  behavior PR that edits it is prima facie breaking the freeze, and that
+  edit itself deserves a review comment asking for justification.
+- **New behavior is era-gated.** Anything that changes what goes on the
+  wire must sit behind the modern-era branch (`era == "modern"` on the
+  relay; `_request_era()` returning modern on serve). A new call site
+  reachable from a legacy request is a finding.
+- **Error-code discipline.** New code must not emit `-32002` (forbidden by
+  the 2026-07-28 spec) and must not invent codes in the reserved
+  `-32020..-32099` range beyond the defined `-32020`/`-32021`/`-32022`.
+  The relay's pre-existing cold-start `-32002` is grandfathered — do not
+  flag it.
+
+### 7. Comment/docstring accuracy — check claims against code
+
+Docstrings and comments in this repo state binding invariants, and
+comment-vs-code contradictions are its single most recurring review
+finding class (examples that shipped and were later caught: a "zero
+threads" claim falsified by an always-on daemon; a teardown-order comment
+stating the reverse of the code; a "(logged once)" promise with no latch;
+a "guards are not duplicated" claim above duplicated predicates). When a
+diff adds or edits a claim-bearing comment, verify the claim against the
+code in the same diff; when a diff changes code near a claim-bearing
+comment, verify the comment still holds. A false claim is a real finding
+even when the code is correct.
+
+### 8. Test soundness — vacuous negative observations
+
+An assertion of absence ("no late response arrived", "nothing was
+forwarded", "no reconnect happened") is only meaningful over a channel
+that is proven alive. Three shipped instances were caught in review:
+`drain()` treating relay EOF as quiet success (a crashed relay made every
+"nothing arrived" assertion pass); a length-snapshot slice into a bounded
+`deque(maxlen=…)` that goes empty after saturation; an SSE reader
+signalling "opened" without checking status/content-type. When a test asserts that
+something did NOT happen, check what the assertion would do if the
+observed process/stream were already dead — if the answer is "still
+pass", flag it.
+
+### 9. Release and dependency discipline
+
+- `src/mcp_stdio/__init__.py` (`__version__`) and `CHANGELOG.md` are owned
+  by release-please — any manual edit to either in a feature PR is a
+  finding.
+- The runtime dependency set is **httpx only**. A new import in
+  `src/mcp_stdio/` must be stdlib or httpx; test-only dependencies belong
+  in the `dev`/`integration` extras.
+- Docs are bilingual siblings: a change to `README.md` or `docs/*.md`
+  without the matching `.ja` change (or vice versa) is incomplete, and
+  explicit `<a id=…>` anchors must stay unique per page (a duplicated
+  anchor was a shipped review finding).
+
+## Reporting bar
+
+High-signal reviews keep this repository's fix loops short. Before
+reporting a finding, it must clear all of these:
+
+- **A concrete failure scenario** — name the input or state and the wrong
+  outcome, anchored to lines this PR changes. For the claim-accuracy and
+  process classes (§7, §9), which have no runtime failure by construction,
+  the equivalent is: quote the claim or rule and the code or file that
+  falsifies it. "Might be worth considering…" and "for robustness…" do
+  not clear the bar either way.
+- **Not pre-existing** — if the behavior exists on `main` untouched by
+  this diff, it is out of scope here.
+- **Not a settled decision** — PR bodies in this repo carry explicit
+  divergence ledgers and adopted-defaults sections, and design records
+  live on the linked issues. If the PR body or linked design record
+  already documents the choice you are about to question, do not
+  re-litigate it; at most note the disagreement once, referencing the
+  record.
+- **Not a linter's job** — formatting, import order, and style belong to
+  ruff/CI, not review comments.
+
+When uncertain whether a finding is real, prefer omitting it: a missed
+borderline nit costs little, while a speculative finding costs a fix
+round.
 
 ## Out of scope
 
