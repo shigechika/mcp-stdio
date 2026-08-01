@@ -2106,6 +2106,66 @@ class TestListenDelivery:
         assert event["params"]["_meta"][SUBSCRIPTION_ID] == "listen-1"
         assert "id" not in event
 
+    def test_an_event_in_the_attach_to_ack_window_is_buffered_not_lost(
+        self, monkeypatch
+    ):
+        """Why the stream attaches BEFORE the ack is written.
+
+        There is a window between "this stream is committed" and "the
+        client has been acknowledged". A child that fires during it has
+        nowhere to be delivered unless the buffer already exists — and
+        the loss is SILENT: the client sees a healthy stream that simply
+        never mentioned the change it was subscribed to.
+
+        The publish is driven from inside the ack write, so the window is
+        entered deterministically rather than raced into with a sleep.
+
+        Revert-check: move `backend.attach_listener(listener)` below
+        `self._write_sse(...)` in `_serve_listen_stream` and the child's
+        notification lands with zero listeners attached, is discarded,
+        and only the ack ever arrives.
+        """
+        httpd, registry = server.build_server(_BACKEND, host="127.0.0.1", port=0)
+        host, port = httpd.server_address[0], httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://{host}:{port}/mcp"
+
+        original = server._Handler._write_sse
+
+        def _publish_before_the_ack(handler, message):
+            if message.get("method") == ACK_METHOD:
+                for entry in list(httpd.modern_pool._entries.values()):
+                    backend = entry.get("backend")
+                    if backend is not None:
+                        backend._queue_server_initiated(
+                            json.dumps(
+                                {
+                                    "jsonrpc": "2.0",
+                                    "method": "notifications/tools/list_changed",
+                                    "params": {"window": "pre-ack"},
+                                }
+                            )
+                        )
+            return original(handler, message)
+
+        monkeypatch.setattr(server._Handler, "_write_sse", _publish_before_the_ack)
+        try:
+            with _Listener(
+                url, _listen_body(notifications={"toolsListChanged": True})
+            ) as ln:
+                frames = ln.wait_frames(2)
+        finally:
+            httpd.shutdown()
+            registry.shutdown_all()
+            httpd.modern_pool.shutdown_all()
+            httpd.server_close()
+
+        # The ack is still first — buffering must not reorder it.
+        assert frames[0]["method"] == ACK_METHOD
+        assert frames[1]["params"]["window"] == "pre-ack"
+        assert frames[1]["params"]["_meta"][SUBSCRIPTION_ID] == "listen-1"
+
     def test_each_family_of_the_trio_is_deliverable(self, gateway):
         """The advertisement the discover un-strip makes, proven one
         family at a time rather than inferred from the tools case."""
@@ -2325,6 +2385,44 @@ class TestListenEndings:
         # settles a route naming it as LOST, which would turn every
         # graceful teardown into a failure at a compliant peer.
         assert all(f.get("method") != "notifications/cancelled" for f in frames)
+
+    def test_a_shutdown_stays_graceful_even_when_the_drain_times_out(self, monkeypatch):
+        """Why the ENDING is classified by its caller, not inferred.
+
+        The drain is bounded. A slow client can outlast it, and then the
+        children are torn down while the pump is still working — so a
+        pump that read `backend.closed` would see a dead child and
+        silently downgrade an orderly shutdown to LOST, telling a
+        compliant peer to reconnect to a gateway that is going away.
+
+        A zero-length drain forces exactly that ordering. The terminal
+        frame must still be written, because `close_listeners` already
+        said what kind of ending this is.
+
+        Revert-check: replace `if listener.graceful:` in
+        `_pump_listen_stream` with `if not listener.overflowed and not
+        backend.closed:` and the terminal frame disappears here — while
+        the ordinary shutdown test above still passes, which is why this
+        one exists.
+        """
+        monkeypatch.setattr(server, "_LISTEN_DRAIN_SECS", 0.0)
+        httpd, registry = server.build_server(_BACKEND, host="127.0.0.1", port=0)
+        host, port = httpd.server_address[0], httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://{host}:{port}/mcp"
+        try:
+            ln = _Listener(url, _listen_body(notifications={"toolsListChanged": True}))
+            with ln:
+                ln.wait_frames(1)
+                httpd.modern_pool.shutdown_all()
+                frames = ln.wait_frames(2)
+        finally:
+            httpd.shutdown()
+            registry.shutdown_all()
+            httpd.server_close()
+        assert frames[1]["result"]["resultType"] == "complete"
+        assert frames[1]["id"] == "listen-1"
 
     def test_a_dead_child_ends_the_stream_with_no_terminal_frame(self, gateway):
         """Abrupt, deliberately. Serve is still alive and the contract is
