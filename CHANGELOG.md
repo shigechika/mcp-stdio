@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.38.0](https://github.com/shigechika/mcp-stdio/compare/v0.37.0...v0.38.0) (2026-08-01)
+
+
+### Features
+
+* idle reaper, checkout refcount and --modern-only for the modern pool ([#376](https://github.com/shigechika/mcp-stdio/issues/376)) ([#379](https://github.com/shigechika/mcp-stdio/issues/379)) ([478d985](https://github.com/shigechika/mcp-stdio/commit/478d985773fd06cd52600b7235e568c8cc741bdf))
+* serve-side subscriptions/listen — the listChanged trio ([#374](https://github.com/shigechika/mcp-stdio/issues/374)) ([#382](https://github.com/shigechika/mcp-stdio/issues/382)) ([6a5c4ca](https://github.com/shigechika/mcp-stdio/commit/6a5c4ca7373ef203458ea496f2f277fff48b4b77))
+
 ## [0.37.0](https://github.com/shigechika/mcp-stdio/compare/v0.36.0...v0.37.0) (2026-08-01)
 
 
