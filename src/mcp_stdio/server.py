@@ -2923,6 +2923,45 @@ class BackendProcess:
         slot["event"].wait(timeout)
         return self._detach(req_id, slot)
 
+    def resume_request(
+        self, reply_line: str, req_id: Any, timeout: float
+    ) -> str | None:
+        """Answer the child's own question, then wait for the ORIGINAL reply.
+
+        #375 §3.5, and the shape is why this cannot just be
+        `send_request`: the line written is the reply to the CHILD's
+        out-of-band request, while the response waited for is the one the
+        child still owes on the original `tools/call`. Two different ids,
+        one round trip.
+
+        The waiter is registered BEFORE the reply is written. A child can
+        answer the instant it unblocks, and a slot created afterwards
+        would miss a response already routed — the same
+        register-then-write ordering `send_request` uses, for the same
+        reason.
+        """
+        slot: dict[str, Any] = {
+            "event": threading.Event(),
+            "line": None,
+            "request_line": reply_line,
+            "waiters": 1,
+        }
+        with self._lock:
+            if self._closed.is_set():
+                return None
+            if req_id in self._pending:
+                # The original slot should be long gone — its handler
+                # returned the InputRequiredResult. If it is not, the
+                # correlation is ambiguous and guessing is what this
+                # whole design refuses to do.
+                return None
+            self._pending[req_id] = slot
+        if not self._write(reply_line):
+            self._detach(req_id, slot)
+            return None
+        slot["event"].wait(timeout)
+        return self._detach(req_id, slot)
+
     def send_oneway(self, line: str) -> bool:
         """Forward a notification or a client->server response (no reply)."""
         return self._write(line)
@@ -4892,6 +4931,141 @@ class _Handler(BaseHTTPRequestHandler):
                     # die with the child anyway.
                     log(f"listen {req_id!r}: unsubscribe on teardown failed: {exc!r}")
 
+    def _serve_mrtr_retry(
+        self,
+        msg: dict[str, Any],
+        req_id: Any,
+        backend: BackendProcess,
+        principal: str | None,
+        request_state: Any,
+        params: dict[str, Any],
+    ) -> None:
+        """Resume a parked round from the client's retry (#375 §3.5).
+
+        Spec: "If an `InputRequiredResult` contains the `requestState`
+        field, the client MUST echo back the exact value of that field
+        when retrying the original request."
+
+        Three checks close three different holes, and naming only one of
+        them would be an incomplete claim: the HMAC stops FORGERY, the
+        single-use consume stops REPLAY of a genuine still-signed blob,
+        and the principal binding stops CROSS-USER use of one that
+        leaked. The round cap rides inside the signature, so a client
+        cannot reset its own count by hand-crafting `round: 1`.
+        """
+        payload, why = _mrtr_decode_pointer(request_state, principal)
+        if payload is None:
+            # No spec-mandated code exists for an integrity failure — the
+            # spec says only "MUST reject state that fails verification"
+            # — so this follows relay's own `_mrtr_abort` precedent and
+            # stays in the local -32000 range rather than inventing a
+            # meaning for a reserved one (§4 Q4).
+            self._send_json(400, _error_body(why, req_id))
+            return
+        entry = backend.mrtr_round_consume(payload["txn_id"])
+        if entry is None:
+            # The ordinary post-restart / post-timeout case, and a replay
+            # attempt looks identical from here — deliberately, since
+            # neither earns anything louder than an honest error.
+            self._send_json(400, _error_body("unknown or expired requestState", req_id))
+            return
+        if entry["round"] != payload["round"] or entry["principal"] != principal:
+            self._send_json(400, _error_body("stale requestState", req_id))
+            return
+        responses = params.get("inputResponses")
+        if not isinstance(responses, dict) or not responses:
+            self._send_json(
+                400,
+                _error_body(
+                    "inputResponses is required on a retry",
+                    req_id,
+                    code=_JSONRPC_INVALID_PARAMS,
+                ),
+            )
+            return
+        child_request_id = entry["child_request_id"]
+        # The gateway invented this key from the child's own id, so that
+        # is what the client echoes back.
+        answer = responses.get(str(child_request_id))
+        if answer is None and len(responses) == 1:
+            # Tolerate a client that re-keyed a single-entry map: the
+            # correlation is unambiguous at N=1, and refusing would be
+            # pedantry that costs the user their answer.
+            answer = next(iter(responses.values()))
+        reply_line, translate_why = _mrtr_input_response_to_reply(
+            answer, child_request_id
+        )
+        if reply_line is None:
+            self._unblock_child(backend, child_request_id, translate_why)
+            self._send_json(
+                400,
+                _error_body(translate_why, req_id, code=_JSONRPC_INVALID_PARAMS),
+            )
+            return
+        # The next round, if the child asks again, is this one plus one.
+        # Published with the claim so no window exists where a bridge
+        # could see a half-built context.
+        next_round = int(entry["round"]) + 1
+        claimed = backend.mrtr_begin_dispatch(
+            {
+                "upstream_id": entry["upstream_id"],
+                "declared_caps": entry["declared_caps"],
+                "principal": principal,
+                "round": next_round,
+            }
+        )
+        try:
+            line = backend.resume_request(
+                reply_line, entry["upstream_id"], _BACKEND_RESPONSE_TIMEOUT_SECS
+            )
+        finally:
+            if claimed:
+                backend.mrtr_end_dispatch()
+        if line is None:
+            self._send_json(
+                504,
+                _error_body(
+                    "no response from backend after the input was delivered",
+                    req_id,
+                    code=_JSONRPC_INTERNAL_ERROR,
+                ),
+            )
+            return
+        try:
+            parsed = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            self._send_json(
+                502,
+                _error_body(
+                    "malformed response from backend",
+                    req_id,
+                    code=_JSONRPC_INTERNAL_ERROR,
+                ),
+            )
+            return
+        # Re-keyed to THIS retry's own id: the client minted a fresh one,
+        # and the child answered under the original upstream id.
+        parsed["id"] = req_id
+        _stamp_modern_result(
+            parsed,
+            msg.get("method"),
+            server_info=None,
+            cache_ttl_ms=self.cache_ttl_ms,
+        )
+        self._send_json(_modern_response_status(parsed), json.dumps(parsed))
+
+    def _unblock_child(
+        self, backend: BackendProcess, child_request_id: Any, reason: str
+    ) -> None:
+        """Answer the child so an unusable retry never leaves it blocked.
+
+        The round has already been consumed by the time anything can fail
+        here, so nothing else will ever reply to this id.
+        """
+        backend.send_oneway(
+            _error_body(reason, child_request_id, code=_JSONRPC_INVALID_PARAMS)
+        )
+
     def _write_sse(self, message: dict[str, Any]) -> None:
         self.wfile.write(f"data: {json.dumps(message)}\n\n".encode("utf-8"))
         self.wfile.flush()
@@ -5209,6 +5383,20 @@ class _Handler(BaseHTTPRequestHandler):
                 else None
             )
             principal = self._current_user()
+            # #375 §3.5: an MRTR RETRY, detected before the concurrency
+            # claim and handled on its own path. It has to bypass that
+            # claim: the round it resumes is precisely the one parked in
+            # `_mrtr_pending`, so the ordinary guard would refuse the one
+            # request able to clear it — a deadlock by construction.
+            params_obj = msg.get("params")
+            request_state = (
+                params_obj.get("requestState") if isinstance(params_obj, dict) else None
+            )
+            if request_state is not None:
+                self._serve_mrtr_retry(
+                    msg, req_id, backend, principal, request_state, params_obj
+                )
+                return
             # §4 Q1's OAuth-only boundary, and this is where it BITES. A
             # context of None means the reader thread finds nothing to
             # bridge into and falls through to today's D4 `-32601` — so a
