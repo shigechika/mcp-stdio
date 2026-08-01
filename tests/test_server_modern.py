@@ -4641,3 +4641,183 @@ class TestMrtrTranslation:
             line, why = server._mrtr_input_response_to_reply(bad, "c1")
             assert line is None, bad
             assert why, bad
+
+
+class TestMrtrRoundOneMinting:
+    """A child's mid-call request becomes an `InputRequiredResult`.
+
+    The unit `gateway` fixture is NO-AUTH, which is exactly why these
+    tests drive `_mrtr_try_bridge` against a `BackendProcess` directly:
+    under no auth the OAuth-only gate publishes no bridging context at
+    all, so the HTTP path cannot reach this code — and that fact is
+    itself pinned, below.
+    """
+
+    def _backend(self):
+        return server.BackendProcess([*_BACKEND], modern_owned=True)
+
+    def test_no_context_means_no_bridge(self):
+        """The D4 fallthrough stays the default outcome: unbridgeable is
+        the answer whenever anything at all is missing."""
+        backend = self._backend()
+        try:
+            assert backend._mrtr_try_bridge({"id": 1, "method": "roots/list"}) is False
+        finally:
+            backend.shutdown()
+
+    def test_a_bridged_request_wakes_the_parked_handler(self):
+        """Round-1 minting needs NO new response path: the handler is
+        already blocked in `send_request` on this slot, so filling it and
+        setting the event delivers the result through the existing
+        stamp/send machinery.
+
+        Asserted on the line the handler would receive — wire evidence,
+        not "no hang observed".
+        """
+        backend = self._backend()
+        try:
+            got: list[str] = []
+
+            def _wait():
+                line = backend.send_request(
+                    json.dumps({"jsonrpc": "2.0", "id": "U1", "method": "noreply"}),
+                    "U1",
+                    10.0,
+                )
+                got.append(line)
+
+            assert backend.mrtr_begin_dispatch(
+                {
+                    "upstream_id": "U1",
+                    "declared_caps": {"sampling": {}},
+                    "principal": "alice",
+                    "round": 1,
+                }
+            )
+            waiter = threading.Thread(target=_wait, daemon=True)
+            waiter.start()
+            deadline = time.monotonic() + 10
+            while not backend.has_pending and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert backend._mrtr_try_bridge(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "child-9",
+                    "method": "sampling/createMessage",
+                    "params": {"messages": []},
+                }
+            )
+            waiter.join(timeout=10)
+            assert got and got[0] is not None
+            result = json.loads(got[0])["result"]
+            assert result["resultType"] == "input_required"
+            # The gateway INVENTS the key from the child's own id.
+            assert list(result["inputRequests"]) == ["child-9"]
+            assert result["inputRequests"]["child-9"]["method"] == (
+                "sampling/createMessage"
+            )
+            # And the pointer is a real, verifiable one.
+            payload, why = server._mrtr_decode_pointer(result["requestState"], "alice")
+            assert why == "" and payload["round"] == 1
+            # The round is parked, keyed to the child's own request id.
+            found = backend.mrtr_round_for_txn(payload["txn_id"])
+            assert found is not None and found[1]["child_request_id"] == "child-9"
+        finally:
+            backend.shutdown()
+
+    def test_an_undeclared_capability_aborts_with_32021(self):
+        """O11: "the server MUST return a
+        `MissingRequiredClientCapabilityError` (-32021) whose
+        `data.requiredCapabilities` lists the missing capabilities."
+
+        No relay precedent to copy — relay can never emit this, only
+        servers can — so copying its generic abort would be
+        non-conformant. And NO round is opened: there is nothing to retry
+        into.
+        """
+        backend = self._backend()
+        try:
+            got: list[str] = []
+
+            def _wait():
+                got.append(
+                    backend.send_request(
+                        json.dumps({"jsonrpc": "2.0", "id": "U1", "method": "noreply"}),
+                        "U1",
+                        10.0,
+                    )
+                )
+
+            assert backend.mrtr_begin_dispatch(
+                {
+                    "upstream_id": "U1",
+                    "declared_caps": {"elicitation": {}},  # no sampling
+                    "principal": "alice",
+                    "round": 1,
+                }
+            )
+            waiter = threading.Thread(target=_wait, daemon=True)
+            waiter.start()
+            deadline = time.monotonic() + 10
+            while not backend.has_pending and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert backend._mrtr_try_bridge(
+                {"jsonrpc": "2.0", "id": "c1", "method": "sampling/createMessage"}
+            )
+            waiter.join(timeout=10)
+            error = json.loads(got[0])["error"]
+            assert error["code"] == -32021
+            assert error["data"]["requiredCapabilities"] == ["sampling"]
+            assert not backend.mrtr_has_pending(), "a round was opened anyway"
+        finally:
+            backend.shutdown()
+
+    def test_a_vanished_handler_falls_through_rather_than_parking(self):
+        """If the handler timed out between the context read and the
+        answer, the round must NOT be left parked for a retry that can
+        never be correlated — and the caller must still answer the child,
+        or it stays blocked forever."""
+        backend = self._backend()
+        try:
+            assert backend.mrtr_begin_dispatch(
+                {
+                    "upstream_id": "U-gone",
+                    "declared_caps": {"roots": {}},
+                    "principal": "alice",
+                    "round": 1,
+                }
+            )
+            # No waiter was ever registered for U-gone.
+            assert (
+                backend._mrtr_try_bridge(
+                    {"jsonrpc": "2.0", "id": "c1", "method": "roots/list"}
+                )
+                is False
+            )
+            assert backend.mrtr_has_pending() is False
+        finally:
+            backend.shutdown()
+
+
+def test_a_no_auth_gateway_publishes_no_bridging_context(gateway_with_pool):
+    """§4 Q1's boundary, end to end, and the reason it is safe to remove
+    the D4 valve: a no-auth deployment gets NO bridging context, so a
+    child that asks still meets the `-32601`.
+
+    Asserted on the child's actual answer — the fake backend's
+    `ask_client` really does raise `elicitation/create` mid-call — rather
+    than on the absence of a bridge.
+    """
+    url, pool = gateway_with_pool
+    resp = _post(
+        url, _modern_body("ask_client", meta=_meta()), _modern_headers("ask_client")
+    )
+    assert resp.status_code == 200, resp.text
+    # The child got its D4 reject and completed normally.
+    assert resp.json()["result"]["asked"] is True
+    backend, _, entry = pool.get_or_create(None)
+    try:
+        assert backend.mrtr_context() is None
+        assert backend.mrtr_has_pending() is False
+    finally:
+        pool.release(entry)

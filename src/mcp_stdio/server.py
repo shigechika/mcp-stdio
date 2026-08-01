@@ -167,6 +167,13 @@ _JSONRPC_INVALID_PARAMS = -32602
 # -32603 Internal error is JSON-RPC's own name for "the gateway broke".
 _JSONRPC_INTERNAL_ERROR = -32603
 _MCP_HEADER_MISMATCH = -32020
+# O11, and #375's one code with no relay precedent to copy: "the server
+# MUST return a `MissingRequiredClientCapabilityError` (-32021) whose
+# `data.requiredCapabilities` lists the missing capabilities". Relay can
+# never emit it — only SERVERS can — so its bridge aborts generically;
+# serve IS the server in this direction, and copying relay's generic
+# error here would be non-conformant.
+_MCP_MISSING_CLIENT_CAPABILITY = -32021
 _MCP_UNSUPPORTED_PROTOCOL_VERSION = -32022
 
 # Headers whose value the spec mirrors from the request body, and which a
@@ -2068,6 +2075,18 @@ class BackendProcess:
         # So the claim is taken BEFORE the send and held until the
         # dispatch returns, under the same lock as the table.
         self._mrtr_inflight = False
+        # #375 PR 2: what the reader thread needs to know about the ONE
+        # eligible request currently in flight, so it can decide whether a
+        # child-initiated request can be bridged back to it. A single slot
+        # rather than a map because `mrtr_begin_dispatch` already
+        # guarantees at most one — the invariant is what makes this shape
+        # legal, and re-deriving it as a dict would quietly permit the
+        # ambiguity PR 1 exists to forbid.
+        #
+        # Distinct from `_mrtr_pending`, deliberately: that table means
+        # "a round is PARKED awaiting a client retry", which is a later
+        # and different state. Conflating them was #389's top finding.
+        self._mrtr_context: dict[str, Any] | None = None
         self._closed = threading.Event()
         self._reader = threading.Thread(
             target=self._read_loop, name="backend-reader", daemon=True
@@ -2487,7 +2506,7 @@ class BackendProcess:
         with self._mrtr_lock:
             return bool(self._mrtr_pending)
 
-    def mrtr_begin_dispatch(self) -> bool:
+    def mrtr_begin_dispatch(self, context: dict[str, Any] | None = None) -> bool:
         """Claim this child for one MRTR-eligible request, or refuse.
 
         THE concurrency invariant (#375 §1.2), and it has to be a single
@@ -2516,7 +2535,126 @@ class BackendProcess:
             if self._mrtr_inflight or self._mrtr_pending:
                 return False
             self._mrtr_inflight = True
+            self._mrtr_context = context
             return True
+
+    def _mrtr_try_bridge(self, msg: dict[str, Any]) -> bool:
+        """Turn a child-initiated request into an `InputRequiredResult`.
+
+        Runs on the READER thread (#375 §3.3). Returns True when the
+        child's request has been accounted for — either bridged or
+        answered with a capability error — and False when the caller
+        should fall through to the D4 `-32601`.
+
+        Round-1 minting needs no new response path: `_dispatch_modern` is
+        already blocked in `send_request` on the very slot this fills, so
+        waking it delivers the result through the existing rekey / stamp
+        / send machinery. That is one place the reverse direction is
+        SIMPLER than relay's PR C, which had to mint a whole new
+        out-of-band request line.
+        """
+        context = self.mrtr_context()
+        if context is None:
+            return False
+        capability, translated = _mrtr_request_to_input_entry(msg)
+        if capability is None:
+            log(f"mrtr: {translated}")
+            return False
+        upstream_id = context["upstream_id"]
+        child_request_id = msg.get("id")
+        declared = context.get("declared_caps")
+        declared = declared if isinstance(declared, dict) else {}
+        if capability not in declared:
+            # O11, and this is the one place the reverse direction has no
+            # PR C precedent to copy: "A server MUST NOT rely on
+            # capabilities the client has not declared. If processing a
+            # request requires a capability the client did not include in
+            # `io.modelcontextprotocol/clientCapabilities`, the server
+            # MUST return a `MissingRequiredClientCapabilityError`
+            # (-32021) whose `data.requiredCapabilities` lists the missing
+            # capabilities." Relay can never emit this — only servers
+            # can — so it aborts generically; copying that here would be
+            # non-conformant.
+            #
+            # The round is NOT opened: there is nothing to retry into.
+            answered = self.answer_pending(
+                upstream_id,
+                _error_body(
+                    "the client did not declare a capability this request needs",
+                    upstream_id,
+                    code=_MCP_MISSING_CLIENT_CAPABILITY,
+                    data={"requiredCapabilities": [capability]},
+                ),
+            )
+            if not answered:
+                return False
+            # The child still needs an answer, or it stays blocked.
+            self._write(
+                _error_body(
+                    "the client cannot fulfil this request",
+                    child_request_id,
+                    code=_JSONRPC_METHOD_NOT_FOUND,
+                )
+            )
+            return True
+        round_no = int(context.get("round", 1))
+        txn_id = self.mrtr_round_open(
+            upstream_id,
+            method=msg.get("method", ""),
+            child_request_id=child_request_id,
+            declared_caps=declared,
+            principal=context.get("principal"),
+            round_no=round_no,
+        )
+        state = _mrtr_encode_pointer(txn_id, context.get("principal"), round_no)
+        result = {
+            "resultType": "input_required",
+            # The gateway INVENTS this key: relay mints an id from a key
+            # the modern server supplied, and the reverse gets a bare
+            # child id with no key at all. The mapping back to the
+            # child's own id lives in the parked-round table, never in
+            # `requestState` (§1.1).
+            "inputRequests": {str(child_request_id): translated},
+            "requestState": state,
+        }
+        if self.answer_pending(
+            upstream_id,
+            json.dumps({"jsonrpc": "2.0", "id": upstream_id, "result": result}),
+        ):
+            return True
+        # The handler vanished between the context read and now. Drop the
+        # round rather than leave it parked for a retry that can never be
+        # correlated, and let the caller answer the child.
+        self.mrtr_round_consume(txn_id)
+        return False
+
+    def mrtr_context(self) -> dict[str, Any] | None:
+        """The in-flight eligible request's bridging context, if any."""
+        with self._mrtr_lock:
+            return self._mrtr_context
+
+    def answer_pending(self, req_id: Any, line: str) -> bool:
+        """Hand a synthesized response to a waiting handler thread.
+
+        #375 §3.3, and the reason round-1 minting needs no new response
+        path at all: `_dispatch_modern` is already blocked in
+        `send_request` on this exact slot, so filling it and setting the
+        event wakes that thread as if the child had answered. The
+        existing rekey / stamp / send machinery then delivers the
+        `InputRequiredResult` unchanged.
+
+        Returns False when the slot is gone — the handler timed out or
+        the client disconnected — which the caller MUST treat as "this
+        cannot be bridged" rather than ignore, or the child is left
+        blocked on a reply nobody will send.
+        """
+        with self._lock:
+            slot = self._pending.get(req_id)
+            if slot is None:
+                return False
+            slot["line"] = line
+            slot["event"].set()
+        return True
 
     def mrtr_end_dispatch(self) -> None:
         """Release the claim; idempotent.
@@ -2528,6 +2666,7 @@ class BackendProcess:
         """
         with self._mrtr_lock:
             self._mrtr_inflight = False
+            self._mrtr_context = None
 
     def mrtr_expire_parked(self, *, now: float | None = None) -> list[dict[str, Any]]:
         """Drop rounds past their park deadline; return what was dropped.
@@ -2654,6 +2793,17 @@ class BackendProcess:
                 # of the kind ever reaches a stream, because there is none.
                 # `_write` is lock-guarded and its broken-pipe path is
                 # already reentrant-safe, so this is safe off-thread.
+                # #375 PR 2: try to bridge it into the parked handler
+                # first. An ADDITION IN FRONT OF the D4 reply below, never
+                # a rewrite of it — everything unbridgeable (no eligible
+                # request in flight, an unbridgeable method, a capability
+                # the client never declared, a handler that already went
+                # away) still falls through to the same `-32601`, which
+                # is what keeps the never-hang invariant the default
+                # outcome rather than something the bridge has to
+                # remember to preserve.
+                if self._mrtr_try_bridge(msg):
+                    return
                 self._write(
                     _error_body(
                         "this gateway does not bridge server-initiated requests",
@@ -5044,8 +5194,48 @@ class _Handler(BaseHTTPRequestHandler):
             # REJECT rather than queue (§4 Q2): queuing reintroduces the
             # stall vector D4 exists to prevent, and narrows perceived
             # concurrency in a way far harder to diagnose than an error.
+            # #375 PR 2: the bridging context the reader thread needs
+            # if this child asks something mid-call. Built HERE, before
+            # the send, because `_meta.clientCapabilities` is a
+            # PER-REQUEST field under O5 — there is no modern
+            # `initialize` to have captured it from, so it is read fresh
+            # off whichever request is currently live and snapshotted.
+            # `isinstance` guarded: the ladder's rung 1 checks the field
+            # is PRESENT, never that it is an object.
+            declared_caps = (msg.get("params") or {}).get("_meta", {})
+            declared_caps = (
+                declared_caps.get(_META_CLIENT_CAPABILITIES)
+                if isinstance(declared_caps, dict)
+                else None
+            )
+            principal = self._current_user()
+            # §4 Q1's OAuth-only boundary, and this is where it BITES. A
+            # context of None means the reader thread finds nothing to
+            # bridge into and falls through to today's D4 `-32601` — so a
+            # no-auth or static-token deployment keeps its behaviour
+            # exactly, even after the valve comes out and the child is
+            # free to ask. Principal binding is what stops one caller
+            # answering another's prompt, and it buys nothing when every
+            # caller shares one constant AND one pooled child.
+            #
+            # The concurrency CLAIM below is taken regardless of
+            # principal: it guards correlation, it is not a feature gate,
+            # and narrowing it would reintroduce the ambiguity for
+            # exactly the deployments least able to tolerate it.
+            mrtr_context = (
+                {
+                    "upstream_id": None,  # filled in once minted, below
+                    "declared_caps": (
+                        declared_caps if isinstance(declared_caps, dict) else {}
+                    ),
+                    "principal": principal,
+                    "round": 1,
+                }
+                if _mrtr_principal_is_eligible(principal)
+                else None
+            )
             if method in _MRTR_ELIGIBLE_METHODS:
-                if not backend.mrtr_begin_dispatch():
+                if not backend.mrtr_begin_dispatch(mrtr_context):
                     self._send_json(
                         503,
                         _error_body(
@@ -5060,6 +5250,11 @@ class _Handler(BaseHTTPRequestHandler):
                 mrtr_claimed = True
 
             upstream_id = _mint_modern_id()
+            # The context was published with the claim (so no window
+            # exists where a bridge could see a half-built one); the id
+            # is the last field and only knowable now.
+            if mrtr_context is not None:
+                mrtr_context["upstream_id"] = upstream_id
             outbound = dict(msg)
             outbound["id"] = upstream_id
             line = backend.send_request(
