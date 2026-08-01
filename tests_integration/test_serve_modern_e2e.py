@@ -42,7 +42,7 @@ import httpx
 import pytest
 
 from ._legacy_child import SERVER_NAME, TOOLS
-from .conftest import wait_until
+from .conftest import LEGACY_CHILD_COMMAND_NO_SUBSCRIBE, wait_until
 
 MODERN_VERSION = "2026-07-28"
 SERVER_INFO_KEY = "io.modelcontextprotocol/serverInfo"
@@ -302,13 +302,19 @@ def test_a_gateway_shutdown_ends_the_stream_without_losing_it(serve_factory):
 
 
 @pytest.mark.timeout(60)
-def test_discover_advertises_the_trio_and_still_withholds_subscribe(serve_gateway):
+def test_discover_advertises_all_four_flags_the_child_supports(serve_gateway):
     """The un-strip, on raw bytes, against the child's real capabilities.
 
-    The child advertises all four flags. Three are now promises serve can
-    keep — `subscriptions/listen` delivers them — and one is not:
-    per-URI subscription driving is #381, and the listen ack declines it,
-    so advertising it here would promise exactly what the ack refuses.
+    The child advertises all four flags, and #381 completed the un-strip
+    so all four are echoed: `subscriptions/listen` delivers the
+    listChanged trio (#374/#382), and serve now drives per-URI
+    `resources/subscribe` at the child for the fourth.
+
+    The conditionality is the point, and it is asserted separately (a
+    child WITHOUT `resources.subscribe` must still have the flag
+    stripped) — see the unit suite's one-predicate pin. Here the child
+    does support it, so advertising it is an honest promise rather than
+    the one thing the ack refuses.
     """
     resp = httpx.post(
         serve_gateway.url,
@@ -335,7 +341,7 @@ def test_discover_advertises_the_trio_and_still_withholds_subscribe(serve_gatewa
     assert caps["tools"]["listChanged"] is True
     assert caps["prompts"]["listChanged"] is True
     assert caps["resources"]["listChanged"] is True
-    assert "subscribe" not in caps["resources"], caps["resources"]
+    assert caps["resources"]["subscribe"] is True, caps["resources"]
 
 
 @pytest.mark.timeout(120)
@@ -514,3 +520,132 @@ def test_the_relay_treats_a_dead_child_as_an_ordinary_reconnectable_drop(
     _drive_list_changed(gateway)
     event = client.expect_notification("notifications/tools/list_changed", timeout=30.0)
     assert event["jsonrpc"] == "2.0"
+
+
+def _drive_resource_update(gateway, uri: str) -> None:
+    """Make the pooled child emit `notifications/resources/updated`."""
+    resp = httpx.post(
+        gateway.url,
+        content=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/resource_update_push",
+                "params": {
+                    "uri": uri,
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": MODERN_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                },
+            }
+        ),
+        headers={"MCP-Protocol-Version": MODERN_VERSION},
+        timeout=20,
+    )
+    assert resp.status_code == 202, resp.text
+
+
+@pytest.mark.timeout(90)
+def test_v2_client_subscribes_to_a_resource_and_receives_its_update(serve_gateway):
+    """**#381's acceptance test**, against the reference peer's own API.
+
+    `client.listen(resource_subscriptions=[...])` blocks until the ack,
+    so entering the context manager already proves serve's ack carries
+    the URI list in the shape the v2 client parses — a list nested at
+    `params.notifications.resourceSubscriptions`, which is checked by a
+    real implementation here rather than by our reading of the spec.
+
+    `sub.honored.resource_subscriptions` then proves the echo survived
+    that parse: the client builds its own admission set from this field,
+    so an ack that shipped the URIs anywhere else would leave it empty
+    and silently drop every update that followed.
+
+    The event itself closes the loop end to end: legacy child ->
+    serve-driven `resources/subscribe` -> child's
+    `notifications/resources/updated` -> per-URI routing -> the client's
+    typed `ResourceUpdated`.
+    """
+    import anyio
+
+    from mcp.client import Client
+
+    uri = "file:///project/config.json"
+
+    async def _drive():
+        async with Client(serve_gateway.url, mode="auto") as client:
+            async with client.listen(resource_subscriptions=[uri]) as sub:
+                honored = list(sub.honored.resource_subscriptions or ())
+                async with anyio.create_task_group() as tg:
+
+                    async def _fire():
+                        await anyio.to_thread.run_sync(
+                            _drive_resource_update, serve_gateway, uri
+                        )
+
+                    tg.start_soon(_fire)
+                    with anyio.fail_after(30):
+                        async for event in sub:
+                            first = event
+                            break
+                return {
+                    "honored": honored,
+                    "event_type": type(first).__name__,
+                    "event_uri": getattr(first, "uri", None),
+                    "discovered": client.session.discover_result is not None,
+                    "initialized": client.session.initialize_result is not None,
+                }
+
+    out = anyio.run(_drive)
+
+    # Without this the whole test can pass on a silent legacy fallback.
+    assert out["discovered"] and not out["initialized"]
+    assert out["honored"] == [uri], out
+    assert out["event_type"] == "ResourceUpdated", out
+    assert out["event_uri"] == uri, out
+
+
+@pytest.mark.timeout(90)
+def test_the_v2_client_sees_the_field_omitted_when_the_child_cannot_subscribe(
+    serve_factory,
+):
+    """The capability gate, read by the peer that acts on it.
+
+    A child without `resources.subscribe` must leave serve advertising
+    nothing and honoring nothing — and the client must still get a
+    well-formed ack. That second half is the subtle one: an ack missing
+    the `notifications` object entirely makes the v2 client discard it
+    and time out, so "declined" has to be an omitted FIELD inside a
+    present object, never a missing object or an empty list.
+    """
+    import anyio
+
+    from mcp.client import Client
+
+    gateway = serve_factory(command=list(LEGACY_CHILD_COMMAND_NO_SUBSCRIBE))
+
+    async def _drive():
+        async with Client(gateway.url, mode="auto") as client:
+            async with client.listen(
+                tools_list_changed=True, resource_subscriptions=["res://a"]
+            ) as sub:
+                return {
+                    "uris": list(sub.honored.resource_subscriptions or ()),
+                    "tools": sub.honored.tools_list_changed,
+                    # A typed model, so an unadvertised flag surfaces as
+                    # `subscribe=None` rather than a missing key.
+                    "subscribe_advertised": bool(
+                        getattr(
+                            client.session.discover_result.capabilities.resources,
+                            "subscribe",
+                            None,
+                        )
+                    ),
+                }
+
+    out = anyio.run(_drive)
+    # Declined, and the ack still parsed — entering the context manager
+    # at all is that proof.
+    assert out["uris"] == [], out
+    # The trio is unaffected by the resource gate.
+    assert out["tools"] is True, out
+    assert out["subscribe_advertised"] is False, out

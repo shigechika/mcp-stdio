@@ -1294,20 +1294,19 @@ class TestSynthesizeDiscover:
             server._SERVE_IMPLEMENTED_MODERN_VERSIONS
         )
 
-    def test_the_listchanged_trio_is_advertised_and_subscribe_is_not(self):
-        """#374's half of the un-strip, and the half that stayed.
+    def test_all_four_flags_are_advertised_when_the_child_supports_them(self):
+        """The un-strip, completed by #381.
 
         The rule is the relay's C8 principle in reverse — advertise a
         notification flag only for a kind serve can actually deliver.
-        Before #374 all four flags were stripped, because a pooled
-        child's notifications went nowhere. `subscriptions/listen` now
-        delivers the listChanged trio, so those three flags became true
-        statements and are echoed again.
+        Before #374 all four were stripped, because a pooled child's
+        notifications went nowhere. #374's `subscriptions/listen` made the
+        listChanged trio true; #381 made `resources.subscribe` true too,
+        by actually driving the subscription against the child.
 
-        `resources.subscribe` stays stripped: it promises per-URI
-        subscription driving, which the listen ack explicitly DECLINES
-        (`resourceSubscriptions: false`) until #381. Advertising it would
-        promise the one thing the ack refuses.
+        A child advertising all four now has all four echoed — but only
+        BECAUSE it advertises `subscribe` itself, which the next test
+        pins from the other side.
         """
         result = server._synthesize_discover_result(
             {
@@ -1322,12 +1321,44 @@ class TestSynthesizeDiscover:
         caps = result["capabilities"]
         assert caps["tools"] == {"listChanged": True}
         assert caps["prompts"] == {"listChanged": True}
-        assert caps["resources"] == {"listChanged": True}
-        assert "subscribe" not in caps["resources"]
+        assert caps["resources"] == {"subscribe": True, "listChanged": True}
         # Control: an unrelated capability passes through untouched,
-        # proving the filter is scoped to one key rather than
-        # over-stripping.
+        # proving the filter is scoped rather than over-stripping.
         assert caps["completions"] == {}
+
+    def test_subscribe_is_stripped_when_the_child_does_not_support_it(self):
+        """The conditional half — and why the table entry survives #381.
+
+        Serve honors `resourceSubscriptions` only by driving
+        `resources/subscribe` at the child, so a child that does not
+        advertise it makes the flag a promise serve cannot keep.
+        `subscribe: false` is the case that makes this observable at all:
+        the key is PRESENT, so a raw echo would forward a falsy flag the
+        ack would then also decline.
+        """
+        result = server._synthesize_discover_result(
+            {"capabilities": {"resources": {"subscribe": False, "listChanged": True}}}
+        )
+        assert result["capabilities"]["resources"] == {"listChanged": True}
+
+    def test_the_discover_gate_and_the_ack_gate_are_one_predicate(self):
+        """Pinned against each other rather than restated.
+
+        Two independent capability checks would be free to drift — serve
+        advertising `subscribe` while the ack declines it, or the reverse
+        — and both are invisible until a client actually tries.
+        """
+        for init_result, expected in (
+            ({"capabilities": {"resources": {"subscribe": True}}}, True),
+            ({"capabilities": {"resources": {"subscribe": False}}}, False),
+            ({"capabilities": {"resources": {}}}, False),
+            ({"capabilities": {}}, False),
+        ):
+            resources = server._synthesize_discover_result(init_result)[
+                "capabilities"
+            ].get("resources", {})
+            assert ("subscribe" in resources) is expected
+            assert server._child_supports_resource_subscribe(init_result) is expected
 
     def test_the_advertised_trio_matches_what_listen_forwards(self):
         """The advertisement and the delivery table cannot drift apart.
@@ -1349,9 +1380,14 @@ class TestSynthesizeDiscover:
         """The filter removes specific KEYS, never the whole family
         object: a hypothetical `resources.other` flag must survive
         alongside `subscribe` being stripped from the SAME family — spec
-        capability semantics are presence-based per key, not per family."""
+        capability semantics are presence-based per key, not per family.
+
+        `subscribe: False` is what makes this reachable post-#381: a
+        truthy `subscribe` is now KEPT (serve can honor it), so the
+        stripping path needs a child that does not support it.
+        """
         result = server._synthesize_discover_result(
-            {"capabilities": {"resources": {"subscribe": True, "other": "x"}}}
+            {"capabilities": {"resources": {"subscribe": False, "other": "x"}}}
         )
         assert result["capabilities"]["resources"] == {"other": "x"}
 
@@ -1377,7 +1413,7 @@ class TestSynthesizeDiscover:
         through as-is, while a sibling well-formed family is still
         stripped normally."""
         result = server._synthesize_discover_result(
-            {"capabilities": {"tools": True, "resources": {"subscribe": True}}}
+            {"capabilities": {"tools": True, "resources": {"subscribe": False}}}
         )
         caps = result["capabilities"]
         assert caps["tools"] is True
@@ -2919,3 +2955,869 @@ def test_a_pooled_child_discards_deliver_and_discard_again(gateway, quick_keepal
         ln.wait_comments(2)
         frames, _ = ln.snapshot()
     assert len(frames) == 1, frames
+
+
+# --- resourceSubscriptions (#381) ----------------------------------------
+
+RESOURCE_FIELD = "resourceSubscriptions"
+RESOURCE_UPDATED = "notifications/resources/updated"
+_BACKEND_NO_SUBSCRIBE = [*_BACKEND, "--no-resource-subscribe"]
+
+
+def _fire_resource_update(url: str, uri: str) -> None:
+    """Make the pooled child emit one `notifications/resources/updated`."""
+    resp = _post(
+        url,
+        {
+            "jsonrpc": "2.0",
+            "method": "trigger_resource_update",
+            "params": {"uri": uri, "_meta": _meta()},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+
+def _subscribe_calls(url: str) -> list[list]:
+    """The child's own record of every subscribe/unsubscribe it received.
+
+    WIRE EVIDENCE. Every refcount assertion in this file reads this rather
+    than inferring from whether updates arrived: "no update showed up" is
+    equally true when the subscription worked and nothing changed, when
+    routing is broken, and when the whole feature is missing. A call log
+    distinguishes them.
+    """
+    resp = _post(
+        url,
+        _modern_body("subscribe_log", meta=_meta()),
+        _modern_headers("subscribe_log"),
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()["result"]["calls"]
+
+
+@pytest.fixture()
+def gateway_no_subscribe():
+    """A gateway whose child does NOT advertise `resources.subscribe`."""
+    httpd, registry = server.build_server(
+        _BACKEND_NO_SUBSCRIBE, host="127.0.0.1", port=0
+    )
+    host, port = httpd.server_address[0], httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://{host}:{port}/mcp"
+    finally:
+        httpd.shutdown()
+        registry.shutdown_all()
+        httpd.modern_pool.shutdown_all()
+        httpd.server_close()
+
+
+class TestResourceSubscriptionAck:
+    """What the ack promises, and what gates it."""
+
+    def test_requested_uris_are_echoed_when_the_child_supports_subscribe(self, gateway):
+        """Honor-all above the capability gate: no per-URI accept/reject.
+
+        There is no servability probe to base one on and the reference
+        implementation has none — its own words are that "a subscription
+        to a nonexistent resource URI is honored and never fires".
+        """
+        uris = ["res://a", "res://b"]
+        with _Listener(
+            gateway, _listen_body(notifications={RESOURCE_FIELD: uris})
+        ) as ln:
+            ack = ln.wait_frames(1)[0]
+        assert ack["params"]["notifications"][RESOURCE_FIELD] == uris
+
+    def test_a_child_without_the_capability_gets_the_field_omitted(
+        self, gateway_no_subscribe
+    ):
+        """Omitted, NEVER `[]`.
+
+        An empty list would claim the feature works and then deliver
+        nothing; omission is the spec's own "notification types the
+        server does not support are omitted", and it is what a client
+        checking the ack (the spec's SHOULD) can act on.
+        """
+        with _Listener(
+            gateway_no_subscribe,
+            _listen_body(notifications={RESOURCE_FIELD: ["res://a"]}),
+        ) as ln:
+            ack = ln.wait_frames(1)[0]
+        notifications = ack["params"]["notifications"]
+        assert RESOURCE_FIELD not in notifications, notifications
+        # The object itself is still present — a MISSING `notifications`
+        # key makes the v2 client discard the whole ack and time out.
+        assert notifications == {}
+
+    def test_nothing_is_driven_against_a_child_without_the_capability(
+        self, gateway_no_subscribe
+    ):
+        """The gate is not cosmetic: it must also stop the drive.
+
+        Asserted on the child's own call log — a capability-lacking child
+        has no documented error for an unsolicited `resources/subscribe`,
+        so serve simply must never send one.
+        """
+        with _Listener(
+            gateway_no_subscribe,
+            _listen_body(notifications={RESOURCE_FIELD: ["res://a"]}),
+        ) as ln:
+            ln.wait_frames(1)
+            time.sleep(0.3)  # let any (incorrect) background drive land
+            assert _subscribe_calls(gateway_no_subscribe) == []
+
+    def test_an_empty_or_absent_list_omits_the_field(self, gateway):
+        for requested in ({RESOURCE_FIELD: []}, {"toolsListChanged": True}):
+            with _Listener(gateway, _listen_body(notifications=requested)) as ln:
+                ack = ln.wait_frames(1)[0]
+            assert RESOURCE_FIELD not in ack["params"]["notifications"]
+
+    def test_a_malformed_list_degrades_instead_of_crashing(self, gateway):
+        """Relay hardened this exact read after a real incident: a nested
+        list inside the URI array raised `TypeError: unhashable type` in a
+        daemon thread and killed it (#358 review R2F1). Non-strings are
+        dropped; a non-list is treated as absent."""
+        with _Listener(
+            gateway,
+            _listen_body(
+                notifications={RESOURCE_FIELD: ["res://a", ["nested"], 7, None]}
+            ),
+        ) as ln:
+            ack = ln.wait_frames(1)[0]
+        assert ack["params"]["notifications"][RESOURCE_FIELD] == ["res://a"]
+
+        with _Listener(
+            gateway, _listen_body("l2", notifications={RESOURCE_FIELD: "res://a"})
+        ) as ln:
+            ack = ln.wait_frames(1)[0]
+        assert RESOURCE_FIELD not in ack["params"]["notifications"]
+
+    def test_duplicate_uris_collapse(self, gateway):
+        """Otherwise one stream could inflate a URI's refcount by
+        repeating it, and the matching unsubscribe would never fire."""
+        with _Listener(
+            gateway,
+            _listen_body(notifications={RESOURCE_FIELD: ["res://a", "res://a"]}),
+        ) as ln:
+            ack = ln.wait_frames(1)[0]
+        assert ack["params"]["notifications"][RESOURCE_FIELD] == ["res://a"]
+
+    def test_over_the_cap_truncates_and_honors_the_subset(self, gateway, monkeypatch):
+        """Truncate-and-honor rather than refuse: the ack echoes exactly
+        what is honored, so a client that checks it sees precisely which
+        URIs it got — strictly more useful than an error the legacy
+        `resources/subscribe` never had a shape for."""
+        monkeypatch.setattr(server, "_LISTEN_MAX_RESOURCE_SUBSCRIPTIONS", 3)
+        uris = [f"res://{i}" for i in range(10)]
+        with _Listener(
+            gateway, _listen_body(notifications={RESOURCE_FIELD: uris})
+        ) as ln:
+            ack = ln.wait_frames(1)[0]
+        assert ack["params"]["notifications"][RESOURCE_FIELD] == uris[:3]
+
+    def test_the_trio_and_uris_coexist_in_one_ack(self, gateway):
+        """One `notifications` object carrying both shapes — booleans and
+        a URI list — because that IS the wire shape the spec shows."""
+        with _Listener(
+            gateway,
+            _listen_body(
+                notifications={"toolsListChanged": True, RESOURCE_FIELD: ["res://a"]}
+            ),
+        ) as ln:
+            ack = ln.wait_frames(1)[0]
+        assert ack["params"]["notifications"] == {
+            "toolsListChanged": True,
+            RESOURCE_FIELD: ["res://a"],
+        }
+
+
+class TestResourceUpdateRouting:
+    """One update, only to the streams that named that exact URI."""
+
+    def test_an_update_reaches_the_subscribing_stream_stamped(self, gateway):
+        with _Listener(
+            gateway, _listen_body(notifications={RESOURCE_FIELD: ["res://a"]})
+        ) as ln:
+            ln.wait_frames(1)
+            _fire_resource_update(gateway, "res://a")
+            event = ln.wait_frames(2)[1]
+        assert event["method"] == RESOURCE_UPDATED
+        assert event["params"]["uri"] == "res://a"
+        assert event["params"]["_meta"][SUBSCRIPTION_ID] == "listen-1"
+
+    def test_an_unsubscribed_uri_is_not_delivered(self, gateway, quick_keepalive):
+        """Per-URI, not per-field. Folding `resourceSubscriptions` into
+        the boolean whitelist would make ANY non-empty list match every
+        URI — the exact "MUST NOT send notification types the client has
+        not explicitly requested" violation the whitelist exists for.
+
+        Bounded by a keepalive, which proves the pump ran and chose to
+        send nothing, rather than by a sleep.
+        """
+        with _Listener(
+            gateway, _listen_body(notifications={RESOURCE_FIELD: ["res://a"]})
+        ) as ln:
+            ln.wait_frames(1)
+            _fire_resource_update(gateway, "res://other")
+            ln.wait_comments(2)
+            frames, _ = ln.snapshot()
+        assert len(frames) == 1, frames
+
+    def test_two_streams_split_by_uri_not_by_field(self, gateway):
+        """The cross-stream leak this branch exists to prevent, pinned
+        directly: A and B share one pooled child, each subscribed to a
+        different URI, and each must see only its own."""
+        a = _Listener(
+            gateway, _listen_body("a", notifications={RESOURCE_FIELD: ["res://a"]})
+        )
+        b = _Listener(
+            gateway, _listen_body("b", notifications={RESOURCE_FIELD: ["res://b"]})
+        )
+        with a, b:
+            a.wait_frames(1)
+            b.wait_frames(1)
+            _fire_resource_update(gateway, "res://a")
+            event = a.wait_frames(2)[1]
+            assert event["params"]["uri"] == "res://a"
+            _fire_resource_update(gateway, "res://b")
+            b_event = b.wait_frames(2)[1]
+        assert b_event["params"]["uri"] == "res://b"
+        # A never saw B's URI: exactly two frames, ack + its own update.
+        a_frames, _ = a.snapshot()
+        assert len(a_frames) == 2, a_frames
+
+    def test_the_same_uri_fans_out_to_both_streams(self, gateway):
+        """Multicast at the fan-out layer, N unicast frames at the wire —
+        each carrying its OWN subscriptionId."""
+        a = _Listener(
+            gateway, _listen_body("a", notifications={RESOURCE_FIELD: ["res://s"]})
+        )
+        b = _Listener(
+            gateway, _listen_body("b", notifications={RESOURCE_FIELD: ["res://s"]})
+        )
+        with a, b:
+            a.wait_frames(1)
+            b.wait_frames(1)
+            _fire_resource_update(gateway, "res://s")
+            a_event = a.wait_frames(2)[1]
+            b_event = b.wait_frames(2)[1]
+        assert a_event["params"]["_meta"][SUBSCRIPTION_ID] == "a"
+        assert b_event["params"]["_meta"][SUBSCRIPTION_ID] == "b"
+
+    def test_a_trio_only_stream_gets_no_resource_updates(
+        self, gateway, quick_keepalive
+    ):
+        with _Listener(
+            gateway, _listen_body(notifications={"toolsListChanged": True})
+        ) as ln:
+            ln.wait_frames(1)
+            _fire_resource_update(gateway, "res://a")
+            ln.wait_comments(2)
+            frames, _ = ln.snapshot()
+        assert len(frames) == 1, frames
+
+
+class TestResourceSubscriptionUnits:
+    """The honored-set computation, away from HTTP."""
+
+    def test_the_capability_predicate_reads_presence_and_truthiness(self):
+        supports = server._child_supports_resource_subscribe
+        assert supports({"capabilities": {"resources": {"subscribe": True}}}) is True
+        assert supports({"capabilities": {"resources": {"subscribe": False}}}) is False
+        assert supports({"capabilities": {"resources": {}}}) is False
+        assert supports({"capabilities": {}}) is False
+        assert supports({}) is False
+        # Degrades on malformed shapes rather than raising — a
+        # misbehaving child forfeits the capability, never the request.
+        assert supports({"capabilities": {"resources": True}}) is False
+        assert supports({"capabilities": "nope"}) is False
+        assert supports(None) is False
+
+    def test_the_capability_gate_short_circuits_the_whole_computation(self):
+        uris, truncated = server._honored_resource_uris(["res://a"], supported=False)
+        assert uris == [] and truncated is False
+
+    def test_first_seen_order_is_preserved(self):
+        uris, _ = server._honored_resource_uris(
+            ["res://b", "res://a", "res://b"], supported=True
+        )
+        assert uris == ["res://b", "res://a"]
+
+    def test_truncation_is_reported_so_it_can_be_logged_once(self, monkeypatch):
+        monkeypatch.setattr(server, "_LISTEN_MAX_RESOURCE_SUBSCRIPTIONS", 2)
+        uris, truncated = server._honored_resource_uris(["a", "b", "c"], supported=True)
+        assert uris == ["a", "b"] and truncated is True
+        uris, truncated = server._honored_resource_uris(["a", "b"], supported=True)
+        assert truncated is False
+
+    def test_wants_resource_update_is_exact(self):
+        """No normalization: trailing slash, case and percent-encoding are
+        DIFFERENT subscriptions, deliberately (there is no child-side echo
+        to normalize against)."""
+        stream = server._ListenStream("x", {}, frozenset({"res://a"}))
+        assert stream.wants_resource_update("res://a") is True
+        assert stream.wants_resource_update("res://a/") is False
+        assert stream.wants_resource_update("RES://A") is False
+        assert stream.wants_resource_update(None) is False
+        assert stream.wants_resource_update(7) is False
+
+
+class TestResourceSubscriptionRefcounts:
+    """The child is told once and untold once, however many streams ask.
+
+    Every assertion here reads the child's own subscribe/unsubscribe call
+    log. Absence-of-updates would pass just as happily when routing is
+    broken or the feature is missing entirely, which is the vacuous
+    observation this project keeps catching; a call log distinguishes
+    "nothing was sent" from "nothing happened".
+    """
+
+    def _wait_calls(self, url, count, timeout=10.0):
+        """The child's call log once it has at least `count` entries.
+
+        Driving is asynchronous by design, so the log is polled to a bound
+        rather than read once — but the assertion is still on the exact
+        contents, never on "at least something arrived".
+        """
+        deadline = time.monotonic() + timeout
+        calls: list = []
+        while time.monotonic() < deadline:
+            calls = _subscribe_calls(url)
+            if len(calls) >= count:
+                return calls
+            time.sleep(0.02)
+        return calls
+
+    def test_the_full_lifecycle_across_two_streams(self, gateway):
+        """§3.10's sequence, end to end: subscribe once, dedup, fan out,
+        no early unsubscribe, unsubscribe exactly once at zero."""
+        uri = "res://shared"
+        first = _Listener(
+            gateway, _listen_body("a", notifications={RESOURCE_FIELD: [uri]})
+        )
+        second = _Listener(
+            gateway, _listen_body("b", notifications={RESOURCE_FIELD: [uri]})
+        )
+
+        with first:
+            first.wait_frames(1)
+            # (2) exactly one subscribe reached the child.
+            assert self._wait_calls(gateway, 1) == [["resources/subscribe", uri]]
+
+            with second:
+                second.wait_frames(1)
+                # (3) STILL exactly one: the second stream deduped. A
+                # positive count, not "no new call was detected".
+                time.sleep(0.3)
+                assert _subscribe_calls(gateway) == [["resources/subscribe", uri]]
+
+                # (4) one update, both streams, each with its own stamp.
+                _fire_resource_update(gateway, uri)
+                a_event = first.wait_frames(2)[1]
+                b_event = second.wait_frames(2)[1]
+                assert a_event["params"]["_meta"][SUBSCRIPTION_ID] == "a"
+                assert b_event["params"]["_meta"][SUBSCRIPTION_ID] == "b"
+
+            # (5)/(6) second stream gone, refcount 1: no unsubscribe yet,
+            # and the survivor still receives.
+            time.sleep(0.3)
+            assert _subscribe_calls(gateway) == [["resources/subscribe", uri]]
+            _fire_resource_update(gateway, uri)
+            assert first.wait_frames(3)[2]["params"]["uri"] == uri
+
+        # (7) last stream gone -> exactly one unsubscribe.
+        calls = self._wait_calls(gateway, 2)
+        assert calls == [
+            ["resources/subscribe", uri],
+            ["resources/unsubscribe", uri],
+        ], calls
+
+    def test_distinct_uris_are_refcounted_independently(self, gateway):
+        with _Listener(
+            gateway,
+            _listen_body(notifications={RESOURCE_FIELD: ["res://x", "res://y"]}),
+        ) as ln:
+            ln.wait_frames(1)
+            calls = self._wait_calls(gateway, 2)
+        assert calls[:2] == [
+            ["resources/subscribe", "res://x"],
+            ["resources/subscribe", "res://y"],
+        ]
+        after = self._wait_calls(gateway, 4)
+        assert sorted(c[1] for c in after if c[0] == "resources/unsubscribe") == [
+            "res://x",
+            "res://y",
+        ]
+
+    def test_an_abrupt_disconnect_still_unsubscribes(self, gateway):
+        """Companion to the clean-detach path (§3.10 item 8): the same
+        zero-refcount unsubscribe must fire when the client vanishes
+        rather than closing politely."""
+        uri = "res://abrupt"
+        ln = _Listener(gateway, _listen_body(notifications={RESOURCE_FIELD: [uri]}))
+        with ln:
+            ln.wait_frames(1)
+            assert self._wait_calls(gateway, 1) == [["resources/subscribe", uri]]
+        calls = self._wait_calls(gateway, 2)
+        assert ["resources/unsubscribe", uri] in calls, calls
+
+    def test_a_failing_subscribe_keeps_the_uri_honored(self, gateway, monkeypatch):
+        """Reply-then-degrade: the ack has already shipped, and a timeout
+        does not say whether the child processed the request. The URI
+        keeps its refcount so the matching unsubscribe still fires."""
+        monkeypatch.setattr(server, "_BACKEND_RESPONSE_TIMEOUT_SECS", 0.3)
+        uri = "res://noreply"
+        # `noreply` is the fake child's documented silent method; routing
+        # the subscribe at it makes the drive time out for real.
+        original = server.BackendProcess._drive_resource_subscription
+
+        def _timing_out(self, method, u):
+            if method == "resources/subscribe":
+                return False
+            return original(self, method, u)
+
+        monkeypatch.setattr(
+            server.BackendProcess, "_drive_resource_subscription", _timing_out
+        )
+        with _Listener(
+            gateway, _listen_body(notifications={RESOURCE_FIELD: [uri]})
+        ) as ln:
+            ack = ln.wait_frames(1)[0]
+            # Still honored in the ack despite the failed drive.
+            assert ack["params"]["notifications"][RESOURCE_FIELD] == [uri]
+            _fire_resource_update(gateway, uri)
+            # And still ROUTED — honoring is what routing reads, not
+            # whether the child confirmed.
+            assert ln.wait_frames(2)[1]["params"]["uri"] == uri
+
+    def test_the_refs_die_with_the_child(self, gateway):
+        """No explicit clear-on-death step exists, deliberately: the map
+        lives on the `BackendProcess`, so a respawn gets an empty one for
+        free. Pinned so a future edit cannot quietly add a second source
+        of truth."""
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            backend.add_resource_subscriptions(["res://a"], "l1")
+            # (count, driven) — #388 review R2F1. The real fake backend
+            # answers resources/subscribe, so this URI is both referenced
+            # and actually driven.
+            assert backend._resource_refs == {"res://a": (1, True)}
+        finally:
+            backend.shutdown()
+        # A fresh child starts clean — the state is object-scoped.
+        replacement = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            assert replacement._resource_refs == {}
+        finally:
+            replacement.shutdown()
+
+
+def test_a_stream_torn_down_before_its_subscribe_lands_leaves_nothing_behind():
+    """The ordering race between the async drive and the sync release.
+
+    Driving is asynchronous, so a client that disconnects immediately
+    after the ack can have its teardown run BEFORE its subscribe. Without
+    the `torn_down` handshake the two invert: release finds no reference
+    and does nothing, then the drive subscribes — and the child stays
+    subscribed forever with no stream to deliver to.
+
+    Revert-check: drop the `torn_down` guard from
+    `add_resource_subscriptions` and this leaves `res://late` refcounted
+    with a live subscribe on the child.
+    """
+    backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+    try:
+        listener = server._ListenStream("late", {}, frozenset({"res://late"}))
+        # Teardown wins the race.
+        listener.torn_down = True
+        backend.release_resource_subscriptions(["res://late"])
+        backend.add_resource_subscriptions(["res://late"], "late", listener)
+        assert backend._resource_refs == {}
+    finally:
+        backend.shutdown()
+
+
+class TestResourceSubscribeDriveIsBounded:
+    """A hung child must not hold `_sub_lock` for hours (#388 review).
+
+    The lock is held across the drive on purpose — it is what keeps
+    subscribe and unsubscribe from inverting on the wire — but that same
+    lock is what every OTHER stream's teardown blocks on. At the ordinary
+    120 s backend timeout, 256 URIs against an unresponsive child would
+    pin it for 8.5 hours.
+    """
+
+    def test_the_drive_uses_its_own_short_timeout(self):
+        """Pinned as a RELATIONSHIP, not a literal: what matters is that
+        this path is bounded far below the general backend timeout, so a
+        later bump of that constant cannot silently re-create the stall.
+
+        Revert-check: pass `_BACKEND_RESPONSE_TIMEOUT_SECS` here again and
+        this fails.
+        """
+        assert server._RESOURCE_SUBSCRIBE_TIMEOUT_SECS < (
+            server._BACKEND_RESPONSE_TIMEOUT_SECS / 10
+        )
+        seen: list[float] = []
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        original = backend.send_request
+
+        def _record(line, req_id, timeout):
+            seen.append(timeout)
+            return original(line, req_id, timeout)
+
+        backend.send_request = _record  # type: ignore[method-assign]
+        try:
+            backend.add_resource_subscriptions(["res://a"], "l1")
+        finally:
+            backend.shutdown()
+        assert seen == [server._RESOURCE_SUBSCRIBE_TIMEOUT_SECS]
+
+    def test_an_unresponsive_child_is_not_hammered_once_per_uri(self, monkeypatch):
+        """One timeout for the batch, not one per URI — the difference
+        between seconds and hours of held lock.
+
+        Every URI still keeps its reference: the ack already promised
+        them, and reply-then-degrade says a subscription that never fires
+        is still honored.
+        """
+        calls: list[str] = []
+
+        def _never_answers(self, method, uri):
+            calls.append(uri)
+            return None
+
+        monkeypatch.setattr(
+            server.BackendProcess, "_drive_resource_subscription", _never_answers
+        )
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            uris = [f"res://{i}" for i in range(10)]
+            backend.add_resource_subscriptions(uris, "l1")
+            assert calls == ["res://0"], calls
+            assert len(backend._resource_refs) == 10
+        finally:
+            backend.shutdown()
+
+    def test_the_teardown_path_short_circuits_too(self, monkeypatch):
+        """This one matters more: `release` runs in the handler's
+        `finally`, so an unbounded loop there holds the handler THREAD as
+        well as the lock."""
+        calls: list[str] = []
+
+        def _never_answers(self, method, uri):
+            calls.append(f"{method}:{uri}")
+            return None
+
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            uris = [f"res://{i}" for i in range(10)]
+            backend.add_resource_subscriptions(uris, "l1")
+            monkeypatch.setattr(
+                server.BackendProcess, "_drive_resource_subscription", _never_answers
+            )
+            backend.release_resource_subscriptions(uris)
+            assert calls == ["resources/unsubscribe:res://0"], calls
+            # The refs are dropped regardless — they die with the child
+            # anyway, and keeping them would leak across a respawn.
+            assert backend._resource_refs == {}
+        finally:
+            backend.shutdown()
+
+    def test_an_error_reply_does_not_stop_the_batch(self):
+        """Only silence short-circuits. An error means the child is ALIVE
+        and answered about that URI, which says nothing about the next
+        one — treating it as unresponsive would silently skip
+        subscriptions a healthy child would have accepted."""
+        seen: list[str] = []
+
+        class _Erroring(server.BackendProcess):
+            def _drive_resource_subscription(self, method, uri):
+                seen.append(uri)
+                return False
+
+        backend = _Erroring([*_BACKEND], modern_owned=True)
+        try:
+            backend.add_resource_subscriptions(["res://a", "res://b"], "l1")
+            assert seen == ["res://a", "res://b"]
+        finally:
+            backend.shutdown()
+
+
+def _selective_recorder(calls: list, *, times_out: frozenset):
+    """A `_drive_resource_subscription` stand-in: any URI in `times_out`
+    returns `None` (the child never answers); everything else returns
+    `True` (a real success) — WHEN it is actually asked. Every call is
+    recorded in `calls` as `(method, uri)`, which is the wire evidence
+    these tests assert on (this file's own precedent, see
+    `_subscribe_calls`'s docstring): whether the request actually
+    reached the child, not whether an update later showed up.
+    """
+
+    def _drive(self, method, uri):
+        calls.append((method, uri))
+        return None if uri in times_out else True
+
+    return _drive
+
+
+class TestResourceSubscriptionDrivenTracking:
+    """#388 review R2F1 — a refcount must not conflate "referenced" with
+    "successfully driven".
+
+    `add_resource_subscriptions` used a plain `int` refcount: `count > 0`
+    meant both "a stream claims this URI" AND "the child was told",
+    which are not the same claim. A batch whose first URI times out
+    stops driving the REST of that batch (the existing, correct
+    `responsive` short-circuit — see `TestResourceSubscribeDriveIsBounded`)
+    but the refcount for every later first-reference URI in that batch
+    still went to 1, indistinguishable from a URI that really was
+    subscribed. No LATER call — a different stream, possibly against a
+    since-recovered child — could ever tell the two apart, so the gap
+    was permanent.
+    """
+
+    def test_a_batch_timeout_leaves_a_later_uri_undriven_not_subscribed(
+        self, monkeypatch
+    ):
+        """The sticky's exact reproduction. `res://slow` (first in the
+        batch) never answers, so `responsive` flips False and
+        `res://healthy` (second) never gets a drive attempt at all —
+        wire evidence: `calls` has no entry for it. That URI must be
+        left marked UNDRIVEN, not silently treated as subscribed.
+        """
+        calls: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            server.BackendProcess,
+            "_drive_resource_subscription",
+            _selective_recorder(calls, times_out=frozenset({"res://slow"})),
+        )
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            backend.add_resource_subscriptions(["res://slow", "res://healthy"], "l1")
+            assert calls == [("resources/subscribe", "res://slow")], calls
+            # res://slow WAS driven — an attempt reached the wire, even
+            # though the reply never came back.
+            assert backend._resource_refs["res://slow"] == (1, True)
+            # res://healthy was only ever refcounted; nothing was sent.
+            assert backend._resource_refs["res://healthy"] == (1, False), (
+                "an undriven URI must not be marked as subscribed"
+            )
+        finally:
+            backend.shutdown()
+
+    def test_an_undriven_uri_is_retried_by_a_later_call(self, monkeypatch):
+        """The fix's whole point: once something asks about `res://healthy`
+        again — a different stream, the child now answering — the drive
+        must be RE-ATTEMPTED, not skipped as "already subscribed".
+
+        Wire evidence, not absence-of-updates: asserts the child actually
+        RECEIVES a second `resources/subscribe` for `res://healthy`.
+
+        Revert-check: restore the single-int refcount and the `if count:
+        continue` skip (drop the `driven` tracking) — the second call
+        never reaches `calls`, because a plain positive count already
+        reads as "subscribed".
+        """
+        calls: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            server.BackendProcess,
+            "_drive_resource_subscription",
+            _selective_recorder(calls, times_out=frozenset({"res://slow"})),
+        )
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            # First stream: the batch that leaves res://healthy undriven
+            # — the undriven state itself is pinned by the sibling test
+            # above; this one only needs it to set up the retry.
+            backend.add_resource_subscriptions(["res://slow", "res://healthy"], "l1")
+            calls.clear()
+
+            # Second stream, later: only res://healthy, child responsive
+            # this time (nothing here times out).
+            backend.add_resource_subscriptions(["res://healthy"], "l2")
+
+            assert calls == [("resources/subscribe", "res://healthy")], calls
+            assert backend._resource_refs["res://healthy"] == (2, True)
+        finally:
+            backend.shutdown()
+
+    def test_release_skips_the_unsubscribe_for_an_undriven_uri(self, monkeypatch):
+        """The mirror bug, on the release side. A URI whose refcount
+        reaches zero without ever having been driven has nothing on the
+        child to undo — sending `resources/unsubscribe` anyway would be
+        serve inventing traffic for a subscribe that never happened.
+
+        Revert-check: restore the plain-int refcount (which drives
+        `resources/unsubscribe` unconditionally once count hits zero,
+        with no driven check) — a spurious unsubscribe reaches the
+        child for `res://healthy`.
+        """
+        calls: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            server.BackendProcess,
+            "_drive_resource_subscription",
+            _selective_recorder(calls, times_out=frozenset({"res://slow"})),
+        )
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            # The undriven state itself is pinned by the first test in
+            # this class; this one only needs it to set up the release.
+            backend.add_resource_subscriptions(["res://slow", "res://healthy"], "l1")
+            calls.clear()
+
+            backend.release_resource_subscriptions(["res://healthy"])
+
+            assert calls == [], calls
+            assert "res://healthy" not in backend._resource_refs
+        finally:
+            backend.shutdown()
+
+
+def _erroring_recorder(calls: list):
+    """A `_drive_resource_subscription` stand-in that always answers with
+    an ERROR reply (`False`, not `None`) — the child is alive and
+    responding, it just declines every URI. Records every call, same
+    wire-evidence idiom as `_selective_recorder`.
+    """
+
+    def _drive(self, method, uri):
+        calls.append((method, uri))
+        return False
+
+    return _drive
+
+
+class TestResourceSubscribeFailureLogThrottle:
+    """#388 review — the "did not confirm subscribe" log needs a
+    once-per-stream latch, mirroring `listen {req_id!r}: capped resource
+    subscriptions...`'s own once-per-stream posture and relay's
+    `unhonored_logged` idiom (the two are the closest existing precedent
+    in this codebase; neither is byte-for-byte what's built here — see
+    the docstring on `subscribe_failure_logged`).
+
+    Today's only call site drives a URI at most ONCE per stream, so a
+    natural end-to-end scenario cannot make the same URI fail twice for
+    one stream — proven below by driving it through the one legitimate
+    mechanism that CAN re-drive a URI within a stream (release, then a
+    fresh reference), and asserting the wire evidence shows two drive
+    attempts but the log fires only once. This is deliberately not a
+    "many distinct URIs in one batch" test: that case is UNAFFECTED by
+    this fix on purpose (per-URI granularity is kept — each of N
+    different failing URIs still gets its own line).
+    """
+
+    def test_a_uri_re_driven_within_one_stream_logs_only_once(self, monkeypatch):
+        """Revert-check: remove the `subscribe_failure_logged` latch
+        (log unconditionally on every `not outcome`) — this test then
+        sees TWO log lines instead of one, because the release-then-
+        re-add below genuinely re-drives the URI and, without the
+        latch, re-logs it too.
+        """
+        calls: list[tuple[str, str]] = []
+        logged: list[str] = []
+        monkeypatch.setattr(
+            server.BackendProcess,
+            "_drive_resource_subscription",
+            _erroring_recorder(calls),
+        )
+        monkeypatch.setattr(server, "log", lambda msg: logged.append(msg))
+
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        listener = server._ListenStream("l1", {}, frozenset({"res://err"}))
+        try:
+            backend.add_resource_subscriptions(["res://err"], "l1", listener)
+            assert calls == [("resources/subscribe", "res://err")], calls
+            assert len(logged) == 1, logged
+
+            # The only legitimate way to re-drive a URI within one
+            # stream's life: it is released (refcount to zero, entry
+            # popped — same listener, same `subscribe_failure_logged`
+            # set, which is NOT cleared by release) and then referenced
+            # again by the same stream.
+            backend.release_resource_subscriptions(["res://err"])
+            backend.add_resource_subscriptions(["res://err"], "l1", listener)
+
+            # Wire evidence: the drive really did happen a SECOND time.
+            assert calls == [
+                ("resources/subscribe", "res://err"),
+                ("resources/unsubscribe", "res://err"),
+                ("resources/subscribe", "res://err"),
+            ], calls
+            # But the failure log did not fire again for this stream.
+            assert len(logged) == 1, logged
+        finally:
+            backend.shutdown()
+
+    def test_a_different_stream_gets_its_own_log(self, monkeypatch):
+        """The latch is per-STREAM (the listener object), not global —
+        once `res://err` is fully released by stream `l1` (its own
+        teardown) and a SECOND, independent stream `l2` subscribes to it
+        fresh, that is a genuinely new drive, and it logs its OWN line
+        into its OWN `subscribe_failure_logged`. Matches the
+        cap-truncation log's own documented scope ("a client that blew
+        the cap will blow it on every reconnect") — the throttle resets
+        per stream, it does not remember a URI's failure forever.
+
+        (Two streams BOTH holding a live reference to the same URI
+        cannot be used to show this: the second would see `driven=True`
+        from the first's attempt and never drive at all — see the
+        sibling re-drive test's docstring. Release is what makes the
+        second attempt real.)
+        """
+        calls: list[tuple[str, str]] = []
+        logged: list[str] = []
+        monkeypatch.setattr(
+            server.BackendProcess,
+            "_drive_resource_subscription",
+            _erroring_recorder(calls),
+        )
+        monkeypatch.setattr(server, "log", lambda msg: logged.append(msg))
+
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        first = server._ListenStream("l1", {}, frozenset({"res://err"}))
+        second = server._ListenStream("l2", {}, frozenset({"res://err"}))
+        try:
+            backend.add_resource_subscriptions(["res://err"], "l1", first)
+            backend.release_resource_subscriptions(["res://err"])  # l1 tears down
+            backend.add_resource_subscriptions(["res://err"], "l2", second)
+
+            assert calls == [
+                ("resources/subscribe", "res://err"),
+                ("resources/unsubscribe", "res://err"),
+                ("resources/subscribe", "res://err"),
+            ], calls
+            assert len(logged) == 2, logged
+            assert "res://err" in first.subscribe_failure_logged
+            assert "res://err" in second.subscribe_failure_logged
+        finally:
+            backend.shutdown()
+
+    def test_many_distinct_uris_in_one_batch_each_still_get_their_own_line(self):
+        """The latch does NOT throttle a large batch of DIFFERENT URIs —
+        per-URI granularity is kept on purpose (still worth knowing
+        WHICH URIs failed). This is the scenario the finding's "256
+        lines" example describes, and the fix leaves it unchanged.
+        """
+
+        class _AlwaysErrors(server.BackendProcess):
+            def _drive_resource_subscription(self, method, uri):
+                return False
+
+        backend = _AlwaysErrors([*_BACKEND], modern_owned=True)
+        listener = server._ListenStream(
+            "l1", {}, frozenset({"res://0", "res://1", "res://2"})
+        )
+        try:
+            backend.add_resource_subscriptions(
+                ["res://0", "res://1", "res://2"], "l1", listener
+            )
+            assert listener.subscribe_failure_logged == {
+                "res://0",
+                "res://1",
+                "res://2",
+            }
+        finally:
+            backend.shutdown()
