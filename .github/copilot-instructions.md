@@ -64,9 +64,12 @@ A separate **integration suite** lives in `tests_integration/` (advisory
 `integration.yml` job, ubuntu-only): real localhost HTTP against a
 python-sdk v2.x reference peer (the `integration` extra pins `mcp>=2.0,<3`)
 and against `mcp-stdio serve` itself. It
-is deliberately NOT part of `pytest tests/` — the unit suite forbids real
-network and real sleeps; the integration conftest replaces that rule with
-bounded polls and a per-test timeout. `mcp`/`uvicorn` live only in the
+is deliberately NOT part of `pytest tests/` — the unit suite's working
+convention (not an enforced rule; there is no socket-blocking plugin) is
+mocked HTTP via pytest-httpx and patched sleeps throughout, and a diff
+adding a real socket or a bare `time.sleep` to `tests/` deserves a
+comment; the integration conftest works differently, with bounded polls
+and a per-test timeout. `mcp`/`uvicorn` live only in the
 `integration` optional-dependency extra and must never appear in
 `[project.dependencies]`.
 
@@ -242,11 +245,11 @@ even when the code is correct.
 
 An assertion of absence ("no late response arrived", "nothing was
 forwarded", "no reconnect happened") is only meaningful over a channel
-that is proven alive. Four shipped instances were caught in review:
-`drain()` treating relay EOF as quiet success; a length-snapshot slice
-into a bounded `deque(maxlen=…)` that goes empty after saturation; an SSE
-reader signalling "opened" without checking status/content-type; a dead
-process making every negative assertion pass. When a test asserts that
+that is proven alive. Three shipped instances were caught in review:
+`drain()` treating relay EOF as quiet success (a crashed relay made every
+"nothing arrived" assertion pass); a length-snapshot slice into a bounded
+`deque(maxlen=…)` that goes empty after saturation; an SSE reader
+signalling "opened" without checking status/content-type. When a test asserts that
 something did NOT happen, check what the assertion would do if the
 observed process/stream were already dead — if the answer is "still
 pass", flag it.
@@ -270,8 +273,11 @@ High-signal reviews keep this repository's fix loops short. Before
 reporting a finding, it must clear all of these:
 
 - **A concrete failure scenario** — name the input or state and the wrong
-  outcome, anchored to lines this PR changes. "Might be worth
-  considering…" and "for robustness…" do not clear the bar.
+  outcome, anchored to lines this PR changes. For the claim-accuracy and
+  process classes (§7, §9), which have no runtime failure by construction,
+  the equivalent is: quote the claim or rule and the code or file that
+  falsifies it. "Might be worth considering…" and "for robustness…" do
+  not clear the bar either way.
 - **Not pre-existing** — if the behavior exists on `main` untouched by
   this diff, it is out of scope here.
 - **Not a settled decision** — PR bodies in this repo carry explicit
