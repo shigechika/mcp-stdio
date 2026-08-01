@@ -3713,8 +3713,10 @@ class _Handler(BaseHTTPRequestHandler):
         - child death or backlog overflow -> close with NO terminal
           frame. Serve is still alive; the contract is that the peer
           re-listens and refetches.
-        - client disconnect -> nothing to send; the write failure above
-          is the signal.
+        - client disconnect -> nothing to send; `_peer_gone()` reads it
+          directly at the top of every iteration, before any write, with
+          a failed write as the backup for the race window between that
+          check and the write itself.
 
         NEVER a server-sent `notifications/cancelled`. The spec assigns
         that message to the client->server, stdio-only direction, and the
