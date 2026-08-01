@@ -710,6 +710,21 @@ def test_encoded_name_round_trips_through_the_real_decoder():
 # --- the modern backend pool (#270 Phase 3 P3-B) -------------------------
 
 
+def _checkout_and_release(pool, principal=None):
+    """Acquire a pooled child the way a handler does, then hand it back.
+
+    `get_or_create` returns a CHECKED-OUT child (#376 §3.1) whose hold
+    must be released, or it stays permanently unevictable. Tests that
+    only want "the child for this principal" go through here so they
+    exercise the same acquire/release pair `_dispatch_modern` does;
+    tests that specifically want a HELD child call `get_or_create`
+    directly and keep the entry.
+    """
+    backend, init_result, entry = pool.get_or_create(principal)
+    pool.release(entry)
+    return backend, init_result
+
+
 class TestModernBackendPool:
     """Gateway-owned children for the session-less modern path (D1)."""
 
@@ -725,11 +740,11 @@ class TestModernBackendPool:
         """
         pool = server.ModernBackendPool(_BACKEND)
         try:
-            backend, init_result = pool.get_or_create(None)
+            backend, init_result = _checkout_and_release(pool, None)
             assert init_result["protocolVersion"] == "2025-06-18"
             assert init_result["serverInfo"]["name"] == "fake"
             # A second call reuses the same child rather than respawning.
-            again, cached = pool.get_or_create(None)
+            again, cached = _checkout_and_release(pool, None)
             assert again is backend
             assert cached is init_result
             assert pool.count() == 1
@@ -745,8 +760,8 @@ class TestModernBackendPool:
         """
         pool = server.ModernBackendPool(_BACKEND)
         try:
-            alice, _ = pool.get_or_create("alice")
-            bob, _ = pool.get_or_create("bob")
+            alice, _ = _checkout_and_release(pool, "alice")
+            bob, _ = _checkout_and_release(pool, "bob")
             assert alice is not bob
             assert pool.count() == 2
         finally:
@@ -765,7 +780,7 @@ class TestModernBackendPool:
 
         def _race():
             barrier.wait(timeout=10)
-            got.append(pool.get_or_create("shared")[0])
+            got.append(_checkout_and_release(pool, "shared")[0])
 
         threads = [threading.Thread(target=_race) for _ in range(4)]
         try:
@@ -783,10 +798,10 @@ class TestModernBackendPool:
         """Mirror of the legacy drop-then-reinit: death is not terminal."""
         pool = server.ModernBackendPool(_BACKEND)
         try:
-            first, _ = pool.get_or_create(None)
+            first, _ = _checkout_and_release(pool, None)
             first.shutdown()
             assert first.closed
-            second, _ = pool.get_or_create(None)
+            second, _ = _checkout_and_release(pool, None)
             assert second is not first
             assert not second.closed
         finally:
@@ -807,7 +822,7 @@ class TestModernBackendPool:
         """
         pool = server.ModernBackendPool(_BACKEND)
         try:
-            first, _ = pool.get_or_create(None)
+            first, _ = _checkout_and_release(pool, None)
             first.send_oneway(json.dumps({"jsonrpc": "2.0", "method": "exit"}))
             deadline = time.monotonic() + 10
             while not first.closed and time.monotonic() < deadline:
@@ -819,7 +834,7 @@ class TestModernBackendPool:
                 "the child was reaped before get_or_create() ever ran"
             )
 
-            second, _ = pool.get_or_create(None)
+            second, _ = _checkout_and_release(pool, None)
 
             assert second is not first
             assert first._proc.returncode is not None, (
@@ -839,10 +854,10 @@ class TestModernBackendPool:
         """
         pool = server.ModernBackendPool(_BACKEND, max_children=2)
         try:
-            pool.get_or_create("a")
-            pool.get_or_create("b")
+            _checkout_and_release(pool, "a")
+            _checkout_and_release(pool, "b")
             assert pool.count() == 2
-            pool.get_or_create("c")
+            _checkout_and_release(pool, "c")
             assert pool.count() == 2, "the cap did not hold"
         finally:
             pool.shutdown_all()
@@ -867,7 +882,7 @@ class TestModernBackendPool:
         """
         pool = server.ModernBackendPool(_BACKEND, max_children=1)
         try:
-            busy, _ = pool.get_or_create("busy")
+            busy, _ = _checkout_and_release(pool, "busy")
             # Park a request on the child so it is provably not idle.
             started = threading.Event()
             done = threading.Event()
@@ -898,11 +913,63 @@ class TestModernBackendPool:
 
             # At cap, with the only child busy: the newcomer is served and
             # the busy child is NOT killed.
-            other, _ = pool.get_or_create("other")
+            other, _ = _checkout_and_release(pool, "other")
             assert other is not busy
             assert not busy.closed, "eviction killed a child mid-request"
             assert pool.count() == 2, "the cap was enforced by breaking live work"
             assert done.wait(timeout=30)
+        finally:
+            pool.shutdown_all()
+
+    def test_a_checked_out_child_is_not_evicted_at_cap(self):
+        """#376 §3.1 — the eviction-vs-send race, closed by refcount.
+
+        `get_or_create` returns with the pool lock released, and the
+        request only becomes `has_pending` later, inside the BACKEND's
+        lock. In that window the child looks perfectly idle, so another
+        principal's first request at cap could evict a child that was
+        already handed to a handler — which shut it down under the
+        caller and produced a spurious 504.
+
+        The checkout refcount closes it by construction: the child is
+        held from the moment it is returned. Reverting the `holds` clause
+        of `_reapable_locked` makes this evict.
+        """
+        pool = server.ModernBackendPool(_BACKEND, max_children=1)
+        try:
+            held, _, entry = pool.get_or_create("first")
+            assert entry["holds"] == 1
+            # Not yet sending: the window the race lives in.
+            assert not held.has_pending
+
+            other, _ = _checkout_and_release(pool, "second")
+            assert other is not held
+            assert not held.closed, "a checked-out child was evicted mid-window"
+            assert pool.count() == 2, "the cap was enforced against a held child"
+        finally:
+            pool.shutdown_all()
+
+    def test_releasing_makes_the_child_evictable_again(self):
+        """A hold is a loan, not a pin — the other half of the contract."""
+        pool = server.ModernBackendPool(_BACKEND, max_children=1)
+        try:
+            held, _, entry = pool.get_or_create("first")
+            pool.release(entry)
+            assert entry["holds"] == 0
+            _checkout_and_release(pool, "second")
+            assert pool.count() == 1, "a released child stayed unevictable"
+            assert held.closed
+        finally:
+            pool.shutdown_all()
+
+    def test_release_never_drives_the_count_negative(self):
+        """An extra release must not lend the next caller a free pass."""
+        pool = server.ModernBackendPool(_BACKEND)
+        try:
+            _, _, entry = pool.get_or_create(None)
+            pool.release(entry)
+            pool.release(entry)
+            assert entry["holds"] == 0
         finally:
             pool.shutdown_all()
 
@@ -1145,7 +1212,7 @@ def test_a_pooled_child_never_fills_the_unread_sse_queue():
     """
     pool = server.ModernBackendPool(_BACKEND)
     try:
-        backend, _ = pool.get_or_create(None)
+        backend, _ = _checkout_and_release(pool, None)
         assert backend.server_initiated.qsize() == 0
         backend._route('{"jsonrpc":"2.0","id":"nobody-waits","result":{}}')
         backend._route('{"jsonrpc":"2.0","method":"notifications/message"}')

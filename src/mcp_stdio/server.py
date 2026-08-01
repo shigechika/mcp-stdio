@@ -480,6 +480,52 @@ class ModernBackendPool:
             self._seq += 1
             return f"{_SERVE_ID_NAMESPACE}init/{self._seq}"
 
+    def _reapable_locked(self, entry: dict[str, Any]) -> bool:
+        """READY, quiet and unheld — the only entries anything may drop.
+
+        #376 §2.3. ONE predicate shared by cap-eviction and the idle
+        reaper, because two copies of this rule would drift and the
+        consequences differ only in which of them kills a live request.
+
+        The three conditions, and why each is separate:
+
+        - a PENDING placeholder has no backend yet. Dropping it detaches
+          the entry the spawning thread is about to fill, and that child
+          then belongs to nobody — `shutdown_all` cannot reach it, so the
+          cap would leak processes rather than bound them.
+        - `has_pending` is work already on the wire. Killing it fails an
+          ordinary request to make room for one that has not started.
+        - `holds` is a handler that has CHECKED THE CHILD OUT but has not
+          sent yet (#376 §3.1). `has_pending` alone does not cover it:
+          `get_or_create` returns with the pool lock released, and the
+          request only becomes pending later, inside the backend's own
+          lock. In that window the child looks perfectly idle.
+
+        `holds` is also the seam #374 plugs into: a listen stream takes a
+        hold for as long as it is subscribed, so a subscribed child is
+        never reaped no matter how old its `used` timestamp is — which is
+        exactly why this is a refcount and not another timestamp.
+        """
+        backend = entry.get("backend")
+        return (
+            backend is not None
+            and not backend.has_pending
+            and entry.get("holds", 0) == 0
+        )
+
+    def release(self, entry: dict[str, Any]) -> None:
+        """Give back a checkout taken by `get_or_create` (#376 §3.1).
+
+        Decrements on the entry dict the caller was handed, not on
+        whatever `_entries` holds now: if the entry was replaced or
+        reaped meanwhile, the decrement lands on an object nobody
+        consults again, which is inert and exactly what we want. Chasing
+        identity here would buy nothing and could double-decrement a
+        successor.
+        """
+        with self._lock:
+            entry["holds"] = max(0, entry.get("holds", 0) - 1)
+
     def _evict_if_at_cap_locked(self) -> None:
         """Make room by dropping the idlest child (§4 Q3).
 
@@ -515,7 +561,7 @@ class ModernBackendPool:
             evictable = [
                 (key, entry)
                 for key, entry in self._entries.items()
-                if entry.get("backend") is not None and not entry["backend"].has_pending
+                if self._reapable_locked(entry)
             ]
             if not evictable:
                 log(
@@ -528,8 +574,16 @@ class ModernBackendPool:
             log(f"modern pool at cap; evicting the idlest child for {key!r}")
             threading.Thread(target=entry["backend"].shutdown, daemon=True).start()
 
-    def get_or_create(self, principal: Any) -> tuple[BackendProcess, dict[str, Any]]:
-        """The child for ``principal``, plus its cached InitializeResult.
+    def get_or_create(
+        self, principal: Any
+    ) -> tuple[BackendProcess, dict[str, Any], dict[str, Any]]:
+        """The child for ``principal``, its InitializeResult, and its entry.
+
+        THE RETURNED CHILD IS CHECKED OUT: the entry's `holds` refcount is
+        incremented before this returns, and the caller MUST hand it back
+        with `release(entry)` — a try/finally, since a leaked hold makes
+        that child permanently unevictable and unreapable. The entry is
+        returned for exactly that purpose (#376 §3.1).
 
         Raises ``RuntimeError`` when the child cannot be spawned or does
         not complete the handshake; the caller turns that into a JSON-RPC
@@ -540,7 +594,16 @@ class ModernBackendPool:
                 entry = self._entries.get(principal)
                 if entry is None:
                     self._evict_if_at_cap_locked()
-                    entry = {"event": threading.Event(), "backend": None, "error": None}
+                    entry = {
+                        "event": threading.Event(),
+                        "backend": None,
+                        "error": None,
+                        # Checkout refcount (#376 §3.1). Non-zero means a
+                        # handler is holding this child right now, which
+                        # makes it untouchable by eviction and by the
+                        # reaper — see `_reapable_locked`.
+                        "holds": 0,
+                    }
                     self._entries[principal] = entry
                     mine = True
                 else:
@@ -548,7 +611,8 @@ class ModernBackendPool:
                     backend = entry.get("backend")
                     if backend is not None and not backend.closed:
                         entry["used"] = time.monotonic()
-                        return backend, entry["init_result"]
+                        entry["holds"] = entry.get("holds", 0) + 1
+                        return backend, entry["init_result"], entry
                     if backend is not None:
                         # Child died. Reap it, then drop the entry and loop
                         # to respawn — the mirror of the legacy path's
@@ -574,7 +638,8 @@ class ModernBackendPool:
                     with self._lock:
                         if self._entries.get(principal) is entry:
                             entry["used"] = time.monotonic()
-                            return entry["backend"], entry["init_result"]
+                            entry["holds"] = entry.get("holds", 0) + 1
+                            return entry["backend"], entry["init_result"], entry
                     continue
                 raise RuntimeError(entry.get("error") or "backend handshake failed")
             try:
@@ -589,8 +654,13 @@ class ModernBackendPool:
             entry["backend"] = backend
             entry["init_result"] = init_result
             entry["used"] = time.monotonic()
+            # Taken under the lock like the other two return sites: this
+            # one runs outside it, and an unheld newborn is evictable by
+            # any racing principal before the caller has sent anything.
+            with self._lock:
+                entry["holds"] = entry.get("holds", 0) + 1
             entry["event"].set()
-            return backend, init_result
+            return backend, init_result, entry
 
     def _spawn_and_handshake(self) -> tuple[BackendProcess, dict[str, Any]]:
         """Spawn a child and drive the handshake the modern wire omits."""
@@ -2928,7 +2998,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            backend, init_result = self.modern_pool.get_or_create(self._current_user())
+            backend, init_result, pool_entry = self.modern_pool.get_or_create(
+                self._current_user()
+            )
         except RuntimeError as exc:
             log(f"modern dispatch: backend unavailable: {exc}")
             self._send_json(
@@ -2939,72 +3011,80 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
 
-        # Notifications: forward and acknowledge. The v2 client sends none
-        # in the discover flow (no `initialize` means no
-        # `notifications/initialized`), so this is consistency rather than
-        # liveness — but leaving modern-classified traffic to fall onto a
-        # legacy session error would be a worse answer than 202.
-        if kind == "notification":
-            backend.send_oneway(json.dumps(msg))
-            self._send_empty(202)
-            return
-
-        # `server/discover` is answered HERE, never forwarded: a legacy
-        # child has never heard of it and would answer -32601.
-        if method == _MODERN_DISCOVER_METHOD:
-            self._send_json(
-                200,
-                json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": _synthesize_discover_result(
-                            init_result, cache_ttl_ms=self.cache_ttl_ms
-                        ),
-                    }
-                ),
-            )
-            return
-
-        upstream_id = _mint_modern_id()
-        outbound = dict(msg)
-        outbound["id"] = upstream_id
-        line = backend.send_request(
-            json.dumps(outbound), upstream_id, _BACKEND_RESPONSE_TIMEOUT_SECS
-        )
-        if line is None:
-            self._send_json(
-                504,
-                _error_body(
-                    "no response from backend", req_id, code=_JSONRPC_INTERNAL_ERROR
-                ),
-            )
-            return
+        # Everything past the checkout runs under try/finally: the child
+        # is CHECKED OUT (#376 §3.1) and a leaked hold would make it
+        # permanently unevictable and unreapable. Releasing here rather
+        # than at each arm keeps that true for the early returns too —
+        # and for anything the never-crash net catches on the way out.
         try:
-            parsed = json.loads(line)
-        except (json.JSONDecodeError, TypeError):
-            log("modern dispatch: backend returned unparseable JSON")
-            self._send_json(
-                502,
-                _error_body(
-                    "malformed response from backend",
-                    req_id,
-                    code=_JSONRPC_INTERNAL_ERROR,
-                ),
-            )
-            return
+            # Notifications: forward and acknowledge. The v2 client sends none
+            # in the discover flow (no `initialize` means no
+            # `notifications/initialized`), so this is consistency rather than
+            # liveness — but leaving modern-classified traffic to fall onto a
+            # legacy session error would be a worse answer than 202.
+            if kind == "notification":
+                backend.send_oneway(json.dumps(msg))
+                self._send_empty(202)
+                return
 
-        # Rekey minted -> client id. One parse total: the same dict is
-        # rekeyed and stamped, so relay's `_mrtr_rekey` (which re-parses a
-        # string) would be strictly more work for the same result here.
-        parsed["id"] = req_id
-        _stamp_modern_result(
-            parsed,
-            method,
-            server_info=init_result.get("serverInfo"),
-            cache_ttl_ms=self.cache_ttl_ms,
-        )
-        self._send_json(_modern_response_status(parsed), json.dumps(parsed))
+            # `server/discover` is answered HERE, never forwarded: a legacy
+            # child has never heard of it and would answer -32601.
+            if method == _MODERN_DISCOVER_METHOD:
+                self._send_json(
+                    200,
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "result": _synthesize_discover_result(
+                                init_result, cache_ttl_ms=self.cache_ttl_ms
+                            ),
+                        }
+                    ),
+                )
+                return
+
+            upstream_id = _mint_modern_id()
+            outbound = dict(msg)
+            outbound["id"] = upstream_id
+            line = backend.send_request(
+                json.dumps(outbound), upstream_id, _BACKEND_RESPONSE_TIMEOUT_SECS
+            )
+            if line is None:
+                self._send_json(
+                    504,
+                    _error_body(
+                        "no response from backend", req_id, code=_JSONRPC_INTERNAL_ERROR
+                    ),
+                )
+                return
+            try:
+                parsed = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                log("modern dispatch: backend returned unparseable JSON")
+                self._send_json(
+                    502,
+                    _error_body(
+                        "malformed response from backend",
+                        req_id,
+                        code=_JSONRPC_INTERNAL_ERROR,
+                    ),
+                )
+                return
+
+            # Rekey minted -> client id. One parse total: the same dict is
+            # rekeyed and stamped, so relay's `_mrtr_rekey` (which re-parses a
+            # string) would be strictly more work for the same result here.
+            parsed["id"] = req_id
+            _stamp_modern_result(
+                parsed,
+                method,
+                server_info=init_result.get("serverInfo"),
+                cache_ttl_ms=self.cache_ttl_ms,
+            )
+            self._send_json(_modern_response_status(parsed), json.dumps(parsed))
+        finally:
+            self.modern_pool.release(pool_entry)
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         # Reset the per-request session id (the handler instance is reused
