@@ -70,6 +70,7 @@ _HERE = pathlib.Path(__file__).parent
 # only a module someone explicitly declares peer-independent survives.
 _PEER_INDEPENDENT_MODULES = frozenset(
     {
+        "test_serve_legacy_get_child_death.py",
         "test_serve_legacy_pin.py",
         "test_serve_modern_before.py",
         "test_serve_sandwich.py",

@@ -3635,12 +3635,12 @@ class _Handler(BaseHTTPRequestHandler):
             # the client blocked on a socket nobody will ever write to
             # again.
             #
-            # NB the legacy GET stream (`do_GET`) has the same shape and
-            # the same omission: its `while not backend.closed` loop can
-            # also end server-side, on child death. Not touched here —
-            # AC2 keeps the legacy path byte-identical in this PR — but
-            # it is a real defect, filed as #383 rather than fixed in
-            # passing.
+            # The legacy GET stream (`do_GET`) had the same shape and the
+            # same omission — its `while not backend.closed` loop also
+            # ends server-side on child death. #382 could not touch it
+            # (AC2 kept the legacy path byte-identical there), so it was
+            # filed as #383 and fixed separately; both sites now carry
+            # this re-assertion.
             self.close_connection = True
             self._write_sse(
                 {
@@ -3713,8 +3713,10 @@ class _Handler(BaseHTTPRequestHandler):
         - child death or backlog overflow -> close with NO terminal
           frame. Serve is still alive; the contract is that the peer
           re-listens and refetches.
-        - client disconnect -> nothing to send; the write failure above
-          is the signal.
+        - client disconnect -> nothing to send; `_peer_gone()` reads it
+          directly at the top of every iteration, before any write, with
+          a failed write as the backup for the race window between that
+          check and the write itself.
 
         NEVER a server-sent `notifications/cancelled`. The spec assigns
         that message to the client->server, stdio-only direction, and the
@@ -4199,6 +4201,18 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.send_header("Mcp-Session-Id", self._session_id)
         self.end_headers()
+        # RE-ASSERTED (#383, closing the gap #382 left open — see the
+        # matching comment in `_serve_listen_stream`): the
+        # `send_header("Connection", "keep-alive")` above is a COMMAND,
+        # not a string, and silently reset `close_connection` to False —
+        # undoing the intent stated four lines earlier. This stream is
+        # close-delimited (no Content-Length, not chunked), so the general
+        # rule applies: any close-delimited SSE response that can end
+        # SERVER-side (here: `while not backend.closed`, on child death)
+        # must keep `close_connection` True after `end_headers()`, or a
+        # stream that ends normally leaves the client blocked on a socket
+        # nobody will ever write to again.
+        self.close_connection = True
         q = backend.server_initiated
         keepalive = self.registry.keepalive_interval()
         try:
@@ -4217,8 +4231,20 @@ class _Handler(BaseHTTPRequestHandler):
                 payload = f"data: {line}\n\n".encode("utf-8")
                 self.wfile.write(payload)
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, ValueError):
+        except (BrokenPipeError, ConnectionResetError, ValueError, OSError):
             # Client went away mid-stream — normal, not an error.
+            #
+            # `OSError` added for symmetry with `_serve_listen_stream`
+            # (#383): the two named subclasses cover the common
+            # disconnects, but a socket write can fail other ways
+            # (ETIMEDOUT, ENOTCONN, EHOSTUNREACH), and those escaped into
+            # `handle_one_request` to be logged as a traceback — noise
+            # for what is an ordinary client disconnect. The only calls
+            # in the loop that can raise `OSError` are the `wfile`
+            # writes, so the widening stays confined to transport
+            # failures. The modern path made this choice deliberately;
+            # the two SSE sites having DRIFTED is what produced the bug
+            # this PR fixes, so they are brought back into one shape.
             return
 
     def do_DELETE(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
