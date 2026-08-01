@@ -4526,3 +4526,118 @@ class TestMrtrDispatchClaim:
             t.join(timeout=20)
 
         assert sorted(statuses) == [200, 503], statuses
+
+
+# --- reverse MRTR: translation (#375 PR 2) -------------------------------
+
+
+class TestMrtrTranslation:
+    """The inversion of relay's PR C, in both directions."""
+
+    def test_a_child_request_becomes_a_bare_input_entry(self):
+        """Relay MINTS an envelope around a bare object; serve STRIPS one
+        back off, because `inputRequests` values "MUST be one of
+        ElicitRequest, CreateMessageRequest, or ListRootsRequest" — bare
+        request objects, not JSON-RPC messages."""
+        cap, entry = server._mrtr_request_to_input_entry(
+            {
+                "jsonrpc": "2.0",
+                "id": "child-1",
+                "method": "sampling/createMessage",
+                "params": {"messages": [], "maxTokens": 10},
+            }
+        )
+        assert cap == "sampling"
+        assert entry == {
+            "method": "sampling/createMessage",
+            "params": {"messages": [], "maxTokens": 10},
+        }
+        # The envelope is gone: no id, no jsonrpc.
+        assert "id" not in entry and "jsonrpc" not in entry
+
+    def test_roots_list_carries_no_params(self):
+        cap, entry = server._mrtr_request_to_input_entry(
+            {"jsonrpc": "2.0", "id": 1, "method": "roots/list"}
+        )
+        assert cap == "roots"
+        assert entry == {"method": "roots/list"}
+
+    def test_every_bridgeable_method_maps_to_its_capability(self):
+        assert server._MRTR_REQUEST_CAPABILITY == {
+            "elicitation/create": "elicitation",
+            "sampling/createMessage": "sampling",
+            "roots/list": "roots",
+        }
+
+    def test_an_unbridgeable_method_is_refused_with_a_reason(self):
+        for method in ("tools/list", "notifications/message", None, ""):
+            cap, reason = server._mrtr_request_to_input_entry({"method": method})
+            assert cap is None, method
+            assert reason, method
+
+    def test_params_pass_through_verbatim(self):
+        """Inventing a lossy down-translation would be worse than passing
+        what the child actually said — every MCP request object is
+        open/extensible."""
+        params = {"messages": [{"role": "user"}], "unknownFuture": {"x": 1}}
+        _, entry = server._mrtr_request_to_input_entry(
+            {"method": "sampling/createMessage", "params": params}
+        )
+        assert entry["params"] == params
+
+    def test_no_reject_arms_for_shapes_a_legacy_child_cannot_emit(self):
+        """Narrower than relay ON PURPOSE (#375 §2, §4 Q6).
+
+        Relay must refuse `mode: "url"` elicitation and tool-augmented
+        sampling because a modern SERVER can express them and a legacy
+        client cannot consume them. Here the CHILD is the legacy side and
+        structurally cannot emit either — both are 2025-11-25+ additions.
+        So they pass through as ordinary params rather than being
+        rejected, and this pins that as a DECISION rather than letting a
+        reviewer read it as a missed case.
+        """
+        cap, entry = server._mrtr_request_to_input_entry(
+            {"method": "elicitation/create", "params": {"mode": "url", "url": "x"}}
+        )
+        assert cap == "elicitation"
+        assert entry["params"]["mode"] == "url"
+
+    def test_a_malformed_params_is_refused(self):
+        cap, reason = server._mrtr_request_to_input_entry(
+            {"method": "elicitation/create", "params": "nope"}
+        )
+        assert cap is None and reason
+
+    def test_an_input_response_becomes_the_reply_the_child_awaits(self):
+        line, why = server._mrtr_input_response_to_reply(
+            {"result": {"action": "accept", "content": {"name": "x"}}}, "child-1"
+        )
+        assert why == ""
+        assert json.loads(line) == {
+            "jsonrpc": "2.0",
+            "id": "child-1",
+            "result": {"action": "accept", "content": {"name": "x"}},
+        }
+
+    def test_a_bare_result_object_is_accepted_too(self):
+        """The client's `InputResponse` IS the result; a caller that
+        hands the result directly must work the same way."""
+        line, why = server._mrtr_input_response_to_reply({"action": "decline"}, 7)
+        assert why == ""
+        assert json.loads(line)["result"] == {"action": "decline"}
+
+    def test_a_client_error_is_forwarded_as_a_jsonrpc_error(self):
+        """A user declining is a legitimate OUTCOME, not a bridge
+        failure — the child must learn what happened rather than see the
+        gateway swallow it."""
+        line, why = server._mrtr_input_response_to_reply(
+            {"error": {"code": -32001, "message": "user declined"}}, "child-1"
+        )
+        assert why == ""
+        assert json.loads(line)["error"]["code"] == -32001
+
+    def test_a_malformed_input_response_is_refused(self):
+        for bad in (None, 7, "x", {"result": "not-an-object"}):
+            line, why = server._mrtr_input_response_to_reply(bad, "c1")
+            assert line is None, bad
+            assert why, bad

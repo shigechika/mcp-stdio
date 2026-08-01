@@ -1599,6 +1599,95 @@ def _b64url_decode(value: str) -> bytes:
 # this mirrors relay's equivalent restriction on the forward side.
 _MRTR_ELIGIBLE_METHODS = frozenset({"tools/call", "resources/read", "prompts/get"})
 
+# The three legacy out-of-band requests a child may raise mid-call, and
+# the client capability each one needs. Identical to relay's own table
+# (`_MRTR_REQUEST_CAPABILITY`) because the method names are the SAME on
+# both sides — what MRTR rev 2026-07-28 changed is who sends them and how
+# the answer travels back, not what they are called.
+_MRTR_REQUEST_CAPABILITY = {
+    "elicitation/create": "elicitation",
+    "sampling/createMessage": "sampling",
+    "roots/list": "roots",
+}
+
+
+def _mrtr_request_to_input_entry(msg: dict[str, Any]) -> tuple[str | None, Any]:
+    """Child JSON-RPC request -> one `inputRequests` entry.
+
+    THE REVERSE of relay's `_mrtr_translate`, and the asymmetry is worth
+    naming: relay receives a bare `{method, params}` and has to MINT a
+    JSON-RPC envelope around it for a legacy client. Serve receives a
+    full envelope from the legacy child and has to STRIP it back down,
+    because "values are request objects that MUST be one of
+    ElicitRequest, CreateMessageRequest, or ListRootsRequest" — bare
+    objects, not JSON-RPC messages.
+
+    Returns `(capability, entry)` or `(None, reason)`.
+
+    Params pass through VERBATIM. NO reject arms for `mode: "url"`
+    elicitation or tool-augmented sampling, and that is narrower on
+    purpose rather than an oversight: relay needs them because a modern
+    SERVER can express both while a legacy client cannot consume them.
+    Here the CHILD is the legacy (2025-06-18) side and structurally
+    cannot emit either — both are 2025-11-25+ additions. Confirmed
+    against the actual fixture set as well as by construction (#375 §4
+    Q6): the only child-initiated request any fixture raises is a bare
+    `elicitation/create`. Adding arms for shapes a legacy child cannot
+    produce would be dead code pretending to be symmetry.
+    """
+    method = msg.get("method")
+    capability = _MRTR_REQUEST_CAPABILITY.get(method) if method else None
+    if capability is None:
+        return None, "the child requested an input kind this gateway cannot bridge"
+    entry: dict[str, Any] = {"method": method}
+    params = msg.get("params")
+    if method == "roots/list":
+        # ListRootsRequest carries no params at all.
+        return capability, entry
+    if params is not None:
+        if not isinstance(params, dict):
+            return None, "the child sent an input request with a malformed params"
+        entry["params"] = params
+    return capability, entry
+
+
+def _mrtr_input_response_to_reply(
+    response: Any, child_request_id: Any
+) -> tuple[str | None, str]:
+    """One `inputResponses` entry -> the JSON-RPC reply the child awaits.
+
+    The other half of the inversion. An `InputResponse` is the RESULT the
+    client produced, not a JSON-RPC envelope, so the reply the child is
+    blocked on has to be minted around it under the child's OWN request
+    id — which lives in the parked-round table, never in `requestState`
+    (#375 §1.1).
+
+    A client MAY answer with an error instead of a result; that is a
+    legitimate outcome (a user declining an elicitation, say), so it is
+    forwarded as a JSON-RPC error rather than treated as a bridge
+    failure. Anything else is malformed and reported to the caller.
+    """
+    if not isinstance(response, dict):
+        return None, "the client sent a malformed input response"
+    if "error" in response and isinstance(response["error"], dict):
+        return (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": child_request_id,
+                    "error": response["error"],
+                }
+            ),
+            "",
+        )
+    result = response.get("result", response)
+    if not isinstance(result, dict):
+        return None, "the client sent an input response with no result object"
+    return (
+        json.dumps({"jsonrpc": "2.0", "id": child_request_id, "result": result}),
+        "",
+    )
+
 
 def _mrtr_principal_is_eligible(principal: str | None) -> bool:
     """Whether this caller may open a reverse-MRTR round at all (§4 Q1).
