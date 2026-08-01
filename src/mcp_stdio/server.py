@@ -170,6 +170,24 @@ _MCP_UNSUPPORTED_PROTOCOL_VERSION = -32022
 # for duplication before anything reads them.
 _MODERN_ROUTING_HEADERS = ("MCP-Protocol-Version", "Mcp-Method", "Mcp-Name")
 
+# The listen filter's boolean fields, and the notification method each
+# one opts into. Mirrors relay's `_LISTEN_FORWARDED_NOTIFICATIONS` on the
+# other side of the wire. Spec: exactly these may ride the stream —
+# "Request-scoped notifications like notifications/progress and
+# notifications/message are not delivered on the listen stream", so the
+# table is a whitelist and everything absent from it is dropped. #374 is
+# the listChanged trio only; `resourceSubscriptions` is declined in the
+# ack until #381.
+_LISTEN_FILTER_METHODS = {
+    "toolsListChanged": "notifications/tools/list_changed",
+    "promptsListChanged": "notifications/prompts/list_changed",
+    "resourcesListChanged": "notifications/resources/list_changed",
+}
+_LISTEN_FORWARDED_METHODS = frozenset(_LISTEN_FILTER_METHODS.values())
+
+_LISTEN_METHOD = "subscriptions/listen"
+_LISTEN_ACK_METHOD = "notifications/subscriptions/acknowledged"
+
 _MODERN_DISCOVER_METHOD = "server/discover"
 
 
@@ -426,6 +444,129 @@ _CACHEABLE_METHODS = frozenset(
         "resources/read",
     }
 )
+
+
+# Per-stream backlog. A full queue ends the stream rather than dropping a
+# frame in the middle: a gap is undetectable to the client, whereas a lost
+# stream is re-established with fresh state.
+_LISTEN_QUEUE_MAX = 1024
+
+# Concurrent listen streams one principal may hold on its pooled child.
+# The relay peer opens at most two; the SDK's global limit is far higher.
+# A cap exists so one client cannot pin unbounded handler threads.
+_LISTEN_MAX_STREAMS_PER_CHILD = 4
+
+# How often a stream waiting for its next notification re-checks whether
+# it has been told to end. A `queue.Queue` and a `threading.Event` cannot
+# be waited on jointly, and BOTH endings (gateway shutdown, child death)
+# are signalled from another thread — so the wait is sliced rather than
+# held for the whole keepalive interval, which would otherwise delay a
+# teardown by up to 15 seconds.
+_LISTEN_POLL_SECS = 0.25
+
+# How long gateway shutdown waits for the streams it just ended to flush
+# their terminal frames and detach. Generous enough for a local socket
+# write, short enough that a wedged client cannot hold shutdown hostage.
+_LISTEN_DRAIN_SECS = 2.0
+
+
+class _ListenStream:
+    """One attached `subscriptions/listen` stream (#374).
+
+    Owns the honored filter, the listen request's id (echoed verbatim as
+    the subscription id — the v2 client mints strings like `"listen-1"`,
+    so nothing coerces types), and a BOUNDED queue the child's reader
+    thread publishes into.
+
+    Filtering happens here, on the reader thread, so a stream's backlog
+    never holds traffic that stream would refuse: "The server MUST NOT
+    send notification types the client has not explicitly requested."
+    Stamping happens on the handler thread instead, because each stream
+    stamps its OWN id and would need its own copy regardless.
+    """
+
+    __slots__ = (
+        "listen_id",
+        "honored",
+        "_queue",
+        "_ended",
+        "_end_lock",
+        "_graceful",
+        "overflowed",
+    )
+
+    def __init__(self, listen_id: Any, honored: dict[str, bool]) -> None:
+        self.listen_id = listen_id
+        self.honored = honored
+        self._queue: "queue.Queue[dict[str, Any]]" = queue.Queue(_LISTEN_QUEUE_MAX)
+        # Set to end the stream: "graceful" emits the terminal result
+        # first, "lost" closes abruptly.
+        self._ended = threading.Event()
+        self._end_lock = threading.Lock()
+        self._graceful = False
+        self.overflowed = False
+
+    def wants(self, method: str) -> bool:
+        flag = next((k for k, v in _LISTEN_FILTER_METHODS.items() if v == method), None)
+        return flag is not None and bool(self.honored.get(flag))
+
+    def publish(self, message: dict[str, Any]) -> None:
+        """Enqueue a matching notification; never block the reader thread."""
+        try:
+            self._queue.put_nowait(message)
+        except queue.Full:
+            # Backlog overflow ends the stream (lost). Blocking here would
+            # stall the child's reader for every other consumer, and
+            # dropping one frame would leave an undetectable gap.
+            self.overflowed = True
+            self.signal_end(graceful=False)
+
+    def signal_end(self, *, graceful: bool) -> None:
+        """Wind the stream up, recording WHICH ending this is.
+
+        The caller states the intent rather than the pump inferring it
+        from surrounding state, because inference races: `shutdown_all`
+        signals its streams and then immediately tears the children down,
+        so a pump that read `backend.closed` would see a dead child and
+        call an orderly shutdown "lost" — telling a compliant peer to
+        reconnect to a gateway that is going away.
+
+        THE FIRST ENDING WINS. A shutdown followed by the child's death
+        is one ending with two symptoms, and the later symptom must not
+        downgrade a graceful teardown the client may already have been
+        told about.
+        """
+        with self._end_lock:
+            if self._ended.is_set():
+                return
+            self._graceful = graceful
+            self._ended.set()
+
+    @property
+    def ending(self) -> bool:
+        return self._ended.is_set()
+
+    @property
+    def graceful(self) -> bool:
+        """True if the ending earns a terminal result frame."""
+        return self._graceful
+
+    def next_message(self, timeout: float) -> dict[str, Any] | None:
+        """The next notification, or None on ending / keepalive expiry.
+
+        The caller re-checks `ending` — None means "nothing to write",
+        not "keep waiting".
+        """
+        deadline = time.monotonic() + timeout
+        while not self._ended.is_set():
+            remaining = min(_LISTEN_POLL_SECS, deadline - time.monotonic())
+            if remaining <= 0:
+                return None
+            try:
+                return self._queue.get(timeout=remaining)
+            except queue.Empty:
+                continue
+        return None
 
 
 class ModernBackendPool:
@@ -1205,6 +1346,13 @@ class BackendProcess:
         # consumer. Unbounded queue is acceptable for one client per session;
         # a later change can bound + shed.
         self.server_initiated: "queue.Queue[str]" = queue.Queue()
+        # Attached `subscriptions/listen` streams (#374). A modern child is
+        # SHARED, and the spec allows several concurrent streams over it,
+        # so the single-consumer `server_initiated` queue above cannot
+        # serve them — each listener gets its own bounded queue instead.
+        # Empty is the steady state and restores the discard behaviour by
+        # construction.
+        self._listeners: list[Any] = []
         self._closed = threading.Event()
         self._reader = threading.Thread(
             target=self._read_loop, name="backend-reader", daemon=True
@@ -1256,12 +1404,79 @@ class BackendProcess:
         if not self._modern_owned:
             self.server_initiated.put(line)
             return
+        # #374: with listen streams attached, a child notification is
+        # FANNED OUT to every stream whose filter asked for it. Parsed
+        # once here on the reader thread and matched per stream, so a
+        # bounded queue never holds traffic its own stream would drop —
+        # the spec's "MUST NOT send notification types the client has not
+        # explicitly requested" is enforced at enqueue, not at emit.
+        listeners = self._snapshot_listeners()
+        if listeners:
+            try:
+                parsed = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                parsed = None
+            method = parsed.get("method") if isinstance(parsed, dict) else None
+            if isinstance(method, str) and method in _LISTEN_FORWARDED_METHODS:
+                delivered = False
+                for listener in listeners:
+                    if listener.wants(method):
+                        listener.publish(parsed)
+                        delivered = True
+                if delivered:
+                    return
+        # No listener wanted it (or none is attached): today's bounded
+        # discard, byte-identical.
         self._discarded += 1
         if self._discarded == 1:
             log(
-                "modern backend produced traffic with no modern channel to "
-                "carry it; discarding (3.5-D adds the listen stream)"
+                "modern backend produced traffic no listen stream asked for; discarding"
             )
+
+    def attach_listener(self, listener: Any) -> None:
+        """Register a listen stream to receive matching child notifications.
+
+        #374 §3.2. Called BEFORE the ack is written, deliberately: an
+        event published while the ack write is in flight has to be
+        buffered rather than lost, which is the server-side form of the
+        ack-first invariant.
+        """
+        with self._lock:
+            self._listeners.append(listener)
+
+    def detach_listener(self, listener: Any) -> None:
+        """Unregister a stream. Idempotent — teardown paths may overlap."""
+        with self._lock:
+            if listener in self._listeners:
+                self._listeners.remove(listener)
+
+    def close_listeners(self) -> None:
+        """End every attached stream gracefully (gateway shutdown)."""
+        for listener in self._snapshot_listeners():
+            listener.signal_end(graceful=True)
+
+    def drain_listeners(self, timeout: float) -> bool:
+        """Wait (bounded) for every stream to finish writing and detach.
+
+        A stream detaches in its handler's `finally`, AFTER the terminal
+        frame is flushed, so an empty listener list is the observable
+        proof that the graceful ending actually reached the wire. Returns
+        False if the timeout won instead — the caller carries on either
+        way, because a shutdown that can be stalled by one wedged client
+        is a worse failure than a truncated stream.
+        """
+        deadline = time.monotonic() + timeout
+        while self._snapshot_listeners():
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+        return True
+
+    def _snapshot_listeners(self) -> list[Any]:
+        """The attached streams, copied so the reader never holds the lock
+        while a listener's bounded queue is being written."""
+        with self._lock:
+            return list(self._listeners)
 
     def _route(self, line: str) -> None:
         try:
@@ -1451,6 +1666,13 @@ class BackendProcess:
             self._pending.clear()
         for slot in waiters:
             slot["event"].set()  # line stays None -> caller emits error
+        # #374: a listen stream is a waiter too. Without this it would sit
+        # on its queue until the next keepalive tick before noticing the
+        # child is gone. LOST, not graceful: serve itself is still up, so
+        # the contract is that the peer re-listens and refetches — and a
+        # terminal `complete` would tell it the opposite.
+        for listener in self._snapshot_listeners():
+            listener.signal_end(graceful=False)
 
     @property
     def closed(self) -> bool:
