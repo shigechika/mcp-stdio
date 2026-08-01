@@ -693,6 +693,7 @@ class _ListenStream:
         "_graceful",
         "overflowed",
         "torn_down",
+        "subscribe_failure_logged",
     )
 
     def __init__(
@@ -731,6 +732,14 @@ class _ListenStream:
         # its subscribe arrive AFTER its unsubscribe, leaving the child
         # subscribed forever with no stream to deliver to.
         self.torn_down = False
+        # #388 review — a once-per-stream latch, mirroring relay's own
+        # `unhonored_logged` idiom (the pattern this project already uses
+        # for "log this fact once per URI for the LIFE of the stream, not
+        # once per attempt"). Read and written only under `_sub_lock`,
+        # from `add_resource_subscriptions` — see that method's docstring
+        # for why it exists even though today's single call-per-stream
+        # path cannot yet observe it firing twice.
+        self.subscribe_failure_logged: set[str] = set()
 
     def wants(self, method: str) -> bool:
         flag = next((k for k, v in _LISTEN_FILTER_METHODS.items() if v == method), None)
@@ -1895,11 +1904,22 @@ class BackendProcess:
         this URI's own lifetime: the ack has shipped, a timeout does not
         say whether the child processed the request, and #374's own
         precedent is that "a subscription that never fires is still
-        honored". Logged once per URI instead. This is deliberately
-        DIFFERENT from a URI that was never driven at all (short-circuited
-        by `responsive`): an attempt that reached the wire is trusted not
-        to need a second try; a URI nothing was ever sent for is not the
-        same claim.
+        honored". This is deliberately DIFFERENT from a URI that was
+        never driven at all (short-circuited by `responsive`): an
+        attempt that reached the wire is trusted not to need a second
+        try; a URI nothing was ever sent for is not the same claim.
+
+        Logged once per URI PER STREAM, via `listener.subscribe_failure_logged`
+        (#388 review) — literally once now, not "once per attempt" as
+        the docstring used to (mis)claim: with only one call site today
+        (see `_serve_listen_stream`), a URI is driven at most once per
+        stream anyway, so this latch is defense-in-depth against a
+        future path that drives the same URI twice for one stream,
+        mirroring relay's own `unhonored_logged` idiom. `listener` may
+        be `None` (bare unit calls) — then there is no stream to latch
+        against, so it just logs. This does NOT throttle a large batch:
+        each of N DIFFERENT unconfirmed URIs in one call still gets its
+        own line — still worth knowing WHICH URIs failed.
 
         `listener.torn_down` is checked under the SAME lock the refs use,
         which is what makes a stream that dies before its subscriptions
@@ -1936,10 +1956,21 @@ class BackendProcess:
                 if outcome is None:
                     responsive = False
                 if not outcome:
-                    log(
-                        f"listen {listen_id!r}: the child did not confirm "
-                        f"resources/subscribe for {uri!r}; keeping it honored"
+                    # Once per URI per STREAM (#388 review), not once per
+                    # attempt: `listener` is the only thing that lives for
+                    # the stream's whole lifetime, so its own set is the
+                    # latch — mirrors relay's `unhonored_logged`.
+                    already_logged = (
+                        listener is not None
+                        and uri in listener.subscribe_failure_logged
                     )
+                    if not already_logged:
+                        if listener is not None:
+                            listener.subscribe_failure_logged.add(uri)
+                        log(
+                            f"listen {listen_id!r}: the child did not confirm "
+                            f"resources/subscribe for {uri!r}; keeping it honored"
+                        )
 
     def release_resource_subscriptions(self, uris: Iterable[str]) -> None:
         """Drop a reference on each URI, unsubscribing on the last — but

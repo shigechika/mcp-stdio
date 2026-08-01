@@ -3674,3 +3674,150 @@ class TestResourceSubscriptionDrivenTracking:
             assert "res://healthy" not in backend._resource_refs
         finally:
             backend.shutdown()
+
+
+def _erroring_recorder(calls: list):
+    """A `_drive_resource_subscription` stand-in that always answers with
+    an ERROR reply (`False`, not `None`) — the child is alive and
+    responding, it just declines every URI. Records every call, same
+    wire-evidence idiom as `_selective_recorder`.
+    """
+
+    def _drive(self, method, uri):
+        calls.append((method, uri))
+        return False
+
+    return _drive
+
+
+class TestResourceSubscribeFailureLogThrottle:
+    """#388 review — the "did not confirm subscribe" log needs a
+    once-per-stream latch, mirroring `listen {req_id!r}: capped resource
+    subscriptions...`'s own once-per-stream posture and relay's
+    `unhonored_logged` idiom (the two are the closest existing precedent
+    in this codebase; neither is byte-for-byte what's built here — see
+    the docstring on `subscribe_failure_logged`).
+
+    Today's only call site drives a URI at most ONCE per stream, so a
+    natural end-to-end scenario cannot make the same URI fail twice for
+    one stream — proven below by driving it through the one legitimate
+    mechanism that CAN re-drive a URI within a stream (release, then a
+    fresh reference), and asserting the wire evidence shows two drive
+    attempts but the log fires only once. This is deliberately not a
+    "many distinct URIs in one batch" test: that case is UNAFFECTED by
+    this fix on purpose (per-URI granularity is kept — each of N
+    different failing URIs still gets its own line).
+    """
+
+    def test_a_uri_re_driven_within_one_stream_logs_only_once(self, monkeypatch):
+        """Revert-check: remove the `subscribe_failure_logged` latch
+        (log unconditionally on every `not outcome`) — this test then
+        sees TWO log lines instead of one, because the release-then-
+        re-add below genuinely re-drives the URI and, without the
+        latch, re-logs it too.
+        """
+        calls: list[tuple[str, str]] = []
+        logged: list[str] = []
+        monkeypatch.setattr(
+            server.BackendProcess,
+            "_drive_resource_subscription",
+            _erroring_recorder(calls),
+        )
+        monkeypatch.setattr(server, "log", lambda msg: logged.append(msg))
+
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        listener = server._ListenStream("l1", {}, frozenset({"res://err"}))
+        try:
+            backend.add_resource_subscriptions(["res://err"], "l1", listener)
+            assert calls == [("resources/subscribe", "res://err")], calls
+            assert len(logged) == 1, logged
+
+            # The only legitimate way to re-drive a URI within one
+            # stream's life: it is released (refcount to zero, entry
+            # popped — same listener, same `subscribe_failure_logged`
+            # set, which is NOT cleared by release) and then referenced
+            # again by the same stream.
+            backend.release_resource_subscriptions(["res://err"])
+            backend.add_resource_subscriptions(["res://err"], "l1", listener)
+
+            # Wire evidence: the drive really did happen a SECOND time.
+            assert calls == [
+                ("resources/subscribe", "res://err"),
+                ("resources/unsubscribe", "res://err"),
+                ("resources/subscribe", "res://err"),
+            ], calls
+            # But the failure log did not fire again for this stream.
+            assert len(logged) == 1, logged
+        finally:
+            backend.shutdown()
+
+    def test_a_different_stream_gets_its_own_log(self, monkeypatch):
+        """The latch is per-STREAM (the listener object), not global —
+        once `res://err` is fully released by stream `l1` (its own
+        teardown) and a SECOND, independent stream `l2` subscribes to it
+        fresh, that is a genuinely new drive, and it logs its OWN line
+        into its OWN `subscribe_failure_logged`. Matches the
+        cap-truncation log's own documented scope ("a client that blew
+        the cap will blow it on every reconnect") — the throttle resets
+        per stream, it does not remember a URI's failure forever.
+
+        (Two streams BOTH holding a live reference to the same URI
+        cannot be used to show this: the second would see `driven=True`
+        from the first's attempt and never drive at all — see the
+        sibling re-drive test's docstring. Release is what makes the
+        second attempt real.)
+        """
+        calls: list[tuple[str, str]] = []
+        logged: list[str] = []
+        monkeypatch.setattr(
+            server.BackendProcess,
+            "_drive_resource_subscription",
+            _erroring_recorder(calls),
+        )
+        monkeypatch.setattr(server, "log", lambda msg: logged.append(msg))
+
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        first = server._ListenStream("l1", {}, frozenset({"res://err"}))
+        second = server._ListenStream("l2", {}, frozenset({"res://err"}))
+        try:
+            backend.add_resource_subscriptions(["res://err"], "l1", first)
+            backend.release_resource_subscriptions(["res://err"])  # l1 tears down
+            backend.add_resource_subscriptions(["res://err"], "l2", second)
+
+            assert calls == [
+                ("resources/subscribe", "res://err"),
+                ("resources/unsubscribe", "res://err"),
+                ("resources/subscribe", "res://err"),
+            ], calls
+            assert len(logged) == 2, logged
+            assert "res://err" in first.subscribe_failure_logged
+            assert "res://err" in second.subscribe_failure_logged
+        finally:
+            backend.shutdown()
+
+    def test_many_distinct_uris_in_one_batch_each_still_get_their_own_line(self):
+        """The latch does NOT throttle a large batch of DIFFERENT URIs —
+        per-URI granularity is kept on purpose (still worth knowing
+        WHICH URIs failed). This is the scenario the finding's "256
+        lines" example describes, and the fix leaves it unchanged.
+        """
+
+        class _AlwaysErrors(server.BackendProcess):
+            def _drive_resource_subscription(self, method, uri):
+                return False
+
+        backend = _AlwaysErrors([*_BACKEND], modern_owned=True)
+        listener = server._ListenStream(
+            "l1", {}, frozenset({"res://0", "res://1", "res://2"})
+        )
+        try:
+            backend.add_resource_subscriptions(
+                ["res://0", "res://1", "res://2"], "l1", listener
+            )
+            assert listener.subscribe_failure_logged == {
+                "res://0",
+                "res://1",
+                "res://2",
+            }
+        finally:
+            backend.shutdown()
