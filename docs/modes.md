@@ -180,10 +180,38 @@ For newer clients, mcp-stdio starts one copy of your server per
 authenticated user (or a single shared one if you run without
 authentication), because those clients have no session to tie a process to.
 
+<a id="listchanged-serve"></a>
+
+#### Telling clients your lists changed
+
+If your server announces that its tools, prompts or resources changed,
+newer clients now hear about it. They open one long-lived connection and
+mcp-stdio pushes your server's announcements down it as they happen —
+your stdio server keeps sending the same notifications it always did, and
+nothing about it changes.
+
+Three announcements travel this way:
+
+| What your server sends | What the client does |
+|---|---|
+| `notifications/tools/list_changed` | re-fetches your tool list |
+| `notifications/prompts/list_changed` | re-fetches your prompt list |
+| `notifications/resources/list_changed` | re-fetches your resource list |
+
+A client asks for the ones it cares about and gets only those. It may
+keep up to four such connections open at once; a fifth is refused rather
+than queued.
+
+If mcp-stdio is shut down, the client is told the stream is over and does
+not try to reconnect. If your server process dies instead, the stream
+just drops — which tells the client to reconnect and re-fetch, because
+mcp-stdio itself is still there.
+
 !!! note "Not yet supported"
-    Newer clients that ask `serve` for a live notification stream get a
-    clear "not implemented" answer rather than silence. Planned in
-    [#374](https://github.com/shigechika/mcp-stdio/issues/374).
+    Watching a **single resource** for changes (`resources/subscribe`)
+    does not work yet — a client that asks is told so, and mcp-stdio does
+    not advertise the capability. Planned in
+    [#381](https://github.com/shigechika/mcp-stdio/issues/381).
 
 ## Both at once
 
