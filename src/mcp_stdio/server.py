@@ -1563,6 +1563,36 @@ def _b64url_decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
+# The only methods a reverse-MRTR round may ever open under. O14 scopes
+# MRTR to requests that can legitimately need more input mid-flight, and
+# this mirrors relay's equivalent restriction on the forward side.
+_MRTR_ELIGIBLE_METHODS = frozenset({"tools/call", "resources/read", "prompts/get"})
+
+
+def _mrtr_principal_is_eligible(principal: str | None) -> bool:
+    """Whether this caller may open a reverse-MRTR round at all (§4 Q1).
+
+    **OAUTH ONLY, and this is a scope boundary rather than a TODO.**
+
+    Principal binding is what stops one caller answering another's
+    prompt, and it buys exactly nothing when the principal is a shared
+    constant. Under no-auth the pool hands ONE child to every caller
+    (decision D1), and a static token does the same — so a prompt raised
+    by caller A's `tools/call` could be answered by whoever's retry
+    happens to land next. That is a cross-caller leak, not merely a
+    degraded experience.
+
+    Both of those postures therefore keep today's behaviour exactly: a
+    clean `-32601`, no bridging, nothing to leak. Only a genuine OAuth
+    user — a principal that actually distinguishes callers — is eligible.
+
+    `None` is the open gateway and `_STATIC_PRINCIPAL` the shared
+    static-token constant; `_authorized` derives both, and this reads the
+    same value rather than re-deriving it.
+    """
+    return principal is not None and principal != _STATIC_PRINCIPAL
+
+
 def _stamp_modern_result(
     msg: dict[str, Any],
     method: str | None,
@@ -4806,6 +4836,33 @@ class _Handler(BaseHTTPRequestHandler):
                                 init_result, cache_ttl_ms=self.cache_ttl_ms
                             ),
                         }
+                    ),
+                )
+                return
+
+            # #375 PR 1 §3.4: the one-MRTR-eligible-in-flight-per-child
+            # invariant, wired here and INERT until PR 2.
+            #
+            # Nothing in PR 1 parks a round, so `mrtr_has_pending()` is
+            # always False on every live path and this guard never fires
+            # — which is what keeps this PR to zero observable behaviour
+            # change. PR 2 adds the registration and the guard starts
+            # meaning something, with no further change to this call
+            # site. (Its test seeds the table directly.)
+            #
+            # REJECT rather than queue (§4 Q2). Queuing would reintroduce
+            # exactly the stall vector D4 exists to prevent, and would
+            # narrow perceived concurrency silently — an explicit busy
+            # error is far easier to diagnose than a request that simply
+            # takes longer for reasons nothing reports.
+            if method in _MRTR_ELIGIBLE_METHODS and backend.mrtr_has_pending():
+                self._send_json(
+                    503,
+                    _error_body(
+                        "this backend is busy with a pending input-required "
+                        "round; retry once it completes",
+                        req_id,
+                        code=_JSONRPC_INTERNAL_ERROR,
                     ),
                 )
                 return

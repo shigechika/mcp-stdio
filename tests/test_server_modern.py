@@ -4181,3 +4181,153 @@ class TestMrtrParkedRoundTable:
             assert replacement.mrtr_has_pending() is False
         finally:
             replacement.shutdown()
+
+
+@pytest.fixture()
+def gateway_with_pool():
+    """A gateway that also hands back its `ModernBackendPool`.
+
+    These tests must SEED a parked round, because PR 1 has nothing that
+    opens one — that is the point of the PR. The ordinary `gateway`
+    fixture yields only a URL, and reaching the pool by scanning live
+    objects would be non-deterministic the moment another test's gateway
+    exists, so the handle is passed explicitly.
+    """
+    httpd, registry = server.build_server(_BACKEND, host="127.0.0.1", port=0)
+    host, port = httpd.server_address[0], httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://{host}:{port}/mcp", httpd.modern_pool
+    finally:
+        httpd.shutdown()
+        registry.shutdown_all()
+        httpd.modern_pool.shutdown_all()
+        httpd.server_close()
+
+
+class TestMrtrEligibility:
+    """Who may open a round, and the invariant that keeps it correlatable."""
+
+    def test_only_a_genuine_oauth_principal_is_eligible(self):
+        """#375 §4 Q1 — a SCOPE BOUNDARY, not a TODO.
+
+        Principal binding is what stops one caller answering another's
+        prompt, and it buys nothing when the principal is a shared
+        constant: under no-auth the pool hands ONE child to every caller,
+        and a static token does the same, so a prompt raised by caller
+        A's request could be answered by whoever's retry lands next.
+        """
+        assert server._mrtr_principal_is_eligible("alice@example.com") is True
+        # The open gateway.
+        assert server._mrtr_principal_is_eligible(None) is False
+        # The shared static-token constant — read from serve's own
+        # definition rather than restated, so a rename cannot leave this
+        # test asserting against a string nothing produces any more.
+        assert server._mrtr_principal_is_eligible(server._STATIC_PRINCIPAL) is False
+
+    def test_only_the_o14_methods_can_open_a_round(self):
+        assert server._MRTR_ELIGIBLE_METHODS == {
+            "tools/call",
+            "resources/read",
+            "prompts/get",
+        }
+        for never in ("tools/list", "server/discover", "subscriptions/listen"):
+            assert never not in server._MRTR_ELIGIBLE_METHODS
+
+    def test_a_busy_child_rejects_a_second_eligible_call(self, gateway_with_pool):
+        """§1.2's invariant, driven through the real dispatch path.
+
+        A bare legacy out-of-band request carries NO field linking it
+        back to whichever in-flight call provoked it, so with two
+        eligible calls on one shared child the correlation is genuinely
+        ambiguous. The table is seeded directly because PR 1 opens no
+        rounds — that is the point of the PR — and seeding is what lets
+        the guard be tested before the thing that populates it exists.
+
+        Revert-check: drop the `mrtr_has_pending()` guard from
+        `_dispatch_modern` and this returns 200.
+        """
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        try:
+            txn = backend.mrtr_round_open(
+                "u1",
+                method="tools/call",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+            )
+            resp = _post(
+                url,
+                _modern_body(
+                    "tools/call",
+                    params={"name": "echo_tool", "arguments": {}},
+                    meta=_meta(),
+                ),
+                _modern_headers("tools/call", name="echo_tool"),
+            )
+            assert resp.status_code == 503, resp.text
+            assert resp.json()["error"]["code"] == -32603
+            assert "input-required" in resp.json()["error"]["message"]
+        finally:
+            backend.mrtr_round_consume(txn)
+            pool.release(entry)
+
+    def test_a_non_eligible_method_is_unaffected_by_a_parked_round(
+        self, gateway_with_pool
+    ):
+        """The guard is scoped to the three O14 methods: a parked round
+        must not stall `tools/list` for everyone on that child."""
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        try:
+            txn = backend.mrtr_round_open(
+                "u1",
+                method="tools/call",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+            )
+            resp = _post(
+                url, _modern_body("tools/list", meta=_meta()), _modern_headers()
+            )
+            assert resp.status_code == 200, resp.text
+        finally:
+            backend.mrtr_round_consume(txn)
+            pool.release(entry)
+
+
+def test_pr1_opens_no_rounds_on_any_live_path(gateway_with_pool):
+    """The zero-behaviour-change claim, asserted rather than argued.
+
+    PR 1 builds the envelope, the table and the invariant; PR 2 wires
+    them to actual traffic. If any live path started parking a round, the
+    concurrency guard above would begin rejecting ordinary concurrent
+    calls — an observable change this PR promises not to make.
+
+    Drives one of each eligible method plus a child-initiated request
+    (`ask_client`, which still earns today's D4 `-32601`) and asserts the
+    table is EMPTY afterwards — a positive check on state, not an
+    absence-of-symptoms observation.
+    """
+    url, pool = gateway_with_pool
+    for body, headers in (
+        (
+            _modern_body(
+                "tools/call",
+                params={"name": "echo_tool", "arguments": {}},
+                meta=_meta(),
+            ),
+            _modern_headers("tools/call", name="echo_tool"),
+        ),
+        (_modern_body("tools/list", meta=_meta()), _modern_headers()),
+        (_modern_body("ask_client", meta=_meta()), _modern_headers("ask_client")),
+    ):
+        _post(url, body, headers)
+    backend, _, entry = pool.get_or_create(None)
+    try:
+        assert backend._mrtr_pending == {}
+        assert backend.mrtr_has_pending() is False
+    finally:
+        pool.release(entry)
