@@ -30,6 +30,9 @@ from __future__ import annotations
 import ast
 import base64
 import json
+import pathlib
+import hmac
+import hashlib
 import os
 import re
 import socket
@@ -3821,3 +3824,146 @@ class TestResourceSubscribeFailureLogThrottle:
             }
         finally:
             backend.shutdown()
+
+
+# --- reverse MRTR: the signed pointer (#375 PR 1) -------------------------
+
+
+class TestMrtrPointer:
+    """`requestState` is a signed POINTER, not a state container.
+
+    The distinction is the design's central correction and worth stating
+    in a test file too: what a retry resumes is a live subprocess blocked
+    on its own stdin read, which no amount of embedded state can
+    un-block from another process. So this blob carries only enough to
+    find an entry in the child's own table and prove entitlement to it.
+    """
+
+    def test_a_minted_pointer_round_trips(self):
+        state = server._mrtr_encode_pointer("txn-1", "alice", 1)
+        payload, why = server._mrtr_decode_pointer(state, "alice")
+        assert why == ""
+        assert payload["txn_id"] == "txn-1"
+        assert payload["round"] == 1
+        assert payload["v"] == server._MRTR_POINTER_VERSION
+
+    def test_the_raw_principal_never_appears_in_the_blob(self):
+        """The client holds this value and the spec only forbids it from
+        PARSING it — which is not a security control. A hash binds the
+        pointer just as well, since the only operation ever performed on
+        it is equality against a freshly-resolved principal."""
+        state = server._mrtr_encode_pointer("txn-1", "alice@example.com", 1)
+        assert "alice" not in server._b64url_decode(state.split(".")[0]).decode()
+
+    def test_a_tampered_payload_is_rejected(self):
+        """O14: "servers MUST ... reject state that fails verification".
+
+        Every byte position is flipped in turn, so this cannot pass by
+        happening to mutate a field nothing reads.
+
+        Revert-check: drop the `compare_digest` check and this fails.
+        """
+        state = server._mrtr_encode_pointer("txn-1", "alice", 1)
+        raw_b64 = state.split(".")[0]
+        for i in range(len(raw_b64)):
+            swapped = "A" if raw_b64[i] != "A" else "B"
+            tampered = f"{raw_b64[:i]}{swapped}{raw_b64[i + 1 :]}.{state.split('.')[1]}"
+            payload, why = server._mrtr_decode_pointer(tampered, "alice")
+            assert payload is None, (i, tampered)
+            assert why, i
+
+    def test_a_tampered_mac_is_rejected(self):
+        state = server._mrtr_encode_pointer("txn-1", "alice", 1)
+        raw_b64, mac_b64 = state.split(".")
+        flipped = ("A" if mac_b64[0] != "A" else "B") + mac_b64[1:]
+        assert server._mrtr_decode_pointer(f"{raw_b64}.{flipped}", "alice")[0] is None
+
+    def test_a_pointer_for_another_principal_is_rejected(self):
+        """Defense in depth beyond the pool's per-principal keying: a
+        GENUINE pointer that leaked between users is exactly the case
+        pool keying alone does not cover."""
+        state = server._mrtr_encode_pointer("txn-1", "alice", 1)
+        payload, why = server._mrtr_decode_pointer(state, "bob")
+        assert payload is None
+        assert "principal" in why
+
+    def test_an_expired_pointer_is_rejected(self):
+        state = server._mrtr_encode_pointer("txn-1", "alice", 1, now=1000.0)
+        assert server._mrtr_decode_pointer(state, "alice", now=1000.0)[0] is not None
+        payload, why = server._mrtr_decode_pointer(
+            state, "alice", now=1000.0 + server._MRTR_POINTER_TTL_SECS + 1
+        )
+        assert payload is None and "expired" in why
+
+    def test_every_malformed_shape_returns_a_reason_rather_than_raising(self):
+        """This parses attacker-controlled input on a request-handling
+        path, so a raise here is a crash in a handler thread."""
+        for bad in (
+            None,
+            7,
+            "",
+            "no-dot",
+            "a.b.c",
+            "!!!.!!!",
+            "....",
+            f"{server._b64url(b'not json')}.{server._b64url(b'x')}",
+        ):
+            payload, why = server._mrtr_decode_pointer(bad, "alice")
+            assert payload is None, bad
+            assert why, bad
+
+    def test_a_forged_payload_cannot_be_signed_without_the_key(self):
+        """The whole point of the MAC: a client that understands the
+        format still cannot mint one."""
+        forged = server._mrtr_pointer_payload_bytes(
+            {
+                "v": 1,
+                "txn_id": "attacker",
+                "principal": server._mrtr_principal_hash("alice"),
+                "round": 1,
+                "issued_at": 0.0,
+                "expires_at": 1e12,
+            }
+        )
+        state = f"{server._b64url(forged)}.{server._b64url(b'whatever')}"
+        assert server._mrtr_decode_pointer(state, "alice")[0] is None
+
+    def test_the_round_rides_inside_the_signature(self):
+        """Serve keeps no per-client round counter across requests, so
+        the count is only trustworthy because it is signed — otherwise a
+        client resets its own cap by hand-crafting `round: 1`."""
+        state = server._mrtr_encode_pointer("txn-1", "alice", 5)
+        assert server._mrtr_decode_pointer(state, "alice")[0]["round"] == 5
+        raw = json.loads(server._b64url_decode(state.split(".")[0]))
+        raw["round"] = 1
+        rewritten = server._mrtr_pointer_payload_bytes(raw)
+        forged = f"{server._b64url(rewritten)}.{state.split('.')[1]}"
+        assert server._mrtr_decode_pointer(forged, "alice")[0] is None
+
+    def test_a_bogus_round_value_is_rejected(self):
+        for bad_round in (0, -1, "1", True, None):
+            payload = {
+                "v": 1,
+                "txn_id": "t",
+                "principal": server._mrtr_principal_hash("alice"),
+                "round": bad_round,
+                "issued_at": 0.0,
+                "expires_at": 1e12,
+            }
+            raw = server._mrtr_pointer_payload_bytes(payload)
+            mac = hmac.new(server._MRTR_POINTER_KEY, raw, hashlib.sha256).digest()
+            state = f"{server._b64url(raw)}.{server._b64url(mac)}"
+            assert server._mrtr_decode_pointer(state, "alice")[0] is None, bad_round
+
+    def test_the_key_is_process_lifetime_and_never_persisted(self):
+        """A restart losing in-flight rounds is CORRECT, not a shortcut:
+        a persisted key would let a client present a perfectly-signed
+        pointer to a txn that provably cannot exist any more, turning an
+        honest "unknown or expired" error into a silent misroute."""
+        assert isinstance(server._MRTR_POINTER_KEY, bytes)
+        assert len(server._MRTR_POINTER_KEY) == 32
+        # Nothing writes it anywhere.
+        source = pathlib.Path(server.__file__).read_text(encoding="utf-8")
+        assert source.count("_MRTR_POINTER_KEY") == 3, (
+            "the key should only be defined and used by encode/decode"
+        )

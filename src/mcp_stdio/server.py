@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -1366,6 +1367,174 @@ def _is_reserved_client_id(req_id: Any) -> bool:
     disambiguated at every later consumer.
     """
     return isinstance(req_id, str) and req_id.startswith(_SERVE_ID_NAMESPACE)
+
+
+# --- reverse MRTR: the signed pointer (#375 PR 1, design §3.2) -----------
+#
+# WHAT THIS IS NOT. The issue's original framing was that serve is
+# stateless, so a round's state must live entirely inside `requestState`.
+# That framing is wrong, and following it literally would misdirect the
+# whole implementation: what a client's retry resumes is not a
+# serializable computation but a LIVE SUBPROCESS blocked on its own stdin
+# read. No amount of state in `requestState` lets a different process — or
+# the same process after a restart — un-block that particular child. The
+# retry MUST land back on the instance holding it. That is an affinity
+# requirement inherent to the child being a real OS process, not a design
+# choice this code can dissolve.
+#
+# So `requestState` is a signed POINTER, never a container: just enough to
+# find an entry in `BackendProcess._mrtr_pending` and prove the finder is
+# entitled to it. The round's real state lives in that table, which dies
+# with the child for free — the same lifetime discipline `_resource_refs`
+# uses (#381/#388).
+#
+# O5/statelessness licenses this: it forbids relying on prior CLIENT
+# requests to reconstruct context (capabilities, protocol version,
+# identity), and an MRTR retry carries its own full `_meta` and its own
+# auth, so every piece of context is still derived fresh. Nothing in the
+# spec forbids a server from keeping its own bookkeeping.
+#
+# O14 is what forces the signature: "servers MUST treat `requestState` as
+# an attacker-controlled input ... MUST protect its integrity (e.g. HMAC
+# or AEAD) and MUST reject state that fails verification". `(e.g. ...)` is
+# illustrative — the spec mandates no algorithm, library or format, and
+# its own worked example uses the placeholder string "AEAD-protected
+# blob" — so stdlib HMAC-SHA256 satisfies it with no new dependency.
+_MRTR_POINTER_VERSION = 1
+
+# Process-lifetime only, never persisted, and that is CORRECT rather than
+# a shortcut. A restart loses every in-flight round — but the alternative
+# is worse: a persisted key would let a client present a perfectly-signed
+# pointer to a txn that provably cannot exist any more, turning an honest
+# "unknown or expired requestState" into a silent misroute. Server
+# Requirements item 8 licenses the loss outright: "Servers MUST NOT assume
+# that clients will fulfill the inputRequests or retry the original
+# request."
+_MRTR_POINTER_KEY = secrets.token_bytes(32)
+
+# Mirrors relay's own `_MRTR_MAX_ROUNDS`; nothing in the spec constrains
+# the value. It rides INSIDE the signed payload because serve keeps no
+# per-client counter across requests — signing it is what stops a client
+# resetting its own round count by hand-crafting `round: 1`.
+_MRTR_MAX_ROUNDS = 32
+
+# How long a signed pointer stays acceptable. Bounds how long a captured
+# blob is worth replaying, independently of single-use consumption.
+_MRTR_POINTER_TTL_SECS = 300.0
+
+
+def _mrtr_principal_hash(principal: str | None) -> str:
+    """A stable, non-reversible tag for the owning principal.
+
+    The raw value is an OAuth username; it goes nowhere near a blob the
+    client holds and could inspect. A hash binds the pointer to its owner
+    just as well, since the only operation ever performed on it is
+    equality against a freshly-resolved principal.
+    """
+    return hashlib.sha256(f"mcp-stdio/mrtr/{principal!r}".encode("utf-8")).hexdigest()
+
+
+def _mrtr_pointer_payload_bytes(payload: dict[str, Any]) -> bytes:
+    """The exact bytes that get signed, and later re-signed to verify.
+
+    Canonical: sorted keys, no incidental whitespace. The verifier never
+    re-serializes a parsed payload to check the MAC — it MACs the bytes it
+    received — so canonicality is about the ISSUER producing a stable
+    encoding, not about the verifier trusting a round-trip.
+    """
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _mrtr_encode_pointer(
+    txn_id: str, principal: str | None, round_no: int, *, now: float | None = None
+) -> str:
+    """Mint one `requestState` value.
+
+    Spec: "An opaque string meaningful only to the server. Clients MUST
+    NOT inspect, parse, modify, or make any assumptions about its
+    contents." Opaque is exactly what this is — the client's only
+    obligation is to echo it back byte-for-byte.
+    """
+    issued = time.time() if now is None else now
+    payload = {
+        "v": _MRTR_POINTER_VERSION,
+        "txn_id": txn_id,
+        "principal": _mrtr_principal_hash(principal),
+        "round": round_no,
+        "issued_at": issued,
+        "expires_at": issued + _MRTR_POINTER_TTL_SECS,
+    }
+    raw = _mrtr_pointer_payload_bytes(payload)
+    mac = hmac.new(_MRTR_POINTER_KEY, raw, hashlib.sha256).digest()
+    return f"{_b64url(raw)}.{_b64url(mac)}"
+
+
+def _mrtr_decode_pointer(
+    state: Any, principal: str | None, *, now: float | None = None
+) -> tuple[dict[str, Any] | None, str]:
+    """Verify and unpack a `requestState`; `(payload, "")` or `(None, why)`.
+
+    ORDER IS THE SECURITY PROPERTY. The MAC is checked against the exact
+    bytes received, with `hmac.compare_digest`, BEFORE the payload is
+    parsed as JSON — never parse-then-trust. A caller that read fields out
+    first and verified afterwards would already have acted on
+    attacker-chosen data.
+
+    Integrity is only ONE THIRD of the closure, and saying "HMAC prevents
+    this" alone would be an incomplete claim:
+
+    - HMAC stops FORGERY — a client cannot invent a pointer.
+    - SINGLE-USE consumption (the caller pops the txn entry) stops REPLAY
+      — a captured, still-validly-signed blob is worthless once used.
+    - PRINCIPAL BINDING, checked here, stops CROSS-USER use of a genuine
+      pointer that leaked.
+
+    Never raises. Every malformed shape returns a reason string, because
+    this parses attacker-controlled input on a request-handling path.
+    """
+    if not isinstance(state, str) or state.count(".") != 1:
+        return None, "malformed requestState"
+    raw_b64, mac_b64 = state.split(".", 1)
+    try:
+        raw = _b64url_decode(raw_b64)
+        mac = _b64url_decode(mac_b64)
+    except (ValueError, binascii.Error):
+        return None, "malformed requestState encoding"
+    expected = hmac.new(_MRTR_POINTER_KEY, raw, hashlib.sha256).digest()
+    if not hmac.compare_digest(mac, expected):
+        return None, "requestState failed integrity verification"
+    # Only now is the payload trustworthy enough to parse.
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None, "malformed requestState payload"
+    if not isinstance(payload, dict) or payload.get("v") != _MRTR_POINTER_VERSION:
+        return None, "unsupported requestState version"
+    if payload.get("principal") != _mrtr_principal_hash(principal):
+        # Defense in depth beyond the pool's own per-principal keying:
+        # O14 says to treat this value as attacker-controlled, and a
+        # genuine pointer that leaked between users is exactly the case
+        # pool keying alone does not cover.
+        return None, "requestState belongs to a different principal"
+    expires = payload.get("expires_at")
+    if not isinstance(expires, (int, float)) or (
+        (time.time() if now is None else now) > expires
+    ):
+        return None, "requestState expired"
+    round_no = payload.get("round")
+    if not isinstance(round_no, int) or isinstance(round_no, bool) or round_no < 1:
+        return None, "malformed requestState round"
+    if not isinstance(payload.get("txn_id"), str):
+        return None, "malformed requestState txn"
+    return payload, ""
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
 def _stamp_modern_result(
