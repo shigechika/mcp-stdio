@@ -4229,8 +4229,20 @@ class _Handler(BaseHTTPRequestHandler):
                 payload = f"data: {line}\n\n".encode("utf-8")
                 self.wfile.write(payload)
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, ValueError):
+        except (BrokenPipeError, ConnectionResetError, ValueError, OSError):
             # Client went away mid-stream — normal, not an error.
+            #
+            # `OSError` added for symmetry with `_serve_listen_stream`
+            # (#383): the two named subclasses cover the common
+            # disconnects, but a socket write can fail other ways
+            # (ETIMEDOUT, ENOTCONN, EHOSTUNREACH), and those escaped into
+            # `handle_one_request` to be logged as a traceback — noise
+            # for what is an ordinary client disconnect. The only calls
+            # in the loop that can raise `OSError` are the `wfile`
+            # writes, so the widening stays confined to transport
+            # failures. The modern path made this choice deliberately;
+            # the two SSE sites having DRIFTED is what produced the bug
+            # this PR fixes, so they are brought back into one shape.
             return
 
     def do_DELETE(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
