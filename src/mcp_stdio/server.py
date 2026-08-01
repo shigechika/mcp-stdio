@@ -535,9 +535,39 @@ class ModernBackendPool:
         consults again, which is inert and exactly what we want. Chasing
         identity here would buy nothing and could double-decrement a
         successor.
+
+        RE-SWEEPS the cap when this release leaves the pool over it
+        (#379 review, /code-review score 100). A spawn race under
+        `max_children` — two principals' FIRST requests each insert a
+        PENDING placeholder before either publishes — can settle the
+        pool ABOVE the cap: neither publish-time sweep (#376 §3.2) can
+        evict the other, still PENDING or still held. This release is
+        the THIRD moment (after the pre-insert check and the post-spawn
+        re-check) a child can become evictable — the instant a handler
+        that was holding it lets go — and without a sweep here that
+        overshoot is PERMANENT in a fixed-principal deployment: no new
+        principal ever arrives to trigger the pre-insert check, and the
+        idle reaper does not save it at the default `--modern-idle-ttl
+        0`. Gated on actually being over cap so the common path (pool
+        within cap) costs a single integer compare, never a scan.
+
+        The sweep is allowed to pick THIS entry, the one just released —
+        there is no "exclude myself" special case, unlike the post-spawn
+        re-check's (that one excludes itself for free, since its own
+        hold is still 1 when it runs). Excluding the just-released entry
+        here would look safer but is not: a principal holding a
+        long-lived subscription (#374's hold seam) would then pin an
+        overshoot forever, since its release is the only event left that
+        could ever trim it.
         """
         with self._lock:
             entry["holds"] = max(0, entry.get("holds", 0) - 1)
+            if (
+                entry["holds"] == 0
+                and self._max_children > 0
+                and len(self._entries) > self._max_children
+            ):
+                self._evict_if_at_cap_locked(reserve=0)
 
     def _evict_if_at_cap_locked(self, *, reserve: int = 1) -> None:
         """Make room by dropping the idlest child (§4 Q3).
@@ -712,6 +742,15 @@ class ModernBackendPool:
                 #
                 # `reserve=0`: this entry is already IN the map, so the
                 # sweep must trim down to the cap, not below it.
+                #
+                # Since `release()` grew its own sweep (#379 review), this
+                # one is defense-in-depth rather than the sole backstop:
+                # it only still matters for a sequence where some entry
+                # became reapable with NO intervening release call to
+                # have already caught it. We could not construct such a
+                # sequence, but do not claim one is impossible — the cost
+                # here is one locked check per spawn, not per request, so
+                # it stays.
                 self._evict_if_at_cap_locked(reserve=0)
             entry["event"].set()
             return backend, init_result, entry

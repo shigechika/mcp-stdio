@@ -879,6 +879,13 @@ class TestModernBackendPool:
         When nothing qualifies the cap is EXCEEDED rather than enforced —
         the right way to fail for a soft resource policy whose only
         alternative is breaking work already in flight.
+
+        The newcomer itself does not survive the checkout, though (#379
+        review): `busy` stays not-reapable (a request is still on the
+        wire), so once `other` is released it is the ONLY reapable
+        entry, and `release()`'s own sweep reclaims it right away —
+        trimming the pool back to the cap rather than leaving the
+        overshoot to sit there.
         """
         pool = server.ModernBackendPool(_BACKEND, max_children=1)
         try:
@@ -916,7 +923,13 @@ class TestModernBackendPool:
             other, _ = _checkout_and_release(pool, "other")
             assert other is not busy
             assert not busy.closed, "eviction killed a child mid-request"
-            assert pool.count() == 2, "the cap was enforced by breaking live work"
+            # `other`'s own release leaves it the only reapable entry
+            # (busy is still mid-request), so release()'s sweep (#379
+            # review) reclaims `other` immediately rather than letting
+            # the overshoot persist.
+            assert pool.count() == 1, (
+                "release() should have reclaimed the transient newcomer"
+            )
             assert done.wait(timeout=30)
         finally:
             pool.shutdown_all()
@@ -934,6 +947,13 @@ class TestModernBackendPool:
         The checkout refcount closes it by construction: the child is
         held from the moment it is returned. Reverting the `holds` clause
         of `_reapable_locked` makes this evict.
+
+        The newcomer itself does not survive the checkout, though (#379
+        review): `held` stays unevictable (still checked out), so once
+        `other` is released it is the ONLY reapable entry, and
+        `release()`'s own sweep reclaims it right away — trimming the
+        pool back to the cap rather than leaving the overshoot to sit
+        there.
         """
         pool = server.ModernBackendPool(_BACKEND, max_children=1)
         try:
@@ -945,7 +965,12 @@ class TestModernBackendPool:
             other, _ = _checkout_and_release(pool, "second")
             assert other is not held
             assert not held.closed, "a checked-out child was evicted mid-window"
-            assert pool.count() == 2, "the cap was enforced against a held child"
+            # `other`'s own release leaves it the only reapable entry
+            # (`held`/"first" is still checked out), so release()'s
+            # sweep (#379 review) reclaims `other` immediately.
+            assert pool.count() == 1, (
+                "release() should have reclaimed the transient newcomer"
+            )
         finally:
             pool.shutdown_all()
 
@@ -974,26 +999,30 @@ class TestModernBackendPool:
             pool.shutdown_all()
 
     def test_the_cap_is_rebounded_after_a_spawn_race(self):
-        """#376 §3.2 — an overshoot that used to be permanent.
+        """#376 §3.2 / #379 review — an overshoot that used to be permanent.
 
         Racing first-requests each insert a PENDING placeholder, and a
         placeholder is not evictable, so once the ready-quiet victims run
-        out every racer logs "exceeding the cap" and inserts anyway.
-        Nothing re-bounded that afterwards: the overshoot persisted until
-        the next NEW principal arrived — in a two-principal deployment,
-        never.
+        out every racer logs "exceeding the cap" and inserts anyway. That
+        is the overshoot this test provokes: both racers park with their
+        placeholders in the map before either publishes.
 
-        Both racers first park with their placeholders in the map, which
-        is what establishes the overshoot. They are then released ONE AT
-        A TIME, and that ordering is deliberate rather than incidental:
-        the second racer's post-spawn sweep can only reclaim the first
-        child once it is quiet AND released, so gating on that makes the
-        outcome deterministic instead of a race the CI host wins or loses
-        (it lost on Windows, where the slower spawn let both children be
-        held at once).
+        What resolves it, today, is `release()`'s own sweep (#379
+        review), not the post-spawn re-check this test originally
+        targeted: releasing alice makes her the ONLY reapable entry (bob
+        is still PENDING, not evictable), so her own release-sweep evicts
+        her immediately — the post-spawn sweep never gets a chance to act
+        first. This test now pins the OUTCOME (the pool re-bounds to the
+        cap once the race resolves), not a specific mechanism; the
+        release-sweep's own mechanism-level revert-check lives in
+        `test_release_re_sweeps_an_overshoot_left_by_a_spawn_race`.
 
-        Revert-check: without the post-spawn `_evict_if_at_cap_locked`
-        the count stays at 2.
+        Both racers are still released ONE AT A TIME, and that ordering
+        is still deliberate: it is what makes alice reapable-but-bob-not
+        at her release, so the outcome is deterministic rather than a
+        race the CI host wins or loses (it lost on Windows, where the
+        slower spawn let both children be held at once — see
+        `test_release_re_sweeps_...` for that simultaneous-hold shape).
         """
         pool = server.ModernBackendPool(_BACKEND, max_children=1)
         both_pending = threading.Barrier(3)
@@ -1027,17 +1056,92 @@ class TestModernBackendPool:
             both_pending.wait(timeout=15)
             assert pool.count() == 2, "the racers did not both hold a placeholder"
 
-            # Alice finishes and releases. Her own sweep finds nothing to
-            # take (bob is still PENDING), so the pool stays over cap.
+            # Alice finishes and releases. Bob is still PENDING (no
+            # backend yet), so he is not a candidate — alice is the ONLY
+            # reapable entry, and her own release-sweep (#379 review)
+            # reclaims her immediately.
             gates["alice"].set()
             assert done["alice"].wait(timeout=30)
-            assert pool.count() == 2, "alice's sweep should have found no victim"
+            assert pool.count() == 1, (
+                "alice's own release-sweep should have reclaimed her"
+            )
 
-            # Bob finishes. His sweep now finds alice ready, quiet and
-            # unheld — the overshoot is reclaimed.
+            # Bob finishes and releases. The pool is already back at cap,
+            # so this is a no-op sweep — the outcome (re-bounded to cap)
+            # was already reached by alice's release.
             gates["bob"].set()
             assert done["bob"].wait(timeout=30)
             assert pool.count() == 1, "the spawn-race overshoot was never re-bounded"
+        finally:
+            pool._spawn_and_handshake = real_spawn
+            for gate in gates.values():
+                gate.set()
+            for t in threads:
+                t.join(timeout=30)
+            pool.shutdown_all()
+
+    def test_release_re_sweeps_an_overshoot_left_by_a_spawn_race(self):
+        """#379 review, /code-review score 100: with `max_children=1`, two
+        principals racing their FIRST requests each insert a PENDING
+        placeholder, each spawns, each publishes — and unlike the
+        one-at-a-time release above, HERE both are released with the
+        OTHER still held throughout its own publish, so neither
+        publish-time sweep (#376 §3.2) can ever evict the other: the
+        pool settles at 2, BOTH held simultaneously. This is the
+        documented transient overshoot.
+
+        Before this fix, `release()` only decremented `holds` — nothing
+        re-swept afterward, so this overshoot was PERMANENT in a
+        fixed-principal deployment: no new principal ever arrives to
+        trigger the pre-insert sweep, and the idle reaper does not save
+        it at the default `--modern-idle-ttl 0`.
+        """
+        pool = server.ModernBackendPool(_BACKEND, max_children=1)
+        both_pending = threading.Barrier(3)
+        gates = {"alice": threading.Event(), "bob": threading.Event()}
+        published = {"alice": threading.Event(), "bob": threading.Event()}
+        entries: dict[str, dict] = {}
+        current = threading.local()
+        real_spawn = pool._spawn_and_handshake
+
+        def _gated_spawn():
+            both_pending.wait(timeout=15)
+            assert gates[current.principal].wait(timeout=15)
+            return real_spawn()
+
+        pool._spawn_and_handshake = _gated_spawn
+
+        def _racer(principal):
+            current.principal = principal
+            _, _, entry = pool.get_or_create(principal)
+            entries[principal] = entry
+            published[principal].set()
+            # Deliberately does NOT release — the main thread holds both
+            # checkouts open until it has proven the overshoot, then
+            # releases both itself (release() does not care which thread
+            # calls it).
+
+        threads = [
+            threading.Thread(target=_racer, args=(name,), daemon=True)
+            for name in ("alice", "bob")
+        ]
+        try:
+            for t in threads:
+                t.start()
+            both_pending.wait(timeout=15)
+            assert pool.count() == 2, "the racers did not both hold a placeholder"
+
+            gates["alice"].set()
+            gates["bob"].set()
+            assert published["alice"].wait(timeout=30)
+            assert published["bob"].wait(timeout=30)
+            # Both children are READY and HELD at once — the state that
+            # makes this a real overshoot, not merely two placeholders.
+            assert pool.count() == 2, "both children should still be held"
+
+            pool.release(entries["alice"])
+            pool.release(entries["bob"])
+            assert pool.count() == 1, "release() never re-swept the cap overshoot"
         finally:
             pool._spawn_and_handshake = real_spawn
             for gate in gates.values():
