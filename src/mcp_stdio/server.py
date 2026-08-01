@@ -54,6 +54,7 @@ from .relay import (
     _META_CLIENT_CAPABILITIES,
     _META_PROTOCOL_VERSION,
     _META_SERVER_INFO,
+    _META_SUBSCRIPTION_ID,
     _NAME_BEARING_METHODS,
     _decode_mcp_name,
     log,
@@ -1039,6 +1040,25 @@ class ModernBackendPool:
         # overrides a checkout, and an in-flight caller gets the same
         # failure the legacy path already produces at shutdown.
         self.stop_reaper()
+        # #374 §3.5: end every attached listen stream FIRST, so a stream
+        # emits its graceful terminal result before its child dies under
+        # it. The drain is what makes that promise real rather than
+        # aspirational: handler threads are daemons, so without it the
+        # process can exit between the signal and the flush and a
+        # compliant peer sees a stream that just stopped — which it reads
+        # as LOST and reconnects to a gateway that is going away.
+        # BOUNDED, so a wedged stream delays shutdown by at most
+        # `_LISTEN_DRAIN_SECS` instead of deadlocking it.
+        with self._lock:
+            entries = list(self._entries.values())
+        for entry in entries:
+            backend = entry.get("backend")
+            if backend is not None:
+                backend.close_listeners()
+        for entry in entries:
+            backend = entry.get("backend")
+            if backend is not None:
+                backend.drain_listeners(_LISTEN_DRAIN_SECS)
         with self._lock:
             entries = list(self._entries.values())
             self._entries.clear()
@@ -1153,10 +1173,13 @@ def _modern_response_status(msg: dict[str, Any]) -> int:
     Found` and ... `-32601`". Everything else keeps 200 and lets the
     JSON-RPC error speak — the client parses an error body at any status.
 
-    This is also the carve-out `subscriptions/listen` needs until 3.5-D
-    implements it: a legacy child answers it `-32601`, and that must
-    reach the client as 404 rather than as a 200 the client would treat
-    as a malformed success.
+    This used to double as the carve-out `subscriptions/listen` needed
+    while serve did not implement it (a legacy child answers it `-32601`,
+    which had to reach the client as 404 rather than as a 200 the client
+    would read as a malformed success). #374 removed that path by
+    intercepting the method in `_dispatch_modern` before it can reach a
+    child, so what remains here is only the general unknown-method rule
+    it always was.
     """
     error = msg.get("error")
     if isinstance(error, dict) and error.get("code") == _JSONRPC_METHOD_NOT_FOUND:
@@ -3387,6 +3410,205 @@ class _Handler(BaseHTTPRequestHandler):
         self._session_id = sid
         return backend
 
+    def _serve_listen_stream(
+        self, msg: dict[str, Any], req_id: Any, backend: BackendProcess
+    ) -> None:
+        """Answer `subscriptions/listen` with a long-lived SSE stream (#374).
+
+        Serve owns this method — it is never forwarded, the same posture
+        `server/discover` takes, and it replaces the carve-out that used
+        to let a legacy child answer `-32601` and turn it into a 404.
+
+        SCOPE: the listChanged trio only. `resourceSubscriptions` is
+        DECLINED by omitting it from the ack, which is spec-legal —
+        "Notification types the server does not support are omitted" —
+        and honest, since serve does not drive `resources/subscribe`
+        against the child yet (#381).
+
+        Order is the contract. Attach BEFORE the ack, so an event
+        published while the ack write is in flight is buffered rather
+        than lost; then the ack as the FIRST frame — "The server MUST
+        send `notifications/subscriptions/acknowledged` as the first
+        message ... and MUST NOT send any notification on the
+        subscription before it."
+
+        The honored subset is echoed at exactly `params.notifications`
+        and the id at exactly `params._meta[subscriptionId]`. That
+        nesting is load-bearing in both directions: a top-level echo is
+        silently ignored by a compliant client, which then forwards
+        nothing and reports no error. The `notifications` key is emitted
+        even when empty — the v2 client reads a missing one as malformed
+        and discards the whole ack.
+
+        All three requested booleans are honored unconditionally. A
+        subscription that never fires is still honored, and narrowing the
+        echo to what the child advertises would make a compliant peer
+        suppress events that do in fact arrive.
+        """
+        # Filter shape. Absent means "subscribed to nothing", which is a
+        # valid ack; present-but-not-an-object is malformed and rejected
+        # BEFORE the stream is committed, as a single JSON error.
+        params = msg.get("params")
+        requested = params.get("notifications") if isinstance(params, dict) else None
+        if requested is None:
+            requested = {}
+        if not isinstance(requested, dict):
+            self._send_json(
+                400,
+                _error_body(
+                    "params.notifications must be an object",
+                    req_id,
+                    code=_JSONRPC_INVALID_PARAMS,
+                ),
+            )
+            return
+
+        # The success path is an SSE stream, so a client that cannot
+        # accept one gets 406 rather than a stream it will not read.
+        accept = self.headers.get("Accept") or ""
+        if "text/event-stream" not in accept and "*/*" not in accept:
+            self._send_json(
+                406,
+                _error_body(
+                    "subscriptions/listen responds with an SSE stream; "
+                    "Accept must include text/event-stream",
+                    req_id,
+                    code=_JSONRPC_INVALID_REQUEST,
+                ),
+            )
+            return
+
+        honored = {
+            flag: True for flag in _LISTEN_FILTER_METHODS if requested.get(flag) is True
+        }
+        listener = _ListenStream(req_id, honored)
+
+        if len(backend._snapshot_listeners()) >= _LISTEN_MAX_STREAMS_PER_CHILD:
+            # Pre-ack rejection, single JSON: -32603 rather than a fresh
+            # -32000-range mint (O18).
+            self._send_json(
+                503,
+                _error_body(
+                    "too many concurrent subscription streams for this client",
+                    req_id,
+                    code=_JSONRPC_INTERNAL_ERROR,
+                ),
+            )
+            return
+
+        # Attach first (see the docstring): the buffer has to exist before
+        # anything can be published against it.
+        backend.attach_listener(listener)
+        unhonored = sorted(set(requested) - set(honored))
+        if unhonored:
+            log(f"listen {req_id!r}: not honoring {unhonored} (#374 serves the trio)")
+        try:
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            # RE-ASSERTED, and this line is load-bearing:
+            # `BaseHTTPRequestHandler.send_header` treats `Connection` as
+            # a COMMAND, not a string — the `keep-alive` above silently
+            # set `close_connection` back to False. An SSE body has
+            # neither Content-Length nor chunked framing, so the close IS
+            # its delimiter: leave this off and a stream that ends
+            # normally (graceful shutdown, dead child) leaves the client
+            # blocked on a socket nobody will ever write to again. The
+            # legacy GET stream never hit this because it only ever exits
+            # on the client's own disconnect.
+            self.close_connection = True
+            self._write_sse(
+                {
+                    "jsonrpc": "2.0",
+                    "method": _LISTEN_ACK_METHOD,
+                    "params": {
+                        "notifications": honored,
+                        "_meta": {_META_SUBSCRIPTION_ID: req_id},
+                    },
+                }
+            )
+            self._pump_listen_stream(listener, backend)
+        except (BrokenPipeError, ConnectionResetError, ValueError, OSError):
+            # The client went away. On HTTP "closing the SSE response
+            # stream is itself the cancellation signal and no
+            # notifications/cancelled message is expected", so this is an
+            # ordinary ending, not an error.
+            log(f"listen {req_id!r}: client disconnected")
+        finally:
+            backend.detach_listener(listener)
+
+    def _write_sse(self, message: dict[str, Any]) -> None:
+        self.wfile.write(f"data: {json.dumps(message)}\n\n".encode("utf-8"))
+        self.wfile.flush()
+
+    def _pump_listen_stream(
+        self, listener: _ListenStream, backend: BackendProcess
+    ) -> None:
+        """Deliver matching notifications until the stream ends (#374 §3.6).
+
+        Every frame carries the subscription id in `_meta` — the stamp is
+        transport-unconditional, and the v2 client routes by it, so an
+        unstamped frame never reaches the consumer.
+
+        How a stream ends decides what the peer should do next:
+
+        - gateway shutdown -> the empty `resultType: "complete"` result,
+          stamped, then close. That is the spec's own graceful example,
+          and it tells a peer not to come back.
+        - child death or backlog overflow -> close with NO terminal
+          frame. Serve is still alive; the contract is that the peer
+          re-listens and refetches.
+        - client disconnect -> nothing to send; the write failure above
+          is the signal.
+
+        NEVER a server-sent `notifications/cancelled`. The spec assigns
+        that message to the client->server, stdio-only direction, and the
+        v2 client settles a listen route naming it as LOST — so emitting
+        it would turn every graceful teardown into a failure at a
+        compliant peer. (This supersedes the "emit both signals" reading
+        recorded against O17 on #270.)
+        """
+        while True:
+            if listener.ending:
+                if listener.graceful:
+                    self._write_sse(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": listener.listen_id,
+                            "result": {
+                                "resultType": "complete",
+                                "_meta": {_META_SUBSCRIPTION_ID: listener.listen_id},
+                            },
+                        }
+                    )
+                return
+            if backend.closed:
+                # Abrupt: no terminal frame. Reachable when the child was
+                # already gone before this stream attached, so `_fail_all`
+                # had nobody to signal.
+                log(f"listen {listener.listen_id!r}: backend gone; closing the stream")
+                return
+            message = listener.next_message(_SSE_KEEPALIVE_SECS)
+            if message is None:
+                if listener.ending or backend.closed:
+                    # Woken to wind up, not to idle. The top of the loop
+                    # decides which ending this is.
+                    continue
+                # Keep-alive comment, and how a dead peer is noticed.
+                self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+                continue
+            stamped = dict(message)
+            params = dict(stamped.get("params") or {})
+            meta = dict(params.get("_meta") or {})
+            meta[_META_SUBSCRIPTION_ID] = listener.listen_id
+            params["_meta"] = meta
+            stamped["params"] = params
+            self._write_sse(stamped)
+
     def _reject_legacy_transport(self) -> None:
         """Answer 405 on a transport verb a modern-only deployment drops.
 
@@ -3477,12 +3699,36 @@ class _Handler(BaseHTTPRequestHandler):
             # liveness — but leaving modern-classified traffic to fall onto a
             # legacy session error would be a worse answer than 202.
             if kind == "notification":
+                if method == _LISTEN_METHOD:
+                    # #374 §3.9. `subscriptions/listen` is a REQUEST: its
+                    # id is what the ack stamps every frame with, so an
+                    # id-less one has nowhere to route. Rejected rather
+                    # than forwarded, matching the SDK's own
+                    # "subscriptions/listen requires a request id".
+                    self._send_json(
+                        400,
+                        _error_body(
+                            "subscriptions/listen requires a request id",
+                            code=_JSONRPC_INVALID_REQUEST,
+                        ),
+                    )
+                    return
                 backend.send_oneway(json.dumps(msg))
                 self._send_empty(202)
                 return
 
             # `server/discover` is answered HERE, never forwarded: a legacy
             # child has never heard of it and would answer -32601.
+            # `subscriptions/listen` is served HERE, never forwarded —
+            # the same posture discover takes, and what replaces the old
+            # carve-out (child -32601 -> 404). The pool hold taken above
+            # is deliberately kept for the whole stream: the `finally`
+            # below releases it only when the stream ends, which is what
+            # keeps the child unreapable while a client is listening.
+            if method == _LISTEN_METHOD:
+                self._serve_listen_stream(msg, req_id, backend)
+                return
+
             if method == _MODERN_DISCOVER_METHOD:
                 self._send_json(
                     200,
