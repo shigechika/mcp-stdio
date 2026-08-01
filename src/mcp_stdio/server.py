@@ -1550,6 +1550,14 @@ def _mrtr_decode_pointer(
     round_no = payload.get("round")
     if not isinstance(round_no, int) or isinstance(round_no, bool) or round_no < 1:
         return None, "malformed requestState round"
+    if round_no > _MRTR_MAX_ROUNDS:
+        # Enforced HERE, at the trust boundary, as well as wherever the
+        # next round is opened (#389 review). The retry handler is the
+        # natural place to refuse to go further, but this decoder is what
+        # decides a pointer is valid at all — so a mint-side regression
+        # cannot hand out a pointer that outlives the cap. A round beyond
+        # it is not a pointer worth honouring, whoever produced it.
+        return None, "requestState exceeded the maximum round count"
     if not isinstance(payload.get("txn_id"), str):
         return None, "malformed requestState txn"
     return payload, ""
@@ -2390,9 +2398,9 @@ class BackendProcess:
                 # catches the real regression: making expiry non-popping
                 # or retry-on-failure.
                 log(
-                    f"mrtr: round {entry['txn_id']!r} abandoned after "
-                    f"{_MRTR_PARK_TIMEOUT_SECS:g}s with no client retry; "
-                    "unblocking the child"
+                    f"mrtr: txn {entry['txn_id']!r} (round {entry['round']}) "
+                    f"abandoned after {_MRTR_PARK_TIMEOUT_SECS:g}s with no "
+                    "client retry; unblocking the child"
                 )
                 expired.append(
                     {**self._mrtr_pending.pop(upstream_id), "upstream_id": upstream_id}

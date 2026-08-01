@@ -30,7 +30,6 @@ from __future__ import annotations
 import ast
 import base64
 import json
-import pathlib
 import hmac
 import hashlib
 import os
@@ -3858,16 +3857,24 @@ class TestMrtrPointer:
     def test_a_tampered_payload_is_rejected(self):
         """O14: "servers MUST ... reject state that fails verification".
 
-        Every byte position is flipped in turn, so this cannot pass by
-        happening to mutate a field nothing reads.
+        Every byte of the payload is flipped in turn, so this cannot pass
+        by happening to mutate a field nothing reads.
+
+        Mutating the DECODED BYTES and re-encoding, not the base64 text
+        (#389 review): unpadded base64's final character carries unused
+        bits, so a text-level flip there can decode to the identical
+        bytes, verify fine, and make this assertion wrong for reasons
+        that have nothing to do with the property under test.
 
         Revert-check: drop the `compare_digest` check and this fails.
         """
         state = server._mrtr_encode_pointer("txn-1", "alice", 1)
-        raw_b64 = state.split(".")[0]
-        for i in range(len(raw_b64)):
-            swapped = "A" if raw_b64[i] != "A" else "B"
-            tampered = f"{raw_b64[:i]}{swapped}{raw_b64[i + 1 :]}.{state.split('.')[1]}"
+        raw_b64, mac_b64 = state.split(".")
+        raw = server._b64url_decode(raw_b64)
+        for i in range(len(raw)):
+            mutated = bytearray(raw)
+            mutated[i] ^= 0x01
+            tampered = f"{server._b64url(bytes(mutated))}.{mac_b64}"
             payload, why = server._mrtr_decode_pointer(tampered, "alice")
             assert payload is None, (i, tampered)
             assert why, i
@@ -3940,6 +3947,22 @@ class TestMrtrPointer:
         forged = f"{server._b64url(rewritten)}.{state.split('.')[1]}"
         assert server._mrtr_decode_pointer(forged, "alice")[0] is None
 
+    def test_a_round_beyond_the_cap_is_rejected(self):
+        """Enforced at the DECODER, not only wherever the next round is
+        opened (#389 review). The decoder is what decides a pointer is
+        valid at all, so a mint-side regression cannot hand out one that
+        outlives the cap.
+
+        Revert-check: drop the `> _MRTR_MAX_ROUNDS` check and this
+        returns a valid payload.
+        """
+        ok = server._mrtr_encode_pointer("t", "alice", server._MRTR_MAX_ROUNDS)
+        assert server._mrtr_decode_pointer(ok, "alice")[0] is not None
+        too_far = server._mrtr_encode_pointer("t", "alice", server._MRTR_MAX_ROUNDS + 1)
+        payload, why = server._mrtr_decode_pointer(too_far, "alice")
+        assert payload is None
+        assert "round" in why
+
     def test_a_bogus_round_value_is_rejected(self):
         for bad_round in (0, -1, "1", True, None):
             payload = {
@@ -3962,11 +3985,13 @@ class TestMrtrPointer:
         honest "unknown or expired" error into a silent misroute."""
         assert isinstance(server._MRTR_POINTER_KEY, bytes)
         assert len(server._MRTR_POINTER_KEY) == 32
-        # Nothing writes it anywhere.
-        source = pathlib.Path(server.__file__).read_text(encoding="utf-8")
-        assert source.count("_MRTR_POINTER_KEY") == 3, (
-            "the key should only be defined and used by encode/decode"
-        )
+        # A source-text scan used to stand in for "never persisted"
+        # (#389 review): it was brittle against any refactor and did not
+        # actually prove the property, since a key can be written out
+        # from anywhere. The real guarantee is structural — the key is a
+        # module-level `secrets.token_bytes` with no writer — and the
+        # observable consequence is pinned by the round-trip tests, which
+        # would fail if the key were ever reloaded rather than kept.
 
 
 class TestMrtrParkedRoundTable:
