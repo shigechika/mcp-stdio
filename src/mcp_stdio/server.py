@@ -670,13 +670,23 @@ class ModernBackendPool:
                 entry["error"] = str(exc)
                 entry["event"].set()
                 raise RuntimeError(str(exc)) from exc
-            entry["backend"] = backend
-            entry["init_result"] = init_result
-            entry["used"] = self._now()
-            # Taken under the lock like the other two return sites: this
-            # one runs outside it, and an unheld newborn is evictable by
-            # any racing principal before the caller has sent anything.
+            # PUBLICATION IS ATOMIC (#379 review R1F1). Backend, `used`
+            # and the initial hold all land in ONE lock hold, because any
+            # gap between them is a window where the entry looks READY,
+            # quiet and unheld — exactly what `_reapable_locked` accepts.
+            #
+            # The sharp version: `backend` used to be assigned before
+            # `used`, so a reaper landing in between read
+            # `entry.get("used", 0.0)` and saw a child that was
+            # apparently idle since the epoch. It would pop and shut down
+            # a backend this call was about to return, and the caller's
+            # first request then failed with a 504 against a corpse.
+            # Taking the hold last does not help if the publication
+            # itself is visible first.
             with self._lock:
+                entry["backend"] = backend
+                entry["init_result"] = init_result
+                entry["used"] = self._now()
                 entry["holds"] = entry.get("holds", 0) + 1
                 # Re-bound the cap after the spawn race (#376 §3.2).
                 # Racing first-requests each insert a PENDING placeholder

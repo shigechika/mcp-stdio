@@ -1612,3 +1612,51 @@ def test_serve_main_threads_both_new_flags_through():
 def test_a_negative_modern_idle_ttl_is_rejected():
     with pytest.raises(SystemExit):
         server.serve_main(["--modern-idle-ttl", "-1", "--", "python", "-c", "pass"])
+
+
+def test_a_newborn_child_is_published_atomically():
+    """#379 review R1F1 — a newborn must never be visible unheld.
+
+    Publication used to assign `entry["backend"]` before `entry["used"]`
+    and take the hold later still. A reaper landing in that gap saw a
+    READY, quiet, unheld entry whose `used` defaulted to 0.0 — a child
+    apparently idle since the epoch — popped it, and shut down the very
+    backend `get_or_create` was about to return. The caller's first
+    request then hit a corpse and came back 504.
+
+    Asserted structurally rather than by winning a race: the pool lock is
+    not reentrant, so `acquire(blocking=False)` from the publishing
+    thread tells us whether that thread already holds it. `_now()` is
+    called exactly where `used` is set, so probing there answers "was
+    publication inside the lock?" deterministically.
+
+    Revert-check: move the assignments back outside the `with` and the
+    probe records False.
+    """
+    observations: list[bool] = []
+    clock = [1000.0]
+
+    pool = server.ModernBackendPool(_BACKEND, idle_ttl=30.0, now=lambda: clock[0])
+
+    def _probing_now():
+        # False from a non-blocking acquire means this thread is already
+        # inside the lock — i.e. publication is atomic.
+        got = pool._lock.acquire(blocking=False)
+        if got:
+            pool._lock.release()
+        observations.append(not got)
+        return clock[0]
+
+    pool._now = _probing_now
+    try:
+        _, _, entry = pool.get_or_create("newborn")
+        assert observations, "the publication path never stamped `used`"
+        assert observations[-1] is True, (
+            "the newborn was published outside the pool lock — a reaper "
+            "could take it before its hold existed"
+        )
+        assert entry["holds"] == 1
+        assert entry["used"] == clock[0]
+        pool.release(entry)
+    finally:
+        pool.shutdown_all()
