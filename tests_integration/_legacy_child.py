@@ -62,7 +62,14 @@ INITIALIZE_RESULT: dict = {
     "capabilities": {
         "tools": {"listChanged": True},
         "prompts": {"listChanged": True},
-        "resources": {"subscribe": True, "listChanged": True},
+        # `--no-resource-subscribe` in argv drops `subscribe`, so a test can
+        # drive serve's #381 capability gate with a child that genuinely
+        # lacks the feature rather than by monkeypatching serve.
+        "resources": (
+            {"subscribe": True, "listChanged": True}
+            if "--no-resource-subscribe" not in sys.argv
+            else {"listChanged": True}
+        ),
     },
     "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
 }
@@ -186,6 +193,23 @@ def main() -> None:
             _send(PUSH_NOTIFICATION)
         elif method == "notifications/list_changed_push":  # a notification
             _send(LIST_CHANGED_NOTIFICATION)
+        elif method in ("resources/subscribe", "resources/unsubscribe") and has_id:
+            # #381. The legacy wire shape: an EMPTY result carrying no
+            # per-URI confirmation of any kind — which is exactly why
+            # serve drives these fire-and-forget rather than blocking its
+            # ack on them.
+            _result(req_id, {})
+        elif method == "notifications/resource_update_push":  # a notification
+            # Drives one `notifications/resources/updated` for the URI the
+            # caller names, so a test can prove per-URI routing rather
+            # than just "some notification arrived".
+            _send(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/resources/updated",
+                    "params": {"uri": (msg.get("params") or {}).get("uri")},
+                }
+            )
         elif method == "exit":
             sys.exit(0)
         elif has_id:

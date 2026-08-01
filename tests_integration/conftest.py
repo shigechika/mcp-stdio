@@ -396,6 +396,8 @@ def relay_factory() -> Iterator[Callable]:
 # The scripted legacy child serve fronts. `sys.executable` pins it to the
 # interpreter running the tests, like `spawn_relay`.
 LEGACY_CHILD_COMMAND = [sys.executable, str(_HERE / "_legacy_child.py")]
+# Same child, minus its `resources.subscribe` capability (#381 gate tests).
+LEGACY_CHILD_COMMAND_NO_SUBSCRIBE = [*LEGACY_CHILD_COMMAND, "--no-resource-subscribe"]
 
 _SERVE_START_TIMEOUT = 20.0
 _SERVE_STOP_TIMEOUT = 5.0
