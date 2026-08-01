@@ -462,10 +462,23 @@ class ModernBackendPool:
     unrelated principal behind it.
     """
 
-    def __init__(self, command: list[str], *, max_children: int = 0) -> None:
+    def __init__(
+        self,
+        command: list[str],
+        *,
+        max_children: int = 0,
+        idle_ttl: float = 0.0,
+        now: Any = time.monotonic,
+    ) -> None:
         if not command:
             raise ValueError("backend command is empty")
         self._command = command
+        # `now` is injectable so the reaper's TTL arithmetic can be driven
+        # by a fake clock in tests, the way `SessionRegistry` already is.
+        self._now = now
+        self._idle_ttl = idle_ttl
+        self._reaper: threading.Thread | None = None
+        self._reaper_stop = threading.Event()
         self._lock = threading.Lock()
         # principal -> entry. An entry is either READY (`backend` set) or
         # PENDING (a placeholder another thread is filling, `event` unset).
@@ -616,7 +629,7 @@ class ModernBackendPool:
                     mine = False
                     backend = entry.get("backend")
                     if backend is not None and not backend.closed:
-                        entry["used"] = time.monotonic()
+                        entry["used"] = self._now()
                         entry["holds"] = entry.get("holds", 0) + 1
                         return backend, entry["init_result"], entry
                     if backend is not None:
@@ -643,7 +656,7 @@ class ModernBackendPool:
                 if entry.get("backend") is not None and entry.get("error") is None:
                     with self._lock:
                         if self._entries.get(principal) is entry:
-                            entry["used"] = time.monotonic()
+                            entry["used"] = self._now()
                             entry["holds"] = entry.get("holds", 0) + 1
                             return entry["backend"], entry["init_result"], entry
                     continue
@@ -659,7 +672,7 @@ class ModernBackendPool:
                 raise RuntimeError(str(exc)) from exc
             entry["backend"] = backend
             entry["init_result"] = init_result
-            entry["used"] = time.monotonic()
+            entry["used"] = self._now()
             # Taken under the lock like the other two return sites: this
             # one runs outside it, and an unheld newborn is evictable by
             # any racing principal before the caller has sent anything.
@@ -692,6 +705,94 @@ class ModernBackendPool:
                 self._evict_if_at_cap_locked(reserve=0)
             entry["event"].set()
             return backend, init_result, entry
+
+    def reap_idle(self) -> int:
+        """Drop children idle past the TTL — or already dead — and return the count.
+
+        #376 §2.3. Two independent reasons to drop, and only one of them
+        is about time:
+
+        - `backend.closed`: reaped UNCONDITIONALLY, TTL or not, mirroring
+          the legacy reaper. Without it a dead child belonging to a
+          principal who never comes back pins a map slot and an unwaited
+          zombie for the life of the process — the lazy cleanup in
+          `get_or_create` only fires on that principal's NEXT request.
+        - idle past the TTL, and `_reapable_locked` — so a child with a
+          request on the wire, or one checked out but not yet sending, or
+          a PENDING placeholder, is never taken. `used` is last-ACQUIRED
+          time, which is why the refcount rather than the timestamp is
+          what protects a long-lived hold (#374's seam).
+
+        Selection and removal happen in ONE lock hold, so a concurrent
+        re-acquire either lands first (refreshing `used`, so we skip it)
+        or after the pop (finding nothing, and respawning cleanly).
+
+        Shutdown then happens OUTSIDE the lock, and deliberately
+        DIFFERENTLY from the legacy reaper's synchronous call: a live
+        victim is torn down on a daemon thread, because `shutdown()`
+        waits up to 5 s for a child to terminate and one wedged child
+        would otherwise stall the whole sweep and delay the next tick. A
+        child that is already `closed` is shut down directly — `poll()`
+        sees it dead and returns at once, so a thread would be pure
+        overhead.
+        """
+        ttl = self._idle_ttl
+        now = self._now()
+        dead: list[tuple[Any, BackendProcess]] = []
+        idle: list[tuple[Any, BackendProcess]] = []
+        with self._lock:
+            for key, entry in list(self._entries.items()):
+                backend = entry.get("backend")
+                if backend is None:
+                    continue
+                if backend.closed:
+                    self._entries.pop(key, None)
+                    dead.append((key, backend))
+                    continue
+                if (
+                    ttl > 0
+                    and now - entry.get("used", 0.0) > ttl
+                    and self._reapable_locked(entry)
+                ):
+                    self._entries.pop(key, None)
+                    idle.append((key, backend))
+        for key, backend in dead:
+            backend.shutdown()
+            log(f"reaped dead modern child for {key!r}")
+        for key, backend in idle:
+            log(f"reaped idle modern child for {key!r}")
+            threading.Thread(target=backend.shutdown, daemon=True).start()
+        return len(dead) + len(idle)
+
+    def start_reaper(self) -> None:
+        """Start the idle-eviction thread (no-op when the TTL is disabled).
+
+        A thread of its own rather than a tick on the legacy session
+        reaper: that one does not exist when `--session-idle-ttl` is 0,
+        and coupling the pool into `SessionRegistry` to borrow it would
+        buy nothing.
+        """
+        if self._idle_ttl <= 0 or self._reaper is not None:
+            return
+        self._reaper_stop.clear()  # allow a restart after a prior stop
+        interval = max(1.0, min(self._idle_ttl, _MAX_REAP_INTERVAL_SECS))
+
+        def _loop() -> None:
+            while not self._reaper_stop.wait(interval):
+                try:
+                    self.reap_idle()
+                except Exception as e:  # pragma: no cover - defensive
+                    log(f"modern pool reaper error: {e}")
+
+        self._reaper = threading.Thread(
+            target=_loop, name="modern-pool-reaper", daemon=True
+        )
+        self._reaper.start()
+
+    def stop_reaper(self) -> None:
+        """Signal the reaper thread to exit; it is a daemon, so no join."""
+        self._reaper_stop.set()
+        self._reaper = None
 
     def _spawn_and_handshake(self) -> tuple[BackendProcess, dict[str, Any]]:
         """Spawn a child and drive the handshake the modern wire omits."""
@@ -733,6 +834,12 @@ class ModernBackendPool:
             raise
 
     def shutdown_all(self) -> None:
+        # Stop the reaper first, mirroring `SessionRegistry.shutdown_all`:
+        # a sweep racing the teardown would shut children down twice.
+        # `holds` is deliberately IGNORED here — gateway shutdown
+        # overrides a checkout, and an in-flight caller gets the same
+        # failure the legacy path already produces at shutdown.
+        self.stop_reaper()
         with self._lock:
             entries = list(self._entries.values())
             self._entries.clear()
@@ -3386,6 +3493,7 @@ def build_server(
     idle_ttl: float = 0.0,
     max_sessions_per_owner: int = 0,
     cache_ttl_ms: int = _DEFAULT_CACHE_TTL_MS,
+    modern_idle_ttl: float = 0.0,
 ) -> tuple[ThreadingHTTPServer, SessionRegistry]:
     """Construct the HTTP server and session registry without running the loop.
 
@@ -3412,7 +3520,11 @@ def build_server(
     # pays a dict and a lock. The per-principal cap reuses the session
     # registry's per-owner value: the same operator knob answers the same
     # question ("how many children may one principal hold?") on both eras.
-    modern_pool = ModernBackendPool(command, max_children=max_sessions_per_owner)
+    modern_pool = ModernBackendPool(
+        command,
+        max_children=max_sessions_per_owner,
+        idle_ttl=modern_idle_ttl,
+    )
     handler = type(
         "_BoundHandler",
         (_Handler,),
@@ -3448,6 +3560,7 @@ def serve(
     idle_ttl: float = 0.0,
     max_sessions_per_owner: int = 0,
     cache_ttl_ms: int = _DEFAULT_CACHE_TTL_MS,
+    modern_idle_ttl: float = 0.0,
 ) -> None:
     """Run the reverse gateway until interrupted.
 
@@ -3468,8 +3581,12 @@ def serve(
         idle_ttl=idle_ttl,
         max_sessions_per_owner=max_sessions_per_owner,
         cache_ttl_ms=cache_ttl_ms,
+        modern_idle_ttl=modern_idle_ttl,
     )
     registry.start_reaper()
+    # Its own thread, gated on its own TTL — the legacy reaper may well
+    # be disabled while this one runs, and vice versa.
+    httpd.modern_pool.start_reaper()
 
     stopping = threading.Event()
 
@@ -3491,13 +3608,19 @@ def serve(
         modes.append("embedded OAuth AS")
     auth_state = " + ".join(modes) if modes else "no auth"
     ttl_state = f"idle-ttl {idle_ttl:g}s" if idle_ttl > 0 else "no idle eviction"
+    modern_ttl_state = (
+        f", modern idle-ttl {modern_idle_ttl:g}s"
+        if modern_idle_ttl > 0
+        else ", no modern idle eviction"
+    )
     per_owner_state = (
         f", max {max_sessions_per_owner}/owner" if max_sessions_per_owner > 0 else ""
     )
     log(
         f"serving {' '.join(command)} at "
         f"http://{host}:{port}{mcp_path} ({auth_state}; "
-        f"max {max_sessions} sessions{per_owner_state}, {ttl_state})"
+        f"max {max_sessions} sessions{per_owner_state}, "
+        f"{ttl_state}{modern_ttl_state})"
     )
     try:
         httpd.serve_forever()
@@ -3674,6 +3797,22 @@ def serve_main(argv: list[str]) -> None:
         ),
     )
     parser.add_argument(
+        "--modern-idle-ttl",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help=(
+            "Shut down a pooled backend for a modern (2026-07-28) client "
+            "after this many seconds with no request, reclaiming the "
+            "process. 0 (default) disables it. Separate from "
+            "--session-idle-ttl on purpose: evicting a modern child costs "
+            "only its warm-up, because those clients keep no session "
+            "state, so this can be far more aggressive than the legacy "
+            "one. A child serving a request, or handed to a request that "
+            "has not sent yet, is never reaped."
+        ),
+    )
+    parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
         help="backend stdio MCP server command (after the options)",
@@ -3723,6 +3862,8 @@ def serve_main(argv: list[str]) -> None:
         parser.error("--trusted-user-header must be a valid header name")
     if args.access_token_ttl <= 0:
         parser.error("--access-token-ttl must be > 0")
+    if args.modern_idle_ttl < 0 or not math.isfinite(args.modern_idle_ttl):
+        parser.error("--modern-idle-ttl must be a non-negative, finite number")
     if args.cache_ttl_ms < 0:
         # The spec's only constraint on the value: "Servers MUST provide a
         # ttlMs value that is >= 0."
@@ -3815,4 +3956,5 @@ def serve_main(argv: list[str]) -> None:
         idle_ttl=args.session_idle_ttl,
         max_sessions_per_owner=args.max_sessions_per_owner,
         cache_ttl_ms=args.cache_ttl_ms,
+        modern_idle_ttl=args.modern_idle_ttl,
     )

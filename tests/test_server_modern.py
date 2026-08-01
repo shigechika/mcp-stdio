@@ -1311,3 +1311,164 @@ def test_a_legacy_child_still_queues_server_initiated_traffic():
         assert backend.server_initiated.qsize() == 2
     finally:
         backend.shutdown()
+
+
+class TestModernPoolReaper:
+    """Idle eviction for pooled children (#376 §2).
+
+    A fake clock throughout — the reaper's only time input is the
+    injected `now`, so nothing here waits on wall time.
+    """
+
+    def _pool(self, clock, **kw):
+        return server.ModernBackendPool(
+            _BACKEND, idle_ttl=kw.pop("idle_ttl", 30.0), now=lambda: clock[0], **kw
+        )
+
+    def test_a_child_is_kept_until_the_ttl_elapses(self):
+        clock = [1000.0]
+        pool = self._pool(clock)
+        try:
+            _checkout_and_release(pool)
+            clock[0] += 29.0
+            assert pool.reap_idle() == 0
+            assert pool.count() == 1
+        finally:
+            pool.shutdown_all()
+
+    def test_a_child_idle_past_the_ttl_is_reaped(self):
+        clock = [1000.0]
+        pool = self._pool(clock)
+        try:
+            backend, _ = _checkout_and_release(pool)
+            clock[0] += 31.0
+            assert pool.reap_idle() == 1
+            assert pool.count() == 0
+            # Shutdown runs on a daemon thread, so observe the outcome
+            # rather than assuming it already happened.
+            deadline = time.monotonic() + 10
+            while not backend.closed and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert backend.closed
+        finally:
+            pool.shutdown_all()
+
+    def test_a_request_on_the_wire_protects_an_old_child(self):
+        """`used` is last-ACQUIRED time, so a long call looks idle by it."""
+        clock = [1000.0]
+        pool = self._pool(clock)
+        try:
+            backend, _ = _checkout_and_release(pool)
+            started = threading.Event()
+
+            def _occupy():
+                started.set()
+                backend.send_request(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": "slow",
+                            "method": "slow_echo",
+                            "params": {"delay": 2.0},
+                        }
+                    ),
+                    "slow",
+                    30.0,
+                )
+
+            worker = threading.Thread(target=_occupy, daemon=True)
+            worker.start()
+            assert started.wait(timeout=10)
+            deadline = time.monotonic() + 10
+            while not backend.has_pending and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert backend.has_pending
+
+            clock[0] += 31.0
+            assert pool.reap_idle() == 0, "reaped a child with a request on the wire"
+            worker.join(timeout=30)
+        finally:
+            pool.shutdown_all()
+
+    def test_a_held_child_is_never_reaped(self):
+        """The #374 seam: a hold outranks any timestamp.
+
+        This is the case a TTL alone cannot express — a listen stream may
+        sit subscribed for hours without the child being 'used'.
+        """
+        clock = [1000.0]
+        pool = self._pool(clock)
+        try:
+            _, _, entry = pool.get_or_create(None)  # held, never released
+            clock[0] += 3600.0
+            assert pool.reap_idle() == 0, "reaped a child that was checked out"
+            assert pool.count() == 1
+            pool.release(entry)
+            assert pool.reap_idle() == 1
+        finally:
+            pool.shutdown_all()
+
+    def test_a_pending_placeholder_is_never_reaped(self):
+        clock = [1000.0]
+        pool = self._pool(clock)
+        try:
+            with pool._lock:
+                pool._entries["ghost"] = {
+                    "event": threading.Event(),
+                    "backend": None,
+                    "error": None,
+                    "holds": 0,
+                }
+            clock[0] += 3600.0
+            assert pool.reap_idle() == 0
+            assert pool.count() == 1
+        finally:
+            with pool._lock:
+                pool._entries.pop("ghost", None)
+            pool.shutdown_all()
+
+    def test_a_dead_child_is_reaped_even_with_the_ttl_disabled(self):
+        """Otherwise a departed principal's zombie pins a slot forever —
+        the lazy cleanup only fires on that principal's next request."""
+        clock = [1000.0]
+        pool = self._pool(clock, idle_ttl=0.0)
+        try:
+            backend, _ = _checkout_and_release(pool)
+            backend.shutdown()
+            assert backend.closed
+            assert pool.reap_idle() == 1
+            assert pool.count() == 0
+        finally:
+            pool.shutdown_all()
+
+    def test_the_reaper_thread_only_starts_when_the_ttl_is_set(self):
+        clock = [1000.0]
+        off = self._pool(clock, idle_ttl=0.0)
+        try:
+            off.start_reaper()
+            assert not any(
+                t.name == "modern-pool-reaper" for t in threading.enumerate()
+            )
+        finally:
+            off.shutdown_all()
+
+        on = self._pool(clock, idle_ttl=30.0)
+        try:
+            on.start_reaper()
+            assert any(t.name == "modern-pool-reaper" for t in threading.enumerate())
+        finally:
+            on.shutdown_all()
+        # shutdown_all stops it; the daemon exits on its next tick.
+        assert on._reaper is None
+
+
+def test_build_server_threads_the_modern_idle_ttl_through():
+    httpd, registry = server.build_server(
+        _BACKEND, host="127.0.0.1", port=0, modern_idle_ttl=45.0
+    )
+    try:
+        assert httpd.modern_pool._idle_ttl == 45.0
+    finally:
+        registry.shutdown_all()
+        httpd.modern_pool.shutdown_all()
+        httpd.server_close()
