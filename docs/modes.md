@@ -84,6 +84,106 @@ You want this mode when:
 
 → Continue with **[Publish your stdio server](guides/serve.md)**.
 
+<a id="protocol-eras"></a>
+
+## Working with MCP 2026-07-28 servers
+
+**Usually you do not have to do anything.** mcp-stdio keeps talking to
+servers the way it always has, so upgrading changes nothing.
+
+If you connect to a server built for the newer MCP spec (2026-07-28), add
+one flag and mcp-stdio figures the rest out:
+
+```bash
+mcp-stdio --protocol-era auto https://mcp.example.com/mcp
+```
+
+Your MCP client — Claude Desktop, Claude Code, anything else — needs no
+changes at all. It keeps speaking the dialect it already knows, and
+mcp-stdio translates.
+
+### Which one am I getting?
+
+mcp-stdio prints the answer to stderr as it starts:
+
+```
+[mcp-stdio] protocol era: modern (auto-detected)
+```
+
+| What you see | What it means |
+|---|---|
+| `protocol era: modern (auto-detected)` | the server is a new one, and mcp-stdio is using the new protocol |
+| `protocol era: legacy (auto-detected)` | the server is an older one — nothing changes |
+| nothing printed | you did not pass `--protocol-era`, so the old protocol is in use |
+
+### The flag
+
+| Value | When to use it |
+|---|---|
+| `legacy` (**default**) | you don't think about it; behaves exactly as before |
+| `auto` | you don't know what the server is — mcp-stdio asks it once at startup and picks |
+| `modern` | you know the server is a new one and want to skip the extra question |
+
+`auto` costs one extra request when mcp-stdio starts. That is the only
+reason it is not the default.
+
+!!! note "Not for the old SSE transport"
+    `--protocol-era` only applies to the default transport. With
+    `--transport sse` it is ignored, and mcp-stdio tells you so:
+
+    ```
+    warning: --protocol-era auto is ignored on --transport sse
+    (always the pre-Streamable-HTTP legacy transport)
+    ```
+
+### What mcp-stdio does for you against a new server
+
+You should not notice any of this — that is the point — but if you are
+wondering what changed under the hood:
+
+- **Tools, resources and prompts work as usual.** The newer spec
+  reorganised how a client and server introduce themselves, and mcp-stdio
+  handles both sides of that.
+- **Notifications still arrive.** Newer servers deliver them over a
+  long-lived connection that mcp-stdio holds open for you, including
+  updates for resources you subscribed to.
+- **Prompts back to you still work.** When a server needs to ask you
+  something mid-call — a confirmation, a piece of text, permission to
+  sample — mcp-stdio turns that into the ordinary request your client
+  already knows how to show you, then continues the original call with
+  your answer.
+- **Cancelling actually stops the work.** Pressing escape now aborts the
+  request on the server instead of just hiding the reply. A few cases
+  still cannot be cut short mid-flight — a cancel that arrives in the same
+  instant as the request, a server that does all its work before it starts
+  replying, and long paginated lists — and in those the reply is still
+  discarded, so you never see a result you cancelled.
+
+### Publishing your own server with `serve`
+
+`mcp-stdio serve` handles both kinds of client on the same address, and
+your stdio server does not need to know which is which:
+
+```bash
+mcp-stdio serve -- python -m my_mcp_server
+```
+
+- **A newer client** connects without a handshake and without a session,
+  and mcp-stdio answers on your server's behalf — including how long
+  results may be cached (tune with
+  [`--cache-ttl-ms`](reference.md#modern-era-serve)).
+- **An older client** works exactly as it always has, with its own
+  isolated child process per session.
+
+For newer clients, mcp-stdio starts one copy of your server per
+authenticated user (or a single shared one if you run without
+authentication), because those clients have no session to tie a process to.
+
+!!! note "Not yet supported"
+    Newer clients that ask `serve` for a live notification stream get a
+    clear "not implemented" answer rather than silence. Planned in
+    [#374](https://github.com/shigechika/mcp-stdio/issues/374).
+
 ## Both at once
 
 The two roles compose. A common pattern: an operator publishes an internal

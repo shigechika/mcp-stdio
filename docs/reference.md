@@ -39,6 +39,26 @@ Arguments:
 | `--sse-read-timeout SEC` | 300 | Idle read timeout on the SSE GET stream (SSE transport only; 0 disables) |
 | `--no-tcp-keepalive` | — | Disable TCP keepalive on the HTTP socket |
 
+<a id="modern-era-client"></a>
+
+### Newer MCP servers (2026-07-28)
+
+Only needed when the server you connect to was built for the newer MCP
+spec. See [Working with MCP 2026-07-28 servers](modes.md#protocol-eras).
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--protocol-era {legacy,modern,auto}` | `legacy` | How to talk to the remote server. `legacy` behaves exactly as before; `auto` asks the server once at startup and picks for you; `modern` skips the question when you already know it is a newer server. Ignored (with a warning) on `--transport sse` |
+| `--listen-read-timeout SEC` | `300` | How long to wait on a quiet notification connection before reconnecting. Only used against newer servers. Unlike `--sse-read-timeout`, `0` is not allowed — the connection always needs a timeout. Silently ignored on `--transport sse` |
+
+!!! note "What `--check` does and does not cover"
+    `--check` confirms the server is reachable either way — if the older
+    handshake is refused it retries the way a newer server expects, so a
+    newer-only server still reports ✓. It is a connectivity check, though:
+    it does not exercise the rest of the newer behaviour, such as the
+    long-lived notification connection.
+
+
 ### Headers & Proxies
 
 | Flag | Description |
@@ -92,7 +112,7 @@ Arguments:
 |------|----------------------|-------------|
 | `--auth-token TOKEN` | `MCP_STDIO_SERVE_TOKEN` | Static bearer token (acts as OAuth Resource Server; optional) |
 | `--enable-oauth` | — | Enable embedded OAuth 2.1 Authorization Server (PKCE auth-code, DCR, refresh) |
-| `--public-url URL` | — | Public HTTPS URL pinning the issuer and well-known documents (required when behind a reverse proxy) |
+| `--public-url URL` | — | Public HTTPS URL pinning the issuer and well-known documents (strongly recommended behind a reverse proxy; serve still starts without it) |
 | `--trusted-user-header HEADER` | — | HTTP header name containing the authenticated user (trusted only because the fronting proxy strips client-supplied copies) |
 | `--dev-user USER` | — | **Insecure, testing only.** Stand-in user identity for loopback testing without real SSO |
 | `--access-token-ttl SECONDS` | `3600` | Access token lifetime in seconds |
@@ -107,6 +127,19 @@ Arguments:
 | `--session-idle-ttl SECONDS` | `0` (disabled) | Idle timeout; evict a session and its child after this much inactivity so a client that disconnects without DELETE does not pin a slot |
 | `--max-sessions-per-owner N` | `0` (disabled) | On a new initialize, LRU-evict that OAuth user's older sessions down to `N`, reclaiming ghosts left by a client that reconnects without DELETE; static-token and open-gateway sessions are exempt |
 
+<a id="modern-era-serve"></a>
+
+### Newer MCP clients (2026-07-28)
+
+Nothing to turn on — `serve` answers newer and older clients on the same
+address automatically. This flag only tunes what it tells newer clients
+about caching.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--cache-ttl-ms MS` | `60000` | How long (in milliseconds) a newer client may cache list-style results such as `tools/list`. `0` tells clients not to cache at all. Results are always marked private, never shared between users. Tool call results are never cached |
+
+
 ---
 
 ## Standards Conformance
@@ -116,6 +149,7 @@ mcp-stdio implements the following specifications:
 ### MCP (Model Context Protocol)
 
 - Streamable HTTP transport (current, spec rev 2025-06-18) — negotiated `MCP-Protocol-Version` is captured from `initialize` and sent on every subsequent request
+- Streamable HTTP transport, spec rev **2026-07-28** — capability discovery, per-request metadata and headers, session-less requests, cache hints on list results, the long-lived notification connection (client side), and mid-call requests back to the client. Opt in with `--protocol-era`; `serve` answers both revisions on one endpoint. Interoperability verified against python-sdk v2.0.0 in both directions
 - SSE transport (legacy, MCP 2024-11-05)
 - Client ID Metadata Documents (MCP 2025-11-25 draft extension) — see the OAuth section below
 

@@ -174,6 +174,30 @@ See Claude Code [#34498](https://github.com/anthropics/claude-code/issues/34498)
 **Solution:**
 Nothing to configure — mcp-stdio reconnects automatically and synthesizes a JSON-RPC error ("SSE stream disconnected before response arrived; please retry") for every request that was in flight when the stream dropped, instead of leaving your client hanging forever. Just retry the call once you see the error. This mirrors the failure mode reported in Claude Code [#60061](https://github.com/anthropics/claude-code/issues/60061); if possible, prefer upgrading the server to Streamable HTTP (the current MCP spec), which does not have this failure mode at all.
 
+### The server rejects requests with `400` and error code `-32020`
+
+**What it means:** the server thinks the request contradicts itself — the
+headers say one thing and the body says another — so it refuses rather
+than guessing.
+
+**If you are connecting to a remote server with mcp-stdio**, you did not
+cause this: mcp-stdio builds those headers itself and keeps them
+consistent. Something between you and the server is rewriting them —
+usually a proxy or an API gateway. Try connecting without it to confirm.
+
+**If you are running `mcp-stdio serve`** and a client gets this, that
+client is sending inconsistent requests; the error message names which
+header disagreed.
+
+Two similar-looking errors mean different things:
+
+| Code | Meaning | What to do |
+|---|---|---|
+| `-32020` | headers and body disagree | look for something rewriting headers in between |
+| `-32602` | the request is missing information the newer spec requires | usually an incomplete client |
+| `-32022` | the protocol version is not supported | the error lists the versions that are — pick one of those |
+
+
 ## Headless / SSH environment
 
 ### Cannot open browser for OAuth login in SSH or CI
