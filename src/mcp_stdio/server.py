@@ -2806,11 +2806,18 @@ class _Handler(BaseHTTPRequestHandler):
 
     protocol_version = "HTTP/1.1"
 
-    def _send_json(self, status: int, body: str) -> None:
+    def _send_json(
+        self, status: int, body: str, *, extra_headers: dict[str, str] | None = None
+    ) -> None:
         data = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        # Only `--modern-only`'s 405s pass anything here, and RFC 9110
+        # §15.5.6 makes one of them mandatory: "the origin server MUST
+        # generate an Allow header field in a 405 response".
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         sid = getattr(self, "_session_id", None)
         if sid is not None:
             self.send_header("Mcp-Session-Id", sid)
@@ -3100,6 +3107,35 @@ class _Handler(BaseHTTPRequestHandler):
         self._session_id = sid
         return backend
 
+    def _reject_legacy_transport(self) -> None:
+        """Answer 405 on a transport verb a modern-only deployment drops.
+
+        #376 §4.1. `--modern-only` says this endpoint serves the
+        2026-07-28 revision and nothing else, and that revision has no
+        session transport: no `GET` for a stream to resume, no `DELETE`
+        for a session to end. The spec's own guidance to "a server that
+        supports only this revision" is to answer 405 on those verbs.
+
+        `Allow: POST` is not decoration — RFC 9110 §15.5.6 requires a 405
+        to name the methods that ARE allowed, and that requirement comes
+        from HTTP rather than from MCP, so it holds whatever the body
+        looks like. A small JSON-RPC error body rides along so a client
+        that only reads bodies still gets a reason.
+
+        Placed after the auth gate on purpose (§6 Q3): an unauthenticated
+        probe sees exactly what it saw before, so the flag does not
+        change the endpoint's unauthenticated fingerprint.
+        """
+        self._send_json(
+            405,
+            _error_body(
+                "this endpoint serves only MCP 2026-07-28, which has no "
+                "session transport; use POST",
+                code=_JSONRPC_INVALID_REQUEST,
+            ),
+            extra_headers={"Allow": "POST"},
+        )
+
     def _dispatch_modern(self, kind: str, msg: dict[str, Any], req_id: Any) -> None:
         """Serve one validated modern request from a gateway-owned child.
 
@@ -3313,6 +3349,31 @@ class _Handler(BaseHTTPRequestHandler):
         # torn down by, a different principal.
         user = self._current_user()
         is_init = kind == "request" and msg.get("method") == "initialize"
+        if is_init and self.modern_only:
+            # --modern-only (#376 §4.1). A legacy `initialize` literally
+            # presents a `params.protocolVersion` this posture does not
+            # serve, and -32022 is the spec's own shape for exactly that
+            # — actionable, because an auto-negotiating client reads
+            # `data.supported` and retries at a version we do name.
+            #
+            # Only `initialize` is intercepted. With it refused no
+            # session can ever exist, so every other legacy POST already
+            # dies on the untouched sessionless-400 path below; rejecting
+            # them again would duplicate an existing rejection for no
+            # behavioural gain.
+            log("modern-only: refusing a legacy initialize")
+            self._send_json(
+                400,
+                _error_body(
+                    "this endpoint serves only MCP 2026-07-28; send "
+                    "per-request _meta instead of an initialize handshake",
+                    req_id,
+                    code=_MCP_UNSUPPORTED_PROTOCOL_VERSION,
+                    data={"supported": sorted(_SERVE_IMPLEMENTED_MODERN_VERSIONS)},
+                ),
+            )
+            return
+
         if is_init:
             # `initialize` starts a session (MCP spec item 1): spawn a fresh
             # child and mint an id, returned via the Mcp-Session-Id response
@@ -3416,6 +3477,13 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if not self._require_auth():
             return
+        # --modern-only: the session SSE stream is legacy transport.
+        # Everything above stays reachable — PRM/AS metadata and the
+        # auth gate are HTTP plumbing a modern-only deployment still
+        # needs to bootstrap OAuth.
+        if self.modern_only:
+            self._reject_legacy_transport()
+            return
         # The SSE stream carries a session's server-initiated messages, so it
         # must name an existing session: sessionless -> 400, unknown/terminated
         # (or another user's) -> 404 (drives the client's re-initialize), as on
@@ -3465,6 +3533,11 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if not self._require_auth():
             return
+        # --modern-only: DELETE ends a session, and this posture mints
+        # none. Rejected after the auth gate, like GET.
+        if self.modern_only:
+            self._reject_legacy_transport()
+            return
         sid_header = self.headers.get("Mcp-Session-Id")
         if not sid_header:
             self._send_json(400, _error_body("Mcp-Session-Id required"))
@@ -3494,6 +3567,7 @@ def build_server(
     max_sessions_per_owner: int = 0,
     cache_ttl_ms: int = _DEFAULT_CACHE_TTL_MS,
     modern_idle_ttl: float = 0.0,
+    modern_only: bool = False,
 ) -> tuple[ThreadingHTTPServer, SessionRegistry]:
     """Construct the HTTP server and session registry without running the loop.
 
@@ -3535,6 +3609,7 @@ def build_server(
             "auth_token": auth_token,
             "oauth": oauth,
             "cache_ttl_ms": cache_ttl_ms,
+            "modern_only": modern_only,
         },
     )
     httpd = ThreadingHTTPServer((host, port), handler)
@@ -3561,6 +3636,7 @@ def serve(
     max_sessions_per_owner: int = 0,
     cache_ttl_ms: int = _DEFAULT_CACHE_TTL_MS,
     modern_idle_ttl: float = 0.0,
+    modern_only: bool = False,
 ) -> None:
     """Run the reverse gateway until interrupted.
 
@@ -3582,6 +3658,7 @@ def serve(
         max_sessions_per_owner=max_sessions_per_owner,
         cache_ttl_ms=cache_ttl_ms,
         modern_idle_ttl=modern_idle_ttl,
+        modern_only=modern_only,
     )
     registry.start_reaper()
     # Its own thread, gated on its own TTL — the legacy reaper may well
@@ -3607,6 +3684,7 @@ def serve(
     if oauth is not None:
         modes.append("embedded OAuth AS")
     auth_state = " + ".join(modes) if modes else "no auth"
+    posture = "modern-only" if modern_only else "dual-era"
     ttl_state = f"idle-ttl {idle_ttl:g}s" if idle_ttl > 0 else "no idle eviction"
     modern_ttl_state = (
         f", modern idle-ttl {modern_idle_ttl:g}s"
@@ -3620,7 +3698,7 @@ def serve(
         f"serving {' '.join(command)} at "
         f"http://{host}:{port}{mcp_path} ({auth_state}; "
         f"max {max_sessions} sessions{per_owner_state}, "
-        f"{ttl_state}{modern_ttl_state})"
+        f"{ttl_state}{modern_ttl_state}, {posture})"
     )
     try:
         httpd.serve_forever()
@@ -3797,6 +3875,17 @@ def serve_main(argv: list[str]) -> None:
         ),
     )
     parser.add_argument(
+        "--modern-only",
+        action="store_true",
+        help=(
+            "Serve ONLY MCP 2026-07-28 clients. Legacy clients are turned "
+            "away instead of being given a session: GET and DELETE answer "
+            "405, and a legacy initialize gets -32022 naming the versions "
+            "this endpoint does serve. Off by default, and off is "
+            "byte-identical to not having the flag."
+        ),
+    )
+    parser.add_argument(
         "--modern-idle-ttl",
         type=float,
         default=0.0,
@@ -3957,4 +4046,5 @@ def serve_main(argv: list[str]) -> None:
         max_sessions_per_owner=args.max_sessions_per_owner,
         cache_ttl_ms=args.cache_ttl_ms,
         modern_idle_ttl=args.modern_idle_ttl,
+        modern_only=args.modern_only,
     )

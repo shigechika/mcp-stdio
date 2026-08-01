@@ -1472,3 +1472,143 @@ def test_build_server_threads_the_modern_idle_ttl_through():
         registry.shutdown_all()
         httpd.modern_pool.shutdown_all()
         httpd.server_close()
+
+
+class TestModernOnly:
+    """The `--modern-only` posture (#376 §4).
+
+    The era predicate is untouched — the flag acts AFTER classification,
+    so modern traffic is byte-identical with it on or off.
+    """
+
+    @pytest.fixture()
+    def strict(self):
+        httpd, registry = server.build_server(
+            _BACKEND, host="127.0.0.1", port=0, modern_only=True
+        )
+        host, port = httpd.server_address[0], httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield f"http://{host}:{port}/mcp"
+        finally:
+            httpd.shutdown()
+            registry.shutdown_all()
+            httpd.modern_pool.shutdown_all()
+            httpd.server_close()
+
+    def test_get_is_405_with_an_allow_header(self, strict):
+        """RFC 9110 §15.5.6 requires `Allow` on a 405 — that requirement
+        is HTTP's, not MCP's, so it holds whatever the body says."""
+        resp = httpx.get(strict, timeout=10)
+        assert resp.status_code == 405
+        assert resp.headers["allow"] == "POST"
+        assert resp.json()["error"]["code"] == -32600
+
+    def test_delete_is_405_with_an_allow_header(self, strict):
+        resp = httpx.request("DELETE", strict, timeout=10)
+        assert resp.status_code == 405
+        assert resp.headers["allow"] == "POST"
+
+    def test_a_legacy_initialize_is_refused_with_the_supported_versions(self, strict):
+        """-32022 is actionable where a bare 400 is not: an
+        auto-negotiating client reads `data.supported` and retries."""
+        resp = _post(strict, {"jsonrpc": "2.0", "id": "init", "method": "initialize"})
+        assert resp.status_code == 400
+        error = resp.json()["error"]
+        assert error["code"] == -32022
+        assert error["data"]["supported"] == [MODERN_VERSION]
+        assert resp.json()["id"] == "init"
+        assert "mcp-session-id" not in resp.headers
+
+    def test_other_legacy_posts_take_the_untouched_sessionless_path(self, strict):
+        """With initialize refused no session can exist, so everything
+        else already dies on the existing path — the flag adds no second
+        rejection for it."""
+        resp = _post(strict, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        assert resp.status_code == 400
+        assert resp.json()["error"]["code"] == LEGACY_ERROR
+
+    def test_modern_traffic_is_unaffected(self, strict):
+        discover = _post(
+            strict,
+            _modern_body("server/discover", meta=_meta()),
+            _modern_headers("server/discover"),
+        )
+        assert discover.status_code == 200
+        assert discover.json()["result"]["supportedVersions"] == [MODERN_VERSION]
+
+        listed = _post(strict, _modern_body(meta=_meta()), _modern_headers())
+        assert listed.status_code == 200
+        assert listed.json()["result"]["resultType"] == "complete"
+
+    def test_the_flag_defaults_off(self, gateway):
+        """The unit-level twin of the pin suite — NOT an edit to it.
+
+        With the flag unset, GET and DELETE behave exactly as they always
+        have: a sessionless GET is 400 (not 405), and DELETE likewise.
+        """
+        get = httpx.get(gateway, timeout=10)
+        assert get.status_code == 400
+        assert "allow" not in get.headers
+        delete = httpx.request("DELETE", gateway, timeout=10)
+        assert delete.status_code == 400
+
+        init = _post(gateway, {"jsonrpc": "2.0", "id": "i", "method": "initialize"})
+        assert init.status_code == 200
+        assert init.headers.get("mcp-session-id")
+
+
+def test_modern_only_keeps_the_oauth_discovery_endpoints_reachable():
+    """The carve-out: PRM and AS metadata are HTTP plumbing, not MCP
+    transport, and a modern-only deployment still needs them to bootstrap
+    OAuth. They are routed before the 405."""
+    provider = server._OAuthProvider(
+        public_url=None, trusted_user_header=None, dev_user="alice"
+    )
+    httpd, registry = server.build_server(
+        _BACKEND, host="127.0.0.1", port=0, modern_only=True, oauth=provider
+    )
+    host, port = httpd.server_address[0], httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://{host}:{port}"
+    try:
+        prm = httpx.get(f"{base}/.well-known/oauth-protected-resource/mcp", timeout=10)
+        assert prm.status_code == 200, prm.text
+        as_meta = httpx.get(
+            f"{base}/.well-known/oauth-authorization-server", timeout=10
+        )
+        assert as_meta.status_code == 200, as_meta.text
+    finally:
+        httpd.shutdown()
+        registry.shutdown_all()
+        httpd.modern_pool.shutdown_all()
+        httpd.server_close()
+
+
+def test_serve_main_threads_both_new_flags_through():
+    """Both knobs have to survive `serve_main` -> `serve`, and neither has
+    a runtime effect a parse test would otherwise notice."""
+    seen: dict = {}
+
+    def _fake_serve(command, **kwargs):
+        seen.update(kwargs)
+
+    with patch.object(server, "serve", _fake_serve):
+        server.serve_main(
+            ["--modern-only", "--modern-idle-ttl", "45", "--", "python", "-c", "pass"]
+        )
+    assert seen["modern_only"] is True
+    assert seen["modern_idle_ttl"] == 45.0
+
+    seen.clear()
+    with patch.object(server, "serve", _fake_serve):
+        server.serve_main(["--", "python", "-c", "pass"])
+    assert seen["modern_only"] is False
+    assert seen["modern_idle_ttl"] == 0.0
+
+
+def test_a_negative_modern_idle_ttl_is_rejected():
+    with pytest.raises(SystemExit):
+        server.serve_main(["--modern-idle-ttl", "-1", "--", "python", "-c", "pass"])
