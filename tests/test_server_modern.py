@@ -2336,6 +2336,14 @@ class TestListenDelivery:
         (None, True),
         ("", True),
         ("text/event-stream ; q=0", False),
+        # #382 review R6F1: a positive wildcard must not override a more
+        # specific explicit refusal — RFC 9110 §12.5.1 says the MOST
+        # SPECIFIC matching range decides.
+        ("text/event-stream;q=0, */*", False),
+        ("text/event-stream;q=0, */*;q=1", False),
+        ("text/*;q=0, */*", False),  # subtype wildcard beats full wildcard
+        ("text/event-stream, text/*;q=0", True),  # exact beats subtype wildcard
+        ("text/event-stream;q=0, text/event-stream", True),  # same-tier: max
     ],
 )
 def test_accepts_sse_matches_media_ranges(accept_header, expected):
@@ -2350,6 +2358,14 @@ def test_accepts_sse_matches_media_ranges(accept_header, expected):
     9110 §12.5.1's "accept anything", which the substring check also
     got backwards (`""` contains no substring, so omitting Accept
     entirely earned a 406).
+
+    The R6F1 rows are precedence, not matching: `_accepts_sse` used to
+    accept if ANY matching range had `q>0`, so a trailing `*/*` could
+    override an explicit `text/event-stream;q=0` refusal earlier in the
+    same header. RFC 9110 §12.5.1 says the MOST SPECIFIC matching range
+    decides — exact beats `text/*` beats `*/*` — and the last row is the
+    documented same-tier tie-break (the range listed twice with
+    different `q` takes the max, leniently).
     """
     assert server._accepts_sse(accept_header) is expected
 
@@ -2438,6 +2454,28 @@ class TestListenRejections:
             gateway,
             _listen_body(),
             {**_modern_headers(LISTEN_METHOD), "Accept": "text/event-stream;q=0"},
+        )
+        assert resp.status_code == 406, resp.text
+        assert resp.json()["error"]["code"] == INVALID_REQUEST
+
+    def test_a_positive_wildcard_does_not_override_an_explicit_refusal(self, gateway):
+        """#382 review R6F1. A trailing `*/*;q=1` used to overrule an
+        earlier, more specific `text/event-stream;q=0` refusal — the old
+        logic accepted if ANY matching range had `q>0`. RFC 9110 §12.5.1
+        says the MOST SPECIFIC matching range decides, so the explicit
+        refusal wins regardless of what a wildcard later in the same
+        header says.
+
+        Revert-check: restore the any-match logic and this gets a 200
+        stream instead of a 406.
+        """
+        resp = _post(
+            gateway,
+            _listen_body(),
+            {
+                **_modern_headers(LISTEN_METHOD),
+                "Accept": "text/event-stream;q=0, */*;q=1",
+            },
         )
         assert resp.status_code == 406, resp.text
         assert resp.json()["error"]["code"] == INVALID_REQUEST

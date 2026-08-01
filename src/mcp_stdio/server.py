@@ -486,9 +486,23 @@ def _accepts_sse(accept_header: str | None) -> bool:
     case-insensitive, RFC 9110 §8.3.1). An unparsable `q` parameter is
     treated as `q=1` — lenient parsing, consistent with the rest of this
     header's handling — rather than rejected outright.
+
+    A POSITIVE wildcard does not override a more specific explicit
+    REFUSAL (#382 review R6F1). `text/event-stream;q=0, */*` used to
+    accept — some matching range had `q>0` — but RFC 9110 §12.5.1 says
+    the MOST SPECIFIC matching range decides a media type's quality:
+    exact `text/event-stream` beats `text/*`, which beats `*/*`. So the
+    effective q is looked up by specificity tier, not "any match with
+    q>0": if the header explicitly refuses `text/event-stream`, a
+    trailing `*/*` cannot undo that. Within one tier, the SAME range
+    listed twice with different q (self-contradictory, but headers are
+    attacker- or bug-supplied) takes the MAX — lenient toward
+    acceptance, matching this function's other leniencies (an
+    unparsable `q`, an absent header).
     """
     if not accept_header:
         return True
+    tier_q: dict[str, float] = {}
     for range_spec in accept_header.split(","):
         params = range_spec.split(";")
         media_range = params[0].strip().casefold()
@@ -502,8 +516,10 @@ def _accepts_sse(accept_header: str | None) -> bool:
                     q = float(value.strip())
                 except ValueError:
                     q = 1.0
-        if q > 0:
-            return True
+        tier_q[media_range] = max(q, tier_q.get(media_range, 0.0))
+    for media_range in ("text/event-stream", "text/*", "*/*"):
+        if media_range in tier_q:
+            return tier_q[media_range] > 0
     return False
 
 
