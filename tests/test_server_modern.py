@@ -973,6 +973,64 @@ class TestModernBackendPool:
         finally:
             pool.shutdown_all()
 
+    def test_the_cap_is_rebounded_after_a_spawn_race(self):
+        """#376 §3.2 — an overshoot that used to be permanent.
+
+        Racing first-requests each insert a PENDING placeholder, and a
+        placeholder is not evictable, so once the ready-quiet victims run
+        out every racer logs "exceeding the cap" and inserts anyway.
+        Nothing re-bounded that afterwards: the overshoot persisted until
+        the next NEW principal arrived — in a two-principal deployment,
+        never.
+
+        Both spawns are gated on one event so the placeholders provably
+        coexist. After both finish and both holds are released, the pool
+        must be back at the cap.
+
+        Revert-check: without the post-spawn `_evict_if_at_cap_locked()`
+        the count stays at 2.
+        """
+        pool = server.ModernBackendPool(_BACKEND, max_children=1)
+        gate = threading.Event()
+        both_pending = threading.Barrier(3)
+        results: list = []
+        lock = threading.Lock()
+        real_spawn = pool._spawn_and_handshake
+
+        def _gated_spawn():
+            # Both racers park here, so both placeholders are in the map
+            # at once — the state that produces the overshoot.
+            both_pending.wait(timeout=15)
+            assert gate.wait(timeout=15)
+            return real_spawn()
+
+        pool._spawn_and_handshake = _gated_spawn
+
+        def _racer(principal):
+            backend, _, entry = pool.get_or_create(principal)
+            pool.release(entry)
+            with lock:
+                results.append((principal, backend))
+
+        threads = [
+            threading.Thread(target=_racer, args=(p,), daemon=True)
+            for p in ("alice", "bob")
+        ]
+        try:
+            for t in threads:
+                t.start()
+            both_pending.wait(timeout=15)
+            assert pool.count() == 2, "the racers did not both hold a placeholder"
+            gate.set()
+            for t in threads:
+                t.join(timeout=30)
+            assert len(results) == 2
+            assert pool.count() == 1, "the spawn-race overshoot was never re-bounded"
+        finally:
+            pool._spawn_and_handshake = real_spawn
+            gate.set()
+            pool.shutdown_all()
+
     def test_a_child_that_never_answers_initialize_raises(self):
         """A failed handshake leaves no entry behind to poison retries."""
         pool = server.ModernBackendPool(

@@ -659,6 +659,28 @@ class ModernBackendPool:
             # any racing principal before the caller has sent anything.
             with self._lock:
                 entry["holds"] = entry.get("holds", 0) + 1
+                # Re-bound the cap after the spawn race (#376 §3.2).
+                # Racing first-requests each insert a PENDING placeholder
+                # under the lock, and a placeholder is not evictable — so
+                # once the ready-quiet victims run out, every racer logs
+                # "exceeding the cap" and inserts anyway. Nothing
+                # re-bounded that afterwards: the overshoot persisted
+                # until the next NEW principal arrived, which in a
+                # two-principal deployment is never.
+                #
+                # Re-checking here reclaims children that went quiet
+                # while we were spawning. It is safe ONLY because the
+                # hold above is already taken: the newborn this call is
+                # about to return has `holds == 1`, so the sweep cannot
+                # choose it — no "exclude my own key" special case
+                # needed. That ordering is the reason this commit follows
+                # the refcount one.
+                #
+                # If nothing qualifies the cap stays soft-exceeded, which
+                # is the documented posture: every alternative kills work
+                # already in flight. The reaper makes that exceedance
+                # time-bounded rather than permanent.
+                self._evict_if_at_cap_locked()
             entry["event"].set()
             return backend, init_result, entry
 
