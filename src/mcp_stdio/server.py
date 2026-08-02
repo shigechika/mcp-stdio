@@ -5686,7 +5686,26 @@ class _Handler(BaseHTTPRequestHandler):
             request_state = (
                 params_obj.get("requestState") if isinstance(params_obj, dict) else None
             )
-            if request_state is not None:
+            # ...AND only for a method that could have OPENED one. The
+            # spec's own words are "retrying the ORIGINAL request", so a
+            # `requestState` riding some other method is not a retry of
+            # anything (#390 Copilot review).
+            #
+            # Without this, `params.requestState` alone was enough: a
+            # client that reused a params object — or was simply buggy —
+            # could put a live pointer on, say, `resources/list` and have
+            # the gateway treat it as the retry. Single-use consumption
+            # then destroyed the round, so the REAL retry had nothing
+            # left to resume and the original `tools/call` could never
+            # be answered. The response would also carry the wrong
+            # method into `_stamp_modern_result`, applying
+            # `resources/list` cache semantics to a `tools/call` result.
+            #
+            # FALL THROUGH rather than reject, deliberately: the round
+            # stays parked and a correct retry can still redeem it, so a
+            # client bug costs one confused request instead of the whole
+            # transaction. (An abandoned round is swept either way.)
+            if request_state is not None and method in _MRTR_ELIGIBLE_METHODS:
                 self._serve_mrtr_retry(
                     msg,
                     req_id,

@@ -5344,3 +5344,88 @@ class TestMrtrHostileChildAndFlagGate:
         assert server._modern_child_capabilities() != {}
         monkeypatch.delenv("MCP_STDIO_MRTR_REVERSE_ENABLE", raising=False)
         assert server._modern_child_capabilities() == {}
+
+
+class TestMrtrRetryMethodGate:
+    """A `requestState` is only a retry OF THE METHOD THAT OPENED THE ROUND."""
+
+    def test_a_pointer_on_a_non_eligible_method_is_not_a_retry(self, gateway_with_pool):
+        """#390 Copilot review. `params.requestState` alone used to be
+        enough to enter the retry path, whatever the method was.
+
+        The damage compounds: single-use consumption destroys the round,
+        so the REAL retry finds nothing left and the original
+        `tools/call` can never be answered — while the response carries
+        the wrong method into `_stamp_modern_result`, applying
+        `resources/list` cache semantics to a `tools/call` result.
+
+        WIRE EVIDENCE that it fell through to ordinary dispatch: the
+        child answers `resources/list` itself (`-32601`, since the fake
+        child does not implement it) rather than the gateway synthesizing
+        a resumed result — and crucially the round is STILL PARKED
+        afterwards, which is what lets a correct retry succeed.
+
+        Revert-check: drop `and method in _MRTR_ELIGIBLE_METHODS` and the
+        round is consumed by a request that never opened it.
+        """
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        txn = backend.mrtr_round_open(
+            "U1",
+            method="tools/call",
+            child_request_id="child-7",
+            declared_caps={},
+            principal=None,
+        )
+        state = server._mrtr_encode_pointer(txn, None, 1)
+        resp = _post(
+            url,
+            {
+                "jsonrpc": "2.0",
+                "id": "stray-1",
+                "method": "resources/list",
+                "params": {"_meta": _meta(), "requestState": state},
+            },
+            _modern_headers("resources/list"),
+        )
+        # Ordinary dispatch: the CHILD answered, not the bridge.
+        assert resp.status_code == 404, resp.text
+        assert resp.json()["error"]["code"] == -32601
+        # And the round survived for the request that actually owns it.
+        assert backend.mrtr_round_for_txn(txn) is not None, (
+            "a stray method consumed a round it never opened"
+        )
+
+    def test_an_eligible_method_still_takes_the_retry_path(self, gateway_with_pool):
+        """The gate must not break the three methods that CAN open a
+        round — otherwise the fix trades one bug for a worse one."""
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        for method in sorted(server._MRTR_ELIGIBLE_METHODS):
+            txn = backend.mrtr_round_open(
+                "U1",
+                method=method,
+                child_request_id="c1",
+                declared_caps={},
+                principal=None,
+            )
+            state = server._mrtr_encode_pointer(txn, None, 1)
+            backend.send_oneway = lambda line: True  # type: ignore[method-assign]
+            resp = _post(
+                url,
+                {
+                    "jsonrpc": "2.0",
+                    "id": f"retry-{method}",
+                    "method": method,
+                    "params": {"_meta": _meta(), "requestState": state},
+                },
+                _modern_headers(method),
+            )
+            # Reached `_serve_mrtr_retry`: it rejects for a MISSING
+            # `inputResponses`, which only that path can produce.
+            assert resp.status_code == 400, (method, resp.text)
+            assert "inputResponses" in resp.json()["error"]["message"], method
+            # And it consumed the round, as a real retry does.
+            assert backend.mrtr_round_for_txn(txn) is None, method
