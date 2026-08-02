@@ -5797,9 +5797,16 @@ class _Handler(BaseHTTPRequestHandler):
             # principal: it guards correlation, it is not a feature gate,
             # and narrowing it would reintroduce the ambiguity for
             # exactly the deployments least able to tolerate it.
+            # Minted BEFORE the context is built, so the context is
+            # complete when it is published and is never mutated
+            # afterwards (#390 Copilot review). `_mint_modern_id` is an
+            # independent process-global counter — it does not depend on
+            # the claim succeeding — so moving it earlier costs nothing
+            # but an id on the paths that then reject.
+            upstream_id = _mint_modern_id()
             mrtr_context = (
                 {
-                    "upstream_id": None,  # filled in once minted, below
+                    "upstream_id": upstream_id,
                     "declared_caps": (
                         declared_caps if isinstance(declared_caps, dict) else {}
                     ),
@@ -5853,12 +5860,6 @@ class _Handler(BaseHTTPRequestHandler):
                     return
                 mrtr_claimed = True
 
-            upstream_id = _mint_modern_id()
-            # The context was published with the claim (so no window
-            # exists where a bridge could see a half-built one); the id
-            # is the last field and only knowable now.
-            if mrtr_context is not None:
-                mrtr_context["upstream_id"] = upstream_id
             outbound = dict(msg)
             outbound["id"] = upstream_id
             line = backend.send_request(
