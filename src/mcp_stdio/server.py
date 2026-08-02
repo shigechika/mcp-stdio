@@ -1767,7 +1767,24 @@ def _mrtr_request_to_input_entry(msg: dict[str, Any]) -> tuple[str | None, Any]:
     produce would be dead code pretending to be symmetry.
     """
     method = msg.get("method")
-    capability = _MRTR_REQUEST_CAPABILITY.get(method) if method else None
+    # `isinstance(method, str)` BEFORE the dict lookup, and the type
+    # check is load-bearing rather than tidiness (#390 Copilot review):
+    # a truthy-but-unhashable `method` — `{"method": {"a": 1}}` from a
+    # misbehaving or hostile child — made `.get(method)` raise
+    # `TypeError: unhashable type`. This runs on the child's READER
+    # thread, whose `try/except` sits OUTSIDE its `while` loop, so the
+    # raise did not merely drop one message: it ended the loop, hit
+    # `finally: _fail_all("backend process exited")`, and failed every
+    # in-flight request on that child. One malformed field killed all
+    # traffic to a live subprocess — a DoS with a two-character payload.
+    #
+    # A non-string method simply is not bridgeable, so it takes the
+    # ordinary `capability is None` path and falls through to D4's
+    # `-32601`, which is where every other unbridgeable shape already
+    # goes.
+    capability = (
+        _MRTR_REQUEST_CAPABILITY.get(method) if isinstance(method, str) else None
+    )
     if capability is None:
         return None, "the child requested an input kind this gateway cannot bridge"
     entry: dict[str, Any] = {"method": method}
@@ -5702,7 +5719,29 @@ class _Handler(BaseHTTPRequestHandler):
                     "principal": principal,
                     "round": 1,
                 }
+                # BOTH gates, and the second one was missing (#390
+                # Copilot review). `_modern_child_capabilities()` was
+                # consulted only where serve ADVERTISES to a child, so
+                # `MCP_STDIO_MRTR_REVERSE_ENABLE=0` withdrew the offer
+                # while leaving the bridge itself live: a child that
+                # ignored the advertisement and asked anyway was still
+                # bridged, provided the caller was OAuth-authenticated.
+                # The flag's whole purpose is that an operator can
+                # withdraw this "without a code rollback", and a switch
+                # that only changes what serve SAYS while the behaviour
+                # stays on does not do that.
+                #
+                # Read live rather than captured at spawn, deliberately:
+                # flipping the flag off must stop bridging on children
+                # that are already running, which is what "withdraw"
+                # means to an operator holding an incident.
+                #
+                # NOT to be confused with the O11 check further in
+                # (`capability not in declared`): that one asks what the
+                # CLIENT declared it can handle. This asks whether this
+                # GATEWAY offers the feature at all.
                 if _mrtr_principal_is_eligible(principal)
+                and _modern_child_capabilities()
                 else None
             )
             if method in _MRTR_ELIGIBLE_METHODS:

@@ -5237,3 +5237,110 @@ class TestMrtrAbandonedAndCapped:
             assert line is None and delivered is True
         finally:
             backend.shutdown()
+
+
+class TestMrtrHostileChildAndFlagGate:
+    """#390 Copilot round 3: a DoS and a switch that did not switch."""
+
+    def test_an_unhashable_method_does_not_kill_the_reader_thread(self):
+        """A truthy-but-unhashable `method` used to raise
+        `TypeError: unhashable type` inside the child's READER thread,
+        whose `try/except` sits OUTSIDE its `while` loop — so it ended
+        the loop, hit `_fail_all("backend process exited")`, and failed
+        every in-flight request on a subprocess that was still perfectly
+        alive. One malformed field, all traffic to that child gone.
+
+        WIRE EVIDENCE: an unrelated request still round-trips afterwards,
+        which is the thing the crash destroyed. Asserting only that the
+        translate call returns a reason would miss the actual damage.
+
+        Revert-check: drop the `isinstance(method, str)` guard and this
+        raises out of `_route`, taking the reader thread with it.
+        """
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            for hostile in ({"a": 1}, ["x"], {"nested": ["deep"]}):
+                cap, why = server._mrtr_request_to_input_entry({"method": hostile})
+                assert cap is None and why, hostile
+                # Straight through the real reader-thread path, too.
+                backend._route(
+                    json.dumps({"jsonrpc": "2.0", "id": 1, "method": hostile})
+                )
+            # The child is still fully usable — the reader survived.
+            line = backend.send_request(
+                json.dumps({"jsonrpc": "2.0", "id": "still-alive", "method": "echo"}),
+                "still-alive",
+                10.0,
+            )
+            assert line is not None, "the reader thread died"
+            assert json.loads(line)["id"] == "still-alive"
+            assert backend.closed is False
+        finally:
+            backend.shutdown()
+
+    def test_the_flag_gates_bridging_not_only_the_advertisement(
+        self, gateway_with_pool, monkeypatch
+    ):
+        """The switch has to switch.
+
+        `_modern_child_capabilities()` was consulted only where serve
+        ADVERTISES to a child, so turning the flag off withdrew the offer
+        while leaving the bridge live — a child that ignored the
+        advertisement and asked anyway was still bridged, provided the
+        caller was OAuth-authenticated. The flag exists so an operator
+        can withdraw this "without a code rollback", and a switch that
+        only changes what serve SAYS does not do that.
+
+        Revert-check: drop the `and _modern_child_capabilities()` term
+        and a round is minted with the flag off.
+        """
+        url, pool = gateway_with_pool
+        # Stand in for an OAuth principal, so the OTHER gate is satisfied
+        # and this test is actually about the flag. Without this the
+        # unit fixture is no-auth and would pass for the wrong reason.
+        monkeypatch.setattr(server, "_mrtr_principal_is_eligible", lambda p: True)
+        seen: list = []
+        original = server.BackendProcess.mrtr_begin_dispatch
+
+        def _record(self, context=None):
+            seen.append(context)
+            return original(self, context)
+
+        monkeypatch.setattr(server.BackendProcess, "mrtr_begin_dispatch", _record)
+
+        monkeypatch.delenv("MCP_STDIO_MRTR_REVERSE_ENABLE", raising=False)
+        assert server._modern_child_capabilities() == {}
+        _post(
+            url,
+            _modern_body(
+                "tools/call",
+                params={"name": "echo_tool", "arguments": {}},
+                meta=_meta(),
+            ),
+            _modern_headers("tools/call", name="echo_tool"),
+        )
+        assert seen and seen[-1] is None, (
+            "the flag was off but a bridging context was still built"
+        )
+
+        # Flag on: the same request DOES publish a context.
+        monkeypatch.setenv("MCP_STDIO_MRTR_REVERSE_ENABLE", "1")
+        _post(
+            url,
+            _modern_body(
+                "tools/call",
+                params={"name": "echo_tool", "arguments": {}},
+                meta=_meta(),
+            ),
+            _modern_headers("tools/call", name="echo_tool"),
+        )
+        assert seen[-1] is not None, "the flag was on but nothing bridged"
+
+    def test_flipping_the_flag_off_stops_bridging_on_a_running_child(self, monkeypatch):
+        """Read live, not captured at spawn: withdrawing must take effect
+        on children already running, which is what an operator holding an
+        incident actually needs."""
+        monkeypatch.setenv("MCP_STDIO_MRTR_REVERSE_ENABLE", "1")
+        assert server._modern_child_capabilities() != {}
+        monkeypatch.delenv("MCP_STDIO_MRTR_REVERSE_ENABLE", raising=False)
+        assert server._modern_child_capabilities() == {}
