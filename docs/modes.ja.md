@@ -242,7 +242,7 @@ mcp-stdio を停止した場合は「この経路はこれで終わり」とク�
     禁じているうえ、ログ機能は MCP 2026-07-28 で非推奨になったため、
     未実装ではなく恒久的な方針です。
 
-<a id="answering-your-servers-mid-call-questions"></a>
+<a id="mid-call-serve"></a>
 
 #### サーバーからの mid-call な問い合わせに答える
 
@@ -250,11 +250,11 @@ mcp-stdio を停止した場合は「この経路はこれで終わり」とク�
 呼び出しの**途中**で何かを尋ねたいことがあります——入力の要求、sampling
 の依頼、クライアントの roots 一覧取得。それに新しいクライアントが答え
 られるようにするのが MRTR 経由のこの機能で、クライアント側の
-[`MCP_STDIO_MRTR_STRIP`](reference.md#environment-variables) が
+[`MCP_STDIO_MRTR_STRIP`](reference.md#env-vars) が
 逃がしているパターンの逆方向にあたります。
 
 **既定では無効**で、`MCP_STDIO_MRTR_REVERSE_ENABLE`
-（[リファレンス](reference.md#environment-variables)）の裏に隠れています。
+（[リファレンス](reference.md#env-vars)）の裏に隠れています。
 未設定のままだと、mcp-stdio は最初からあなたのサーバーに「尋ねられない」
 と伝えるので、行儀のよいサーバーは決して尋ねません。有効化すると、
 mcp-stdio が起動するすべての子プロセスへのハンドシェイクが実際に変わ

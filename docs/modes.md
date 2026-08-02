@@ -243,7 +243,7 @@ Worth knowing:
     of MCP 2026-07-28, so this is a permanent decision rather than a
     gap.
 
-<a id="answering-your-servers-mid-call-questions"></a>
+<a id="mid-call-serve"></a>
 
 #### Answering your server's mid-call questions
 
@@ -251,11 +251,11 @@ If your server is still on an older protocol version but wants to ask
 something *during* a call it is handling — elicit input, request a
 sampling completion, or list the client's roots — a newer client can
 answer it, over MRTR (the reverse direction of the pattern
-[`MCP_STDIO_MRTR_STRIP`](reference.md#environment-variables) escapes
+[`MCP_STDIO_MRTR_STRIP`](reference.md#env-vars) escapes
 on the client side).
 
 **Off by default**, behind `MCP_STDIO_MRTR_REVERSE_ENABLE`
-([reference](reference.md#environment-variables)). With it unset,
+([reference](reference.md#env-vars)). With it unset,
 mcp-stdio tells your server up front that it cannot ask, and a
 well-behaved server never does. Turning it on is a real, observable
 handshake change on every child process mcp-stdio spawns, so an
