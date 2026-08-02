@@ -1819,7 +1819,7 @@ def _mrtr_request_to_input_entry(msg: dict[str, Any]) -> tuple[str | None, Any]:
         return capability, entry
     if params is not None:
         if not isinstance(params, dict):
-            return None, "the child sent an input request with a malformed params"
+            return None, "the child sent an input request with malformed params"
         entry["params"] = params
     return capability, entry
 
@@ -2780,7 +2780,7 @@ class BackendProcess:
             # The child still needs an answer, or it stays blocked.
             self._write(
                 _error_body(
-                    "the client cannot fulfil this request",
+                    "the client cannot fulfill this request",
                     child_request_id,
                     code=_JSONRPC_METHOD_NOT_FOUND,
                 )
