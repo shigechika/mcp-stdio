@@ -243,6 +243,53 @@ Worth knowing:
     of MCP 2026-07-28, so this is a permanent decision rather than a
     gap.
 
+<a id="answering-your-servers-mid-call-questions"></a>
+
+#### Answering your server's mid-call questions
+
+If your server is still on an older protocol version but wants to ask
+something *during* a call it is handling — elicit input, request a
+sampling completion, or list the client's roots — a newer client can
+answer it, over MRTR (the reverse direction of the pattern
+[`MCP_STDIO_MRTR_STRIP`](reference.md#environment-variables) escapes
+on the client side).
+
+**Off by default**, behind `MCP_STDIO_MRTR_REVERSE_ENABLE`
+([reference](reference.md#environment-variables)). With it unset,
+mcp-stdio tells your server up front that it cannot ask, and a
+well-behaved server never does. Turning it on is a real, observable
+handshake change on every child process mcp-stdio spawns, so an
+operator withdraws it the same way it was granted — by unsetting the
+variable and restarting.
+
+**OAuth-authenticated callers only.** A caller with no session — no
+auth, or a shared static token — cannot be told apart from any other
+caller, and answering the wrong one's prompt would be worse than
+refusing. Those callers keep today's behavior even with the flag on:
+your server's question gets `-32601`, exactly as if it had never
+asked.
+
+What the client sees: the call it made comes back as an
+`input_required` result instead of the answer it expected, carrying
+your server's question and an opaque `requestState`. It answers by
+retrying the *same* request with `inputResponses` and that
+`requestState` attached. mcp-stdio delivers the answer to your server
+and, once your server finishes handling it, returns the original
+result on that retry.
+
+Worth knowing:
+
+- **One eligible call in flight per child at a time.** A second
+  `tools/call`, `resources/read`, or `prompts/get` on the same child
+  while one is already parked waiting for its answer gets a `503` —
+  the caller retries once the parked one resolves.
+- **The client is not required to come back.** If it never retries,
+  mcp-stdio eventually gives up and answers your server's question
+  with an error rather than leaving it blocked forever.
+- **Only three requests bridge**: `elicitation/create`,
+  `sampling/createMessage`, `roots/list`. Anything else your server
+  raises mid-call still gets the `-32601` it always would.
+
 ## Both at once
 
 The two roles compose. A common pattern: an operator publishes an internal
