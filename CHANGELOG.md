@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.39.0](https://github.com/shigechika/mcp-stdio/compare/v0.38.0...v0.39.0) (2026-08-02)
+
+
+### Features
+
+* reverse MRTR envelope, per-child txn table, concurrency invariant ([#375](https://github.com/shigechika/mcp-stdio/issues/375) PR 1) ([#389](https://github.com/shigechika/mcp-stdio/issues/389)) ([cc30eb4](https://github.com/shigechika/mcp-stdio/commit/cc30eb42e4fa263dc00db6e1eee6f32a3cf15703))
+* serve-side resourceSubscriptions ([#381](https://github.com/shigechika/mcp-stdio/issues/381)) ([#388](https://github.com/shigechika/mcp-stdio/issues/388)) ([299938c](https://github.com/shigechika/mcp-stdio/commit/299938cc7bc3fe68fb48bd2a2cf3df1359bc5c37))
+* the reverse MRTR bridge — translation, minting, retry correlation, D4 valve removal ([#375](https://github.com/shigechika/mcp-stdio/issues/375)) ([#390](https://github.com/shigechika/mcp-stdio/issues/390)) ([297861b](https://github.com/shigechika/mcp-stdio/commit/297861b76ebd9823972e41d9b4f1805702dd6c35))
+
+
+### Bug Fixes
+
+* keep close_connection true on the legacy GET SSE path ([#383](https://github.com/shigechika/mcp-stdio/issues/383)) ([#384](https://github.com/shigechika/mcp-stdio/issues/384)) ([48a0b0a](https://github.com/shigechika/mcp-stdio/commit/48a0b0a521ae2548f93386194f4d7d457988ae12))
+
 ## [0.38.0](https://github.com/shigechika/mcp-stdio/compare/v0.37.0...v0.38.0) (2026-08-01)
 
 
