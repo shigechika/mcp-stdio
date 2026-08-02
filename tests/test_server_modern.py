@@ -5627,3 +5627,104 @@ class TestBackendNonObjectResponse:
         )
         assert resp.status_code == 502, resp.text
         assert "malformed response" in resp.json()["error"]["message"]
+
+
+class TestMrtrErrorObjectValidation:
+    """#390 /code-review: what reaches the child's stdin, and under which code."""
+
+    def test_an_incomplete_error_object_is_refused(self):
+        """Every other error this file puts on a wire goes through
+        `_error_body`, which guarantees `code` and `message`. This one is
+        CLIENT-supplied and was forwarded to the child unexamined — and a
+        legacy child on a strict parser that dies here takes every
+        in-flight request on that backend with it via `_fail_all`.
+
+        Revert-check: restore the bare `isinstance(..., dict)` check and
+        these all produce a reply line.
+        """
+        for bad in (
+            {},  # no code, no message
+            {"code": -1},  # no message
+            {"message": "x"},  # no code
+            {"code": "oops", "message": "x"},  # code not an int
+            {"code": -1, "message": 7},  # message not a str
+            {"code": None, "message": "x"},
+        ):
+            line, why = server._mrtr_input_response_to_reply({"error": bad}, "c1")
+            assert line is None, bad
+            assert why, bad
+
+    def test_a_boolean_code_is_refused(self):
+        """`bool` subclasses `int`, so `{"code": true}` sails through a
+        bare `isinstance` check and reaches the child as a code no peer
+        can interpret."""
+        line, _ = server._mrtr_input_response_to_reply(
+            {"error": {"code": True, "message": "x"}}, "c1"
+        )
+        assert line is None
+
+    def test_a_well_formed_error_still_passes(self):
+        line, why = server._mrtr_input_response_to_reply(
+            {"error": {"code": -32001, "message": "user declined"}}, "c1"
+        )
+        assert why == ""
+        assert json.loads(line)["error"] == {"code": -32001, "message": "user declined"}
+
+    def test_the_child_hears_the_same_code_as_the_client(self, gateway_with_pool):
+        """One event, two peers, one explanation.
+
+        `_unblock_child` hardcoded `-32602`, so a concurrency conflict
+        reached the child as "your parameters are invalid" — untrue and
+        unactionable — while the client was correctly told `-32603`.
+
+        Driven through the real lost-claim path, and asserted on the line
+        that actually reaches the child.
+
+        Revert-check: hardcode `_JSONRPC_INVALID_PARAMS` again and the
+        two codes diverge.
+        """
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        txn = backend.mrtr_round_open(
+            "U1",
+            method="tools/call",
+            child_request_id="c1",
+            declared_caps={},
+            principal=None,
+        )
+        state = server._mrtr_encode_pointer(txn, None, 1)
+        sent: list[str] = []
+        backend.send_oneway = lambda line: sent.append(line) or True  # type: ignore
+        backend.resume_request = (  # type: ignore[method-assign]
+            lambda reply, rid, timeout: (None, True)
+        )
+        original = backend.mrtr_round_consume
+
+        def _consume_then_steal(t):
+            out = original(t)
+            with backend._mrtr_lock:
+                if not backend._mrtr_pending:
+                    backend._mrtr_inflight = True
+            return out
+
+        backend.mrtr_round_consume = _consume_then_steal  # type: ignore
+        resp = _post(
+            url,
+            {
+                "jsonrpc": "2.0",
+                "id": "retry-1",
+                "method": "tools/call",
+                "params": {
+                    "_meta": _meta(),
+                    "requestState": state,
+                    "inputResponses": {"c1": {"result": {"ok": True}}},
+                },
+            },
+            _modern_headers("tools/call"),
+        )
+        client_code = resp.json()["error"]["code"]
+        assert client_code == -32603, resp.text
+        assert sent, "the child was never unblocked"
+        child_code = json.loads(sent[0])["error"]["code"]
+        assert child_code == client_code, (child_code, client_code)

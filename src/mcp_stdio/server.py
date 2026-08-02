@@ -1852,14 +1852,33 @@ def _mrtr_input_response_to_reply(
         # the error as the answer. The docstring already promised
         # "anything else is malformed and reported to the caller"; this
         # is what makes that true.
-        if not isinstance(response["error"], dict):
+        error = response["error"]
+        # The CONTENTS, not just the type (#390 /code-review). Every
+        # other error this file puts on a wire goes through
+        # `_error_body`, which guarantees `code` and `message`; this one
+        # is client-supplied and was forwarded to the child's stdin
+        # unexamined. `{"error": {}}` or `{"error": {"code": "oops"}}`
+        # is not a JSON-RPC error object, and a legacy child using a
+        # strict parser can die on it — taking every in-flight request
+        # on that backend with it via `_fail_all`, the same blast radius
+        # as the other never-hang bugs in this PR.
+        #
+        # `bool` is excluded explicitly: it subclasses `int`, so
+        # `{"code": true}` would otherwise pass a bare `isinstance`
+        # check and reach the child as a code no peer can interpret.
+        if (
+            not isinstance(error, dict)
+            or not isinstance(error.get("code"), int)
+            or isinstance(error.get("code"), bool)
+            or not isinstance(error.get("message"), str)
+        ):
             return None, "the client sent a malformed input response error"
         return (
             json.dumps(
                 {
                     "jsonrpc": "2.0",
                     "id": child_request_id,
-                    "error": response["error"],
+                    "error": error,
                 }
             ),
             "",
@@ -5413,20 +5432,29 @@ class _Handler(BaseHTTPRequestHandler):
         existed before this helper did; making the pair a single call is
         what stops a third appearing.
         """
-        self._unblock_child(backend, child_request_id, reason)
+        self._unblock_child(backend, child_request_id, reason, code=code)
         self._send_json(status, _error_body(reason, req_id, code=code))
 
     def _unblock_child(
-        self, backend: BackendProcess, child_request_id: Any, reason: str
+        self,
+        backend: BackendProcess,
+        child_request_id: Any,
+        reason: str,
+        *,
+        code: int = _JSONRPC_INVALID_PARAMS,
     ) -> None:
         """Answer the child so an unusable retry never leaves it blocked.
 
         The round has already been consumed by the time anything can fail
         here, so nothing else will ever reply to this id.
         """
-        backend.send_oneway(
-            _error_body(reason, child_request_id, code=_JSONRPC_INVALID_PARAMS)
-        )
+        # The SAME code the client is told (#390 /code-review). This was
+        # hardcoded to `-32602`, so one event reached the two peers with
+        # semantically contradictory explanations — a concurrency
+        # conflict arrived at the child as "your parameters are invalid",
+        # which is both untrue and unactionable. The default stays
+        # `-32602` for callers whose failure genuinely IS the params.
+        backend.send_oneway(_error_body(reason, child_request_id, code=code))
 
     def _write_sse(self, message: dict[str, Any]) -> None:
         self.wfile.write(f"data: {json.dumps(message)}\n\n".encode("utf-8"))
