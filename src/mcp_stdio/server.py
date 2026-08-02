@@ -1316,9 +1316,27 @@ class ModernBackendPool:
         `reap_idle` already gates eviction internally, so a thread
         started only for the bridge evicts nothing: `--modern-idle-ttl 0`
         still means idle eviction is OFF, exactly as before.
+
+        The bridge flag gates STARTUP ONLY — see the comment below.
         """
-        # Tied to the bridge's own switch rather than to a second flag,
-        # so the sweep cannot outlive or lag behind the thing it sweeps.
+        # Read ONCE, here, so this decides whether the thread starts and
+        # nothing more. A previous version of this comment claimed the
+        # sweep "cannot outlive the thing it sweeps", which overstated
+        # it: clearing `MCP_STDIO_MRTR_REVERSE_ENABLE` afterwards does
+        # not stop a thread already running (#390 Copilot review).
+        #
+        # That is CORRECT rather than merely harmless, and worth saying
+        # so nobody "fixes" it into a per-tick check. Rounds parked
+        # BEFORE the flag was cleared still have children blocked on
+        # them, and the sweep is the only thing that ever unblocks them.
+        # A sweep that switched itself off would strand exactly those
+        # children — turning a withdrawal into a leak.
+        #
+        # Nothing new accumulates either way: the dispatch path reads the
+        # same flag live per request, so once it is off no further round
+        # is ever opened. The running sweep just drains what is left and
+        # then finds nothing, which is the behaviour an operator
+        # withdrawing the feature actually wants.
         bridge_enabled = bool(_modern_child_capabilities())
         if (self._idle_ttl <= 0 and not bridge_enabled) or self._reaper is not None:
             return
