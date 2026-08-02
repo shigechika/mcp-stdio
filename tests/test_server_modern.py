@@ -4636,6 +4636,40 @@ class TestMrtrTranslation:
         assert why == ""
         assert json.loads(line)["error"]["code"] == -32001
 
+    def test_a_non_dict_error_value_is_malformed_not_a_success(self):
+        """#390 Copilot review — the nastiest shape in this function.
+
+        A non-dict `error` used to SKIP the error branch and fall into
+        the bare-result path, where `.get("result", response)` fell back
+        to the whole object. So `{"error": "x"}` came out as a SUCCESS
+        carrying `result: {"error": "x"}` — a child that asked a question
+        was told its request succeeded and handed the error as the
+        answer. Silent, and exactly backwards.
+
+        Revert-check: restore the `and isinstance(...)` fall-through and
+        this returns a success line instead of a refusal.
+        """
+        for bad_error in ("x", 7, None, [], ["a"]):
+            line, why = server._mrtr_input_response_to_reply({"error": bad_error}, "c1")
+            assert line is None, (bad_error, line)
+            assert why, bad_error
+
+    def test_the_error_key_decides_the_shape_with_no_fall_through(self):
+        """The three legal shapes still resolve as they did — the fix
+        narrows one hole without moving the others."""
+        # A real error is forwarded as an error.
+        line, _ = server._mrtr_input_response_to_reply(
+            {"error": {"code": -1, "message": "no"}}, "c1"
+        )
+        assert json.loads(line)["error"]["code"] == -1
+        # An explicit result is unwrapped.
+        line, _ = server._mrtr_input_response_to_reply({"result": {"ok": 1}}, "c1")
+        assert json.loads(line)["result"] == {"ok": 1}
+        # And a bare result object — no `error`, no `result` — is still
+        # accepted as the result itself.
+        line, _ = server._mrtr_input_response_to_reply({"action": "decline"}, "c1")
+        assert json.loads(line)["result"] == {"action": "decline"}
+
     def test_a_malformed_input_response_is_refused(self):
         for bad in (None, 7, "x", {"result": "not-an-object"}):
             line, why = server._mrtr_input_response_to_reply(bad, "c1")

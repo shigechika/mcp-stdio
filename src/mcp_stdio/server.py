@@ -1800,7 +1800,18 @@ def _mrtr_input_response_to_reply(
     """
     if not isinstance(response, dict):
         return None, "the client sent a malformed input response"
-    if "error" in response and isinstance(response["error"], dict):
+    if "error" in response:
+        # The `error` key DECIDES the shape — no fall-through (#390
+        # Copilot review). A malformed value used to skip this branch and
+        # land in the bare-result path below, where `.get("result",
+        # response)` fell back to the whole object: `{"error": "x"}` came
+        # out as a SUCCESS carrying `result: {"error": "x"}`, so a child
+        # that asked a question was told its request succeeded and handed
+        # the error as the answer. The docstring already promised
+        # "anything else is malformed and reported to the caller"; this
+        # is what makes that true.
+        if not isinstance(response["error"], dict):
+            return None, "the client sent a malformed input response error"
         return (
             json.dumps(
                 {
@@ -1811,6 +1822,8 @@ def _mrtr_input_response_to_reply(
             ),
             "",
         )
+    # No `error` key: the whole object may itself BE the result, which is
+    # the shape a client sending an `InputResponse` directly produces.
     result = response.get("result", response)
     if not isinstance(result, dict):
         return None, "the client sent an input response with no result object"
