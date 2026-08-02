@@ -1297,16 +1297,41 @@ class ModernBackendPool:
         return swept
 
     def start_reaper(self) -> None:
-        """Start the idle-eviction thread (no-op when the TTL is disabled).
+        """Start the pool's background sweep thread.
 
         A thread of its own rather than a tick on the legacy session
         reaper: that one does not exist when `--session-idle-ttl` is 0,
         and coupling the pool into `SessionRegistry` to borrow it would
         buy nothing.
+
+        TWO INDEPENDENT REASONS TO RUN, and conflating them was #390's
+        R3F1. Idle eviction needs `--modern-idle-ttl`; sweeping abandoned
+        MRTR rounds needs only the bridge to be enabled. Gating the whole
+        thread on the TTL alone meant that in the DEFAULT deployment the
+        thread never started, so `reap_idle` — where the sweep lives,
+        correctly placed outside its own TTL check — was never called at
+        all. That is finding 1 again, one layer up: code with no
+        production caller.
+
+        `reap_idle` already gates eviction internally, so a thread
+        started only for the bridge evicts nothing: `--modern-idle-ttl 0`
+        still means idle eviction is OFF, exactly as before.
         """
-        if self._idle_ttl <= 0 or self._reaper is not None:
+        # Tied to the bridge's own switch rather than to a second flag,
+        # so the sweep cannot outlive or lag behind the thing it sweeps.
+        bridge_enabled = bool(_modern_child_capabilities())
+        if (self._idle_ttl <= 0 and not bridge_enabled) or self._reaper is not None:
             return
-        interval = max(1.0, min(self._idle_ttl, _MAX_REAP_INTERVAL_SECS))
+        if self._idle_ttl > 0:
+            interval = max(1.0, min(self._idle_ttl, _MAX_REAP_INTERVAL_SECS))
+        else:
+            # Bridge-only: pace off the park deadline, as a RATIO rather
+            # than a literal (the rule #388's review established), so a
+            # change to the deadline cannot silently leave the sweep too
+            # coarse to notice an abandoned round in reasonable time.
+            interval = max(
+                1.0, min(_MRTR_PARK_TIMEOUT_SECS / 4, _MAX_REAP_INTERVAL_SECS)
+            )
         # A FRESH stop event per thread (#379 Copilot review), not a
         # shared one cleared on restart: `stop_reaper` does not join —
         # the thread is a daemon parked in `wait(interval)` — so a

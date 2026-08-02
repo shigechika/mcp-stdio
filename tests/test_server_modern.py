@@ -5042,10 +5042,57 @@ class TestMrtrAbandonedAndCapped:
         finally:
             pool.shutdown_all()
 
-    def test_the_sweep_runs_even_with_no_idle_ttl_configured(self):
-        """The park deadline is the ROUND's own. A deployment that never
-        set `--modern-idle-ttl` still must not strand children, so the
-        sweep sits outside the TTL gate."""
+    def test_the_reaper_thread_starts_for_the_bridge_without_any_idle_ttl(
+        self, monkeypatch
+    ):
+        """#390 R3F1 — the layer above the sweep.
+
+        Placing the sweep outside `reap_idle`'s TTL check was right, and
+        insufficient: `start_reaper` gated the whole THREAD on the TTL,
+        so in the default deployment nothing ever called `reap_idle` at
+        all. That is finding 1 again, one layer up — and the test that
+        was here before could not see it, because it called
+        `reap_idle()` directly rather than letting the thread do it.
+
+        This drives the real thread end to end with NO idle TTL, and
+        asserts wire evidence that the child was unblocked.
+
+        Revert-check: restore the `self._idle_ttl <= 0` gate and no
+        thread starts, so the child is never unblocked and this times
+        out.
+        """
+        monkeypatch.setenv("MCP_STDIO_MRTR_REVERSE_ENABLE", "1")
+        monkeypatch.setattr(server, "_MRTR_PARK_TIMEOUT_SECS", 4.0)
+        pool = server.ModernBackendPool(_BACKEND, idle_ttl=0.0)
+        try:
+            backend, _, entry = pool.get_or_create("alice")
+            pool.release(entry)
+            sent: list[str] = []
+            backend.send_oneway = lambda line: sent.append(line) or True  # type: ignore
+            backend.mrtr_round_open(
+                "U1",
+                method="tools/call",
+                child_request_id="c-abandoned",
+                declared_caps={},
+                principal="alice",
+                now=time.monotonic() - 99,  # already past its deadline
+            )
+            pool.start_reaper()
+            assert pool._reaper is not None, "no reaper thread started"
+            deadline = time.monotonic() + 15
+            while not sent and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert sent, "the reaper never swept the abandoned round"
+            assert json.loads(sent[0])["id"] == "c-abandoned"
+            # Idle eviction stays OFF: a bridge-only reaper evicts nothing.
+            assert pool.count() == 1, "an idle child was evicted with ttl=0"
+        finally:
+            pool.stop_reaper()
+            pool.shutdown_all()
+
+    def test_the_sweep_itself_ignores_the_idle_ttl(self):
+        """The sweep's own placement, independent of who calls it: the
+        park deadline is the ROUND's, not the pool's."""
         pool = server.ModernBackendPool(_BACKEND, idle_ttl=0.0)
         try:
             backend, _, entry = pool.get_or_create("alice")
