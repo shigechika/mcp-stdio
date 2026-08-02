@@ -5545,3 +5545,85 @@ class TestMrtrRetryMethodExactMatch:
             assert parked and parked[0]["method"] == "tools/call", parked
         finally:
             backend.shutdown()
+
+
+class TestBackendNonObjectResponse:
+    """A backend answering valid-but-not-an-object JSON must not crash.
+
+    `json.loads` raises on invalid JSON but NOT on `[1, 2, 3]` — that
+    parses cleanly to a list, and the rekey that follows then raises
+    `TypeError: list indices must be integers` OUTSIDE any handler.
+    """
+
+    def _park(self, backend):
+        txn = backend.mrtr_round_open(
+            "U1",
+            method="tools/call",
+            child_request_id="c1",
+            declared_caps={},
+            principal=None,
+        )
+        return server._mrtr_encode_pointer(txn, None, 1)
+
+    def test_the_retry_path_survives_a_non_object_response(self, gateway_with_pool):
+        """The reported site. Revert-check: drop the `isinstance(parsed,
+        dict)` guard and this raises `TypeError` instead of answering."""
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        backend.send_oneway = lambda line: True  # type: ignore[method-assign]
+        for hostile in ("[1, 2, 3]", '"just a string"', "42", "null", "true"):
+            state = self._park(backend)
+            backend.resume_request = (  # type: ignore[method-assign]
+                lambda reply, rid, timeout, _h=hostile: (_h, True)
+            )
+            resp = _post(
+                url,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "retry-1",
+                    "method": "tools/call",
+                    "params": {
+                        "_meta": _meta(),
+                        "requestState": state,
+                        "inputResponses": {"c1": {"result": {"ok": True}}},
+                    },
+                },
+                _modern_headers("tools/call"),
+            )
+            assert resp.status_code == 502, (hostile, resp.text)
+            assert "malformed response" in resp.json()["error"]["message"], hostile
+        # The gateway is still serving afterwards — a traceback out of a
+        # handler thread would have left this connection dead.
+        assert (
+            _post(
+                url, _modern_body("tools/list", meta=_meta()), _modern_headers()
+            ).status_code
+            == 200
+        )
+
+    def test_the_ordinary_dispatch_path_survives_it_too(self, gateway_with_pool):
+        """The SAME hole on the path every modern request takes — not
+        introduced by this PR, but found by looking where the reported
+        one was.
+
+        Revert-check: drop that site's guard and this raises instead of
+        answering 502.
+        """
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        backend.send_request = (  # type: ignore[method-assign]
+            lambda line, rid, timeout: "[1, 2, 3]"
+        )
+        resp = _post(
+            url,
+            _modern_body(
+                "tools/call",
+                params={"name": "echo_tool", "arguments": {}},
+                meta=_meta(),
+            ),
+            _modern_headers("tools/call", name="echo_tool"),
+        )
+        assert resp.status_code == 502, resp.text
+        assert "malformed response" in resp.json()["error"]["message"]

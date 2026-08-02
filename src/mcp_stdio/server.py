@@ -5360,6 +5360,15 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             parsed = json.loads(line)
         except (json.JSONDecodeError, TypeError):
+            parsed = None
+        # `json.loads` raises on invalid JSON but NOT on valid non-object
+        # JSON (#390 Copilot review): `[1, 2, 3]` parses cleanly to a
+        # list, and the `parsed["id"] = ...` below then raises `TypeError:
+        # list indices must be integers` OUTSIDE any handler — killing
+        # the request with a traceback instead of an error response.
+        # A JSON-RPC response is an object by definition, so anything
+        # else is malformed and takes the same 502 as unparseable bytes.
+        if not isinstance(parsed, dict):
             self._send_json(
                 502,
                 _error_body(
@@ -5866,7 +5875,14 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 parsed = json.loads(line)
             except (json.JSONDecodeError, TypeError):
-                log("modern dispatch: backend returned unparseable JSON")
+                parsed = None
+            # Same non-object hole as the retry path's (#390 Copilot
+            # review found it there; this site had it too, and it is on
+            # the path EVERY modern request takes). `json.loads` is happy
+            # with `[1, 2, 3]`, and the rekey below would then raise
+            # `TypeError` outside any handler.
+            if not isinstance(parsed, dict):
+                log("modern dispatch: backend returned a non-object response")
                 self._send_json(
                     502,
                     _error_body(
