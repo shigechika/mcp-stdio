@@ -4905,11 +4905,21 @@ class TestMrtrRetryFailurePaths:
             _modern_headers("tools/call"),
         )
 
-    def test_a_stale_pointer_unblocks_the_child_before_erroring(
+    def test_a_stale_pointer_leaves_the_round_and_the_child_alone(
         self, gateway_with_pool
     ):
-        """Finding B, half one. Revert-check: drop the `_fail_retry` call
-        here and the child never hears back."""
+        """Updated when validation moved BEFORE the consume (#390).
+
+        This used to assert the opposite — that a stale pointer unblocks
+        the child — and that was right while the round was consumed
+        first. Now the stale check runs on a PEEK, so the round survives
+        and may still be redeemed by its real owner: unblocking the child
+        here would destroy a live transaction on behalf of an impostor.
+
+        Finding B's rule is unchanged and still holds — every path AFTER
+        the consume owes the child a reply. This path simply is no longer
+        one of them.
+        """
         url, pool = gateway_with_pool
         backend, _, entry = pool.get_or_create(None)
         pool.release(entry)
@@ -4922,9 +4932,8 @@ class TestMrtrRetryFailurePaths:
         resp = self._retry(url, state)
         assert resp.status_code == 400, resp.text
         assert "stale" in resp.json()["error"]["message"]
-        assert sent, "the child was never unblocked"
-        assert json.loads(sent[0])["id"] == "child-7"
-        assert "error" in json.loads(sent[0])
+        assert sent == [], "a stale pointer unblocked a child it does not own"
+        assert backend.mrtr_has_pending(), "a stale pointer destroyed a live round"
 
     def test_missing_input_responses_unblocks_the_child_before_erroring(
         self, gateway_with_pool
@@ -5429,3 +5438,110 @@ class TestMrtrRetryMethodGate:
             assert "inputResponses" in resp.json()["error"]["message"], method
             # And it consumed the round, as a real retry does.
             assert backend.mrtr_round_for_txn(txn) is None, method
+
+
+class TestMrtrRetryMethodExactMatch:
+    """A pointer redeems the round it opened — not merely *a* round."""
+
+    def test_a_pointer_from_one_eligible_method_cannot_redeem_another(
+        self, gateway_with_pool
+    ):
+        """#390 Copilot review, the follow-on to the eligibility gate.
+
+        `method in _MRTR_ELIGIBLE_METHODS` proves a request COULD have
+        opened a round. It does not prove it opened THIS one — so a
+        pointer minted by `tools/call` could be redeemed by
+        `resources/read`, both eligible, consuming a round belonging to a
+        different in-flight call.
+
+        WIRE EVIDENCE both ways: the mismatched retry is refused, AND the
+        round is still parked afterwards, which is what lets its real
+        owner finish.
+
+        Revert-check: drop the `entry["method"] != msg.get("method")`
+        term and the mismatched method consumes the round.
+        """
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        backend.send_oneway = lambda line: True  # type: ignore[method-assign]
+        txn = backend.mrtr_round_open(
+            "U1",
+            method="tools/call",
+            child_request_id="c1",
+            declared_caps={},
+            principal=None,
+        )
+        state = server._mrtr_encode_pointer(txn, None, 1)
+        resp = _post(
+            url,
+            {
+                "jsonrpc": "2.0",
+                "id": "wrong-method",
+                "method": "resources/read",
+                "params": {
+                    "_meta": _meta(),
+                    "requestState": state,
+                    "inputResponses": {"c1": {"result": {"ok": True}}},
+                    "uri": "res://a",
+                },
+            },
+            _modern_headers("resources/read", name="res://a"),
+        )
+        assert resp.status_code == 400, resp.text
+        assert "stale" in resp.json()["error"]["message"], resp.text
+        assert backend.mrtr_round_for_txn(txn) is not None, (
+            "a different method consumed a round it did not open"
+        )
+
+    def test_a_round_records_the_upstream_method_not_the_childs_question(self):
+        """The root cause, pinned directly.
+
+        `mrtr_round_open` used to be handed `msg.get("method")` from
+        inside `_mrtr_try_bridge`, where `msg` is the CHILD's question
+        (`sampling/createMessage`) — a semantically different value from
+        the client request the round belongs to (`tools/call`). The field
+        exists to be compared against an incoming retry's method, so
+        recording the wrong one made that comparison unwritable.
+
+        Driven through the real bridge rather than by calling
+        `mrtr_round_open` directly, because calling it directly is what
+        made the existing tests agree with an intention production did
+        not implement.
+        """
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            assert backend.mrtr_begin_dispatch(
+                {
+                    "upstream_id": "U1",
+                    "declared_caps": {"sampling": {}},
+                    "principal": "alice",
+                    "method": "tools/call",
+                    "round": 1,
+                }
+            )
+            waiter = threading.Thread(
+                target=lambda: backend.send_request(
+                    json.dumps({"jsonrpc": "2.0", "id": "U1", "method": "noreply"}),
+                    "U1",
+                    10.0,
+                ),
+                daemon=True,
+            )
+            waiter.start()
+            deadline = time.monotonic() + 10
+            while not backend.has_pending and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert backend._mrtr_try_bridge(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "child-1",
+                    "method": "sampling/createMessage",
+                    "params": {"messages": []},
+                }
+            )
+            waiter.join(timeout=10)
+            parked = list(backend._mrtr_pending.values())
+            assert parked and parked[0]["method"] == "tools/call", parked
+        finally:
+            backend.shutdown()

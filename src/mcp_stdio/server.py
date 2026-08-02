@@ -2786,7 +2786,13 @@ class BackendProcess:
             return True
         txn_id = self.mrtr_round_open(
             upstream_id,
-            method=msg.get("method", ""),
+            # From the CONTEXT, never from `msg`: `msg` is the child's
+            # out-of-band question (`sampling/createMessage`), while a
+            # round belongs to the client request that provoked it
+            # (`tools/call`). Recording the former put a semantically
+            # different value in a field whose only consumer compares it
+            # to an incoming request's method.
+            method=context.get("method", ""),
             child_request_id=child_request_id,
             declared_caps=declared,
             principal=context.get("principal"),
@@ -5172,11 +5178,40 @@ class _Handler(BaseHTTPRequestHandler):
             # meaning for a reserved one (§4 Q4).
             self._send_json(400, _error_body(why, req_id))
             return
-        entry = backend.mrtr_round_consume(payload["txn_id"])
-        if entry is None:
+        # VALIDATE ON A PEEK, CONSUME ONLY ONCE IT MATCHES. The order is
+        # the point (#390 Copilot review): consuming first meant a
+        # mismatched retry destroyed a round that was still perfectly
+        # valid, so its real owner could never redeem it — the check
+        # rejected the impostor and took the victim down with it.
+        peeked = backend.mrtr_round_for_txn(payload["txn_id"])
+        if peeked is None:
             # The ordinary post-restart / post-timeout case, and a replay
             # attempt looks identical from here — deliberately, since
             # neither earns anything louder than an honest error.
+            self._send_json(400, _error_body("unknown or expired requestState", req_id))
+            return
+        _, candidate = peeked
+        if (
+            candidate["round"] != payload["round"]
+            or candidate["principal"] != principal
+            # EXACT method match. `method in _MRTR_ELIGIBLE_METHODS` at
+            # the dispatch hook only proves this request COULD have
+            # opened a round; this proves it opened THIS one. Without it
+            # a pointer minted by `tools/call` could be redeemed by
+            # `resources/read` — both eligible — and take over a round
+            # belonging to a different in-flight call.
+            or candidate["method"] != msg.get("method")
+        ):
+            # NOT `_fail_retry`: the round is untouched and still owned
+            # by someone who may yet redeem it, so the child is owed
+            # nothing here. Unblocking it would be the same
+            # take-the-victim-down-too mistake in a quieter form.
+            self._send_json(400, _error_body("stale requestState", req_id))
+            return
+        entry = backend.mrtr_round_consume(payload["txn_id"])
+        if entry is None:
+            # Lost the race to a concurrent retry between the peek and
+            # here. `mrtr_round_consume` is atomic, so exactly one won.
             self._send_json(400, _error_body("unknown or expired requestState", req_id))
             return
         # PAST THIS POINT THE ROUND IS GONE FROM THE TABLE, so nothing
@@ -5186,11 +5221,6 @@ class _Handler(BaseHTTPRequestHandler):
         # — #390's review found two paths that had discharged only the
         # client's half, leaving the subprocess blocked forever.
         child_request_id = entry["child_request_id"]
-        if entry["round"] != payload["round"] or entry["principal"] != principal:
-            self._fail_retry(
-                backend, child_request_id, req_id, "stale requestState", 400
-            )
-            return
         responses = params.get("inputResponses")
         if not isinstance(responses, dict) or not responses:
             self._fail_retry(
@@ -5245,6 +5275,10 @@ class _Handler(BaseHTTPRequestHandler):
                 "upstream_id": entry["upstream_id"],
                 "declared_caps": retry_caps if isinstance(retry_caps, dict) else {},
                 "principal": principal,
+                # Carried forward: round N+1 belongs to the same original
+                # request, so a second question must record the same
+                # upstream method the first one did.
+                "method": entry["method"],
                 "round": next_round,
             }
         )
@@ -5736,6 +5770,13 @@ class _Handler(BaseHTTPRequestHandler):
                         declared_caps if isinstance(declared_caps, dict) else {}
                     ),
                     "principal": principal,
+                    # The UPSTREAM method — what the client would be
+                    # retrying — not whatever the child later asks
+                    # (#390 Copilot review). A round remembers the
+                    # request it belongs to so a retry can be checked
+                    # against it; recording the child's question instead
+                    # made that check impossible to write.
+                    "method": method,
                     "round": 1,
                 }
                 # BOTH gates, and the second one was missing (#390
