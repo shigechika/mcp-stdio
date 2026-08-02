@@ -1286,11 +1286,18 @@ class ModernBackendPool:
             ]
         for backend in backends:
             for expired in backend.mrtr_expire_parked():
+                # The DEFAULT -32000, not -32603 (#390 Copilot review).
+                # This file reserves -32603 for "the gateway broke"; a
+                # client that simply did not come back is an EXPECTED
+                # path — Server Requirements item 8 licenses it outright
+                # ("Servers MUST NOT assume that clients will fulfill the
+                # inputRequests or retry") — so calling it an internal
+                # error would tell the child something untrue about who
+                # failed.
                 backend.send_oneway(
                     _error_body(
                         "the client did not return the requested input in time",
                         expired["child_request_id"],
-                        code=_JSONRPC_INTERNAL_ERROR,
                     )
                 )
                 swept += 1
