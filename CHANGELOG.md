@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.39.1](https://github.com/shigechika/mcp-stdio/compare/v0.39.0...v0.39.1) (2026-08-02)
+
+
+### Bug Fixes
+
+* eliminate two flaky/false signals — test init timeout leak, ledger cap notice ([#392](https://github.com/shigechika/mcp-stdio/issues/392)) ([4eb9701](https://github.com/shigechika/mcp-stdio/commit/4eb970174a6d434f5dcd4e0622148a9852dbb8bd))
+
 ## [0.39.0](https://github.com/shigechika/mcp-stdio/compare/v0.38.0...v0.39.0) (2026-08-02)
 
 
