@@ -279,10 +279,11 @@ result on that retry.
 
 Worth knowing:
 
-- **One eligible call in flight per child at a time.** A second
-  `tools/call`, `resources/read`, or `prompts/get` on the same child
-  while one is already parked waiting for its answer gets a `503` —
-  the caller retries once the parked one resolves.
+- **One eligible call per child at a time.** A second `tools/call`,
+  `resources/read`, or `prompts/get` on the same child while one is
+  still in progress — in flight, or already parked waiting for its
+  answer — gets a `503`. The caller retries once the first one
+  resolves.
 - **The client is not required to come back.** If it never retries,
   mcp-stdio eventually gives up and answers your server's question
   with an error rather than leaving it blocked forever.
