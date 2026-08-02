@@ -595,7 +595,7 @@ jobs:
                         | {id: .[0], summary: ((.[1:] | join(" "))[0:200]), status: "dismissed"})' 2>/dev/null || true)
           if [ -z "$dropped_json" ]; then dropped_json='[]'; fi
 
-          FINAL_FINDINGS=$(jq -n -c --argjson base "$merged" --argjson old "$OLD_FINDINGS" \
+          LEDGER_RESULT=$(jq -n -c --argjson base "$merged" --argjson old "$OLD_FINDINGS" \
               --argjson kept "$kept_json" --argjson dropped "$dropped_json" --arg round "$ROUND" '
             ($base | map(.id)) as $ids
             | ($old | map(.id?)) as $oldids
@@ -652,23 +652,43 @@ jobs:
             # the whole open list precisely when there is no room for any of
             # it. (No apostrophes in these comments — the surrounding shell
             # single-quote would end the jq program right here.)
-            | if length > 80
-              then (map(select(.status != "open")) | .[-80:]) as $s
-                   | (80 - ($s | length)) as $room
-                   | $s + (if $room > 0
-                           then (map(select(.status == "open")) | .[-$room:])
-                           else [] end)
-              else . end
+            | . as $precap
+            | (if ($precap | length) > 80
+               then ($precap | map(select(.status != "open")) | .[-80:]) as $s
+                    | (80 - ($s | length)) as $room
+                    | $s + (if $room > 0
+                            then ($precap | map(select(.status == "open")) | .[-$room:])
+                            else [] end)
+               else $precap end) as $capped
+            | {findings: $capped, precap_n: ($precap | length)}
           ' 2>/dev/null || true)
-          if [ -z "$FINAL_FINDINGS" ]; then FINAL_FINDINGS="$merged"; fi
+          if [ -z "$LEDGER_RESULT" ]; then
+            FINAL_FINDINGS="$merged"
+            precap_n=0
+          else
+            FINAL_FINDINGS=$(printf '%s' "$LEDGER_RESULT" | jq -c '.findings' 2>/dev/null || true)
+            precap_n=$(printf '%s' "$LEDGER_RESULT" | jq -r '.precap_n' 2>/dev/null || true)
+          fi
+          # Either fallback below means the real pre-cap count from
+          # $LEDGER_RESULT is being discarded — force precap_n to 0 so the
+          # notice check treats this as truncation-unknown and fires rather
+          # than silently agreeing that nothing was shed.
+          if [ -z "$FINAL_FINDINGS" ]; then
+            FINAL_FINDINGS="$merged"
+            precap_n=0
+          fi
+          case "$precap_n" in ''|*[!0-9]*) precap_n=0 ;; esac
 
           # Say so when the cap bites. Shedding open entries is the intended
           # trade-off — they come back next round — but a cap that silently
           # drops history reads as "the ledger has everything" when it does
-          # not, and the reader has no way to tell.
+          # not, and the reader has no way to tell. Compared against the
+          # pre-cap count rather than a bare `-eq 80`, so a ledger that
+          # legitimately holds exactly 80 entries (nothing shed) does not
+          # claim a truncation that did not happen.
           kept_n=$(printf '%s' "$FINAL_FINDINGS" | jq -r 'length' 2>/dev/null || true)
           case "$kept_n" in ''|*[!0-9]*) kept_n=0 ;; esac
-          if [ "$kept_n" -eq 80 ]; then
+          if [ "$kept_n" -ne "$precap_n" ]; then
             echo "::notice::findings ledger is at its 80-entry cap — the oldest open entries were shed (settled ones are kept first)"
           fi
 
@@ -685,12 +705,17 @@ jobs:
           # line counts as advisory rather than inventing a blocker.
           # Counted from kept.txt (post-verifier, pre-render): rendered.md has
           # already rewritten the block markers and dropped the severity line.
-          blocking_n=$(grep -ciE '^[[:space:]]*severity:[[:space:]]*blocking' kept.txt 2>/dev/null || true)
+          blocking_n=$(grep -ciE '^[[:space:]]*severity:[[:space:]]*blocking[[:space:]]*$' kept.txt 2>/dev/null || true)
           case "$blocking_n" in ''|*[!0-9]*) blocking_n=0 ;; esac
+          advisory_n=$(grep -ciE '^[[:space:]]*severity:[[:space:]]*advisory[[:space:]]*$' kept.txt 2>/dev/null || true)
+          case "$advisory_n" in ''|*[!0-9]*) advisory_n=0 ;; esac
           finding_n=$(grep -c '^===FINDING ' kept.txt 2>/dev/null || true)
           case "$finding_n" in ''|*[!0-9]*) finding_n=0 ;; esac
-          advisory_n=$((finding_n - blocking_n))
-          [ "$advisory_n" -lt 0 ] && advisory_n=0
+          # A severity line matching neither anchored pattern (missing,
+          # malformed, a typo) still counts as advisory rather than
+          # inventing a blocker.
+          unclassified_n=$((finding_n - blocking_n - advisory_n))
+          [ "$unclassified_n" -gt 0 ] && advisory_n=$((advisory_n + unclassified_n))
           if [ "$blocking_n" -gt 0 ]; then
             VERDICT="**Verdict: changes requested** — ${blocking_n} blocking, ${advisory_n} advisory."
           elif [ "$finding_n" -gt 0 ]; then

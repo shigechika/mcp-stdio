@@ -425,8 +425,11 @@ def test_wrong_path_returns_404(gateway):
 
 def test_backend_timeout_returns_504(gateway, monkeypatch):
     url, _ = gateway
-    monkeypatch.setattr(server, "_BACKEND_RESPONSE_TIMEOUT_SECS", 0.4)
     sid, _ = _init(url)
+    # Patched only after init: init's own spawn+handshake round-trip is exempt
+    # from the shortened timeout, so a loaded machine can't make init itself
+    # exceed it and evict the session before the test's real request runs.
+    monkeypatch.setattr(server, "_BACKEND_RESPONSE_TIMEOUT_SECS", 0.4)
     resp = _post(url, {"jsonrpc": "2.0", "id": 7, "method": "noreply"}, sid)
     assert resp.status_code == 504
     assert resp.json()["id"] == 7
