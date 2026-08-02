@@ -4929,7 +4929,7 @@ class TestMrtrRetryFailurePaths:
         state = self._park(backend)
         resumed: list[str] = []
         backend.resume_request = (  # type: ignore[method-assign]
-            lambda reply, rid, timeout: resumed.append(reply) or None
+            lambda reply, rid, timeout: (resumed.append(reply), (None, True))[1]
         )
         sent: list[str] = []
         backend.send_oneway = lambda line: sent.append(line) or True  # type: ignore
@@ -4974,7 +4974,10 @@ class TestMrtrRetryFailurePaths:
         def _capture(reply, rid, timeout):
             ctx = backend.mrtr_context()
             seen.append(dict(ctx) if ctx else {})
-            return json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"ok": True}})
+            return (
+                json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"ok": True}}),
+                True,
+            )
 
         backend.resume_request = _capture  # type: ignore[method-assign]
         # The RETRY declares elicitation instead.
@@ -4983,3 +4986,173 @@ class TestMrtrRetryFailurePaths:
         assert resp.status_code == 200, resp.text
         assert seen and seen[0]["declared_caps"] == {"elicitation": {}}, seen
         assert seen[0]["round"] == 2
+        # Finding 4: a RESUMED response carries the child's `serverInfo`
+        # like every other modern result. Omitting it made this the one
+        # response missing the `_meta` the spec says servers SHOULD put
+        # on every result — invisible until someone compared two
+        # responses to the same tool.
+        #
+        # Revert-check: pass `server_info=None` and this key disappears.
+        meta = resp.json()["result"]["_meta"]
+        assert meta["io.modelcontextprotocol/serverInfo"]["name"] == "fake", meta
+
+
+class TestMrtrAbandonedAndCapped:
+    """The never-hang invariant, at the two ends #390's review found open."""
+
+    def test_an_abandoned_round_is_swept_and_the_child_unblocked(self):
+        """Finding 1. A client is EXPLICITLY licensed not to come back
+        ("Servers MUST NOT assume that clients will fulfill the
+        inputRequests or retry"), so an unswept round left the child
+        blocked forever AND wedged the principal's pool slot, since
+        `mrtr_begin_dispatch` refuses while anything is parked.
+
+        Wire evidence: the child receives an error under its OWN request
+        id. Revert-check: remove the `_sweep_abandoned_rounds()` call and
+        nothing is written and the slot stays wedged.
+        """
+        clock = [1000.0]
+        pool = server.ModernBackendPool(_BACKEND, idle_ttl=0.0, now=lambda: clock[0])
+        try:
+            backend, _, entry = pool.get_or_create("alice")
+            pool.release(entry)
+            sent: list[str] = []
+            backend.send_oneway = lambda line: sent.append(line) or True  # type: ignore
+            backend.mrtr_round_open(
+                "U1",
+                method="tools/call",
+                child_request_id="child-42",
+                declared_caps={},
+                principal="alice",
+                now=time.monotonic(),
+            )
+            assert backend.mrtr_begin_dispatch() is False, "slot should be wedged"
+            # Before the deadline: nothing swept.
+            pool.reap_idle()
+            assert sent == []
+            # Past it: the child is told, and the slot frees up.
+            with backend._mrtr_lock:
+                for e in backend._mrtr_pending.values():
+                    e["park_deadline"] = time.monotonic() - 1
+            pool.reap_idle()
+            assert sent, "the child was never unblocked"
+            assert json.loads(sent[0])["id"] == "child-42"
+            assert "error" in json.loads(sent[0])
+            assert backend.mrtr_begin_dispatch() is True, "the slot stayed wedged"
+        finally:
+            pool.shutdown_all()
+
+    def test_the_sweep_runs_even_with_no_idle_ttl_configured(self):
+        """The park deadline is the ROUND's own. A deployment that never
+        set `--modern-idle-ttl` still must not strand children, so the
+        sweep sits outside the TTL gate."""
+        pool = server.ModernBackendPool(_BACKEND, idle_ttl=0.0)
+        try:
+            backend, _, entry = pool.get_or_create("alice")
+            pool.release(entry)
+            sent: list[str] = []
+            backend.send_oneway = lambda line: sent.append(line) or True  # type: ignore
+            backend.mrtr_round_open(
+                "U1",
+                method="tools/call",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+                now=time.monotonic() - server._MRTR_PARK_TIMEOUT_SECS - 1,
+            )
+            pool.reap_idle()
+            assert sent and json.loads(sent[0])["id"] == "c1"
+        finally:
+            pool.shutdown_all()
+
+    def test_a_round_past_the_cap_is_refused_at_mint_time(self):
+        """Finding 2. `_mrtr_decode_pointer` refuses a pointer past the
+        cap, so minting one would hand the client a `requestState` it can
+        NEVER redeem — parked until the park timeout, and before finding
+        1 was fixed, forever.
+
+        The child is told so it stops waiting; its own call then fails
+        through the ordinary path rather than the gateway inventing a
+        competing error for a call the child can still answer.
+
+        Revert-check: drop the cap check and a round IS parked with an
+        unredeemable pointer.
+        """
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            sent: list[str] = []
+            backend._write = lambda line: sent.append(line) or True  # type: ignore
+            assert backend.mrtr_begin_dispatch(
+                {
+                    "upstream_id": "U1",
+                    "declared_caps": {"roots": {}},
+                    "principal": "alice",
+                    "round": server._MRTR_MAX_ROUNDS + 1,
+                }
+            )
+            assert backend._mrtr_try_bridge(
+                {"jsonrpc": "2.0", "id": "c1", "method": "roots/list"}
+            )
+            assert sent and json.loads(sent[0])["id"] == "c1"
+            assert "error" in json.loads(sent[0])
+            assert backend.mrtr_has_pending() is False, "an unredeemable round parked"
+        finally:
+            backend.shutdown()
+
+    def test_a_second_round_never_overwrites_a_parked_one(self):
+        """Finding 3. Overwriting would ORPHAN the first round: its txn id
+        still rides a client-held `requestState`, and the entry that
+        pointer names would silently become a different round.
+
+        Steady state cannot reach this — a parked round means the handler
+        already returned and cleared the context — but a child that
+        ignores its own blocking read can, and guessing costs an
+        unredeemable pointer.
+        """
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            first = backend.mrtr_round_open(
+                "U1",
+                method="tools/call",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+            )
+            second = backend.mrtr_round_open(
+                "U1",
+                method="tools/call",
+                child_request_id="c2",
+                declared_caps={},
+                principal="alice",
+            )
+            assert second == "", "a second round overwrote the first"
+            found = backend.mrtr_round_for_txn(first)
+            assert found is not None and found[1]["child_request_id"] == "c1"
+        finally:
+            backend.shutdown()
+
+    def test_an_undelivered_resume_still_answers_the_child(self):
+        """Finding 5, the one sub-case that was real: `resume_request`
+        returns None from several places, and only ONE of them means the
+        child was never told. A timeout after a successful write means it
+        WAS told, so re-answering would put a second reply on its stream.
+        """
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            # Occupy the slot so `resume_request` takes its
+            # ambiguous-correlation early return.
+            with backend._lock:
+                backend._pending["U1"] = {
+                    "event": threading.Event(),
+                    "line": None,
+                    "request_line": "",
+                    "waiters": 1,
+                }
+            line, delivered = backend.resume_request("{}", "U1", 1.0)
+            assert line is None and delivered is False
+            # A closed child: unreachable, so nothing is owed.
+            backend.shutdown()
+            line, delivered = backend.resume_request("{}", "U2", 1.0)
+            assert line is None and delivered is True
+        finally:
+            backend.shutdown()

@@ -1223,6 +1223,24 @@ class ModernBackendPool:
         now = self._now()
         dead: list[tuple[Any, BackendProcess]] = []
         idle: list[tuple[Any, BackendProcess]] = []
+        # #390 review, finding 1: abandoned MRTR rounds are swept HERE,
+        # on the sweep that already exists, rather than by a second timer
+        # (#375 §3.8 named this or a lazy pool-touch check as equally
+        # acceptable; this one already runs, already holds no locks it
+        # must not, and cannot drift out of sync with child lifetime).
+        #
+        # It matters because a client is EXPLICITLY licensed not to come
+        # back — "Servers MUST NOT assume that clients will fulfill the
+        # inputRequests or retry the original request" — and an
+        # unswept round leaves the legacy child blocked on a reply
+        # nobody will send AND wedges that principal's pool slot for
+        # good, since `mrtr_begin_dispatch` refuses while anything is
+        # parked.
+        #
+        # Deliberately OUTSIDE the `ttl > 0` gate below: the park
+        # deadline is the round's own, and a deployment that never
+        # configured an idle TTL still must not strand children.
+        self._sweep_abandoned_rounds()
         with self._lock:
             for key, entry in list(self._entries.items()):
                 backend = entry.get("backend")
@@ -1246,6 +1264,37 @@ class ModernBackendPool:
             log(f"reaped idle modern child for {key!r}")
             threading.Thread(target=backend.shutdown, daemon=True).start()
         return len(dead) + len(idle)
+
+    def _sweep_abandoned_rounds(self) -> int:
+        """Unblock children whose parked round no client ever came back for.
+
+        `mrtr_expire_parked` drops the entries and hands them back; this
+        is what discharges the obligation its docstring names — a
+        JSON-RPC error to each child under its OWN request id, which is
+        the only thing that can un-block a subprocess sitting on a stdin
+        read.
+
+        No client-facing action is owed: that HTTP request completed the
+        moment the `InputRequiredResult` went out.
+        """
+        swept = 0
+        with self._lock:
+            backends = [
+                entry["backend"]
+                for entry in self._entries.values()
+                if entry.get("backend") is not None
+            ]
+        for backend in backends:
+            for expired in backend.mrtr_expire_parked():
+                backend.send_oneway(
+                    _error_body(
+                        "the client did not return the requested input in time",
+                        expired["child_request_id"],
+                        code=_JSONRPC_INTERNAL_ERROR,
+                    )
+                )
+                swept += 1
+        return swept
 
     def start_reaper(self) -> None:
         """Start the idle-eviction thread (no-op when the TTL is disabled).
@@ -2500,6 +2549,16 @@ class BackendProcess:
         txn_id = secrets.token_urlsafe(16)
         deadline = (time.monotonic() if now is None else now) + _MRTR_PARK_TIMEOUT_SECS
         with self._mrtr_lock:
+            if upstream_id in self._mrtr_pending:
+                # #390 review, finding 3. Overwriting would ORPHAN the
+                # existing round: its txn id still rides a client-held
+                # `requestState`, and the table entry that pointer names
+                # would silently become a different round. Steady state
+                # cannot reach here — a parked round means the handler
+                # already returned and cleared the context — but a child
+                # that ignores its own blocking read can, and the cost of
+                # guessing here is an unredeemable pointer.
+                return ""
             self._mrtr_pending[upstream_id] = {
                 "txn_id": txn_id,
                 "method": method,
@@ -2648,6 +2707,28 @@ class BackendProcess:
             )
             return True
         round_no = int(context.get("round", 1))
+        if round_no > _MRTR_MAX_ROUNDS:
+            # #390 review, finding 2. `_mrtr_decode_pointer` refuses a
+            # pointer past the cap, so minting one here would hand the
+            # client a `requestState` it can NEVER redeem — the round
+            # would stay parked until the park timeout, and before that
+            # timeout was wired (finding 1) forever. Refuse at the mint
+            # instead, and tell the child so it stops waiting.
+            #
+            # The original caller is not given a distinct error: the
+            # child, now unblocked, fails its own `tools/call` and that
+            # failure propagates through the ordinary response path. The
+            # gateway inventing a second, competing error for a call the
+            # child is still perfectly able to answer would be worse.
+            log(f"mrtr: refusing round {round_no} past the {_MRTR_MAX_ROUNDS} cap")
+            self._write(
+                _error_body(
+                    "the input-required round limit was reached",
+                    child_request_id,
+                    code=_JSONRPC_INVALID_PARAMS,
+                )
+            )
+            return True
         txn_id = self.mrtr_round_open(
             upstream_id,
             method=msg.get("method", ""),
@@ -2656,6 +2737,17 @@ class BackendProcess:
             principal=context.get("principal"),
             round_no=round_no,
         )
+        if not txn_id:
+            # A round is already parked on this id (finding 3's guard).
+            log("mrtr: a round is already parked for this request; refusing")
+            self._write(
+                _error_body(
+                    "a previous input request is still outstanding",
+                    child_request_id,
+                    code=_JSONRPC_INVALID_PARAMS,
+                )
+            )
+            return True
         state = _mrtr_encode_pointer(txn_id, context.get("principal"), round_no)
         result = {
             "resultType": "input_required",
@@ -2975,7 +3067,7 @@ class BackendProcess:
 
     def resume_request(
         self, reply_line: str, req_id: Any, timeout: float
-    ) -> str | None:
+    ) -> tuple[str | None, bool]:
         """Answer the child's own question, then wait for the ORIGINAL reply.
 
         #375 §3.5, and the shape is why this cannot just be
@@ -2989,6 +3081,14 @@ class BackendProcess:
         would miss a response already routed — the same
         register-then-write ordering `send_request` uses, for the same
         reason.
+
+        Returns `(line, delivered)`. `delivered` is what a bare `None`
+        cannot express (#390 review, finding 5): a timeout AFTER a
+        successful write means the child was told and simply has not
+        answered yet, so answering it again would put a second reply on
+        its stream — while the early returns below mean it was never told
+        and is still blocked. Conflating the two either wedges a child or
+        corrupts it.
         """
         slot: dict[str, Any] = {
             "event": threading.Event(),
@@ -2998,19 +3098,23 @@ class BackendProcess:
         }
         with self._lock:
             if self._closed.is_set():
-                return None
+                # Nothing is owed: the child is gone.
+                return None, True
             if req_id in self._pending:
                 # The original slot should be long gone — its handler
                 # returned the InputRequiredResult. If it is not, the
                 # correlation is ambiguous and guessing is what this
-                # whole design refuses to do.
-                return None
+                # whole design refuses to do. NOT delivered: the child
+                # is still blocked, and the caller must answer it.
+                return None, False
             self._pending[req_id] = slot
         if not self._write(reply_line):
             self._detach(req_id, slot)
-            return None
+            # A broken pipe makes the child unreachable rather than merely
+            # untold; nothing further can be delivered to it.
+            return None, True
         slot["event"].wait(timeout)
-        return self._detach(req_id, slot)
+        return self._detach(req_id, slot), True
 
     def send_oneway(self, line: str) -> bool:
         """Forward a notification or a client->server response (no reply)."""
@@ -4989,6 +5093,7 @@ class _Handler(BaseHTTPRequestHandler):
         principal: str | None,
         request_state: Any,
         params: dict[str, Any],
+        init_result: dict[str, Any],
     ) -> None:
         """Resume a parked round from the client's retry (#375 §3.5).
 
@@ -5111,12 +5216,24 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
         try:
-            line = backend.resume_request(
+            line, delivered = backend.resume_request(
                 reply_line, entry["upstream_id"], _BACKEND_RESPONSE_TIMEOUT_SECS
             )
         finally:
             backend.mrtr_end_dispatch()
         if line is None:
+            if not delivered:
+                # The reply never reached the child, so it is still
+                # blocked and this is the last chance to answer it.
+                self._fail_retry(
+                    backend,
+                    child_request_id,
+                    req_id,
+                    "the input could not be delivered to the backend",
+                    503,
+                    code=_JSONRPC_INTERNAL_ERROR,
+                )
+                return
             self._send_json(
                 504,
                 _error_body(
@@ -5144,7 +5261,12 @@ class _Handler(BaseHTTPRequestHandler):
         _stamp_modern_result(
             parsed,
             msg.get("method"),
-            server_info=None,
+            # #390 review, finding 4: the child's `serverInfo`, same as
+            # every other modern result. Omitting it made a RESUMED call
+            # the one response missing the `_meta` the spec says servers
+            # SHOULD put on every result — invisible until someone
+            # compared two responses to the same tool.
+            server_info=init_result.get("serverInfo"),
             cache_ttl_ms=self.cache_ttl_ms,
         )
         self._send_json(_modern_response_status(parsed), json.dumps(parsed))
@@ -5511,7 +5633,13 @@ class _Handler(BaseHTTPRequestHandler):
             )
             if request_state is not None:
                 self._serve_mrtr_retry(
-                    msg, req_id, backend, principal, request_state, params_obj
+                    msg,
+                    req_id,
+                    backend,
+                    principal,
+                    request_state,
+                    params_obj,
+                    init_result,
                 )
                 return
             # §4 Q1's OAuth-only boundary, and this is where it BITES. A
