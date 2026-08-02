@@ -258,9 +258,11 @@ lets you escape on the client side.
 ([reference](reference.md#env-vars)). With it unset,
 mcp-stdio tells your server up front that it cannot ask, and a
 well-behaved server never does. Turning it on is a real, observable
-handshake change on every child process mcp-stdio spawns, so an
-operator withdraws it the same way it was granted — by unsetting the
-variable and restarting.
+handshake change on every child process mcp-stdio spawns. The flag is
+read fresh on every request — nothing caches it — but it is an
+ordinary environment variable, so a change only reaches an
+already-running gateway through a restart. Unsetting it and
+restarting is how an operator withdraws it.
 
 **OAuth-authenticated callers only.** A caller with no session — no
 auth, or a shared static token — cannot be told apart from any other
