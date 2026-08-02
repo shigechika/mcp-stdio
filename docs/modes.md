@@ -250,9 +250,9 @@ Worth knowing:
 If your server is still on an older protocol version but wants to ask
 something *during* a call it is handling — elicit input, request a
 sampling completion, or list the client's roots — a newer client can
-answer it, over MRTR (the reverse direction of the pattern
-[`MCP_STDIO_MRTR_STRIP`](reference.md#env-vars) escapes
-on the client side).
+answer it, over MRTR — the reverse direction of the same multi
+round-trip pattern that [`MCP_STDIO_MRTR_STRIP`](reference.md#env-vars)
+lets you escape on the client side.
 
 **Off by default**, behind `MCP_STDIO_MRTR_REVERSE_ENABLE`
 ([reference](reference.md#env-vars)). With it unset,
