@@ -250,6 +250,8 @@ mcp-stdio works around these issues at the wire level where possible.
 
 ---
 
+<a id="env-vars"></a>
+
 ## Environment Variables
 
 | Variable | Purpose |
@@ -259,6 +261,7 @@ mcp-stdio works around these issues at the wire level where possible.
 | `MCP_OAUTH_REFRESH_LEEWAY` | Seconds before token expiry to trigger refresh (default: 60) |
 | `MCP_STDIO_SERVE_TOKEN` | Static bearer token for serve mode |
 | `MCP_STDIO_MRTR_STRIP` | Set to `1` to stop advertising the client's `sampling` / `elicitation` / `roots` capabilities to a modern-era remote, withdrawing its invitation to use the multi round-trip requests (MRTR) pattern. Escape hatch only — the relay bridges MRTR by default, and a server that sends it anyway is still bridged. |
+| `MCP_STDIO_MRTR_REVERSE_ENABLE` | Set to `1` to let an older `serve`-published server ask a newer client something mid-call — elicit input, request a sampling completion, or list roots — over MRTR, the reverse direction of `MCP_STDIO_MRTR_STRIP` above. Off by default; only bridges for OAuth-authenticated callers. See [Answering your server's mid-call questions](modes.md#mid-call-serve). |
 | `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` | Standard proxy configuration |
 
 ---
