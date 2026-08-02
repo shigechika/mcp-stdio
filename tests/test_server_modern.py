@@ -4526,3 +4526,1205 @@ class TestMrtrDispatchClaim:
             t.join(timeout=20)
 
         assert sorted(statuses) == [200, 503], statuses
+
+
+# --- reverse MRTR: translation (#375 PR 2) -------------------------------
+
+
+class TestMrtrTranslation:
+    """The inversion of relay's PR C, in both directions."""
+
+    def test_a_child_request_becomes_a_bare_input_entry(self):
+        """Relay MINTS an envelope around a bare object; serve STRIPS one
+        back off, because `inputRequests` values "MUST be one of
+        ElicitRequest, CreateMessageRequest, or ListRootsRequest" — bare
+        request objects, not JSON-RPC messages."""
+        cap, entry = server._mrtr_request_to_input_entry(
+            {
+                "jsonrpc": "2.0",
+                "id": "child-1",
+                "method": "sampling/createMessage",
+                "params": {"messages": [], "maxTokens": 10},
+            }
+        )
+        assert cap == "sampling"
+        assert entry == {
+            "method": "sampling/createMessage",
+            "params": {"messages": [], "maxTokens": 10},
+        }
+        # The envelope is gone: no id, no jsonrpc.
+        assert "id" not in entry and "jsonrpc" not in entry
+
+    def test_roots_list_carries_no_params(self):
+        cap, entry = server._mrtr_request_to_input_entry(
+            {"jsonrpc": "2.0", "id": 1, "method": "roots/list"}
+        )
+        assert cap == "roots"
+        assert entry == {"method": "roots/list"}
+
+    def test_every_bridgeable_method_maps_to_its_capability(self):
+        assert server._MRTR_REQUEST_CAPABILITY == {
+            "elicitation/create": "elicitation",
+            "sampling/createMessage": "sampling",
+            "roots/list": "roots",
+        }
+
+    def test_an_unbridgeable_method_is_refused_with_a_reason(self):
+        for method in ("tools/list", "notifications/message", None, ""):
+            cap, reason = server._mrtr_request_to_input_entry({"method": method})
+            assert cap is None, method
+            assert reason, method
+
+    def test_params_pass_through_verbatim(self):
+        """Inventing a lossy down-translation would be worse than passing
+        what the child actually said — every MCP request object is
+        open/extensible."""
+        params = {"messages": [{"role": "user"}], "unknownFuture": {"x": 1}}
+        _, entry = server._mrtr_request_to_input_entry(
+            {"method": "sampling/createMessage", "params": params}
+        )
+        assert entry["params"] == params
+
+    def test_no_reject_arms_for_shapes_a_legacy_child_cannot_emit(self):
+        """Narrower than relay ON PURPOSE (#375 §2, §4 Q6).
+
+        Relay must refuse `mode: "url"` elicitation and tool-augmented
+        sampling because a modern SERVER can express them and a legacy
+        client cannot consume them. Here the CHILD is the legacy side and
+        structurally cannot emit either — both are 2025-11-25+ additions.
+        So they pass through as ordinary params rather than being
+        rejected, and this pins that as a DECISION rather than letting a
+        reviewer read it as a missed case.
+        """
+        cap, entry = server._mrtr_request_to_input_entry(
+            {"method": "elicitation/create", "params": {"mode": "url", "url": "x"}}
+        )
+        assert cap == "elicitation"
+        assert entry["params"]["mode"] == "url"
+
+    def test_a_malformed_params_is_refused(self):
+        cap, reason = server._mrtr_request_to_input_entry(
+            {"method": "elicitation/create", "params": "nope"}
+        )
+        assert cap is None and reason
+
+    def test_an_input_response_becomes_the_reply_the_child_awaits(self):
+        line, why = server._mrtr_input_response_to_reply(
+            {"result": {"action": "accept", "content": {"name": "x"}}}, "child-1"
+        )
+        assert why == ""
+        assert json.loads(line) == {
+            "jsonrpc": "2.0",
+            "id": "child-1",
+            "result": {"action": "accept", "content": {"name": "x"}},
+        }
+
+    def test_a_bare_result_object_is_accepted_too(self):
+        """The client's `InputResponse` IS the result; a caller that
+        hands the result directly must work the same way."""
+        line, why = server._mrtr_input_response_to_reply({"action": "decline"}, 7)
+        assert why == ""
+        assert json.loads(line)["result"] == {"action": "decline"}
+
+    def test_a_client_error_is_forwarded_as_a_jsonrpc_error(self):
+        """A user declining is a legitimate OUTCOME, not a bridge
+        failure — the child must learn what happened rather than see the
+        gateway swallow it."""
+        line, why = server._mrtr_input_response_to_reply(
+            {"error": {"code": -32001, "message": "user declined"}}, "child-1"
+        )
+        assert why == ""
+        assert json.loads(line)["error"]["code"] == -32001
+
+    def test_a_non_dict_error_value_is_malformed_not_a_success(self):
+        """#390 Copilot review — the nastiest shape in this function.
+
+        A non-dict `error` used to SKIP the error branch and fall into
+        the bare-result path, where `.get("result", response)` fell back
+        to the whole object. So `{"error": "x"}` came out as a SUCCESS
+        carrying `result: {"error": "x"}` — a child that asked a question
+        was told its request succeeded and handed the error as the
+        answer. Silent, and exactly backwards.
+
+        Revert-check: restore the `and isinstance(...)` fall-through and
+        this returns a success line instead of a refusal.
+        """
+        for bad_error in ("x", 7, None, [], ["a"]):
+            line, why = server._mrtr_input_response_to_reply({"error": bad_error}, "c1")
+            assert line is None, (bad_error, line)
+            assert why, bad_error
+
+    def test_the_error_key_decides_the_shape_with_no_fall_through(self):
+        """The three legal shapes still resolve as they did — the fix
+        narrows one hole without moving the others."""
+        # A real error is forwarded as an error.
+        line, _ = server._mrtr_input_response_to_reply(
+            {"error": {"code": -1, "message": "no"}}, "c1"
+        )
+        assert json.loads(line)["error"]["code"] == -1
+        # An explicit result is unwrapped.
+        line, _ = server._mrtr_input_response_to_reply({"result": {"ok": 1}}, "c1")
+        assert json.loads(line)["result"] == {"ok": 1}
+        # And a bare result object — no `error`, no `result` — is still
+        # accepted as the result itself.
+        line, _ = server._mrtr_input_response_to_reply({"action": "decline"}, "c1")
+        assert json.loads(line)["result"] == {"action": "decline"}
+
+    def test_a_malformed_input_response_is_refused(self):
+        for bad in (None, 7, "x", {"result": "not-an-object"}):
+            line, why = server._mrtr_input_response_to_reply(bad, "c1")
+            assert line is None, bad
+            assert why, bad
+
+
+class TestMrtrRoundOneMinting:
+    """A child's mid-call request becomes an `InputRequiredResult`.
+
+    The unit `gateway` fixture is NO-AUTH, which is exactly why these
+    tests drive `_mrtr_try_bridge` against a `BackendProcess` directly:
+    under no auth the OAuth-only gate publishes no bridging context at
+    all, so the HTTP path cannot reach this code — and that fact is
+    itself pinned, below.
+    """
+
+    def _backend(self):
+        return server.BackendProcess([*_BACKEND], modern_owned=True)
+
+    def test_no_context_means_no_bridge(self):
+        """The D4 fallthrough stays the default outcome: unbridgeable is
+        the answer whenever anything at all is missing."""
+        backend = self._backend()
+        try:
+            assert backend._mrtr_try_bridge({"id": 1, "method": "roots/list"}) is False
+        finally:
+            backend.shutdown()
+
+    def test_a_bridged_request_wakes_the_parked_handler(self):
+        """Round-1 minting needs NO new response path: the handler is
+        already blocked in `send_request` on this slot, so filling it and
+        setting the event delivers the result through the existing
+        stamp/send machinery.
+
+        Asserted on the line the handler would receive — wire evidence,
+        not "no hang observed".
+        """
+        backend = self._backend()
+        try:
+            got: list[str] = []
+
+            def _wait():
+                line = backend.send_request(
+                    json.dumps({"jsonrpc": "2.0", "id": "U1", "method": "noreply"}),
+                    "U1",
+                    10.0,
+                )
+                got.append(line)
+
+            assert backend.mrtr_begin_dispatch(
+                {
+                    "upstream_id": "U1",
+                    "declared_caps": {"sampling": {}},
+                    "principal": "alice",
+                    "round": 1,
+                }
+            )
+            waiter = threading.Thread(target=_wait, daemon=True)
+            waiter.start()
+            deadline = time.monotonic() + 10
+            while not backend.has_pending and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert backend._mrtr_try_bridge(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "child-9",
+                    "method": "sampling/createMessage",
+                    "params": {"messages": []},
+                }
+            )
+            waiter.join(timeout=10)
+            assert got and got[0] is not None
+            result = json.loads(got[0])["result"]
+            assert result["resultType"] == "input_required"
+            # The gateway INVENTS the key from the child's own id.
+            assert list(result["inputRequests"]) == ["child-9"]
+            assert result["inputRequests"]["child-9"]["method"] == (
+                "sampling/createMessage"
+            )
+            # And the pointer is a real, verifiable one.
+            payload, why = server._mrtr_decode_pointer(result["requestState"], "alice")
+            assert why == "" and payload["round"] == 1
+            # The round is parked, keyed to the child's own request id.
+            found = backend.mrtr_round_for_txn(payload["txn_id"])
+            assert found is not None and found[1]["child_request_id"] == "child-9"
+        finally:
+            backend.shutdown()
+
+    def test_an_undeclared_capability_aborts_with_32021(self):
+        """O11: "the server MUST return a
+        `MissingRequiredClientCapabilityError` (-32021) whose
+        `data.requiredCapabilities` lists the missing capabilities."
+
+        No relay precedent to copy — relay can never emit this, only
+        servers can — so copying its generic abort would be
+        non-conformant. And NO round is opened: there is nothing to retry
+        into.
+        """
+        backend = self._backend()
+        try:
+            got: list[str] = []
+
+            def _wait():
+                got.append(
+                    backend.send_request(
+                        json.dumps({"jsonrpc": "2.0", "id": "U1", "method": "noreply"}),
+                        "U1",
+                        10.0,
+                    )
+                )
+
+            assert backend.mrtr_begin_dispatch(
+                {
+                    "upstream_id": "U1",
+                    "declared_caps": {"elicitation": {}},  # no sampling
+                    "principal": "alice",
+                    "round": 1,
+                }
+            )
+            waiter = threading.Thread(target=_wait, daemon=True)
+            waiter.start()
+            deadline = time.monotonic() + 10
+            while not backend.has_pending and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert backend._mrtr_try_bridge(
+                {"jsonrpc": "2.0", "id": "c1", "method": "sampling/createMessage"}
+            )
+            waiter.join(timeout=10)
+            error = json.loads(got[0])["error"]
+            assert error["code"] == -32021
+            assert error["data"]["requiredCapabilities"] == ["sampling"]
+            assert not backend.mrtr_has_pending(), "a round was opened anyway"
+        finally:
+            backend.shutdown()
+
+    def test_a_vanished_handler_falls_through_rather_than_parking(self):
+        """If the handler timed out between the context read and the
+        answer, the round must NOT be left parked for a retry that can
+        never be correlated — and the caller must still answer the child,
+        or it stays blocked forever."""
+        backend = self._backend()
+        try:
+            assert backend.mrtr_begin_dispatch(
+                {
+                    "upstream_id": "U-gone",
+                    "declared_caps": {"roots": {}},
+                    "principal": "alice",
+                    "round": 1,
+                }
+            )
+            # No waiter was ever registered for U-gone.
+            assert (
+                backend._mrtr_try_bridge(
+                    {"jsonrpc": "2.0", "id": "c1", "method": "roots/list"}
+                )
+                is False
+            )
+            assert backend.mrtr_has_pending() is False
+        finally:
+            backend.shutdown()
+
+
+def test_a_no_auth_gateway_publishes_no_bridging_context(gateway_with_pool):
+    """§4 Q1's boundary, end to end, and the reason it is safe to remove
+    the D4 valve: a no-auth deployment gets NO bridging context, so a
+    child that asks still meets the `-32601`.
+
+    Asserted on the child's actual answer — the fake backend's
+    `ask_client` really does raise `elicitation/create` mid-call — rather
+    than on the absence of a bridge.
+    """
+    url, pool = gateway_with_pool
+    resp = _post(
+        url, _modern_body("ask_client", meta=_meta()), _modern_headers("ask_client")
+    )
+    assert resp.status_code == 200, resp.text
+    # The child got its D4 reject and completed normally.
+    assert resp.json()["result"]["asked"] is True
+    backend, _, entry = pool.get_or_create(None)
+    try:
+        assert backend.mrtr_context() is None
+        assert backend.mrtr_has_pending() is False
+    finally:
+        pool.release(entry)
+
+
+class TestMrtrRetryFailurePaths:
+    """After the round is consumed, the child is owed a reply on EVERY exit.
+
+    #390's review found two paths that answered only the client, leaving
+    the subprocess blocked forever — the round was already gone from the
+    table, so nothing else could ever reply to it. Every test here asserts
+    WIRE EVIDENCE that the child got an error for its own id, not merely
+    that the client got one.
+    """
+
+    def _park(self, backend, *, declared=None, round_no=1):
+        """Park a round the way a real mint would, and return its pointer."""
+        txn = backend.mrtr_round_open(
+            "U1",
+            method="tools/call",
+            child_request_id="child-7",
+            declared_caps=declared if declared is not None else {"sampling": {}},
+            # The `gateway_with_pool` fixture is NO-AUTH, so the live
+            # principal is None. The pointer's principal binding compares
+            # against whatever the CURRENT request resolves to, so a round
+            # parked under any other value would be rejected before these
+            # failure paths could be reached at all — which is itself the
+            # binding working, just not what these tests are about.
+            principal=None,
+            round_no=round_no,
+        )
+        return server._mrtr_encode_pointer(txn, None, round_no)
+
+    def _retry(self, url, state, responses="default", meta=None):
+        params = {"_meta": meta if meta is not None else _meta()}
+        params["requestState"] = state
+        if responses != "omit":
+            params["inputResponses"] = (
+                {"child-7": {"result": {"ok": True}}}
+                if responses == "default"
+                else responses
+            )
+        return _post(
+            url,
+            {
+                "jsonrpc": "2.0",
+                "id": "retry-1",
+                "method": "tools/call",
+                "params": params,
+            },
+            _modern_headers("tools/call"),
+        )
+
+    def test_a_stale_pointer_leaves_the_round_and_the_child_alone(
+        self, gateway_with_pool
+    ):
+        """Updated when validation moved BEFORE the consume (#390).
+
+        This used to assert the opposite — that a stale pointer unblocks
+        the child — and that was right while the round was consumed
+        first. Now the stale check runs on a PEEK, so the round survives
+        and may still be redeemed by its real owner: unblocking the child
+        here would destroy a live transaction on behalf of an impostor.
+
+        Finding B's rule is unchanged and still holds — every path AFTER
+        the consume owes the child a reply. This path simply is no longer
+        one of them.
+        """
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        state = self._park(backend, round_no=1)
+        # Corrupt the parked entry's round so the pointer reads stale.
+        with backend._mrtr_lock:
+            next(iter(backend._mrtr_pending.values()))["round"] = 9
+        sent: list[str] = []
+        backend.send_oneway = lambda line: sent.append(line) or True  # type: ignore
+        resp = self._retry(url, state)
+        assert resp.status_code == 400, resp.text
+        assert "stale" in resp.json()["error"]["message"]
+        assert sent == [], "a stale pointer unblocked a child it does not own"
+        assert backend.mrtr_has_pending(), "a stale pointer destroyed a live round"
+
+    def test_missing_input_responses_unblocks_the_child_before_erroring(
+        self, gateway_with_pool
+    ):
+        """Finding B, half two."""
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        state = self._park(backend)
+        sent: list[str] = []
+        backend.send_oneway = lambda line: sent.append(line) or True  # type: ignore
+        resp = self._retry(url, state, responses="omit")
+        assert resp.status_code == 400, resp.text
+        assert "inputResponses" in resp.json()["error"]["message"]
+        assert sent and json.loads(sent[0])["id"] == "child-7"
+
+    def test_a_lost_claim_aborts_instead_of_resuming_the_child(self, gateway_with_pool):
+        """Finding A, the blocking one.
+
+        Consuming the round leaves the child momentarily unclaimed, and a
+        brand-new eligible request can win the claim in that window.
+        Resuming anyway would put the child back to work while someone
+        else holds the dispatch claim — and a second question would
+        bridge into the wrong context.
+
+        The race is FORCED rather than hoped for: the claim is taken by a
+        stand-in before the retry runs, which is exactly the state the
+        window produces.
+
+        Revert-check: call `resume_request` regardless of `claimed` and
+        this returns 200 with the child resumed.
+        """
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        state = self._park(backend)
+        resumed: list[str] = []
+        backend.resume_request = (  # type: ignore[method-assign]
+            lambda reply, rid, timeout: (resumed.append(reply), (None, True))[1]
+        )
+        sent: list[str] = []
+        backend.send_oneway = lambda line: sent.append(line) or True  # type: ignore
+
+        # A concurrent claimant wins the window.
+        def _steal():
+            with backend._mrtr_lock:
+                if not backend._mrtr_pending:
+                    backend._mrtr_inflight = True
+
+        original_consume = backend.mrtr_round_consume
+
+        def _consume_then_steal(txn):
+            out = original_consume(txn)
+            _steal()
+            return out
+
+        backend.mrtr_round_consume = _consume_then_steal  # type: ignore
+        resp = self._retry(url, state)
+
+        assert resp.status_code == 503, resp.text
+        assert "concurrent" in resp.json()["error"]["message"]
+        assert resumed == [], "the child was resumed despite a lost claim"
+        assert sent and json.loads(sent[0])["id"] == "child-7"
+
+    def test_the_next_round_uses_the_retrys_own_capabilities(self, gateway_with_pool):
+        """Finding C. O5 makes `clientCapabilities` PER REQUEST, and the
+        retry is a fresh, separately-validated one — so a second
+        `input_required` mint must gate against what THIS request
+        declared, not what the original did.
+
+        Revert-check: pass `entry["declared_caps"]` and the context shows
+        the original's capabilities instead.
+        """
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        # Original round declared sampling only.
+        state = self._park(backend, declared={"sampling": {}})
+        seen: list[dict] = []
+
+        def _capture(reply, rid, timeout):
+            ctx = backend.mrtr_context()
+            seen.append(dict(ctx) if ctx else {})
+            return (
+                json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"ok": True}}),
+                True,
+            )
+
+        backend.resume_request = _capture  # type: ignore[method-assign]
+        # The RETRY declares elicitation instead.
+        retry_meta = {**_meta(), META_CAPS: {"elicitation": {}}}
+        resp = self._retry(url, state, meta=retry_meta)
+        assert resp.status_code == 200, resp.text
+        assert seen and seen[0]["declared_caps"] == {"elicitation": {}}, seen
+        assert seen[0]["round"] == 2
+        # Finding 4: a RESUMED response carries the child's `serverInfo`
+        # like every other modern result. Omitting it made this the one
+        # response missing the `_meta` the spec says servers SHOULD put
+        # on every result — invisible until someone compared two
+        # responses to the same tool.
+        #
+        # Revert-check: pass `server_info=None` and this key disappears.
+        meta = resp.json()["result"]["_meta"]
+        assert meta["io.modelcontextprotocol/serverInfo"]["name"] == "fake", meta
+
+
+class TestMrtrAbandonedAndCapped:
+    """The never-hang invariant, at the two ends #390's review found open."""
+
+    def test_an_abandoned_round_is_swept_and_the_child_unblocked(self):
+        """Finding 1. A client is EXPLICITLY licensed not to come back
+        ("Servers MUST NOT assume that clients will fulfill the
+        inputRequests or retry"), so an unswept round left the child
+        blocked forever AND wedged the principal's pool slot, since
+        `mrtr_begin_dispatch` refuses while anything is parked.
+
+        Wire evidence: the child receives an error under its OWN request
+        id. Revert-check: remove the `_sweep_abandoned_rounds()` call and
+        nothing is written and the slot stays wedged.
+        """
+        clock = [1000.0]
+        pool = server.ModernBackendPool(_BACKEND, idle_ttl=0.0, now=lambda: clock[0])
+        try:
+            backend, _, entry = pool.get_or_create("alice")
+            pool.release(entry)
+            sent: list[str] = []
+            backend.send_oneway = lambda line: sent.append(line) or True  # type: ignore
+            backend.mrtr_round_open(
+                "U1",
+                method="tools/call",
+                child_request_id="child-42",
+                declared_caps={},
+                principal="alice",
+                now=time.monotonic(),
+            )
+            assert backend.mrtr_begin_dispatch() is False, "slot should be wedged"
+            # Before the deadline: nothing swept.
+            pool.reap_idle()
+            assert sent == []
+            # Past it: the child is told, and the slot frees up.
+            with backend._mrtr_lock:
+                for e in backend._mrtr_pending.values():
+                    e["park_deadline"] = time.monotonic() - 1
+            pool.reap_idle()
+            assert sent, "the child was never unblocked"
+            assert json.loads(sent[0])["id"] == "child-42"
+            assert "error" in json.loads(sent[0])
+            assert backend.mrtr_begin_dispatch() is True, "the slot stayed wedged"
+        finally:
+            pool.shutdown_all()
+
+    def test_the_reaper_thread_starts_for_the_bridge_without_any_idle_ttl(
+        self, monkeypatch
+    ):
+        """#390 R3F1 — the layer above the sweep.
+
+        Placing the sweep outside `reap_idle`'s TTL check was right, and
+        insufficient: `start_reaper` gated the whole THREAD on the TTL,
+        so in the default deployment nothing ever called `reap_idle` at
+        all. That is finding 1 again, one layer up — and the test that
+        was here before could not see it, because it called
+        `reap_idle()` directly rather than letting the thread do it.
+
+        This drives the real thread end to end with NO idle TTL, and
+        asserts wire evidence that the child was unblocked.
+
+        Revert-check: restore the `self._idle_ttl <= 0` gate and no
+        thread starts, so the child is never unblocked and this times
+        out.
+        """
+        monkeypatch.setenv("MCP_STDIO_MRTR_REVERSE_ENABLE", "1")
+        monkeypatch.setattr(server, "_MRTR_PARK_TIMEOUT_SECS", 4.0)
+        pool = server.ModernBackendPool(_BACKEND, idle_ttl=0.0)
+        try:
+            backend, _, entry = pool.get_or_create("alice")
+            pool.release(entry)
+            sent: list[str] = []
+            backend.send_oneway = lambda line: sent.append(line) or True  # type: ignore
+            backend.mrtr_round_open(
+                "U1",
+                method="tools/call",
+                child_request_id="c-abandoned",
+                declared_caps={},
+                principal="alice",
+                now=time.monotonic() - 99,  # already past its deadline
+            )
+            pool.start_reaper()
+            assert pool._reaper is not None, "no reaper thread started"
+            deadline = time.monotonic() + 15
+            while not sent and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert sent, "the reaper never swept the abandoned round"
+            assert json.loads(sent[0])["id"] == "c-abandoned"
+            # Idle eviction stays OFF: a bridge-only reaper evicts nothing.
+            assert pool.count() == 1, "an idle child was evicted with ttl=0"
+        finally:
+            pool.stop_reaper()
+            pool.shutdown_all()
+
+    def test_the_sweep_itself_ignores_the_idle_ttl(self):
+        """The sweep's own placement, independent of who calls it: the
+        park deadline is the ROUND's, not the pool's."""
+        pool = server.ModernBackendPool(_BACKEND, idle_ttl=0.0)
+        try:
+            backend, _, entry = pool.get_or_create("alice")
+            pool.release(entry)
+            sent: list[str] = []
+            backend.send_oneway = lambda line: sent.append(line) or True  # type: ignore
+            backend.mrtr_round_open(
+                "U1",
+                method="tools/call",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+                now=time.monotonic() - server._MRTR_PARK_TIMEOUT_SECS - 1,
+            )
+            pool.reap_idle()
+            assert sent and json.loads(sent[0])["id"] == "c1"
+        finally:
+            pool.shutdown_all()
+
+    def test_a_round_past_the_cap_is_refused_at_mint_time(self):
+        """Finding 2. `_mrtr_decode_pointer` refuses a pointer past the
+        cap, so minting one would hand the client a `requestState` it can
+        NEVER redeem — parked until the park timeout, and before finding
+        1 was fixed, forever.
+
+        The child is told so it stops waiting; its own call then fails
+        through the ordinary path rather than the gateway inventing a
+        competing error for a call the child can still answer.
+
+        Revert-check: drop the cap check and a round IS parked with an
+        unredeemable pointer.
+        """
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            sent: list[str] = []
+            backend._write = lambda line: sent.append(line) or True  # type: ignore
+            assert backend.mrtr_begin_dispatch(
+                {
+                    "upstream_id": "U1",
+                    "declared_caps": {"roots": {}},
+                    "principal": "alice",
+                    "round": server._MRTR_MAX_ROUNDS + 1,
+                }
+            )
+            assert backend._mrtr_try_bridge(
+                {"jsonrpc": "2.0", "id": "c1", "method": "roots/list"}
+            )
+            assert sent and json.loads(sent[0])["id"] == "c1"
+            assert "error" in json.loads(sent[0])
+            assert backend.mrtr_has_pending() is False, "an unredeemable round parked"
+        finally:
+            backend.shutdown()
+
+    def test_a_second_round_never_overwrites_a_parked_one(self):
+        """Finding 3. Overwriting would ORPHAN the first round: its txn id
+        still rides a client-held `requestState`, and the entry that
+        pointer names would silently become a different round.
+
+        Steady state cannot reach this — a parked round means the handler
+        already returned and cleared the context — but a child that
+        ignores its own blocking read can, and guessing costs an
+        unredeemable pointer.
+        """
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            first = backend.mrtr_round_open(
+                "U1",
+                method="tools/call",
+                child_request_id="c1",
+                declared_caps={},
+                principal="alice",
+            )
+            second = backend.mrtr_round_open(
+                "U1",
+                method="tools/call",
+                child_request_id="c2",
+                declared_caps={},
+                principal="alice",
+            )
+            assert second == "", "a second round overwrote the first"
+            found = backend.mrtr_round_for_txn(first)
+            assert found is not None and found[1]["child_request_id"] == "c1"
+        finally:
+            backend.shutdown()
+
+    def test_an_undelivered_resume_still_answers_the_child(self):
+        """Finding 5, the one sub-case that was real: `resume_request`
+        returns None from several places, and only ONE of them means the
+        child was never told. A timeout after a successful write means it
+        WAS told, so re-answering would put a second reply on its stream.
+        """
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            # Occupy the slot so `resume_request` takes its
+            # ambiguous-correlation early return.
+            with backend._lock:
+                backend._pending["U1"] = {
+                    "event": threading.Event(),
+                    "line": None,
+                    "request_line": "",
+                    "waiters": 1,
+                }
+            line, delivered = backend.resume_request("{}", "U1", 1.0)
+            assert line is None and delivered is False
+            # A closed child: unreachable, so nothing is owed.
+            backend.shutdown()
+            line, delivered = backend.resume_request("{}", "U2", 1.0)
+            assert line is None and delivered is True
+        finally:
+            backend.shutdown()
+
+
+class TestMrtrHostileChildAndFlagGate:
+    """#390 Copilot round 3: a DoS and a switch that did not switch."""
+
+    def test_an_unhashable_method_does_not_kill_the_reader_thread(self):
+        """A truthy-but-unhashable `method` used to raise
+        `TypeError: unhashable type` inside the child's READER thread,
+        whose `try/except` sits OUTSIDE its `while` loop — so it ended
+        the loop, hit `_fail_all("backend process exited")`, and failed
+        every in-flight request on a subprocess that was still perfectly
+        alive. One malformed field, all traffic to that child gone.
+
+        WIRE EVIDENCE: an unrelated request still round-trips afterwards,
+        which is the thing the crash destroyed. Asserting only that the
+        translate call returns a reason would miss the actual damage.
+
+        Revert-check: drop the `isinstance(method, str)` guard and this
+        raises out of `_route`, taking the reader thread with it.
+        """
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            for hostile in ({"a": 1}, ["x"], {"nested": ["deep"]}):
+                cap, why = server._mrtr_request_to_input_entry({"method": hostile})
+                assert cap is None and why, hostile
+                # Straight through the real reader-thread path, too.
+                backend._route(
+                    json.dumps({"jsonrpc": "2.0", "id": 1, "method": hostile})
+                )
+            # The child is still fully usable — the reader survived.
+            line = backend.send_request(
+                json.dumps({"jsonrpc": "2.0", "id": "still-alive", "method": "echo"}),
+                "still-alive",
+                10.0,
+            )
+            assert line is not None, "the reader thread died"
+            assert json.loads(line)["id"] == "still-alive"
+            assert backend.closed is False
+        finally:
+            backend.shutdown()
+
+    def test_the_flag_gates_bridging_not_only_the_advertisement(
+        self, gateway_with_pool, monkeypatch
+    ):
+        """The switch has to switch.
+
+        `_modern_child_capabilities()` was consulted only where serve
+        ADVERTISES to a child, so turning the flag off withdrew the offer
+        while leaving the bridge live — a child that ignored the
+        advertisement and asked anyway was still bridged, provided the
+        caller was OAuth-authenticated. The flag exists so an operator
+        can withdraw this "without a code rollback", and a switch that
+        only changes what serve SAYS does not do that.
+
+        Revert-check: drop the `and _modern_child_capabilities()` term
+        and a round is minted with the flag off.
+        """
+        url, pool = gateway_with_pool
+        # Stand in for an OAuth principal, so the OTHER gate is satisfied
+        # and this test is actually about the flag. Without this the
+        # unit fixture is no-auth and would pass for the wrong reason.
+        monkeypatch.setattr(server, "_mrtr_principal_is_eligible", lambda p: True)
+        seen: list = []
+        original = server.BackendProcess.mrtr_begin_dispatch
+
+        def _record(self, context=None):
+            seen.append(context)
+            return original(self, context)
+
+        monkeypatch.setattr(server.BackendProcess, "mrtr_begin_dispatch", _record)
+
+        monkeypatch.delenv("MCP_STDIO_MRTR_REVERSE_ENABLE", raising=False)
+        assert server._modern_child_capabilities() == {}
+        _post(
+            url,
+            _modern_body(
+                "tools/call",
+                params={"name": "echo_tool", "arguments": {}},
+                meta=_meta(),
+            ),
+            _modern_headers("tools/call", name="echo_tool"),
+        )
+        assert seen and seen[-1] is None, (
+            "the flag was off but a bridging context was still built"
+        )
+
+        # Flag on: the same request DOES publish a context.
+        monkeypatch.setenv("MCP_STDIO_MRTR_REVERSE_ENABLE", "1")
+        _post(
+            url,
+            _modern_body(
+                "tools/call",
+                params={"name": "echo_tool", "arguments": {}},
+                meta=_meta(),
+            ),
+            _modern_headers("tools/call", name="echo_tool"),
+        )
+        assert seen[-1] is not None, "the flag was on but nothing bridged"
+
+    def test_flipping_the_flag_off_stops_bridging_on_a_running_child(self, monkeypatch):
+        """Read live, not captured at spawn: withdrawing must take effect
+        on children already running, which is what an operator holding an
+        incident actually needs."""
+        monkeypatch.setenv("MCP_STDIO_MRTR_REVERSE_ENABLE", "1")
+        assert server._modern_child_capabilities() != {}
+        monkeypatch.delenv("MCP_STDIO_MRTR_REVERSE_ENABLE", raising=False)
+        assert server._modern_child_capabilities() == {}
+
+
+class TestMrtrRetryMethodGate:
+    """A `requestState` is only a retry OF THE METHOD THAT OPENED THE ROUND."""
+
+    def test_a_pointer_on_a_non_eligible_method_is_not_a_retry(self, gateway_with_pool):
+        """#390 Copilot review. `params.requestState` alone used to be
+        enough to enter the retry path, whatever the method was.
+
+        The damage compounds: single-use consumption destroys the round,
+        so the REAL retry finds nothing left and the original
+        `tools/call` can never be answered — while the response carries
+        the wrong method into `_stamp_modern_result`, applying
+        `resources/list` cache semantics to a `tools/call` result.
+
+        WIRE EVIDENCE that it fell through to ordinary dispatch: the
+        child answers `resources/list` itself (`-32601`, since the fake
+        child does not implement it) rather than the gateway synthesizing
+        a resumed result — and crucially the round is STILL PARKED
+        afterwards, which is what lets a correct retry succeed.
+
+        Revert-check: drop `and method in _MRTR_ELIGIBLE_METHODS` and the
+        round is consumed by a request that never opened it.
+        """
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        txn = backend.mrtr_round_open(
+            "U1",
+            method="tools/call",
+            child_request_id="child-7",
+            declared_caps={},
+            principal=None,
+        )
+        state = server._mrtr_encode_pointer(txn, None, 1)
+        resp = _post(
+            url,
+            {
+                "jsonrpc": "2.0",
+                "id": "stray-1",
+                "method": "resources/list",
+                "params": {"_meta": _meta(), "requestState": state},
+            },
+            _modern_headers("resources/list"),
+        )
+        # Ordinary dispatch: the CHILD answered, not the bridge.
+        assert resp.status_code == 404, resp.text
+        assert resp.json()["error"]["code"] == -32601
+        # And the round survived for the request that actually owns it.
+        assert backend.mrtr_round_for_txn(txn) is not None, (
+            "a stray method consumed a round it never opened"
+        )
+
+    def test_an_eligible_method_still_takes_the_retry_path(self, gateway_with_pool):
+        """The gate must not break the three methods that CAN open a
+        round — otherwise the fix trades one bug for a worse one."""
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        for method in sorted(server._MRTR_ELIGIBLE_METHODS):
+            txn = backend.mrtr_round_open(
+                "U1",
+                method=method,
+                child_request_id="c1",
+                declared_caps={},
+                principal=None,
+            )
+            state = server._mrtr_encode_pointer(txn, None, 1)
+            backend.send_oneway = lambda line: True  # type: ignore[method-assign]
+            resp = _post(
+                url,
+                {
+                    "jsonrpc": "2.0",
+                    "id": f"retry-{method}",
+                    "method": method,
+                    "params": {"_meta": _meta(), "requestState": state},
+                },
+                _modern_headers(method),
+            )
+            # Reached `_serve_mrtr_retry`: it rejects for a MISSING
+            # `inputResponses`, which only that path can produce.
+            assert resp.status_code == 400, (method, resp.text)
+            assert "inputResponses" in resp.json()["error"]["message"], method
+            # And it consumed the round, as a real retry does.
+            assert backend.mrtr_round_for_txn(txn) is None, method
+
+
+class TestMrtrRetryMethodExactMatch:
+    """A pointer redeems the round it opened — not merely *a* round."""
+
+    def test_a_pointer_from_one_eligible_method_cannot_redeem_another(
+        self, gateway_with_pool
+    ):
+        """#390 Copilot review, the follow-on to the eligibility gate.
+
+        `method in _MRTR_ELIGIBLE_METHODS` proves a request COULD have
+        opened a round. It does not prove it opened THIS one — so a
+        pointer minted by `tools/call` could be redeemed by
+        `resources/read`, both eligible, consuming a round belonging to a
+        different in-flight call.
+
+        WIRE EVIDENCE both ways: the mismatched retry is refused, AND the
+        round is still parked afterwards, which is what lets its real
+        owner finish.
+
+        Revert-check: drop the `entry["method"] != msg.get("method")`
+        term and the mismatched method consumes the round.
+        """
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        backend.send_oneway = lambda line: True  # type: ignore[method-assign]
+        txn = backend.mrtr_round_open(
+            "U1",
+            method="tools/call",
+            child_request_id="c1",
+            declared_caps={},
+            principal=None,
+        )
+        state = server._mrtr_encode_pointer(txn, None, 1)
+        resp = _post(
+            url,
+            {
+                "jsonrpc": "2.0",
+                "id": "wrong-method",
+                "method": "resources/read",
+                "params": {
+                    "_meta": _meta(),
+                    "requestState": state,
+                    "inputResponses": {"c1": {"result": {"ok": True}}},
+                    "uri": "res://a",
+                },
+            },
+            _modern_headers("resources/read", name="res://a"),
+        )
+        assert resp.status_code == 400, resp.text
+        assert "stale" in resp.json()["error"]["message"], resp.text
+        assert backend.mrtr_round_for_txn(txn) is not None, (
+            "a different method consumed a round it did not open"
+        )
+
+    def test_a_round_records_the_upstream_method_not_the_childs_question(self):
+        """The root cause, pinned directly.
+
+        `mrtr_round_open` used to be handed `msg.get("method")` from
+        inside `_mrtr_try_bridge`, where `msg` is the CHILD's question
+        (`sampling/createMessage`) — a semantically different value from
+        the client request the round belongs to (`tools/call`). The field
+        exists to be compared against an incoming retry's method, so
+        recording the wrong one made that comparison unwritable.
+
+        Driven through the real bridge rather than by calling
+        `mrtr_round_open` directly, because calling it directly is what
+        made the existing tests agree with an intention production did
+        not implement.
+        """
+        backend = server.BackendProcess([*_BACKEND], modern_owned=True)
+        try:
+            assert backend.mrtr_begin_dispatch(
+                {
+                    "upstream_id": "U1",
+                    "declared_caps": {"sampling": {}},
+                    "principal": "alice",
+                    "method": "tools/call",
+                    "round": 1,
+                }
+            )
+            waiter = threading.Thread(
+                target=lambda: backend.send_request(
+                    json.dumps({"jsonrpc": "2.0", "id": "U1", "method": "noreply"}),
+                    "U1",
+                    10.0,
+                ),
+                daemon=True,
+            )
+            waiter.start()
+            deadline = time.monotonic() + 10
+            while not backend.has_pending and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert backend._mrtr_try_bridge(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "child-1",
+                    "method": "sampling/createMessage",
+                    "params": {"messages": []},
+                }
+            )
+            waiter.join(timeout=10)
+            parked = list(backend._mrtr_pending.values())
+            assert parked and parked[0]["method"] == "tools/call", parked
+        finally:
+            backend.shutdown()
+
+
+class TestBackendNonObjectResponse:
+    """A backend answering valid-but-not-an-object JSON must not crash.
+
+    `json.loads` raises on invalid JSON but NOT on `[1, 2, 3]` — that
+    parses cleanly to a list, and the rekey that follows then raises
+    `TypeError: list indices must be integers` OUTSIDE any handler.
+    """
+
+    def _park(self, backend):
+        txn = backend.mrtr_round_open(
+            "U1",
+            method="tools/call",
+            child_request_id="c1",
+            declared_caps={},
+            principal=None,
+        )
+        return server._mrtr_encode_pointer(txn, None, 1)
+
+    def test_the_retry_path_survives_a_non_object_response(self, gateway_with_pool):
+        """The reported site. Revert-check: drop the `isinstance(parsed,
+        dict)` guard and this raises `TypeError` instead of answering."""
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        backend.send_oneway = lambda line: True  # type: ignore[method-assign]
+        for hostile in ("[1, 2, 3]", '"just a string"', "42", "null", "true"):
+            state = self._park(backend)
+            backend.resume_request = (  # type: ignore[method-assign]
+                lambda reply, rid, timeout, _h=hostile: (_h, True)
+            )
+            resp = _post(
+                url,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "retry-1",
+                    "method": "tools/call",
+                    "params": {
+                        "_meta": _meta(),
+                        "requestState": state,
+                        "inputResponses": {"c1": {"result": {"ok": True}}},
+                    },
+                },
+                _modern_headers("tools/call"),
+            )
+            assert resp.status_code == 502, (hostile, resp.text)
+            assert "malformed response" in resp.json()["error"]["message"], hostile
+        # The gateway is still serving afterwards — a traceback out of a
+        # handler thread would have left this connection dead.
+        assert (
+            _post(
+                url, _modern_body("tools/list", meta=_meta()), _modern_headers()
+            ).status_code
+            == 200
+        )
+
+    def test_the_ordinary_dispatch_path_survives_it_too(self, gateway_with_pool):
+        """The SAME hole on the path every modern request takes — not
+        introduced by this PR, but found by looking where the reported
+        one was.
+
+        Revert-check: drop that site's guard and this raises instead of
+        answering 502.
+        """
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        backend.send_request = (  # type: ignore[method-assign]
+            lambda line, rid, timeout: "[1, 2, 3]"
+        )
+        resp = _post(
+            url,
+            _modern_body(
+                "tools/call",
+                params={"name": "echo_tool", "arguments": {}},
+                meta=_meta(),
+            ),
+            _modern_headers("tools/call", name="echo_tool"),
+        )
+        assert resp.status_code == 502, resp.text
+        assert "malformed response" in resp.json()["error"]["message"]
+
+
+class TestMrtrErrorObjectValidation:
+    """#390 /code-review: what reaches the child's stdin, and under which code."""
+
+    def test_an_incomplete_error_object_is_refused(self):
+        """Every other error this file puts on a wire goes through
+        `_error_body`, which guarantees `code` and `message`. This one is
+        CLIENT-supplied and was forwarded to the child unexamined — and a
+        legacy child on a strict parser that dies here takes every
+        in-flight request on that backend with it via `_fail_all`.
+
+        Revert-check: restore the bare `isinstance(..., dict)` check and
+        these all produce a reply line.
+        """
+        for bad in (
+            {},  # no code, no message
+            {"code": -1},  # no message
+            {"message": "x"},  # no code
+            {"code": "oops", "message": "x"},  # code not an int
+            {"code": -1, "message": 7},  # message not a str
+            {"code": None, "message": "x"},
+        ):
+            line, why = server._mrtr_input_response_to_reply({"error": bad}, "c1")
+            assert line is None, bad
+            assert why, bad
+
+    def test_a_boolean_code_is_refused(self):
+        """`bool` subclasses `int`, so `{"code": true}` sails through a
+        bare `isinstance` check and reaches the child as a code no peer
+        can interpret."""
+        line, _ = server._mrtr_input_response_to_reply(
+            {"error": {"code": True, "message": "x"}}, "c1"
+        )
+        assert line is None
+
+    def test_a_well_formed_error_still_passes(self):
+        line, why = server._mrtr_input_response_to_reply(
+            {"error": {"code": -32001, "message": "user declined"}}, "c1"
+        )
+        assert why == ""
+        assert json.loads(line)["error"] == {"code": -32001, "message": "user declined"}
+
+    def test_the_child_hears_the_same_code_as_the_client(self, gateway_with_pool):
+        """One event, two peers, one explanation.
+
+        `_unblock_child` hardcoded `-32602`, so a concurrency conflict
+        reached the child as "your parameters are invalid" — untrue and
+        unactionable — while the client was correctly told `-32603`.
+
+        Driven through the real lost-claim path, and asserted on the line
+        that actually reaches the child.
+
+        Revert-check: hardcode `_JSONRPC_INVALID_PARAMS` again and the
+        two codes diverge.
+        """
+        url, pool = gateway_with_pool
+        backend, _, entry = pool.get_or_create(None)
+        pool.release(entry)
+        txn = backend.mrtr_round_open(
+            "U1",
+            method="tools/call",
+            child_request_id="c1",
+            declared_caps={},
+            principal=None,
+        )
+        state = server._mrtr_encode_pointer(txn, None, 1)
+        sent: list[str] = []
+        backend.send_oneway = lambda line: sent.append(line) or True  # type: ignore
+        backend.resume_request = (  # type: ignore[method-assign]
+            lambda reply, rid, timeout: (None, True)
+        )
+        original = backend.mrtr_round_consume
+
+        def _consume_then_steal(t):
+            out = original(t)
+            with backend._mrtr_lock:
+                if not backend._mrtr_pending:
+                    backend._mrtr_inflight = True
+            return out
+
+        backend.mrtr_round_consume = _consume_then_steal  # type: ignore
+        resp = _post(
+            url,
+            {
+                "jsonrpc": "2.0",
+                "id": "retry-1",
+                "method": "tools/call",
+                "params": {
+                    "_meta": _meta(),
+                    "requestState": state,
+                    "inputResponses": {"c1": {"result": {"ok": True}}},
+                },
+            },
+            _modern_headers("tools/call"),
+        )
+        client_code = resp.json()["error"]["code"]
+        assert client_code == -32603, resp.text
+        assert sent, "the child was never unblocked"
+        child_code = json.loads(sent[0])["error"]["code"]
+        assert child_code == client_code, (child_code, client_code)

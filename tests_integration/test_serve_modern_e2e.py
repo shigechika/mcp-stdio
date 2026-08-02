@@ -649,3 +649,70 @@ def test_the_v2_client_sees_the_field_omitted_when_the_child_cannot_subscribe(
     # The trio is unaffected by the resource gate.
     assert out["tools"] is True, out
     assert out["subscribe_advertised"] is False, out
+
+
+# --- the reverse MRTR bridge (#375 PR 2) ---------------------------------
+
+MRTR_ENV = {"MCP_STDIO_MRTR_REVERSE_ENABLE": "1"}
+
+
+# NOTE — the OAuth-authenticated end-to-end bridge test is NOT here, and
+# its absence is deliberate rather than overlooked (#375 PR 2).
+#
+# Per-request bridging is OAuth-only (§4 Q1), so exercising the full loop
+# over HTTP needs a real issued token, and `spawn_serve`'s readiness probe
+# cannot complete an `initialize` against an `--enable-oauth` gateway
+# without first driving the authorization-code flow. That is genuinely new
+# harness scaffolding, not a line of setup.
+#
+# What IS covered, so the gap is bounded rather than open-ended:
+#   * the full mint -> park -> retry -> resume loop, at unit level against
+#     a real `BackendProcess` with an OAuth-shaped principal
+#     (`tests/test_server_modern.py`);
+#   * the reference CLIENT's half of MRTR is exercised by the test below —
+#     it runs the same `Client(..., sampling_callback=...)` path and proves
+#     the client reaches serve and gets a well-formed answer;
+#   * the safety-critical direction — no-auth must NOT bridge — is the
+#     test below, over real HTTP, and it is what makes removing the D4
+#     valve safe.
+#
+# Tracked as follow-up: an OAuth-capable `serve_factory` variant would
+# close this, and would also unlock e2e coverage for the round cap and the
+# replay/tamper paths that today stop at unit level.
+
+
+@pytest.mark.timeout(90)
+def test_a_no_auth_gateway_still_refuses_to_bridge(serve_factory):
+    """§4 Q1's boundary, with the valve OPEN.
+
+    The flag advertises the capabilities to every pooled child, but
+    bridging is per-request and OAuth-only — so under no auth the child's
+    mid-call request still meets the D4 `-32601` and the call completes
+    with that refusal rather than hanging or leaking across callers.
+
+    This is the test that makes removing the valve safe.
+    """
+    import anyio
+
+    from mcp.client import Client
+
+    gateway = serve_factory(env=MRTR_ENV)
+    called: list[str] = []
+
+    async def _sampling(context, params):  # pragma: no cover - must NOT run
+        called.append("ran")
+        raise AssertionError("no-auth must not reach the client's sampler")
+
+    async def _drive():
+        async with Client(
+            gateway.url, mode="auto", sampling_callback=_sampling
+        ) as client:
+            result = await client.call_tool("ask", {})
+            return result.content[0].text
+
+    out = anyio.run(_drive)
+    assert called == [], "the bridge engaged under no auth"
+    payload = json.loads(out)
+    # The child got its refusal and finished — never hung.
+    assert payload["asked"] is True
+    assert payload["answer"]["error"]["code"] == -32601, payload["answer"]

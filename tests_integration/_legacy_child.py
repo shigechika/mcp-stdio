@@ -139,6 +139,40 @@ def _text_content(payload) -> dict:
 def _handle_tools_call(req_id, params: dict) -> None:
     name = params.get("name")
     arguments = params.get("arguments") or {}
+    if name == "ask":
+        # #375 PR 2: a genuine MID-CALL out-of-band request. The child
+        # BLOCKS on its own stdin read here, exactly as a real legacy
+        # server would — which is the whole reason a retry has to land
+        # back on the gateway process holding this child.
+        _send(
+            {
+                "jsonrpc": "2.0",
+                "id": "ask-1",
+                "method": "sampling/createMessage",
+                "params": {
+                    "messages": [
+                        {"role": "user", "content": {"type": "text", "text": "who?"}}
+                    ],
+                    "maxTokens": 16,
+                },
+            }
+        )
+        answered = None
+        while answered is None:
+            line = sys.stdin.readline()
+            if line == "":
+                return
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                reply = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if reply.get("id") == "ask-1":
+                answered = reply
+        _result(req_id, _text_content({"asked": True, "answer": answered}))
+        return
     if name == "echo":
         _result(req_id, _text_content({"echoed": arguments, "pid": os.getpid()}))
         return

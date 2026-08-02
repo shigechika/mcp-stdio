@@ -167,6 +167,13 @@ _JSONRPC_INVALID_PARAMS = -32602
 # -32603 Internal error is JSON-RPC's own name for "the gateway broke".
 _JSONRPC_INTERNAL_ERROR = -32603
 _MCP_HEADER_MISMATCH = -32020
+# O11, and #375's one code with no relay precedent to copy: "the server
+# MUST return a `MissingRequiredClientCapabilityError` (-32021) whose
+# `data.requiredCapabilities` lists the missing capabilities". Relay can
+# never emit it — only SERVERS can — so its bridge aborts generically;
+# serve IS the server in this direction, and copying relay's generic
+# error here would be non-conformant.
+_MCP_MISSING_CLIENT_CAPABILITY = -32021
 _MCP_UNSUPPORTED_PROTOCOL_VERSION = -32022
 
 # Headers whose value the spec mirrors from the request body, and which a
@@ -1216,6 +1223,24 @@ class ModernBackendPool:
         now = self._now()
         dead: list[tuple[Any, BackendProcess]] = []
         idle: list[tuple[Any, BackendProcess]] = []
+        # #390 review, finding 1: abandoned MRTR rounds are swept HERE,
+        # on the sweep that already exists, rather than by a second timer
+        # (#375 §3.8 named this or a lazy pool-touch check as equally
+        # acceptable; this one already runs, already holds no locks it
+        # must not, and cannot drift out of sync with child lifetime).
+        #
+        # It matters because a client is EXPLICITLY licensed not to come
+        # back — "Servers MUST NOT assume that clients will fulfill the
+        # inputRequests or retry the original request" — and an
+        # unswept round leaves the legacy child blocked on a reply
+        # nobody will send AND wedges that principal's pool slot for
+        # good, since `mrtr_begin_dispatch` refuses while anything is
+        # parked.
+        #
+        # Deliberately OUTSIDE the `ttl > 0` gate below: the park
+        # deadline is the round's own, and a deployment that never
+        # configured an idle TTL still must not strand children.
+        self._sweep_abandoned_rounds()
         with self._lock:
             for key, entry in list(self._entries.items()):
                 backend = entry.get("backend")
@@ -1240,17 +1265,98 @@ class ModernBackendPool:
             threading.Thread(target=backend.shutdown, daemon=True).start()
         return len(dead) + len(idle)
 
+    def _sweep_abandoned_rounds(self) -> int:
+        """Unblock children whose parked round no client ever came back for.
+
+        `mrtr_expire_parked` drops the entries and hands them back; this
+        is what discharges the obligation its docstring names — a
+        JSON-RPC error to each child under its OWN request id, which is
+        the only thing that can un-block a subprocess sitting on a stdin
+        read.
+
+        No client-facing action is owed: that HTTP request completed the
+        moment the `InputRequiredResult` went out.
+        """
+        swept = 0
+        with self._lock:
+            backends = [
+                entry["backend"]
+                for entry in self._entries.values()
+                if entry.get("backend") is not None
+            ]
+        for backend in backends:
+            for expired in backend.mrtr_expire_parked():
+                # The DEFAULT -32000, not -32603 (#390 Copilot review).
+                # This file reserves -32603 for "the gateway broke"; a
+                # client that simply did not come back is an EXPECTED
+                # path — Server Requirements item 8 licenses it outright
+                # ("Servers MUST NOT assume that clients will fulfill the
+                # inputRequests or retry") — so calling it an internal
+                # error would tell the child something untrue about who
+                # failed.
+                backend.send_oneway(
+                    _error_body(
+                        "the client did not return the requested input in time",
+                        expired["child_request_id"],
+                    )
+                )
+                swept += 1
+        return swept
+
     def start_reaper(self) -> None:
-        """Start the idle-eviction thread (no-op when the TTL is disabled).
+        """Start the pool's background sweep thread.
 
         A thread of its own rather than a tick on the legacy session
         reaper: that one does not exist when `--session-idle-ttl` is 0,
         and coupling the pool into `SessionRegistry` to borrow it would
         buy nothing.
+
+        TWO INDEPENDENT REASONS TO RUN, and conflating them was #390's
+        R3F1. Idle eviction needs `--modern-idle-ttl`; sweeping abandoned
+        MRTR rounds needs only the bridge to be enabled. Gating the whole
+        thread on the TTL alone meant that in the DEFAULT deployment the
+        thread never started, so `reap_idle` — where the sweep lives,
+        correctly placed outside its own TTL check — was never called at
+        all. That is finding 1 again, one layer up: code with no
+        production caller.
+
+        `reap_idle` already gates eviction internally, so a thread
+        started only for the bridge evicts nothing: `--modern-idle-ttl 0`
+        still means idle eviction is OFF, exactly as before.
+
+        The bridge flag gates STARTUP ONLY — see the comment below.
         """
-        if self._idle_ttl <= 0 or self._reaper is not None:
+        # Read ONCE, here, so this decides whether the thread starts and
+        # nothing more. A previous version of this comment claimed the
+        # sweep "cannot outlive the thing it sweeps", which overstated
+        # it: clearing `MCP_STDIO_MRTR_REVERSE_ENABLE` afterwards does
+        # not stop a thread already running (#390 Copilot review).
+        #
+        # That is CORRECT rather than merely harmless, and worth saying
+        # so nobody "fixes" it into a per-tick check. Rounds parked
+        # BEFORE the flag was cleared still have children blocked on
+        # them, and the sweep is the only thing that ever unblocks them.
+        # A sweep that switched itself off would strand exactly those
+        # children — turning a withdrawal into a leak.
+        #
+        # Nothing new accumulates either way: the dispatch path reads the
+        # same flag live per request, so once it is off no further round
+        # is ever opened. The running sweep just drains what is left and
+        # then finds nothing, which is the behaviour an operator
+        # withdrawing the feature actually wants.
+        bridge_enabled = bool(_modern_child_capabilities())
+        if (self._idle_ttl <= 0 and not bridge_enabled) or self._reaper is not None:
             return
-        interval = max(1.0, min(self._idle_ttl, _MAX_REAP_INTERVAL_SECS))
+        if self._idle_ttl > 0:
+            interval = max(1.0, min(self._idle_ttl, _MAX_REAP_INTERVAL_SECS))
+        else:
+            # Bridge-only: pace off the park deadline, as a RATIO rather
+            # than a literal (the rule #388's review established), so a
+            # change to the deadline cannot silently leave the sweep too
+            # coarse to notice an abandoned round in reasonable time.
+            interval = max(
+                1.0, min(_MRTR_PARK_TIMEOUT_SECS / 4, _MAX_REAP_INTERVAL_SECS)
+            )
         # A FRESH stop event per thread (#379 Copilot review), not a
         # shared one cleared on restart: `stop_reaper` does not join —
         # the thread is a daemon parked in `wait(interval)` — so a
@@ -1292,9 +1398,7 @@ class ModernBackendPool:
                         "method": "initialize",
                         "params": {
                             "protocolVersion": _MODERN_CHILD_HANDSHAKE_VERSION,
-                            # D4's valve: advertise NOTHING the child could
-                            # ask us to bridge back.
-                            "capabilities": {},
+                            "capabilities": _modern_child_capabilities(),
                             "clientInfo": {"name": "mcp-stdio serve", "version": "0"},
                         },
                     }
@@ -1598,6 +1702,196 @@ def _b64url_decode(value: str) -> bytes:
 # MRTR to requests that can legitimately need more input mid-flight, and
 # this mirrors relay's equivalent restriction on the forward side.
 _MRTR_ELIGIBLE_METHODS = frozenset({"tools/call", "resources/read", "prompts/get"})
+
+# The three legacy out-of-band requests a child may raise mid-call, and
+# the client capability each one needs. Identical to relay's own table
+# (`_MRTR_REQUEST_CAPABILITY`) because the method names are the SAME on
+# both sides — what MRTR rev 2026-07-28 changed is who sends them and how
+# the answer travels back, not what they are called.
+_MRTR_REVERSE_ENV = "MCP_STDIO_MRTR_REVERSE_ENABLE"
+
+
+def _modern_child_capabilities() -> dict[str, Any]:
+    """What serve advertises to a pooled child during the handshake.
+
+    **THIS IS D4'S VALVE, and removing it is what activates the reverse
+    bridge.** Everything else in #375 is inert while this returns `{}`:
+    a well-behaved child does not raise `elicitation/create`,
+    `sampling/createMessage` or `roots/list` at a peer that never claimed
+    to support them, so the translation, the minting and the retry
+    correlation all sit behind a door nobody knocks on.
+
+    OFF BY DEFAULT, behind `MCP_STDIO_MRTR_REVERSE_ENABLE` (§4 Q3,
+    mirroring relay's own `MCP_STDIO_MRTR_STRIP` caution). This is a
+    genuine, observable handshake change on EVERY pooled child, so an
+    operator must be able to withdraw it without a code rollback.
+
+    `elicitation: {}` is the form-mode-equivalent posture — an empty
+    declaration "is equivalent to declaring support for form mode only"
+    — and `roots.listChanged: false` says roots can be listed but never
+    announces changes, which is true: nothing here watches for them.
+
+    SEP-2577 deprecates Roots and Sampling, and bridging them anyway is
+    inside its own carve-out: "New implementations SHOULD NOT add support
+    for deprecated features unless needed for backward compatibility with
+    existing counterparts" — pre-existing legacy children reached by a
+    modern client is exactly that case.
+
+    NOTE the advertisement is per-GATEWAY while the bridge is per-request
+    OAuth-only (§4 Q1). A no-auth deployment that enables the flag tells
+    its child the capabilities exist and then answers `-32601` to any
+    request raised under them. That is deliberate — a clean refusal the
+    child already handles, and the same answer it gets today — but it is
+    why the flag exists rather than the capabilities simply being on.
+    """
+    if os.environ.get(_MRTR_REVERSE_ENV, "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return {}
+    return {
+        "sampling": {},
+        "elicitation": {},
+        "roots": {"listChanged": False},
+    }
+
+
+_MRTR_REQUEST_CAPABILITY = {
+    "elicitation/create": "elicitation",
+    "sampling/createMessage": "sampling",
+    "roots/list": "roots",
+}
+
+
+def _mrtr_request_to_input_entry(msg: dict[str, Any]) -> tuple[str | None, Any]:
+    """Child JSON-RPC request -> one `inputRequests` entry.
+
+    THE REVERSE of relay's `_mrtr_translate`, and the asymmetry is worth
+    naming: relay receives a bare `{method, params}` and has to MINT a
+    JSON-RPC envelope around it for a legacy client. Serve receives a
+    full envelope from the legacy child and has to STRIP it back down,
+    because "values are request objects that MUST be one of
+    ElicitRequest, CreateMessageRequest, or ListRootsRequest" — bare
+    objects, not JSON-RPC messages.
+
+    Returns `(capability, entry)` or `(None, reason)`.
+
+    Params pass through VERBATIM. NO reject arms for `mode: "url"`
+    elicitation or tool-augmented sampling, and that is narrower on
+    purpose rather than an oversight: relay needs them because a modern
+    SERVER can express both while a legacy client cannot consume them.
+    Here the CHILD is the legacy (2025-06-18) side and structurally
+    cannot emit either — both are 2025-11-25+ additions. Confirmed
+    against the actual fixture set as well as by construction (#375 §4
+    Q6): the fixtures raise a bare `elicitation/create` (the unit fake
+    child's `ask_client`) and a bare `sampling/createMessage` (the
+    integration child's `ask` tool) — neither carries `mode` or `tools`,
+    and neither could. Adding arms for shapes a legacy child cannot
+    produce would be dead code pretending to be symmetry.
+    """
+    method = msg.get("method")
+    # `isinstance(method, str)` BEFORE the dict lookup, and the type
+    # check is load-bearing rather than tidiness (#390 Copilot review):
+    # a truthy-but-unhashable `method` — `{"method": {"a": 1}}` from a
+    # misbehaving or hostile child — made `.get(method)` raise
+    # `TypeError: unhashable type`. This runs on the child's READER
+    # thread, whose `try/except` sits OUTSIDE its `while` loop, so the
+    # raise did not merely drop one message: it ended the loop, hit
+    # `finally: _fail_all("backend process exited")`, and failed every
+    # in-flight request on that child. One malformed field killed all
+    # traffic to a live subprocess — a DoS with a two-character payload.
+    #
+    # A non-string method simply is not bridgeable, so it takes the
+    # ordinary `capability is None` path and falls through to D4's
+    # `-32601`, which is where every other unbridgeable shape already
+    # goes.
+    capability = (
+        _MRTR_REQUEST_CAPABILITY.get(method) if isinstance(method, str) else None
+    )
+    if capability is None:
+        return None, "the child requested an input kind this gateway cannot bridge"
+    entry: dict[str, Any] = {"method": method}
+    params = msg.get("params")
+    if method == "roots/list":
+        # ListRootsRequest carries no params at all.
+        return capability, entry
+    if params is not None:
+        if not isinstance(params, dict):
+            return None, "the child sent an input request with malformed params"
+        entry["params"] = params
+    return capability, entry
+
+
+def _mrtr_input_response_to_reply(
+    response: Any, child_request_id: Any
+) -> tuple[str | None, str]:
+    """One `inputResponses` entry -> the JSON-RPC reply the child awaits.
+
+    The other half of the inversion. An `InputResponse` is the RESULT the
+    client produced, not a JSON-RPC envelope, so the reply the child is
+    blocked on has to be minted around it under the child's OWN request
+    id — which lives in the parked-round table, never in `requestState`
+    (#375 §1.1).
+
+    A client MAY answer with an error instead of a result; that is a
+    legitimate outcome (a user declining an elicitation, say), so it is
+    forwarded as a JSON-RPC error rather than treated as a bridge
+    failure. Anything else is malformed and reported to the caller.
+    """
+    if not isinstance(response, dict):
+        return None, "the client sent a malformed input response"
+    if "error" in response:
+        # The `error` key DECIDES the shape — no fall-through (#390
+        # Copilot review). A malformed value used to skip this branch and
+        # land in the bare-result path below, where `.get("result",
+        # response)` fell back to the whole object: `{"error": "x"}` came
+        # out as a SUCCESS carrying `result: {"error": "x"}`, so a child
+        # that asked a question was told its request succeeded and handed
+        # the error as the answer. The docstring already promised
+        # "anything else is malformed and reported to the caller"; this
+        # is what makes that true.
+        error = response["error"]
+        # The CONTENTS, not just the type (#390 /code-review). Every
+        # other error this file puts on a wire goes through
+        # `_error_body`, which guarantees `code` and `message`; this one
+        # is client-supplied and was forwarded to the child's stdin
+        # unexamined. `{"error": {}}` or `{"error": {"code": "oops"}}`
+        # is not a JSON-RPC error object, and a legacy child using a
+        # strict parser can die on it — taking every in-flight request
+        # on that backend with it via `_fail_all`, the same blast radius
+        # as the other never-hang bugs in this PR.
+        #
+        # `bool` is excluded explicitly: it subclasses `int`, so
+        # `{"code": true}` would otherwise pass a bare `isinstance`
+        # check and reach the child as a code no peer can interpret.
+        if (
+            not isinstance(error, dict)
+            or not isinstance(error.get("code"), int)
+            or isinstance(error.get("code"), bool)
+            or not isinstance(error.get("message"), str)
+        ):
+            return None, "the client sent a malformed input response error"
+        return (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": child_request_id,
+                    "error": error,
+                }
+            ),
+            "",
+        )
+    # No `error` key: the whole object may itself BE the result, which is
+    # the shape a client sending an `InputResponse` directly produces.
+    result = response.get("result", response)
+    if not isinstance(result, dict):
+        return None, "the client sent an input response with no result object"
+    return (
+        json.dumps({"jsonrpc": "2.0", "id": child_request_id, "result": result}),
+        "",
+    )
 
 
 def _mrtr_principal_is_eligible(principal: str | None) -> bool:
@@ -1979,6 +2273,18 @@ class BackendProcess:
         # So the claim is taken BEFORE the send and held until the
         # dispatch returns, under the same lock as the table.
         self._mrtr_inflight = False
+        # #375 PR 2: what the reader thread needs to know about the ONE
+        # eligible request currently in flight, so it can decide whether a
+        # child-initiated request can be bridged back to it. A single slot
+        # rather than a map because `mrtr_begin_dispatch` already
+        # guarantees at most one — the invariant is what makes this shape
+        # legal, and re-deriving it as a dict would quietly permit the
+        # ambiguity PR 1 exists to forbid.
+        #
+        # Distinct from `_mrtr_pending`, deliberately: that table means
+        # "a round is PARKED awaiting a client retry", which is a later
+        # and different state. Conflating them was #389's top finding.
+        self._mrtr_context: dict[str, Any] | None = None
         self._closed = threading.Event()
         self._reader = threading.Thread(
             target=self._read_loop, name="backend-reader", daemon=True
@@ -2342,6 +2648,16 @@ class BackendProcess:
         txn_id = secrets.token_urlsafe(16)
         deadline = (time.monotonic() if now is None else now) + _MRTR_PARK_TIMEOUT_SECS
         with self._mrtr_lock:
+            if upstream_id in self._mrtr_pending:
+                # #390 review, finding 3. Overwriting would ORPHAN the
+                # existing round: its txn id still rides a client-held
+                # `requestState`, and the table entry that pointer names
+                # would silently become a different round. Steady state
+                # cannot reach here — a parked round means the handler
+                # already returned and cleared the context — but a child
+                # that ignores its own blocking read can, and the cost of
+                # guessing here is an unredeemable pointer.
+                return ""
             self._mrtr_pending[upstream_id] = {
                 "txn_id": txn_id,
                 "method": method,
@@ -2398,7 +2714,7 @@ class BackendProcess:
         with self._mrtr_lock:
             return bool(self._mrtr_pending)
 
-    def mrtr_begin_dispatch(self) -> bool:
+    def mrtr_begin_dispatch(self, context: dict[str, Any] | None = None) -> bool:
         """Claim this child for one MRTR-eligible request, or refuse.
 
         THE concurrency invariant (#375 §1.2), and it has to be a single
@@ -2427,7 +2743,165 @@ class BackendProcess:
             if self._mrtr_inflight or self._mrtr_pending:
                 return False
             self._mrtr_inflight = True
+            self._mrtr_context = context
             return True
+
+    def _mrtr_try_bridge(self, msg: dict[str, Any]) -> bool:
+        """Turn a child-initiated request into an `InputRequiredResult`.
+
+        Runs on the READER thread (#375 §3.3). Returns True when the
+        child's request has been accounted for — either bridged or
+        answered with a capability error — and False when the caller
+        should fall through to the D4 `-32601`.
+
+        Round-1 minting needs no new response path: `_dispatch_modern` is
+        already blocked in `send_request` on the very slot this fills, so
+        waking it delivers the result through the existing rekey / stamp
+        / send machinery. That is one place the reverse direction is
+        SIMPLER than relay's PR C, which had to mint a whole new
+        out-of-band request line.
+        """
+        context = self.mrtr_context()
+        if context is None:
+            return False
+        capability, translated = _mrtr_request_to_input_entry(msg)
+        if capability is None:
+            log(f"mrtr: {translated}")
+            return False
+        upstream_id = context["upstream_id"]
+        child_request_id = msg.get("id")
+        declared = context.get("declared_caps")
+        declared = declared if isinstance(declared, dict) else {}
+        if capability not in declared:
+            # O11, and this is the one place the reverse direction has no
+            # PR C precedent to copy: "A server MUST NOT rely on
+            # capabilities the client has not declared. If processing a
+            # request requires a capability the client did not include in
+            # `io.modelcontextprotocol/clientCapabilities`, the server
+            # MUST return a `MissingRequiredClientCapabilityError`
+            # (-32021) whose `data.requiredCapabilities` lists the missing
+            # capabilities." Relay can never emit this — only servers
+            # can — so it aborts generically; copying that here would be
+            # non-conformant.
+            #
+            # The round is NOT opened: there is nothing to retry into.
+            answered = self.answer_pending(
+                upstream_id,
+                _error_body(
+                    "the client did not declare a capability this request needs",
+                    upstream_id,
+                    code=_MCP_MISSING_CLIENT_CAPABILITY,
+                    data={"requiredCapabilities": [capability]},
+                ),
+            )
+            if not answered:
+                return False
+            # The child still needs an answer, or it stays blocked.
+            self._write(
+                _error_body(
+                    "the client cannot fulfill this request",
+                    child_request_id,
+                    code=_JSONRPC_METHOD_NOT_FOUND,
+                )
+            )
+            return True
+        round_no = int(context.get("round", 1))
+        if round_no > _MRTR_MAX_ROUNDS:
+            # #390 review, finding 2. `_mrtr_decode_pointer` refuses a
+            # pointer past the cap, so minting one here would hand the
+            # client a `requestState` it can NEVER redeem — the round
+            # would stay parked until the park timeout, and before that
+            # timeout was wired (finding 1) forever. Refuse at the mint
+            # instead, and tell the child so it stops waiting.
+            #
+            # The original caller is not given a distinct error: the
+            # child, now unblocked, fails its own `tools/call` and that
+            # failure propagates through the ordinary response path. The
+            # gateway inventing a second, competing error for a call the
+            # child is still perfectly able to answer would be worse.
+            log(f"mrtr: refusing round {round_no} past the {_MRTR_MAX_ROUNDS} cap")
+            self._write(
+                _error_body(
+                    "the input-required round limit was reached",
+                    child_request_id,
+                    code=_JSONRPC_INVALID_PARAMS,
+                )
+            )
+            return True
+        txn_id = self.mrtr_round_open(
+            upstream_id,
+            # From the CONTEXT, never from `msg`: `msg` is the child's
+            # out-of-band question (`sampling/createMessage`), while a
+            # round belongs to the client request that provoked it
+            # (`tools/call`). Recording the former put a semantically
+            # different value in a field whose only consumer compares it
+            # to an incoming request's method.
+            method=context.get("method", ""),
+            child_request_id=child_request_id,
+            declared_caps=declared,
+            principal=context.get("principal"),
+            round_no=round_no,
+        )
+        if not txn_id:
+            # A round is already parked on this id (finding 3's guard).
+            log("mrtr: a round is already parked for this request; refusing")
+            self._write(
+                _error_body(
+                    "a previous input request is still outstanding",
+                    child_request_id,
+                    code=_JSONRPC_INVALID_PARAMS,
+                )
+            )
+            return True
+        state = _mrtr_encode_pointer(txn_id, context.get("principal"), round_no)
+        result = {
+            "resultType": "input_required",
+            # The gateway INVENTS this key: relay mints an id from a key
+            # the modern server supplied, and the reverse gets a bare
+            # child id with no key at all. The mapping back to the
+            # child's own id lives in the parked-round table, never in
+            # `requestState` (§1.1).
+            "inputRequests": {str(child_request_id): translated},
+            "requestState": state,
+        }
+        if self.answer_pending(
+            upstream_id,
+            json.dumps({"jsonrpc": "2.0", "id": upstream_id, "result": result}),
+        ):
+            return True
+        # The handler vanished between the context read and now. Drop the
+        # round rather than leave it parked for a retry that can never be
+        # correlated, and let the caller answer the child.
+        self.mrtr_round_consume(txn_id)
+        return False
+
+    def mrtr_context(self) -> dict[str, Any] | None:
+        """The in-flight eligible request's bridging context, if any."""
+        with self._mrtr_lock:
+            return self._mrtr_context
+
+    def answer_pending(self, req_id: Any, line: str) -> bool:
+        """Hand a synthesized response to a waiting handler thread.
+
+        #375 §3.3, and the reason round-1 minting needs no new response
+        path at all: `_dispatch_modern` is already blocked in
+        `send_request` on this exact slot, so filling it and setting the
+        event wakes that thread as if the child had answered. The
+        existing rekey / stamp / send machinery then delivers the
+        `InputRequiredResult` unchanged.
+
+        Returns False when the slot is gone — the handler timed out or
+        the client disconnected — which the caller MUST treat as "this
+        cannot be bridged" rather than ignore, or the child is left
+        blocked on a reply nobody will send.
+        """
+        with self._lock:
+            slot = self._pending.get(req_id)
+            if slot is None:
+                return False
+            slot["line"] = line
+            slot["event"].set()
+        return True
 
     def mrtr_end_dispatch(self) -> None:
         """Release the claim; idempotent.
@@ -2439,6 +2913,7 @@ class BackendProcess:
         """
         with self._mrtr_lock:
             self._mrtr_inflight = False
+            self._mrtr_context = None
 
     def mrtr_expire_parked(self, *, now: float | None = None) -> list[dict[str, Any]]:
         """Drop rounds past their park deadline; return what was dropped.
@@ -2565,6 +3040,17 @@ class BackendProcess:
                 # of the kind ever reaches a stream, because there is none.
                 # `_write` is lock-guarded and its broken-pipe path is
                 # already reentrant-safe, so this is safe off-thread.
+                # #375 PR 2: try to bridge it into the parked handler
+                # first. An ADDITION IN FRONT OF the D4 reply below, never
+                # a rewrite of it — everything unbridgeable (no eligible
+                # request in flight, an unbridgeable method, a capability
+                # the client never declared, a handler that already went
+                # away) still falls through to the same `-32601`, which
+                # is what keeps the never-hang invariant the default
+                # outcome rather than something the bridge has to
+                # remember to preserve.
+                if self._mrtr_try_bridge(msg):
+                    return
                 self._write(
                     _error_body(
                         "this gateway does not bridge server-initiated requests",
@@ -2683,6 +3169,57 @@ class BackendProcess:
             return None
         slot["event"].wait(timeout)
         return self._detach(req_id, slot)
+
+    def resume_request(
+        self, reply_line: str, req_id: Any, timeout: float
+    ) -> tuple[str | None, bool]:
+        """Answer the child's own question, then wait for the ORIGINAL reply.
+
+        #375 §3.5, and the shape is why this cannot just be
+        `send_request`: the line written is the reply to the CHILD's
+        out-of-band request, while the response waited for is the one the
+        child still owes on the original `tools/call`. Two different ids,
+        one round trip.
+
+        The waiter is registered BEFORE the reply is written. A child can
+        answer the instant it unblocks, and a slot created afterwards
+        would miss a response already routed — the same
+        register-then-write ordering `send_request` uses, for the same
+        reason.
+
+        Returns `(line, delivered)`. `delivered` is what a bare `None`
+        cannot express (#390 review, finding 5): a timeout AFTER a
+        successful write means the child was told and simply has not
+        answered yet, so answering it again would put a second reply on
+        its stream — while the early returns below mean it was never told
+        and is still blocked. Conflating the two either wedges a child or
+        corrupts it.
+        """
+        slot: dict[str, Any] = {
+            "event": threading.Event(),
+            "line": None,
+            "request_line": reply_line,
+            "waiters": 1,
+        }
+        with self._lock:
+            if self._closed.is_set():
+                # Nothing is owed: the child is gone.
+                return None, True
+            if req_id in self._pending:
+                # The original slot should be long gone — its handler
+                # returned the InputRequiredResult. If it is not, the
+                # correlation is ambiguous and guessing is what this
+                # whole design refuses to do. NOT delivered: the child
+                # is still blocked, and the caller must answer it.
+                return None, False
+            self._pending[req_id] = slot
+        if not self._write(reply_line):
+            self._detach(req_id, slot)
+            # A broken pipe makes the child unreachable rather than merely
+            # untold; nothing further can be delivered to it.
+            return None, True
+        slot["event"].wait(timeout)
+        return self._detach(req_id, slot), True
 
     def send_oneway(self, line: str) -> bool:
         """Forward a notification or a client->server response (no reply)."""
@@ -4653,6 +5190,272 @@ class _Handler(BaseHTTPRequestHandler):
                     # die with the child anyway.
                     log(f"listen {req_id!r}: unsubscribe on teardown failed: {exc!r}")
 
+    def _serve_mrtr_retry(
+        self,
+        msg: dict[str, Any],
+        req_id: Any,
+        backend: BackendProcess,
+        principal: str | None,
+        request_state: Any,
+        params: dict[str, Any],
+        init_result: dict[str, Any],
+    ) -> None:
+        """Resume a parked round from the client's retry (#375 §3.5).
+
+        Spec: "If an `InputRequiredResult` contains the `requestState`
+        field, the client MUST echo back the exact value of that field
+        when retrying the original request."
+
+        Three checks close three different holes, and naming only one of
+        them would be an incomplete claim: the HMAC stops FORGERY, the
+        single-use consume stops REPLAY of a genuine still-signed blob,
+        and the principal binding stops CROSS-USER use of one that
+        leaked. The round cap rides inside the signature, so a client
+        cannot reset its own count by hand-crafting `round: 1`.
+        """
+        payload, why = _mrtr_decode_pointer(request_state, principal)
+        if payload is None:
+            # No spec-mandated code exists for an integrity failure — the
+            # spec says only "MUST reject state that fails verification"
+            # — so this follows relay's own `_mrtr_abort` precedent and
+            # stays in the local -32000 range rather than inventing a
+            # meaning for a reserved one (§4 Q4).
+            self._send_json(400, _error_body(why, req_id))
+            return
+        # VALIDATE ON A PEEK, CONSUME ONLY ONCE IT MATCHES. The order is
+        # the point (#390 Copilot review): consuming first meant a
+        # mismatched retry destroyed a round that was still perfectly
+        # valid, so its real owner could never redeem it — the check
+        # rejected the impostor and took the victim down with it.
+        peeked = backend.mrtr_round_for_txn(payload["txn_id"])
+        if peeked is None:
+            # The ordinary post-restart / post-timeout case, and a replay
+            # attempt looks identical from here — deliberately, since
+            # neither earns anything louder than an honest error.
+            self._send_json(400, _error_body("unknown or expired requestState", req_id))
+            return
+        _, candidate = peeked
+        if (
+            candidate["round"] != payload["round"]
+            or candidate["principal"] != principal
+            # EXACT method match. `method in _MRTR_ELIGIBLE_METHODS` at
+            # the dispatch hook only proves this request COULD have
+            # opened a round; this proves it opened THIS one. Without it
+            # a pointer minted by `tools/call` could be redeemed by
+            # `resources/read` — both eligible — and take over a round
+            # belonging to a different in-flight call.
+            or candidate["method"] != msg.get("method")
+        ):
+            # NOT `_fail_retry`: the round is untouched and still owned
+            # by someone who may yet redeem it, so the child is owed
+            # nothing here. Unblocking it would be the same
+            # take-the-victim-down-too mistake in a quieter form.
+            self._send_json(400, _error_body("stale requestState", req_id))
+            return
+        entry = backend.mrtr_round_consume(payload["txn_id"])
+        if entry is None:
+            # Lost the race to a concurrent retry between the peek and
+            # here. `mrtr_round_consume` is atomic, so exactly one won.
+            self._send_json(400, _error_body("unknown or expired requestState", req_id))
+            return
+        # PAST THIS POINT THE ROUND IS GONE FROM THE TABLE, so nothing
+        # else will ever answer the child's own request id. Every exit
+        # below therefore owes the child a reply as well as the client
+        # one, and `_fail_retry` is the single call that discharges both
+        # — #390's review found two paths that had discharged only the
+        # client's half, leaving the subprocess blocked forever.
+        child_request_id = entry["child_request_id"]
+        responses = params.get("inputResponses")
+        if not isinstance(responses, dict) or not responses:
+            self._fail_retry(
+                backend,
+                child_request_id,
+                req_id,
+                "inputResponses is required on a retry",
+                400,
+                code=_JSONRPC_INVALID_PARAMS,
+            )
+            return
+        # The gateway invented this key from the child's own id, so that
+        # is what the client echoes back.
+        answer = responses.get(str(child_request_id))
+        if answer is None and len(responses) == 1:
+            # Tolerate a client that re-keyed a single-entry map: the
+            # correlation is unambiguous at N=1, and refusing would be
+            # pedantry that costs the user their answer.
+            answer = next(iter(responses.values()))
+        reply_line, translate_why = _mrtr_input_response_to_reply(
+            answer, child_request_id
+        )
+        if reply_line is None:
+            self._fail_retry(
+                backend,
+                child_request_id,
+                req_id,
+                translate_why,
+                400,
+                code=_JSONRPC_INVALID_PARAMS,
+            )
+            return
+        # The next round, if the child asks again, is this one plus one.
+        # Published with the claim so no window exists where a bridge
+        # could see a half-built context.
+        next_round = int(entry["round"]) + 1
+        # #390 review, finding C: the next round's capabilities come from
+        # THIS retry's own `_meta`, never from the entry. O5 makes
+        # `clientCapabilities` per-request, and the retry IS a fresh,
+        # separately-validated request — carrying the original's forward
+        # would gate a second `input_required` mint against capabilities
+        # this client may no longer (or may newly) declare, wrong in both
+        # directions.
+        retry_meta = params.get("_meta")
+        retry_caps = (
+            retry_meta.get(_META_CLIENT_CAPABILITIES)
+            if isinstance(retry_meta, dict)
+            else None
+        )
+        claimed = backend.mrtr_begin_dispatch(
+            {
+                "upstream_id": entry["upstream_id"],
+                "declared_caps": retry_caps if isinstance(retry_caps, dict) else {},
+                "principal": principal,
+                # Carried forward: round N+1 belongs to the same original
+                # request, so a second question must record the same
+                # upstream method the first one did.
+                "method": entry["method"],
+                "round": next_round,
+            }
+        )
+        if not claimed:
+            # #390 review, finding A. Consuming the round left the child
+            # momentarily unclaimed, and a brand-new eligible request on
+            # another thread can win the claim in that window. Resuming
+            # anyway would put the child back to work while someone else
+            # holds the dispatch claim — and a second question from it
+            # would bridge into the wrong context, which is precisely the
+            # ambiguous correlation the invariant exists to forbid.
+            #
+            # Clean abort, matching §4 Q2's reject-don't-queue posture.
+            # The original call is lost either way (both claimants cannot
+            # win), so it is reported honestly rather than misrouted.
+            self._fail_retry(
+                backend,
+                child_request_id,
+                req_id,
+                "the backend was claimed by a concurrent request; this "
+                "retry could not be delivered",
+                503,
+                code=_JSONRPC_INTERNAL_ERROR,
+            )
+            return
+        try:
+            line, delivered = backend.resume_request(
+                reply_line, entry["upstream_id"], _BACKEND_RESPONSE_TIMEOUT_SECS
+            )
+        finally:
+            backend.mrtr_end_dispatch()
+        if line is None:
+            if not delivered:
+                # The reply never reached the child, so it is still
+                # blocked and this is the last chance to answer it.
+                self._fail_retry(
+                    backend,
+                    child_request_id,
+                    req_id,
+                    "the input could not be delivered to the backend",
+                    503,
+                    code=_JSONRPC_INTERNAL_ERROR,
+                )
+                return
+            self._send_json(
+                504,
+                _error_body(
+                    "no response from backend after the input was delivered",
+                    req_id,
+                    code=_JSONRPC_INTERNAL_ERROR,
+                ),
+            )
+            return
+        try:
+            parsed = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        # `json.loads` raises on invalid JSON but NOT on valid non-object
+        # JSON (#390 Copilot review): `[1, 2, 3]` parses cleanly to a
+        # list, and the `parsed["id"] = ...` below then raises `TypeError:
+        # list indices must be integers` OUTSIDE any handler — killing
+        # the request with a traceback instead of an error response.
+        # A JSON-RPC response is an object by definition, so anything
+        # else is malformed and takes the same 502 as unparseable bytes.
+        if not isinstance(parsed, dict):
+            self._send_json(
+                502,
+                _error_body(
+                    "malformed response from backend",
+                    req_id,
+                    code=_JSONRPC_INTERNAL_ERROR,
+                ),
+            )
+            return
+        # Re-keyed to THIS retry's own id: the client minted a fresh one,
+        # and the child answered under the original upstream id.
+        parsed["id"] = req_id
+        _stamp_modern_result(
+            parsed,
+            msg.get("method"),
+            # #390 review, finding 4: the child's `serverInfo`, same as
+            # every other modern result. Omitting it made a RESUMED call
+            # the one response missing the `_meta` the spec says servers
+            # SHOULD put on every result — invisible until someone
+            # compared two responses to the same tool.
+            server_info=init_result.get("serverInfo"),
+            cache_ttl_ms=self.cache_ttl_ms,
+        )
+        self._send_json(_modern_response_status(parsed), json.dumps(parsed))
+
+    def _fail_retry(
+        self,
+        backend: BackendProcess,
+        child_request_id: Any,
+        req_id: Any,
+        reason: str,
+        status: int,
+        *,
+        code: int = -32000,
+    ) -> None:
+        """Fail a retry after its round was consumed — answering BOTH peers.
+
+        One call, two obligations, deliberately fused (#390 review). Once
+        `mrtr_round_consume` has popped the entry, nothing else can ever
+        reply to the child's own request id, so a path that tells only
+        the client leaves a subprocess blocked forever. Two such paths
+        existed before this helper did; making the pair a single call is
+        what stops a third appearing.
+        """
+        self._unblock_child(backend, child_request_id, reason, code=code)
+        self._send_json(status, _error_body(reason, req_id, code=code))
+
+    def _unblock_child(
+        self,
+        backend: BackendProcess,
+        child_request_id: Any,
+        reason: str,
+        *,
+        code: int = _JSONRPC_INVALID_PARAMS,
+    ) -> None:
+        """Answer the child so an unusable retry never leaves it blocked.
+
+        The round has already been consumed by the time anything can fail
+        here, so nothing else will ever reply to this id.
+        """
+        # The SAME code the client is told (#390 /code-review). This was
+        # hardcoded to `-32602`, so one event reached the two peers with
+        # semantically contradictory explanations — a concurrency
+        # conflict arrived at the child as "your parameters are invalid",
+        # which is both untrue and unactionable. The default stays
+        # `-32602` for callers whose failure genuinely IS the params.
+        backend.send_oneway(_error_body(reason, child_request_id, code=code))
+
     def _write_sse(self, message: dict[str, Any]) -> None:
         self.wfile.write(f"data: {json.dumps(message)}\n\n".encode("utf-8"))
         self.wfile.flush()
@@ -4955,8 +5758,123 @@ class _Handler(BaseHTTPRequestHandler):
             # REJECT rather than queue (§4 Q2): queuing reintroduces the
             # stall vector D4 exists to prevent, and narrows perceived
             # concurrency in a way far harder to diagnose than an error.
+            # #375 PR 2: the bridging context the reader thread needs
+            # if this child asks something mid-call. Built HERE, before
+            # the send, because `_meta.clientCapabilities` is a
+            # PER-REQUEST field under O5 — there is no modern
+            # `initialize` to have captured it from, so it is read fresh
+            # off whichever request is currently live and snapshotted.
+            # `isinstance` guarded: the ladder's rung 1 checks the field
+            # is PRESENT, never that it is an object.
+            declared_caps = (msg.get("params") or {}).get("_meta", {})
+            declared_caps = (
+                declared_caps.get(_META_CLIENT_CAPABILITIES)
+                if isinstance(declared_caps, dict)
+                else None
+            )
+            principal = self._current_user()
+            # #375 §3.5: an MRTR RETRY, detected before the concurrency
+            # claim and handled on its own path. It has to bypass that
+            # claim: the round it resumes is precisely the one parked in
+            # `_mrtr_pending`, so the ordinary guard would refuse the one
+            # request able to clear it — a deadlock by construction.
+            params_obj = msg.get("params")
+            request_state = (
+                params_obj.get("requestState") if isinstance(params_obj, dict) else None
+            )
+            # ...AND only for a method that could have OPENED one. The
+            # spec's own words are "retrying the ORIGINAL request", so a
+            # `requestState` riding some other method is not a retry of
+            # anything (#390 Copilot review).
+            #
+            # Without this, `params.requestState` alone was enough: a
+            # client that reused a params object — or was simply buggy —
+            # could put a live pointer on, say, `resources/list` and have
+            # the gateway treat it as the retry. Single-use consumption
+            # then destroyed the round, so the REAL retry had nothing
+            # left to resume and the original `tools/call` could never
+            # be answered. The response would also carry the wrong
+            # method into `_stamp_modern_result`, applying
+            # `resources/list` cache semantics to a `tools/call` result.
+            #
+            # FALL THROUGH rather than reject, deliberately: the round
+            # stays parked and a correct retry can still redeem it, so a
+            # client bug costs one confused request instead of the whole
+            # transaction. (An abandoned round is swept either way.)
+            if request_state is not None and method in _MRTR_ELIGIBLE_METHODS:
+                self._serve_mrtr_retry(
+                    msg,
+                    req_id,
+                    backend,
+                    principal,
+                    request_state,
+                    params_obj,
+                    init_result,
+                )
+                return
+            # §4 Q1's OAuth-only boundary, and this is where it BITES. A
+            # context of None means the reader thread finds nothing to
+            # bridge into and falls through to today's D4 `-32601` — so a
+            # no-auth or static-token deployment keeps its behaviour
+            # exactly, even after the valve comes out and the child is
+            # free to ask. Principal binding is what stops one caller
+            # answering another's prompt, and it buys nothing when every
+            # caller shares one constant AND one pooled child.
+            #
+            # The concurrency CLAIM below is taken regardless of
+            # principal: it guards correlation, it is not a feature gate,
+            # and narrowing it would reintroduce the ambiguity for
+            # exactly the deployments least able to tolerate it.
+            # Minted BEFORE the context is built, so the context is
+            # complete when it is published and is never mutated
+            # afterwards (#390 Copilot review). `_mint_modern_id` is an
+            # independent process-global counter — it does not depend on
+            # the claim succeeding — so moving it earlier costs nothing
+            # but an id on the paths that then reject.
+            upstream_id = _mint_modern_id()
+            mrtr_context = (
+                {
+                    "upstream_id": upstream_id,
+                    "declared_caps": (
+                        declared_caps if isinstance(declared_caps, dict) else {}
+                    ),
+                    "principal": principal,
+                    # The UPSTREAM method — what the client would be
+                    # retrying — not whatever the child later asks
+                    # (#390 Copilot review). A round remembers the
+                    # request it belongs to so a retry can be checked
+                    # against it; recording the child's question instead
+                    # made that check impossible to write.
+                    "method": method,
+                    "round": 1,
+                }
+                # BOTH gates, and the second one was missing (#390
+                # Copilot review). `_modern_child_capabilities()` was
+                # consulted only where serve ADVERTISES to a child, so
+                # `MCP_STDIO_MRTR_REVERSE_ENABLE=0` withdrew the offer
+                # while leaving the bridge itself live: a child that
+                # ignored the advertisement and asked anyway was still
+                # bridged, provided the caller was OAuth-authenticated.
+                # The flag's whole purpose is that an operator can
+                # withdraw this "without a code rollback", and a switch
+                # that only changes what serve SAYS while the behaviour
+                # stays on does not do that.
+                #
+                # Read live rather than captured at spawn, deliberately:
+                # flipping the flag off must stop bridging on children
+                # that are already running, which is what "withdraw"
+                # means to an operator holding an incident.
+                #
+                # NOT to be confused with the O11 check further in
+                # (`capability not in declared`): that one asks what the
+                # CLIENT declared it can handle. This asks whether this
+                # GATEWAY offers the feature at all.
+                if _mrtr_principal_is_eligible(principal)
+                and _modern_child_capabilities()
+                else None
+            )
             if method in _MRTR_ELIGIBLE_METHODS:
-                if not backend.mrtr_begin_dispatch():
+                if not backend.mrtr_begin_dispatch(mrtr_context):
                     self._send_json(
                         503,
                         _error_body(
@@ -4970,7 +5888,6 @@ class _Handler(BaseHTTPRequestHandler):
                     return
                 mrtr_claimed = True
 
-            upstream_id = _mint_modern_id()
             outbound = dict(msg)
             outbound["id"] = upstream_id
             line = backend.send_request(
@@ -4987,7 +5904,14 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 parsed = json.loads(line)
             except (json.JSONDecodeError, TypeError):
-                log("modern dispatch: backend returned unparseable JSON")
+                parsed = None
+            # Same non-object hole as the retry path's (#390 Copilot
+            # review found it there; this site had it too, and it is on
+            # the path EVERY modern request takes). `json.loads` is happy
+            # with `[1, 2, 3]`, and the rekey below would then raise
+            # `TypeError` outside any handler.
+            if not isinstance(parsed, dict):
+                log("modern dispatch: backend returned a non-object response")
                 self._send_json(
                     502,
                     _error_body(
