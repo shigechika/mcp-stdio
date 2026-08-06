@@ -509,9 +509,19 @@ jobs:
             awk '
               /^===FINDING / { id = $2; sub(/=+$/, "", id); printf "**%s** — ", id; next }
               /^===END FINDING===/ { print ""; next }
-              # The severity line drives the verdict below; showing it inside
-              # the prose as well is just noise.
-              /^[[:space:]]*severity:[[:space:]]*/ { next }
+              # A cleanly-classified severity line drives the verdict below;
+              # showing it inside the prose as well is just noise, so drop it.
+              /^[[:space:]]*severity:[[:space:]]*(blocking|advisory)[[:space:]]*$/ { next }
+              # A malformed one (missing or mistyped) is counted as advisory
+              # below (see "Verdict"), but silently dropping it here would
+              # hide from the reader *why* — it would render identically to
+              # an ordinary, cleanly-classified advisory finding. Surface it.
+              /^[[:space:]]*severity:[[:space:]]*/ {
+                val = $0
+                sub(/^[[:space:]]*severity:[[:space:]]*/, "", val)
+                printf "_(malformed severity %s — treated as advisory)_\n", (val == "" ? "(empty)" : "\"" val "\"")
+                next
+              }
               { print }
             ' kept.txt > rendered.md || true
           elif [ -n "$ids" ]; then
@@ -704,7 +714,8 @@ jobs:
           # issue. Severity is model-supplied, so an unparseable or missing
           # line counts as advisory rather than inventing a blocker.
           # Counted from kept.txt (post-verifier, pre-render): rendered.md has
-          # already rewritten the block markers and dropped the severity line.
+          # already rewritten the block markers and replaced each severity
+          # line with either nothing (clean) or a visible malformed-value note.
           blocking_n=$(grep -ciE '^[[:space:]]*severity:[[:space:]]*blocking[[:space:]]*$' kept.txt 2>/dev/null || true)
           case "$blocking_n" in ''|*[!0-9]*) blocking_n=0 ;; esac
           advisory_n=$(grep -ciE '^[[:space:]]*severity:[[:space:]]*advisory[[:space:]]*$' kept.txt 2>/dev/null || true)
