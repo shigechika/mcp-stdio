@@ -510,15 +510,29 @@ jobs:
               /^===FINDING / { id = $2; sub(/=+$/, "", id); printf "**%s** — ", id; next }
               /^===END FINDING===/ { print ""; next }
               # A cleanly-classified severity line drives the verdict below;
-              # showing it inside the prose as well is just noise, so drop it.
-              /^[[:space:]]*severity:[[:space:]]*(blocking|advisory)[[:space:]]*$/ { next }
-              # A malformed one (missing or mistyped) is counted as advisory
-              # below (see "Verdict"), but silently dropping it here would
-              # hide from the reader *why* — it would render identically to
-              # an ordinary, cleanly-classified advisory finding. Surface it.
+              # showing it inside the prose as well is just noise, so drop
+              # it. Case-insensitive to match the `grep -ci` counting logic
+              # below — a case-sensitive match here would let e.g. "severity:
+              # Blocking" count as blocking in the verdict while rendering
+              # as a "malformed ... treated as advisory" note, contradicting
+              # the verdict line right above it.
+              tolower($0) ~ /^[[:space:]]*severity:[[:space:]]*(blocking|advisory)[[:space:]]*$/ { next }
+              # A malformed one (empty or mistyped — a line with no
+              # `severity:` prefix at all does not reach this rule, so a
+              # finding missing the line entirely still renders unmarked,
+              # same as before this change) is counted as advisory below
+              # (see "Verdict"), but silently dropping it here would hide
+              # from the reader *why* — it would render identically to an
+              # ordinary, cleanly-classified advisory finding. Surface it.
               /^[[:space:]]*severity:[[:space:]]*/ {
                 val = $0
                 sub(/^[[:space:]]*severity:[[:space:]]*/, "", val)
+                # Model output is untrusted (see ledger-marker stripping
+                # below, and the 200-char summary cap this file already
+                # applies to model text elsewhere) — bound the echoed value
+                # the same way rather than let a degenerate response inflate
+                # the rendered comment.
+                if (length(val) > 200) val = substr(val, 1, 200) "..."
                 printf "_(malformed severity %s — treated as advisory)_\n", (val == "" ? "(empty)" : "\"" val "\"")
                 next
               }
