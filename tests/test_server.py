@@ -648,9 +648,7 @@ def test_serve_main_rejects_user_env_without_oauth():
 @pytest.mark.parametrize("bad", ["1bad", "bad-name", "bad name", ""])
 def test_serve_main_rejects_malformed_user_env_name(bad):
     with pytest.raises(SystemExit):
-        server.serve_main(
-            ["--enable-oauth", "--user-env", bad, "--", "true"]
-        )
+        server.serve_main(["--enable-oauth", "--user-env", bad, "--", "true"])
 
 
 def test_serve_main_rejects_negative_max_sessions_per_owner():

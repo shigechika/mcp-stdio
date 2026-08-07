@@ -1400,9 +1400,7 @@ class ModernBackendPool:
             value = _user_env_value(principal)
             if value is not None:
                 extra_env = {self._user_env_var: value}
-        backend = BackendProcess(
-            self._command, modern_owned=True, extra_env=extra_env
-        )
+        backend = BackendProcess(self._command, modern_owned=True, extra_env=extra_env)
         try:
             req_id = self._next_handshake_id()
             line = backend.send_request(
@@ -2214,7 +2212,11 @@ class BackendProcess:
     """
 
     def __init__(
-        self, command: list[str], *, modern_owned: bool = False, extra_env: dict[str, str] | None = None
+        self,
+        command: list[str],
+        *,
+        modern_owned: bool = False,
+        extra_env: dict[str, str] | None = None,
     ) -> None:
         if not command:
             raise ValueError("backend command is empty")
