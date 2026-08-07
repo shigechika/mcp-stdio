@@ -4,11 +4,14 @@
 
 📖 **はじめての方は[ユーザーガイド](https://shigechika.github.io/mcp-stdio/ja/)へ**——「つなぐ」「公開する」のやりたいこと別ドキュメントです。この README は網羅的なリファレンスです。
 
-Stdio-to-HTTP ゲートウェイ — MCP クライアントとリモート HTTP MCP サーバーを接続します。
+**双方向**の stdio↔HTTP MCP ゲートウェイです — 同じバイナリが MCP-over-HTTP の
+**クライアント**ゲートウェイにも、`serve` モードによって（OAuth 2.1 認可サーバー
+内蔵オプション付きの）フル機能の MCP-over-HTTP **サーバー**にもなるため、MCP
+接続のどちら側にも立てます。
 
 ## 概要
 
-[MCP](https://modelcontextprotocol.io/) クライアント（Claude Desktop, Claude Code）に対してローカルで稼働するセルフホスト MCP サーバのように振る舞いつつ、各種認証でリモート MCP サーバーへの接続を橋渡しします：
+**クライアントゲートウェイ（既定モード） — stdio → HTTP。** [MCP](https://modelcontextprotocol.io/) クライアント（Claude Desktop, Claude Code）に対してローカルで稼働するセルフホスト MCP サーバのように振る舞いつつ、各種認証でリモート MCP サーバーへの接続を橋渡しします：
 
 ```mermaid
 flowchart BT
@@ -20,6 +23,15 @@ flowchart BT
 ```
 
 Bearer token、カスタムヘッダー、OAuth 2.1 認証情報をリモートサーバーへ転送します。
+
+**逆ゲートウェイ（`mcp-stdio serve`） — HTTP → stdio。** 鏡像の関係にあるモードです。
+ローカルの stdio MCP サーバー（言語・フレームワーク問わず）を、bearer トークンや
+埋め込み OAuth 2.1 認証、OAuth 有効時のユーザー単位バックエンド分離、再起動耐性の
+あるトークンストアと
+いったオプション付きで Streamable HTTP エンドポイントとして公開します — 詳細は
+下記[逆ゲートウェイ: `serve` モード](#逆ゲートウェイ-serve-モード)を参照。ツール定義
+自体は既に stdio で問題なく動く場合、フレームワーク自前の HTTP/OAuth ホスティング層
+（の一部だけ）の代わりに mcp-stdio を据える、という使い方もできます。
 
 ## 特徴
 
