@@ -4,13 +4,16 @@
 
 English | [日本語](README.ja.md)
 
-Stdio-to-HTTP gateway — connects MCP clients to remote HTTP MCP servers.
+A stdio↔HTTP MCP gateway that works in **both directions** — the same
+binary is both an MCP-over-HTTP **client** gateway and, via `serve` mode, a
+full MCP-over-HTTP **server** (with an optional embedded OAuth 2.1
+Authorization Server), so it can sit on either end of an MCP connection.
 
 📖 **New here? Start with the [user guide](https://shigechika.github.io/mcp-stdio/)** — task-oriented docs for connecting a client or publishing a server. This README is the full reference.
 
 ## Overview
 
-[MCP](https://modelcontextprotocol.io/) clients like Claude Desktop and Claude Code see mcp-stdio as a locally running self-hosted MCP server, while it relays all requests to a remote MCP server with support for various authentication methods:
+**Client gateway (default mode) — stdio → HTTP.** [MCP](https://modelcontextprotocol.io/) clients like Claude Desktop and Claude Code see mcp-stdio as a locally running self-hosted MCP server, while it relays all requests to a remote MCP server with support for various authentication methods:
 
 ```mermaid
 flowchart BT
@@ -22,6 +25,16 @@ flowchart BT
 ```
 
 Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the remote server.
+
+**Reverse gateway (`mcp-stdio serve`) — HTTP → stdio.** The mirror image: takes a
+local stdio MCP server (any language, any framework) and exposes it as a
+Streamable HTTP endpoint, with optional bearer-token or embedded-OAuth-2.1
+authentication, multi-session isolation, and a restart-durable token store —
+see [Reverse gateway: `serve` mode](#reverse-gateway-serve-mode) below. This
+is how mcp-stdio can stand in for a framework's own HTTP/OAuth hosting layer
+(e.g. instead of depending on a Python web framework's built-in server for
+just that part) when the tool definitions themselves already run fine over
+stdio.
 
 ## Features
 
