@@ -640,6 +640,36 @@ def test_serve_main_rejects_non_finite_idle_ttl():
             server.serve_main(["--session-idle-ttl", bad, "--", "true"])
 
 
+def test_serve_main_rejects_user_env_without_oauth():
+    with pytest.raises(SystemExit):
+        server.serve_main(["--user-env", "TEST_USER", "--", "true"])
+
+
+@pytest.mark.parametrize("bad", ["1bad", "bad-name", "bad name", ""])
+def test_serve_main_rejects_malformed_user_env_name(bad):
+    with pytest.raises(SystemExit):
+        server.serve_main(["--enable-oauth", "--user-env", bad, "--", "true"])
+
+
+@pytest.mark.parametrize(
+    "dangerous",
+    [
+        "PATH",
+        "path",  # case-insensitive: refused regardless of the case an operator types
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "NODE_OPTIONS",
+    ],
+)
+def test_serve_main_rejects_dangerous_user_env_name(dangerous):
+    with pytest.raises(SystemExit):
+        server.serve_main(["--enable-oauth", "--user-env", dangerous, "--", "true"])
+
+
 def test_serve_main_rejects_negative_max_sessions_per_owner():
     with pytest.raises(SystemExit):
         server.serve_main(["--max-sessions-per-owner", "-1", "--", "true"])
@@ -709,6 +739,64 @@ def test_per_owner_exempts_static_and_open_gateway():
         reg.create(owner=server._STATIC_PRINCIPAL)
         reg.create(owner=server._STATIC_PRINCIPAL)
         assert reg.count == 4  # none reclaimed
+    finally:
+        reg.shutdown_all()
+
+
+def _initialize_and_get_env_value(backend):
+    """Send the child a real `initialize` and return `serverInfo.envValue`
+    (see _fake_backend.py's `--echo-env`) -- the value that child's Popen
+    environment actually carried at spawn, not a live re-read."""
+    line = backend.send_request(
+        '{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}',
+        1,
+        5.0,
+    )
+    assert line is not None, "backend did not answer initialize"
+    return json.loads(line)["result"]["serverInfo"]["envValue"]
+
+
+def test_user_env_injects_owner_into_child_environment():
+    # A genuine OAuth owner is injected under --user-env's variable name.
+    reg = server.SessionRegistry(
+        _BACKEND + ["--echo-env", "TEST_USER"], user_env_var="TEST_USER"
+    )
+    try:
+        _, backend = reg.create(owner="alice")
+        assert _initialize_and_get_env_value(backend) == "alice"
+    finally:
+        reg.shutdown_all()
+
+
+def test_user_env_exempts_static_and_open_gateway(monkeypatch):
+    # Neither the open-gateway (owner=None) nor the shared static-token
+    # principal is a real per-caller identity, so --user-env injects
+    # nothing for either -- the child's environment is left untouched.
+    # Cleared so a TEST_USER already set in the runner's own environment
+    # (inherited by the child via Popen's env=None passthrough) cannot be
+    # mistaken for an injected value (ai-review #400 R1F2).
+    monkeypatch.delenv("TEST_USER", raising=False)
+    reg = server.SessionRegistry(
+        _BACKEND + ["--echo-env", "TEST_USER"], user_env_var="TEST_USER"
+    )
+    try:
+        _, backend_open = reg.create(owner=None)
+        assert _initialize_and_get_env_value(backend_open) is None
+        _, backend_static = reg.create(owner=server._STATIC_PRINCIPAL)
+        assert _initialize_and_get_env_value(backend_static) is None
+    finally:
+        reg.shutdown_all()
+
+
+def test_user_env_off_by_default(monkeypatch):
+    # Without user_env_var, behaviour is byte-identical to before the flag
+    # existed: the child's environment is never touched. Cleared for the
+    # same reason as test_user_env_exempts_static_and_open_gateway.
+    monkeypatch.delenv("TEST_USER", raising=False)
+    reg = server.SessionRegistry(_BACKEND + ["--echo-env", "TEST_USER"])
+    try:
+        _, backend = reg.create(owner="alice")
+        assert _initialize_and_get_env_value(backend) is None
     finally:
         reg.shutdown_all()
 

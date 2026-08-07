@@ -773,6 +773,48 @@ class TestModernBackendPool:
         finally:
             pool.shutdown_all()
 
+    def test_user_env_injects_principal_into_child_environment(self):
+        # A genuine OAuth principal is injected under --user-env's variable
+        # name, visible via the handshake's cached serverInfo.
+        pool = server.ModernBackendPool(
+            _BACKEND + ["--echo-env", "TEST_USER"], user_env_var="TEST_USER"
+        )
+        try:
+            _, init_result = _checkout_and_release(pool, "alice")
+            assert init_result["serverInfo"]["envValue"] == "alice"
+        finally:
+            pool.shutdown_all()
+
+    def test_user_env_exempts_static_and_open_gateway(self, monkeypatch):
+        # None (open gateway) and the shared static-token principal are not
+        # genuine per-caller identities, so nothing is injected for either.
+        # Cleared so a TEST_USER already set in the runner's own environment
+        # (inherited by the child via Popen's env=None passthrough) cannot be
+        # mistaken for an injected value (ai-review #400 R1F2).
+        monkeypatch.delenv("TEST_USER", raising=False)
+        pool = server.ModernBackendPool(
+            _BACKEND + ["--echo-env", "TEST_USER"], user_env_var="TEST_USER"
+        )
+        try:
+            _, init_open = _checkout_and_release(pool, None)
+            assert init_open["serverInfo"]["envValue"] is None
+            _, init_static = _checkout_and_release(pool, server._STATIC_PRINCIPAL)
+            assert init_static["serverInfo"]["envValue"] is None
+        finally:
+            pool.shutdown_all()
+
+    def test_user_env_off_by_default(self, monkeypatch):
+        # Without user_env_var, behaviour is byte-identical to before the
+        # flag existed. Cleared for the same reason as
+        # test_user_env_exempts_static_and_open_gateway.
+        monkeypatch.delenv("TEST_USER", raising=False)
+        pool = server.ModernBackendPool(_BACKEND + ["--echo-env", "TEST_USER"])
+        try:
+            _, init_result = _checkout_and_release(pool, "alice")
+            assert init_result["serverInfo"]["envValue"] is None
+        finally:
+            pool.shutdown_all()
+
     def test_concurrent_first_requests_spawn_one_child(self):
         """The latch: racing first requests must not double-spawn.
 
@@ -1037,12 +1079,12 @@ class TestModernBackendPool:
         current = threading.local()
         real_spawn = pool._spawn_and_handshake
 
-        def _gated_spawn():
+        def _gated_spawn(principal):
             # Both racers park here, so both placeholders coexist — the
             # state that produces the overshoot.
             both_pending.wait(timeout=15)
             assert gates[current.principal].wait(timeout=15)
-            return real_spawn()
+            return real_spawn(principal)
 
         pool._spawn_and_handshake = _gated_spawn
 
@@ -1110,10 +1152,10 @@ class TestModernBackendPool:
         current = threading.local()
         real_spawn = pool._spawn_and_handshake
 
-        def _gated_spawn():
+        def _gated_spawn(principal):
             both_pending.wait(timeout=15)
             assert gates[current.principal].wait(timeout=15)
-            return real_spawn()
+            return real_spawn(principal)
 
         pool._spawn_and_handshake = _gated_spawn
 

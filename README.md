@@ -359,8 +359,14 @@ after this much inactivity so a client that disconnects without `DELETE` does
 not pin a slot; `0` = disabled, the default), and `--max-sessions-per-owner N`
 (on a new `initialize`, LRU-evict that OAuth user's older sessions down to `N`,
 reclaiming ghosts left by a client that reconnects without `DELETE`; `0` =
-disabled, the default; static-token and open-gateway sessions are exempt); and
-for the embedded AS:
+disabled, the default; static-token and open-gateway sessions are exempt);
+`--user-env VAR` (inject the authenticated principal into each spawned
+child's environment under this name, so a multi-user-aware backend can read
+its caller's identity without its own OAuth stack — requires
+`--enable-oauth`; the open-gateway and shared static-token principals are
+exempt, same as `--max-sessions-per-owner`; refuses a search-path /
+dynamic-linker variable name such as `PATH`, `LD_PRELOAD`, or `PYTHONPATH`
+that the child's own runtime needs to start); and for the embedded AS:
 `--enable-oauth`, `--public-url URL` (pins the issuer; recommended behind a
 proxy), `--trusted-user-header HEADER`, `--dev-user USER` (insecure, testing
 only), `--access-token-ttl SECONDS`, `--allow-redirect-uri URL` (repeatable;
