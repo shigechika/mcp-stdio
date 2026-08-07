@@ -785,9 +785,13 @@ class TestModernBackendPool:
         finally:
             pool.shutdown_all()
 
-    def test_user_env_exempts_static_and_open_gateway(self):
+    def test_user_env_exempts_static_and_open_gateway(self, monkeypatch):
         # None (open gateway) and the shared static-token principal are not
         # genuine per-caller identities, so nothing is injected for either.
+        # Cleared so a TEST_USER already set in the runner's own environment
+        # (inherited by the child via Popen's env=None passthrough) cannot be
+        # mistaken for an injected value (ai-review #400 R1F2).
+        monkeypatch.delenv("TEST_USER", raising=False)
         pool = server.ModernBackendPool(
             _BACKEND + ["--echo-env", "TEST_USER"], user_env_var="TEST_USER"
         )
@@ -799,9 +803,11 @@ class TestModernBackendPool:
         finally:
             pool.shutdown_all()
 
-    def test_user_env_off_by_default(self):
+    def test_user_env_off_by_default(self, monkeypatch):
         # Without user_env_var, behaviour is byte-identical to before the
-        # flag existed.
+        # flag existed. Cleared for the same reason as
+        # test_user_env_exempts_static_and_open_gateway.
+        monkeypatch.delenv("TEST_USER", raising=False)
         pool = server.ModernBackendPool(_BACKEND + ["--echo-env", "TEST_USER"])
         try:
             _, init_result = _checkout_and_release(pool, "alice")

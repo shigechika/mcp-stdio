@@ -751,10 +751,14 @@ def test_user_env_injects_owner_into_child_environment():
         reg.shutdown_all()
 
 
-def test_user_env_exempts_static_and_open_gateway():
+def test_user_env_exempts_static_and_open_gateway(monkeypatch):
     # Neither the open-gateway (owner=None) nor the shared static-token
     # principal is a real per-caller identity, so --user-env injects
     # nothing for either -- the child's environment is left untouched.
+    # Cleared so a TEST_USER already set in the runner's own environment
+    # (inherited by the child via Popen's env=None passthrough) cannot be
+    # mistaken for an injected value (ai-review #400 R1F2).
+    monkeypatch.delenv("TEST_USER", raising=False)
     reg = server.SessionRegistry(
         _BACKEND + ["--echo-env", "TEST_USER"], user_env_var="TEST_USER"
     )
@@ -767,9 +771,11 @@ def test_user_env_exempts_static_and_open_gateway():
         reg.shutdown_all()
 
 
-def test_user_env_off_by_default():
+def test_user_env_off_by_default(monkeypatch):
     # Without user_env_var, behaviour is byte-identical to before the flag
-    # existed: the child's environment is never touched.
+    # existed: the child's environment is never touched. Cleared for the
+    # same reason as test_user_env_exempts_static_and_open_gateway.
+    monkeypatch.delenv("TEST_USER", raising=False)
     reg = server.SessionRegistry(_BACKEND + ["--echo-env", "TEST_USER"])
     try:
         _, backend = reg.create(owner="alice")
