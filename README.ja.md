@@ -355,7 +355,9 @@ mcp-stdio --oauth http://127.0.0.1:8080/mcp
 持たずに呼び出し元の identity を読めるようになる — HTTP境界ではなくプロセス
 spawn境界に trusted-header パターンを適用したもの。`--enable-oauth` が前提。
 open-gateway と共有 static-token principal は、いずれも本物の呼び出し元識別子
-ではないため注入対象から除外される。`--max-sessions-per-owner` と同じ除外規則）;
+ではないため注入対象から除外される。`--max-sessions-per-owner` と同じ除外規則。
+`PATH`・`LD_PRELOAD`・`PYTHONPATH` など、子プロセス自身のランタイムが起動に
+必要とする検索パス／動的リンカ系の変数名は指定を拒否する）;
 埋め込み AS 用: `--enable-oauth`、`--public-url URL`（issuer 固定・
 プロキシ背後で推奨）、`--trusted-user-header HEADER`、`--dev-user USER`
 （非セキュア・検証用）、`--access-token-ttl SECONDS`、`--allow-redirect-uri URL`

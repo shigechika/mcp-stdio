@@ -651,6 +651,25 @@ def test_serve_main_rejects_malformed_user_env_name(bad):
         server.serve_main(["--enable-oauth", "--user-env", bad, "--", "true"])
 
 
+@pytest.mark.parametrize(
+    "dangerous",
+    [
+        "PATH",
+        "path",  # case-insensitive: refused regardless of the case an operator types
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "NODE_OPTIONS",
+    ],
+)
+def test_serve_main_rejects_dangerous_user_env_name(dangerous):
+    with pytest.raises(SystemExit):
+        server.serve_main(["--enable-oauth", "--user-env", dangerous, "--", "true"])
+
+
 def test_serve_main_rejects_negative_max_sessions_per_owner():
     with pytest.raises(SystemExit):
         server.serve_main(["--max-sessions-per-owner", "-1", "--", "true"])

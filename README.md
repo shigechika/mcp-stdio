@@ -364,7 +364,9 @@ disabled, the default; static-token and open-gateway sessions are exempt);
 child's environment under this name, so a multi-user-aware backend can read
 its caller's identity without its own OAuth stack — requires
 `--enable-oauth`; the open-gateway and shared static-token principals are
-exempt, same as `--max-sessions-per-owner`); and for the embedded AS:
+exempt, same as `--max-sessions-per-owner`; refuses a search-path /
+dynamic-linker variable name such as `PATH`, `LD_PRELOAD`, or `PYTHONPATH`
+that the child's own runtime needs to start); and for the embedded AS:
 `--enable-oauth`, `--public-url URL` (pins the issuer; recommended behind a
 proxy), `--trusted-user-header HEADER`, `--dev-user USER` (insecure, testing
 only), `--access-token-ttl SECONDS`, `--allow-redirect-uri URL` (repeatable;

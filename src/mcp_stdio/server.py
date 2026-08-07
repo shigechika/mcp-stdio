@@ -1395,11 +1395,7 @@ class ModernBackendPool:
         self, principal: Any
     ) -> tuple[BackendProcess, dict[str, Any]]:
         """Spawn a child and drive the handshake the modern wire omits."""
-        extra_env = None
-        if self._user_env_var:
-            value = _user_env_value(principal)
-            if value is not None:
-                extra_env = {self._user_env_var: value}
+        extra_env = _extra_env_for_principal(self._user_env_var, principal)
         backend = BackendProcess(self._command, modern_owned=True, extra_env=extra_env)
         try:
             req_id = self._next_handshake_id()
@@ -1907,6 +1903,20 @@ def _mrtr_input_response_to_reply(
     )
 
 
+def _is_genuine_per_caller_principal(principal: str | None) -> bool:
+    """Whether ``principal`` actually distinguishes one caller from another.
+
+    `None` is the open gateway and `_STATIC_PRINCIPAL` the shared
+    static-token constant; `_authorized` derives both. Neither identifies a
+    specific caller, so any feature that treats a principal as a per-user
+    credential (reverse-MRTR binding, `--user-env` injection, ...) must
+    exclude both -- shared here so each such feature stays correct if the
+    other's owner changes it for unrelated reasons, rather than one feature
+    silently reusing a helper scoped in its docstring to a different one.
+    """
+    return principal is not None and principal != _STATIC_PRINCIPAL
+
+
 def _mrtr_principal_is_eligible(principal: str | None) -> bool:
     """Whether this caller may open a reverse-MRTR round at all (§4 Q1).
 
@@ -1923,12 +1933,8 @@ def _mrtr_principal_is_eligible(principal: str | None) -> bool:
     Both of those postures therefore keep today's behaviour exactly: a
     clean `-32601`, no bridging, nothing to leak. Only a genuine OAuth
     user — a principal that actually distinguishes callers — is eligible.
-
-    `None` is the open gateway and `_STATIC_PRINCIPAL` the shared
-    static-token constant; `_authorized` derives both, and this reads the
-    same value rather than re-deriving it.
     """
-    return principal is not None and principal != _STATIC_PRINCIPAL
+    return _is_genuine_per_caller_principal(principal)
 
 
 def _user_env_value(principal: Any) -> str | None:
@@ -1936,22 +1942,67 @@ def _user_env_value(principal: Any) -> str | None:
     to leave the child's environment unmodified (--user-env not requested,
     open gateway, or the shared static-token principal).
 
-    Reuses the exact eligibility a genuine per-caller identity requires
-    (:func:`_mrtr_principal_is_eligible`'s reasoning applies here too: an
-    open-gateway or static-token "principal" does not distinguish callers,
+    Uses the same "does this actually distinguish callers" test every
+    per-user-credential feature needs (:func:`_is_genuine_per_caller_principal`):
+    an open-gateway or static-token "principal" does not distinguish callers,
     so injecting it would either inject nothing meaningful or falsely claim
-    a shared credential belongs to one specific user). `_STATIC_PRINCIPAL`
+    a shared credential belongs to one specific user. `_STATIC_PRINCIPAL`
     itself contains a NUL byte, but the eligibility check above already
     excludes it before the NUL check would matter — the NUL check here is
     defense in depth against any OTHER principal value that happens to
     embed one: `Popen(env=...)` raises `ValueError` on an embedded NUL,
     which would otherwise fail every request for that caller.
     """
-    if not _mrtr_principal_is_eligible(principal):
+    if not _is_genuine_per_caller_principal(principal):
         return None
     if not isinstance(principal, str) or "\x00" in principal:
         return None
     return principal
+
+
+# --user-env variable names CLI validation refuses outright: each is a
+# dynamic-linker / interpreter search-path variable that a spawned child
+# reads to locate its OWN code before it ever gets to application logic.
+# Injecting an authenticated principal string under one of these names
+# would silently replace it (a plain identity string is never a valid
+# PATH/library-search value), breaking child spawn outright the moment the
+# backend command isn't an absolute path, or -- for the *_PRELOAD/*_LIBRARIES
+# variables specifically -- doing something far worse if it ever DID parse.
+# Operator error, not an attack surface (the value comes from --user-env's
+# CLI argument, not request data), but cheap and worth refusing at parse
+# time rather than as a runtime footgun (#400 review).
+_DANGEROUS_USER_ENV_NAMES = frozenset(
+    {
+        "PATH",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "NODE_OPTIONS",
+    }
+)
+
+
+def _extra_env_for_principal(
+    user_env_var: str | None, principal: Any
+) -> dict[str, str] | None:
+    """The ``extra_env`` a spawned child should get for this principal, or
+    `None` for an unmodified environment.
+
+    Shared by :meth:`ModernBackendPool._spawn_and_handshake` and
+    :meth:`SessionRegistry.create` -- the two call sites that spawn a child
+    for a specific principal/owner -- so the injection rule (variable name,
+    eligibility, future changes such as an additional exemption or
+    sanitization step) cannot drift between the legacy and modern paths.
+    """
+    if not user_env_var:
+        return None
+    value = _user_env_value(principal)
+    if value is None:
+        return None
+    return {user_env_var: value}
 
 
 def _stamp_modern_result(
@@ -3468,11 +3519,7 @@ class SessionRegistry:
             return None
         # Spawn outside the lock: a Popen exec must not serialize other
         # sessions' creation or routing.
-        extra_env = None
-        if self._user_env_var:
-            value = _user_env_value(owner)
-            if value is not None:
-                extra_env = {self._user_env_var: value}
+        extra_env = _extra_env_for_principal(self._user_env_var, owner)
         backend = BackendProcess(self._command, extra_env=extra_env)
         # MCP spec: the session id SHOULD be globally unique and
         # cryptographically secure, and MUST contain only visible ASCII.
@@ -6650,7 +6697,10 @@ def serve_main(argv: list[str]) -> None:
             "genuine per-caller identity is injected -- the open-gateway "
             "(no auth) and shared static-token principals are exempt, "
             "leaving the child's environment unmodified for those, exactly "
-            "as before this flag existed. Off (default) injects nothing."
+            "as before this flag existed. Off (default) injects nothing. "
+            "Refuses a search-path / dynamic-linker variable name "
+            "(PATH, *PRELOAD*, *LIBRARY_PATH, PYTHONPATH, ...) that the "
+            "child's own runtime needs to start."
         ),
     )
     parser.add_argument(
@@ -6760,6 +6810,12 @@ def serve_main(argv: list[str]) -> None:
             parser.error(
                 "--user-env must be a valid environment variable name "
                 "([A-Za-z_][A-Za-z0-9_]*)"
+            )
+        if args.user_env.upper() in _DANGEROUS_USER_ENV_NAMES:
+            parser.error(
+                f"--user-env {args.user_env!r} would replace a variable the "
+                "child's own runtime needs to start (search path / dynamic "
+                "linker); choose an application-specific name instead"
             )
     if args.enable_oauth:
         public_url = None
