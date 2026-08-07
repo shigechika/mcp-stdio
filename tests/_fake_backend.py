@@ -25,6 +25,12 @@ Reads newline-delimited JSON-RPC from stdin and reacts:
 advertised capabilities, so a test can drive serve's capability gate with a
 child that genuinely lacks the feature rather than by monkeypatching serve.
 
+``--echo-env VAR`` reads ``os.environ.get(VAR)`` ONCE at process start (the
+value a real ``--user-env`` backend would see) and stamps it into the
+``initialize`` response's ``serverInfo`` as ``envValue``, so a test can prove
+what a spawned child actually saw in its environment without adding a whole
+new request method.
+
 Run as: ``python -m tests._fake_backend`` is not needed — it is launched as a
 script path by the tests.
 """
@@ -38,6 +44,16 @@ import time
 # the flag instead removes the capability, so the fake child looks like a
 # normal modern-capable server unless a test says otherwise.
 _ADVERTISES_RESOURCE_SUBSCRIBE = "--no-resource-subscribe" not in sys.argv
+
+# Read once at spawn time -- exactly what a --user-env-aware backend would do,
+# and what makes this a meaningful probe of the env a specific child process
+# was actually started with (as opposed to one read live, which could not
+# distinguish "the gateway injected nothing" from "this test forgot to ask").
+_ECHO_ENV_VALUE: str | None = None
+if "--echo-env" in sys.argv:
+    _idx = sys.argv.index("--echo-env")
+    if _idx + 1 < len(sys.argv):
+        _ECHO_ENV_VALUE = os.environ.get(sys.argv[_idx + 1])
 
 
 FAKE_TOOLS = [
@@ -74,13 +90,16 @@ def main() -> None:
         method = msg.get("method")
         mid = msg.get("id")
         if method == "initialize" and "id" in msg:
+            server_info = {"name": "fake", "version": "0"}
+            if "--echo-env" in sys.argv:
+                server_info["envValue"] = _ECHO_ENV_VALUE
             _send(
                 {
                     "jsonrpc": "2.0",
                     "id": mid,
                     "result": {
                         "protocolVersion": "2025-06-18",
-                        "serverInfo": {"name": "fake", "version": "0"},
+                        "serverInfo": server_info,
                         "capabilities": (
                             {"resources": {"subscribe": True}}
                             if _ADVERTISES_RESOURCE_SUBSCRIBE

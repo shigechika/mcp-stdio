@@ -903,6 +903,7 @@ class ModernBackendPool:
         max_children: int = 0,
         idle_ttl: float = 0.0,
         now: Any = time.monotonic,
+        user_env_var: str | None = None,
     ) -> None:
         if not command:
             raise ValueError("backend command is empty")
@@ -911,6 +912,11 @@ class ModernBackendPool:
         # by a fake clock in tests, the way `SessionRegistry` already is.
         self._now = now
         self._idle_ttl = idle_ttl
+        # --user-env VAR: the env var name each spawned child's identity is
+        # injected under (see `_user_env_value`). None means the flag was
+        # not passed -- children inherit the gateway's environment
+        # unmodified, exactly as before this parameter existed.
+        self._user_env_var = user_env_var
         self._reaper: threading.Thread | None = None
         self._reaper_stop = threading.Event()
         self._lock = threading.Lock()
@@ -1126,7 +1132,7 @@ class ModernBackendPool:
                     continue
                 raise RuntimeError(entry.get("error") or "backend handshake failed")
             try:
-                backend, init_result = self._spawn_and_handshake()
+                backend, init_result = self._spawn_and_handshake(principal)
             except Exception as exc:  # noqa: BLE001 — surfaced to the caller
                 with self._lock:
                     if self._entries.get(principal) is entry:
@@ -1385,9 +1391,18 @@ class ModernBackendPool:
         self._reaper_stop.set()
         self._reaper = None
 
-    def _spawn_and_handshake(self) -> tuple[BackendProcess, dict[str, Any]]:
+    def _spawn_and_handshake(
+        self, principal: Any
+    ) -> tuple[BackendProcess, dict[str, Any]]:
         """Spawn a child and drive the handshake the modern wire omits."""
-        backend = BackendProcess(self._command, modern_owned=True)
+        extra_env = None
+        if self._user_env_var:
+            value = _user_env_value(principal)
+            if value is not None:
+                extra_env = {self._user_env_var: value}
+        backend = BackendProcess(
+            self._command, modern_owned=True, extra_env=extra_env
+        )
         try:
             req_id = self._next_handshake_id()
             line = backend.send_request(
@@ -1918,6 +1933,29 @@ def _mrtr_principal_is_eligible(principal: str | None) -> bool:
     return principal is not None and principal != _STATIC_PRINCIPAL
 
 
+def _user_env_value(principal: Any) -> str | None:
+    """The value to inject via ``--user-env`` for this principal, or `None`
+    to leave the child's environment unmodified (--user-env not requested,
+    open gateway, or the shared static-token principal).
+
+    Reuses the exact eligibility a genuine per-caller identity requires
+    (:func:`_mrtr_principal_is_eligible`'s reasoning applies here too: an
+    open-gateway or static-token "principal" does not distinguish callers,
+    so injecting it would either inject nothing meaningful or falsely claim
+    a shared credential belongs to one specific user). `_STATIC_PRINCIPAL`
+    itself contains a NUL byte, but the eligibility check above already
+    excludes it before the NUL check would matter — the NUL check here is
+    defense in depth against any OTHER principal value that happens to
+    embed one: `Popen(env=...)` raises `ValueError` on an embedded NUL,
+    which would otherwise fail every request for that caller.
+    """
+    if not _mrtr_principal_is_eligible(principal):
+        return None
+    if not isinstance(principal, str) or "\x00" in principal:
+        return None
+    return principal
+
+
 def _stamp_modern_result(
     msg: dict[str, Any],
     method: str | None,
@@ -2175,7 +2213,9 @@ class BackendProcess:
     ``server_initiated`` for the GET SSE stream to deliver.
     """
 
-    def __init__(self, command: list[str], *, modern_owned: bool = False) -> None:
+    def __init__(
+        self, command: list[str], *, modern_owned: bool = False, extra_env: dict[str, str] | None = None
+    ) -> None:
         if not command:
             raise ValueError("backend command is empty")
         self._command = command
@@ -2189,6 +2229,9 @@ class BackendProcess:
         # text mode + line buffering so the reader thread sees one JSON-RPC
         # message per iteration. errors="replace" keeps a stray non-UTF-8 byte
         # from killing the reader (matching relay's never-crash posture).
+        # `env=None` (the `extra_env`-falsy default) is Popen's own "inherit
+        # the current environment" behavior — byte-identical to before this
+        # parameter existed, so every pre-existing call site is unaffected.
         self._proc = subprocess.Popen(  # noqa: S603 — operator-supplied argv
             command,
             stdin=subprocess.PIPE,
@@ -2197,6 +2240,7 @@ class BackendProcess:
             text=True,
             bufsize=1,
             errors="replace",
+            env={**os.environ, **extra_env} if extra_env else None,
         )
         self._lock = threading.Lock()
         self._write_lock = threading.Lock()
@@ -3360,6 +3404,7 @@ class SessionRegistry:
         idle_ttl: float = 0.0,
         max_sessions_per_owner: int = 0,
         now: Any = time.monotonic,
+        user_env_var: str | None = None,
     ) -> None:
         if not command:
             raise ValueError("backend command is empty")
@@ -3368,6 +3413,8 @@ class SessionRegistry:
         self._idle_ttl = idle_ttl
         self._max_per_owner = max_sessions_per_owner
         self._now = now
+        # --user-env VAR: see ModernBackendPool.__init__ for the contract.
+        self._user_env_var = user_env_var
         self._lock = threading.Lock()
         self._sessions: dict[str, _Session] = {}
         self._reaper: threading.Thread | None = None
@@ -3419,7 +3466,12 @@ class SessionRegistry:
             return None
         # Spawn outside the lock: a Popen exec must not serialize other
         # sessions' creation or routing.
-        backend = BackendProcess(self._command)
+        extra_env = None
+        if self._user_env_var:
+            value = _user_env_value(owner)
+            if value is not None:
+                extra_env = {self._user_env_var: value}
+        backend = BackendProcess(self._command, extra_env=extra_env)
         # MCP spec: the session id SHOULD be globally unique and
         # cryptographically secure, and MUST contain only visible ASCII.
         sid = secrets.token_hex(16)
@@ -6276,6 +6328,7 @@ def build_server(
     cache_ttl_ms: int = _DEFAULT_CACHE_TTL_MS,
     modern_idle_ttl: float = 0.0,
     modern_only: bool = False,
+    user_env_var: str | None = None,
 ) -> tuple[ThreadingHTTPServer, SessionRegistry]:
     """Construct the HTTP server and session registry without running the loop.
 
@@ -6289,13 +6342,19 @@ def build_server(
     Authorization Server: /authorize /token /register + AS metadata, and
     the RS gate then also accepts issued access tokens. ``idle_ttl`` (when
     ``> 0``) arms idle session eviction; the caller starts the reaper with
-    ``registry.start_reaper()``.
+    ``registry.start_reaper()``. ``user_env_var`` (when not None) injects the
+    authenticated principal into each spawned child's environment under this
+    variable name (see :func:`_user_env_value`) -- both the per-session
+    (legacy) and per-principal (modern) pools spawn one child per real
+    identity already, so this is purely an env-injection concern, not a
+    pooling-strategy change.
     """
     registry = SessionRegistry(
         command,
         max_sessions=max_sessions,
         idle_ttl=idle_ttl,
         max_sessions_per_owner=max_sessions_per_owner,
+        user_env_var=user_env_var,
     )
     # #270 Phase 3 P3-B. Constructed unconditionally but SPAWNS NOTHING
     # until a modern request arrives, so a deployment that never sees one
@@ -6306,6 +6365,7 @@ def build_server(
         command,
         max_children=max_sessions_per_owner,
         idle_ttl=modern_idle_ttl,
+        user_env_var=user_env_var,
     )
     handler = type(
         "_BoundHandler",
@@ -6345,6 +6405,7 @@ def serve(
     cache_ttl_ms: int = _DEFAULT_CACHE_TTL_MS,
     modern_idle_ttl: float = 0.0,
     modern_only: bool = False,
+    user_env_var: str | None = None,
 ) -> None:
     """Run the reverse gateway until interrupted.
 
@@ -6353,6 +6414,8 @@ def serve(
     the backend down. ``auth_token`` enables the static-token gate;
     ``oauth`` enables the embedded Authorization Server. ``max_sessions`` caps
     concurrent sessions; ``idle_ttl`` (when ``> 0``) evicts idle sessions.
+    ``user_env_var`` injects the authenticated principal into each spawned
+    child's environment (see :func:`build_server`).
     """
     httpd, registry = build_server(
         command,
@@ -6367,6 +6430,7 @@ def serve(
         cache_ttl_ms=cache_ttl_ms,
         modern_idle_ttl=modern_idle_ttl,
         modern_only=modern_only,
+        user_env_var=user_env_var,
     )
     registry.start_reaper()
     # Its own thread, gated on its own TTL — the legacy reaper may well
@@ -6572,6 +6636,22 @@ def serve_main(argv: list[str]) -> None:
         ),
     )
     parser.add_argument(
+        "--user-env",
+        default=None,
+        metavar="VAR",
+        help=(
+            "Inject the authenticated principal into each spawned backend "
+            "child's environment under this variable name, so a "
+            "multi-user-aware backend can read its caller's identity "
+            "without its own OAuth stack (a trusted-header pattern at the "
+            "process-spawn boundary instead of the HTTP boundary). Only a "
+            "genuine per-caller identity is injected -- the open-gateway "
+            "(no auth) and shared static-token principals are exempt, "
+            "leaving the child's environment unmodified for those, exactly "
+            "as before this flag existed. Off (default) injects nothing."
+        ),
+    )
+    parser.add_argument(
         "--cache-ttl-ms",
         type=int,
         default=_DEFAULT_CACHE_TTL_MS,
@@ -6671,6 +6751,14 @@ def serve_main(argv: list[str]) -> None:
         parser.error("--session-idle-ttl must be a non-negative, finite number")
     if args.max_sessions_per_owner < 0:
         parser.error("--max-sessions-per-owner must be >= 0")
+    if args.user_env is not None:
+        if not args.enable_oauth:
+            parser.error("--user-env requires --enable-oauth")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", args.user_env):
+            parser.error(
+                "--user-env must be a valid environment variable name "
+                "([A-Za-z_][A-Za-z0-9_]*)"
+            )
     if args.enable_oauth:
         public_url = None
         if args.public_url is not None:
@@ -6755,4 +6843,5 @@ def serve_main(argv: list[str]) -> None:
         cache_ttl_ms=args.cache_ttl_ms,
         modern_idle_ttl=args.modern_idle_ttl,
         modern_only=args.modern_only,
+        user_env_var=args.user_env,
     )
