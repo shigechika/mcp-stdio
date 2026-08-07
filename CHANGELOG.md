@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.40.0](https://github.com/shigechika/mcp-stdio/compare/v0.39.1...v0.40.0) (2026-08-07)
+
+
+### Features
+
+* add --user-env to inject the authenticated principal into spawned children ([#400](https://github.com/shigechika/mcp-stdio/issues/400)) ([bbff675](https://github.com/shigechika/mcp-stdio/commit/bbff675143c85fdb1fb7114f2feffa5c7934e49a))
+
 ## [0.39.1](https://github.com/shigechika/mcp-stdio/compare/v0.39.0...v0.39.1) (2026-08-02)
 
 
