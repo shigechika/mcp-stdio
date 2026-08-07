@@ -29,7 +29,8 @@ Bearer tokens, custom headers, and OAuth 2.1 credentials are forwarded to the re
 **Reverse gateway (`mcp-stdio serve`) — HTTP → stdio.** The mirror image: takes a
 local stdio MCP server (any language, any framework) and exposes it as a
 Streamable HTTP endpoint, with optional bearer-token or embedded-OAuth-2.1
-authentication, multi-session isolation, and a restart-durable token store —
+authentication, per-user backend isolation when OAuth is enabled, and a
+restart-durable token store —
 see [Reverse gateway: `serve` mode](#reverse-gateway-serve-mode) below. This
 is how mcp-stdio can stand in for a framework's own HTTP/OAuth hosting layer
 (e.g. instead of depending on a Python web framework's built-in server for
