@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.41.0](https://github.com/shigechika/mcp-stdio/compare/v0.40.0...v0.41.0) (2026-08-08)
+
+
+### Features
+
+* add pr-gate.yml admission control caller ([#402](https://github.com/shigechika/mcp-stdio/issues/402)) ([eb860a2](https://github.com/shigechika/mcp-stdio/commit/eb860a216ae913a6a10520b3f56a88b472fd9dc0))
+
 ## [0.40.0](https://github.com/shigechika/mcp-stdio/compare/v0.39.1...v0.40.0) (2026-08-07)
 
 
