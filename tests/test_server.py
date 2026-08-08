@@ -10,6 +10,7 @@ import stat
 import sys
 import threading
 import time
+import types
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs, urlsplit
 
@@ -3068,6 +3069,184 @@ def test_token_store_allowlist_drop_warning_names_client(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "dropping persisted client registration" in err
     assert reg["client_id"] in err
+
+
+# --- --token-store-firestore (#Firestore) ---
+#
+# google-cloud-firestore is an optional extra (see pyproject.toml), so these
+# tests fake the module at the sys.modules level rather than importing the
+# real package — CI's `dev` group deliberately does not install `firestore`,
+# matching the "plain `pip install mcp-stdio` never needs it on disk"
+# guarantee documented on _get_firestore_client.
+
+
+class _FakeFirestoreSnapshot:
+    def __init__(self, data):
+        self._data = data
+
+    @property
+    def exists(self):
+        return self._data is not None
+
+    def to_dict(self):
+        return self._data
+
+
+class _FakeFirestoreDocument:
+    def __init__(self, store, key, *, fail_set_with=None):
+        self._store = store
+        self._key = key
+        self._fail_set_with = fail_set_with
+
+    def get(self):
+        return _FakeFirestoreSnapshot(self._store.get(self._key))
+
+    def set(self, data):
+        if self._fail_set_with is not None:
+            raise self._fail_set_with
+        self._store[self._key] = data
+
+
+class _FakeFirestoreCollection:
+    def __init__(self, store, name, **doc_kwargs):
+        self._store = store
+        self._name = name
+        self._doc_kwargs = doc_kwargs
+
+    def document(self, doc_id):
+        return _FakeFirestoreDocument(self._store, (self._name, doc_id), **self._doc_kwargs)
+
+
+class _FakeFirestoreClient:
+    def __init__(self, store, **doc_kwargs):
+        self._store = store
+        self._doc_kwargs = doc_kwargs
+
+    def collection(self, name):
+        return _FakeFirestoreCollection(self._store, name, **self._doc_kwargs)
+
+
+@pytest.fixture()
+def fake_firestore(monkeypatch):
+    """Installs a fake google.cloud.firestore module backed by a shared
+    in-memory dict, so multiple _OAuthProvider instances constructed within
+    one test see the same "database" (simulating a restart) the same way
+    the --token-store tests reuse one tmp_path file. Yields the backing
+    dict for direct inspection/seeding.
+    """
+    store: dict[tuple[str, str], dict] = {}
+    fake_module = types.ModuleType("google.cloud.firestore")
+    fake_module.Client = lambda: _FakeFirestoreClient(store)  # type: ignore[attr-defined]
+    google_module = types.ModuleType("google")
+    google_cloud_module = types.ModuleType("google.cloud")
+    google_cloud_module.firestore = fake_module  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "google", google_module)
+    monkeypatch.setitem(sys.modules, "google.cloud", google_cloud_module)
+    monkeypatch.setitem(sys.modules, "google.cloud.firestore", fake_module)
+    yield store
+
+
+def test_token_store_firestore_access_token_survives_restart(fake_firestore):
+    ref = ("oauth-state", "jquants")
+    p1 = _provider(firestore_ref=ref)
+    _, tok = _direct_flow(p1)
+    p2 = _provider(firestore_ref=ref)  # simulated restart
+    assert p2.validate_access_token(tok["access_token"]) is True
+    assert p2.user_for_token(tok["access_token"]) == "alice"
+
+
+def test_token_store_firestore_missing_document_is_clean_start(fake_firestore):
+    # No prior .set() call for this ref -- get().exists is False, same as a
+    # missing --token-store file: a clean first start, not an error.
+    p = _provider(firestore_ref=("oauth-state", "jquants"))
+    assert p.validate_access_token("nonexistent") is False
+
+
+def test_token_store_firestore_persist_failure_soft_fails_and_warns_once(
+    fake_firestore, monkeypatch, capsys
+):
+    ref = ("oauth-state", "jquants")
+    p = _provider(firestore_ref=ref)
+    monkeypatch.setattr(
+        p,
+        "_firestore_document",
+        lambda: _FakeFirestoreDocument(
+            fake_firestore, ref, fail_set_with=RuntimeError("boom")
+        ),
+    )
+    _direct_flow(p)  # a mutation triggers _persist_locked
+    _direct_flow(p)  # a second mutation must not warn again
+    err = capsys.readouterr().err
+    assert err.count("could not persist OAuth state") == 1
+    assert "continuing in-memory only" in err
+
+
+def test_token_store_firestore_persist_now_propagates_failure(fake_firestore, monkeypatch):
+    ref = ("oauth-state", "jquants")
+    p = _provider(firestore_ref=ref)
+    monkeypatch.setattr(
+        p,
+        "_firestore_document",
+        lambda: _FakeFirestoreDocument(
+            fake_firestore, ref, fail_set_with=RuntimeError("boom")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="boom"):
+        p.persist_now()
+
+
+def test_get_firestore_client_missing_package_raises_clear_error(monkeypatch):
+    monkeypatch.delitem(sys.modules, "google.cloud.firestore", raising=False)
+    monkeypatch.delitem(sys.modules, "google.cloud", raising=False)
+    monkeypatch.delitem(sys.modules, "google", raising=False)
+    # Construction itself does not raise: _load_state soft-fails the same
+    # way an unreadable --token-store file does (a warning, empty start) --
+    # the missing-package error only propagates once something actually
+    # tries to use the (still uncached) client, which is what this test
+    # pins directly rather than relying on a specific caller.
+    p = _provider(firestore_ref=("oauth-state", "jquants"))
+    with pytest.raises(RuntimeError, match=r"pip install mcp-stdio\[firestore\]"):
+        p._get_firestore_client()
+
+
+def test_serve_main_token_store_firestore_requires_oauth():
+    with pytest.raises(SystemExit):
+        server.serve_main(
+            ["--token-store-firestore", "coll/doc", "--", "true"]
+        )
+
+
+def test_serve_main_token_store_firestore_and_token_store_mutually_exclusive():
+    with pytest.raises(SystemExit):
+        server.serve_main(
+            [
+                "--enable-oauth",
+                "--dev-user",
+                "a",
+                "--token-store",
+                "/tmp/x.json",
+                "--token-store-firestore",
+                "coll/doc",
+                "--",
+                "true",
+            ]
+        )
+
+
+@pytest.mark.parametrize("value", ["nocollectionslash", "coll/", "/doc", "a/b/c"])
+def test_serve_main_token_store_firestore_malformed_ref_rejected(value):
+    with pytest.raises(SystemExit):
+        server.serve_main(
+            [
+                "--enable-oauth",
+                "--dev-user",
+                "a",
+                "--token-store-firestore",
+                value,
+                "--",
+                "true",
+            ]
+        )
 
 
 # --- cross-SDK guard tests (#273) ---

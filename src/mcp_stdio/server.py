@@ -4004,7 +4004,8 @@ def _acquire_store_lock(store_path: Path) -> Any:
 class _OAuthProvider:
     """Minimal OAuth 2.1 Authorization Server: DCR + authorization-code + PKCE
     + refresh, with opaque bearer tokens held in memory and optionally
-    persisted via --token-store (no crypto dependency).
+    persisted via --token-store or --token-store-firestore (no crypto
+    dependency).
 
     All stores share one lock; ThreadingHTTPServer serves each request on
     its own thread. ``now`` is injectable so tests can drive TTL expiry without
@@ -4012,7 +4013,10 @@ class _OAuthProvider:
     passes a per-request reflected origin into the metadata builders.
     ``store_path`` (--token-store) optionally persists all state to a 0o600
     JSON file on every mutation so issued tokens survive a restart (#277);
-    None keeps the tokens purely in-memory.
+    ``firestore_ref`` (--token-store-firestore, a ``(collection, document)``
+    pair) does the same into one Firestore document instead, for a
+    deployment with no durable local disk. Exactly one of the two may be
+    set; both keep the tokens purely in-memory when None.
     """
 
     def __init__(
@@ -4027,6 +4031,7 @@ class _OAuthProvider:
         allowed_redirect_uris: frozenset[str] = frozenset(),
         now: Any = time.time,
         store_path: Path | None = None,
+        firestore_ref: tuple[str, str] | None = None,
     ) -> None:
         self.public_url = public_url
         self.trusted_user_header = trusted_user_header
@@ -4058,41 +4063,86 @@ class _OAuthProvider:
         # client registrations survive a process restart (issue #277). None
         # keeps the pre-existing in-memory-only behavior.
         self._store_path = store_path
+        # --token-store-firestore: same snapshot, written to one Firestore
+        # document instead. The CLI enforces store_path/firestore_ref are
+        # never both set. No sidecar lock exists for this backend (unlike
+        # store_path's _acquire_store_lock) — safe only with exactly one
+        # writer (see the flag's --help text).
+        self._firestore_ref = firestore_ref
+        self._firestore_client: Any = None
         self._warned_persist_failure = False
         # serve_main parks the sidecar-lock fd here so the advisory lock
         # (which guards against two processes sharing one store) stays alive
-        # exactly as long as the provider does.
+        # exactly as long as the provider does. Unused in Firestore mode.
         self._store_lock_fd: Any = None
-        if store_path is not None:
+        if store_path is not None or firestore_ref is not None:
             self._load_state()
+
+    def _get_firestore_client(self) -> Any:
+        """Lazily create and cache the Firestore client (--token-store-firestore
+        only). Imported here, not at module scope, so a plain ``pip install
+        mcp-stdio`` never needs google-cloud-firestore on disk — only a
+        deployment that actually passes the flag does.
+        """
+        if self._firestore_client is None:
+            try:
+                from google.cloud import firestore
+            except ImportError as e:
+                raise RuntimeError(
+                    "--token-store-firestore requires the google-cloud-firestore "
+                    "package: pip install mcp-stdio[firestore]"
+                ) from e
+            self._firestore_client = firestore.Client()
+        return self._firestore_client
+
+    def _firestore_document(self) -> Any:
+        assert self._firestore_ref is not None
+        collection, document = self._firestore_ref
+        return self._get_firestore_client().collection(collection).document(document)
 
     # -- state persistence (--token-store) --------------------------------
 
     def _load_state(self) -> None:
-        """Restore AS state from ``self._store_path``.
+        """Restore AS state from ``self._store_path`` or ``self._firestore_ref``
+        (exactly one is set — the CLI enforces this).
 
         Called from ``__init__`` only, before the HTTP server threads start,
-        so no lock is needed. Defensive by construction: a missing file is a
-        clean first start; an unreadable/corrupt/unversioned file starts empty
-        with a warning (the file is replaced on the next mutation, mirroring
-        the client token store's overwrite-safe recovery); individual
-        malformed or expired entries are dropped, never trusted.
+        so no lock is needed. Defensive by construction: a missing file/
+        document is a clean first start; an unreadable/corrupt/unversioned
+        one starts empty with a warning (it is replaced on the next
+        mutation, mirroring the client token store's overwrite-safe
+        recovery); individual malformed or expired entries are dropped,
+        never trusted.
         """
-        path = self._store_path
-        assert path is not None
-        data = _read_json_object_file(path)
-        if data is None:
-            if path.exists():
+        if self._store_path is not None:
+            source_label = str(self._store_path)
+            data = _read_json_object_file(self._store_path)
+            if data is None and self._store_path.exists():
                 log(
-                    f"warning: OAuth state file {path} is unreadable or "
-                    "corrupt; starting empty (previously issued tokens need a "
-                    "re-auth). It is replaced on the next issuance."
+                    f"warning: OAuth state file {source_label} is unreadable "
+                    "or corrupt; starting empty (previously issued tokens "
+                    "need a re-auth). It is replaced on the next issuance."
                 )
+        else:
+            assert self._firestore_ref is not None
+            source_label = f"{self._firestore_ref[0]}/{self._firestore_ref[1]}"
+            try:
+                snapshot = self._firestore_document().get()
+                data = snapshot.to_dict() if snapshot.exists else None
+            except Exception as e:
+                data = None
+                log(
+                    f"warning: could not read OAuth state from Firestore "
+                    f"{source_label}: {e}; starting empty (previously issued "
+                    "tokens need a re-auth). It is replaced on the next "
+                    "issuance."
+                )
+        if data is None:
             return
         if data.get("version") != _STATE_VERSION:
             log(
-                f"warning: OAuth state file {path} has unsupported version "
-                f"{data.get('version')!r}; starting empty."
+                f"warning: OAuth state at {source_label} has unsupported "
+                f"version {data.get('version')!r}; starting empty."
             )
             return
         now = self._now()
@@ -4156,10 +4206,10 @@ class _OAuthProvider:
         if dropped:
             log(
                 f"note: dropped {dropped} expired or malformed entr"
-                f"{'y' if dropped == 1 else 'ies'} while loading {path}"
+                f"{'y' if dropped == 1 else 'ies'} while loading {source_label}"
             )
         log(
-            f"note: restored OAuth state from {path}: "
+            f"note: restored OAuth state from {source_label}: "
             f"{len(self._access)} access / {len(self._refresh)} refresh "
             f"token(s), {len(self._clients)} client registration(s)"
         )
@@ -4184,21 +4234,32 @@ class _OAuthProvider:
             "consumed_refresh": self._consumed_refresh,
         }
 
+    def _write_snapshot_locked(self) -> None:
+        """Write the current snapshot to whichever backend is configured
+        (caller holds ``self._lock``). Raises on failure; callers decide
+        whether that propagates (``persist_now``) or is soft-failed
+        (``_persist_locked``). A no-op when neither backend is set.
+        """
+        if self._store_path is not None:
+            _atomic_write_json_file(self._store_path, self._snapshot_locked())
+        elif self._firestore_ref is not None:
+            self._firestore_document().set(self._snapshot_locked())
+
     def persist_now(self) -> None:
         """Write the current state immediately, PROPAGATING any failure.
 
         Called once at startup (after the restore) so a misconfigured
-        --token-store — an unwritable path, an existing directory, an
-        empty-basename path like ``.`` — fails fast at launch instead of
-        degrading silently to in-memory-only at the first token issuance
-        while the startup log claims persistence is on.
+        --token-store / --token-store-firestore — an unwritable path, an
+        existing directory, an empty-basename path like ``.``, a missing
+        google-cloud-firestore package, an unreachable project — fails fast
+        at launch instead of degrading silently to in-memory-only at the
+        first token issuance while the startup log claims persistence is on.
         """
         with self._lock:
-            if self._store_path is not None:
-                _atomic_write_json_file(self._store_path, self._snapshot_locked())
+            self._write_snapshot_locked()
 
     def _persist_locked(self) -> None:
-        """Snapshot all six stores to ``self._store_path`` (caller holds
+        """Snapshot all six stores to the configured backend (caller holds
         ``self._lock``, which makes the snapshot point-in-time consistent and
         serializes concurrent writers).
 
@@ -4208,16 +4269,21 @@ class _OAuthProvider:
         (issuance, rotation, revocation, registration), never on the
         read-heavy validation path.
         """
-        if self._store_path is None:
+        if self._store_path is None and self._firestore_ref is None:
             return
         try:
-            _atomic_write_json_file(self._store_path, self._snapshot_locked())
+            self._write_snapshot_locked()
         except Exception as e:
             if not self._warned_persist_failure:
                 self._warned_persist_failure = True
+                target = (
+                    self._store_path
+                    if self._store_path is not None
+                    else f"{self._firestore_ref[0]}/{self._firestore_ref[1]}"  # type: ignore[index]
+                )
                 log(
                     f"warning: could not persist OAuth state to "
-                    f"{self._store_path}: {e}; continuing in-memory only "
+                    f"{target}: {e}; continuing in-memory only "
                     "(issued tokens will not survive a restart)"
                 )
 
@@ -6643,7 +6709,30 @@ def serve_main(argv: list[str]) -> None:
             "connected client must re-authorize. The file is credential "
             "material — guard it like a private key. Each serve process "
             "needs its own path (a sidecar .lock refuses accidental "
-            "sharing). Requires --enable-oauth."
+            "sharing). Requires --enable-oauth. Mutually exclusive with "
+            "--token-store-firestore."
+        ),
+    )
+    parser.add_argument(
+        "--token-store-firestore",
+        default=None,
+        metavar="COLLECTION/DOCUMENT",
+        help=(
+            "Persist the same OAuth state --token-store does, but as one "
+            "Firestore document at this collection/document path instead of "
+            "a local file — for a deployment with no durable local disk "
+            "(e.g. Cloud Run) where every restart would otherwise invalidate "
+            "every issued token. The GCP project is resolved the standard "
+            "google-cloud way (GOOGLE_CLOUD_PROJECT env var, or ADC on "
+            "Cloud Run); there is no separate --project flag. Requires the "
+            "google-cloud-firestore package (`pip install "
+            "mcp-stdio[firestore]`) and --enable-oauth. Mutually exclusive "
+            "with --token-store. Unlike --token-store there is no lock "
+            "against two processes sharing one document — safe ONLY when "
+            "exactly one serve process ever writes to a given document at a "
+            "time (e.g. Cloud Run with min-instances=1 and max-instances=1); "
+            "two concurrent writers silently last-writer-wins clobber each "
+            "other's issued tokens."
         ),
     )
     parser.add_argument(
@@ -6785,6 +6874,22 @@ def serve_main(argv: list[str]) -> None:
         parser.error("--token-store requires --enable-oauth")
     if args.token_store is not None and not args.token_store.strip():
         parser.error("--token-store must not be empty")
+    firestore_ref: tuple[str, str] | None = None
+    if args.token_store_firestore is not None:
+        if args.token_store is not None:
+            parser.error(
+                "--token-store and --token-store-firestore are mutually "
+                "exclusive"
+            )
+        if not args.enable_oauth:
+            parser.error("--token-store-firestore requires --enable-oauth")
+        parts = args.token_store_firestore.split("/")
+        if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+            parser.error(
+                "--token-store-firestore must be COLLECTION/DOCUMENT "
+                f"(got {args.token_store_firestore!r})"
+            )
+        firestore_ref = (parts[0], parts[1])
     if args.trusted_user_header is not None and any(
         c in args.trusted_user_header for c in (" ", "\r", "\n", ":")
     ):
@@ -6869,6 +6974,12 @@ def serve_main(argv: list[str]) -> None:
                 f"note: persisting issued OAuth state to {store_path} "
                 "(credential material; created 0600)"
             )
+        if firestore_ref is not None:
+            log(
+                f"note: persisting issued OAuth state to Firestore "
+                f"{firestore_ref[0]}/{firestore_ref[1]} (credential "
+                "material; safe only with exactly one writer)"
+            )
         oauth = _OAuthProvider(
             public_url=public_url,
             trusted_user_header=args.trusted_user_header,
@@ -6876,6 +6987,7 @@ def serve_main(argv: list[str]) -> None:
             access_ttl=float(args.access_token_ttl),
             allowed_redirect_uris=allowed_redirect_uris,
             store_path=store_path,
+            firestore_ref=firestore_ref,
         )
         if store_path is not None:
             oauth._store_lock_fd = store_lock_fd
@@ -6887,6 +6999,19 @@ def serve_main(argv: list[str]) -> None:
                 oauth.persist_now()
             except Exception as e:
                 parser.error(f"--token-store: cannot write {store_path}: {e}")
+        if firestore_ref is not None:
+            # Same fail-fast rationale as --token-store above: a missing
+            # google-cloud-firestore package, an unreachable project, or a
+            # permissions error should abort startup, not silently degrade
+            # to in-memory-only after promising persistence in the log line
+            # just printed.
+            try:
+                oauth.persist_now()
+            except Exception as e:
+                parser.error(
+                    f"--token-store-firestore: cannot write "
+                    f"{firestore_ref[0]}/{firestore_ref[1]}: {e}"
+                )
 
     serve(
         command,

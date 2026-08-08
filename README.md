@@ -370,10 +370,10 @@ that the child's own runtime needs to start); and for the embedded AS:
 `--enable-oauth`, `--public-url URL` (pins the issuer; recommended behind a
 proxy), `--trusted-user-header HEADER`, `--dev-user USER` (insecure, testing
 only), `--access-token-ttl SECONDS`, `--allow-redirect-uri URL` (repeatable;
-see below), `--token-store PATH` (see below). Without `--token-store`, tokens
-are in-memory only and a restart invalidates them (the client re-runs
-`--oauth`). The backend command follows the options (an optional `--`
-separator is supported).
+see below), `--token-store PATH` or `--token-store-firestore COLLECTION/DOCUMENT`
+(mutually exclusive, see below). Without either, tokens are in-memory only
+and a restart invalidates them (the client re-runs `--oauth`). The backend
+command follows the options (an optional `--` separator is supported).
 
   - *Non-loopback remote clients* — DCR only accepts an RFC 8252 loopback
     `http://` `redirect_uri` by default, which a browser-based remote MCP
@@ -400,6 +400,22 @@ separator is supported).
     issued tokens), and the path is probe-written at launch so a
     misconfigured target fails the start instead of silently disabling
     persistence. Requires `--enable-oauth` (#277).
+  - *Restart-durable tokens, no local disk* — `--token-store-firestore
+    COLLECTION/DOCUMENT` persists the same state as `--token-store` (same
+    JSON-shaped snapshot, same probe-write-at-launch fail-fast behavior) to
+    one [Firestore](https://cloud.google.com/firestore) document instead of
+    a local file, for a deployment with no durable local disk (Cloud Run and
+    similar). The GCP project is resolved the standard google-cloud way
+    (`GOOGLE_CLOUD_PROJECT` env var, or ADC on Cloud Run) — there is no
+    separate `--project` flag. Requires the `google-cloud-firestore` package
+    (`pip install mcp-stdio[firestore]`, an optional extra — plain
+    `pip install mcp-stdio` never needs it) and `--enable-oauth`. **Unlike
+    `--token-store` there is no lock against two processes sharing one
+    document** — safe ONLY when exactly one `serve` process ever writes to a
+    given document at a time (e.g. Cloud Run with `min-instances=1` and
+    `max-instances=1`); two concurrent writers silently last-writer-wins
+    clobber each other's issued tokens. Mutually exclusive with
+    `--token-store`.
   - *Path-scoped issuer* — `--public-url` retains a path, so several
     `--enable-oauth` backends can share one host behind a reverse proxy, each
     under its own prefix (e.g. `--public-url https://gw.example.org/team-a`
