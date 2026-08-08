@@ -4001,6 +4001,17 @@ def _acquire_store_lock(store_path: Path) -> Any:
         raise
 
 
+class _FirestoreReadError(Exception):
+    """Raised by _load_state when reading --token-store-firestore's document
+    itself fails (network error, permission error, ...) -- as opposed to the
+    document genuinely not existing, which is a normal clean-start and NOT
+    this. Distinct from a bare RuntimeError so the CLI (serve_main) can
+    single it out and abort startup instead of letting __init__ succeed
+    into an empty-looking state that persist_now() would then happily
+    overwrite the real (merely unread) document with.
+    """
+
+
 class _OAuthProvider:
     """Minimal OAuth 2.1 Authorization Server: DCR + authorization-code + PKCE
     + refresh, with opaque bearer tokens held in memory and optionally
@@ -4130,13 +4141,19 @@ class _OAuthProvider:
                 snapshot = self._firestore_document().get()
                 data = snapshot.to_dict() if snapshot.exists else None
             except Exception as e:
-                data = None
-                log(
-                    f"warning: could not read OAuth state from Firestore "
-                    f"{source_label}: {e}; starting empty (previously issued "
-                    "tokens need a re-auth). It is replaced on the next "
-                    "issuance."
-                )
+                # A read FAILURE (network error, permission error, ...) is
+                # NOT the same as the document genuinely not existing
+                # (snapshot.exists is False, handled above -- a normal
+                # clean first start). Silently treating a failure the same
+                # as "empty" would be actively dangerous here, unlike the
+                # local-file branch above: the CLI's persist_now() call
+                # right after construction would then overwrite the real
+                # (merely unread) document with that empty snapshot,
+                # permanently destroying every previously issued token.
+                # Propagate instead, so the CLI aborts startup.
+                raise _FirestoreReadError(
+                    f"could not read OAuth state from Firestore {source_label}: {e}"
+                ) from e
         if data is None:
             return
         if data.get("version") != _STATE_VERSION:
@@ -6878,8 +6895,7 @@ def serve_main(argv: list[str]) -> None:
     if args.token_store_firestore is not None:
         if args.token_store is not None:
             parser.error(
-                "--token-store and --token-store-firestore are mutually "
-                "exclusive"
+                "--token-store and --token-store-firestore are mutually exclusive"
             )
         if not args.enable_oauth:
             parser.error("--token-store-firestore requires --enable-oauth")
@@ -6980,15 +6996,27 @@ def serve_main(argv: list[str]) -> None:
                 f"{firestore_ref[0]}/{firestore_ref[1]} (credential "
                 "material; safe only with exactly one writer)"
             )
-        oauth = _OAuthProvider(
-            public_url=public_url,
-            trusted_user_header=args.trusted_user_header,
-            dev_user=args.dev_user,
-            access_ttl=float(args.access_token_ttl),
-            allowed_redirect_uris=allowed_redirect_uris,
-            store_path=store_path,
-            firestore_ref=firestore_ref,
-        )
+        try:
+            oauth = _OAuthProvider(
+                public_url=public_url,
+                trusted_user_header=args.trusted_user_header,
+                dev_user=args.dev_user,
+                access_ttl=float(args.access_token_ttl),
+                allowed_redirect_uris=allowed_redirect_uris,
+                store_path=store_path,
+                firestore_ref=firestore_ref,
+            )
+        except _FirestoreReadError as e:
+            # A transient read failure (network blip, momentary permission
+            # error) must abort startup rather than be treated like a
+            # missing document: __init__ -> _load_state would otherwise
+            # start empty, and the persist_now() call a few lines below
+            # would then happily overwrite the (unread, but very much
+            # still real) document with that empty snapshot, permanently
+            # destroying every previously issued token. A genuinely
+            # missing document (snapshot.exists is False) is NOT this
+            # path -- that is the normal "clean first start."
+            parser.error(f"--token-store-firestore: {e}")
         if store_path is not None:
             oauth._store_lock_fd = store_lock_fd
             # Fail fast on an unwritable store (existing directory, read-only

@@ -3093,12 +3093,15 @@ class _FakeFirestoreSnapshot:
 
 
 class _FakeFirestoreDocument:
-    def __init__(self, store, key, *, fail_set_with=None):
+    def __init__(self, store, key, *, fail_set_with=None, fail_get_with=None):
         self._store = store
         self._key = key
         self._fail_set_with = fail_set_with
+        self._fail_get_with = fail_get_with
 
     def get(self):
+        if self._fail_get_with is not None:
+            raise self._fail_get_with
         return _FakeFirestoreSnapshot(self._store.get(self._key))
 
     def set(self, data):
@@ -3114,7 +3117,9 @@ class _FakeFirestoreCollection:
         self._doc_kwargs = doc_kwargs
 
     def document(self, doc_id):
-        return _FakeFirestoreDocument(self._store, (self._name, doc_id), **self._doc_kwargs)
+        return _FakeFirestoreDocument(
+            self._store, (self._name, doc_id), **self._doc_kwargs
+        )
 
 
 class _FakeFirestoreClient:
@@ -3162,6 +3167,26 @@ def test_token_store_firestore_missing_document_is_clean_start(fake_firestore):
     assert p.validate_access_token("nonexistent") is False
 
 
+def test_token_store_firestore_read_failure_raises_instead_of_starting_empty(
+    fake_firestore, monkeypatch
+):
+    # R1F1 (ai-review round 1): a transient read failure (network blip,
+    # momentary permission error) must NOT be treated like a missing
+    # document. If it silently started empty here, the CLI's persist_now()
+    # right after construction would overwrite the real (merely unread)
+    # document with an empty snapshot, permanently destroying every
+    # previously issued token. It must propagate instead.
+    monkeypatch.setattr(
+        sys.modules["google.cloud.firestore"],
+        "Client",
+        lambda: _FakeFirestoreClient(
+            fake_firestore, fail_get_with=RuntimeError("boom")
+        ),
+    )
+    with pytest.raises(server._FirestoreReadError, match="boom"):
+        _provider(firestore_ref=("oauth-state", "jquants"))
+
+
 def test_token_store_firestore_persist_failure_soft_fails_and_warns_once(
     fake_firestore, monkeypatch, capsys
 ):
@@ -3181,7 +3206,9 @@ def test_token_store_firestore_persist_failure_soft_fails_and_warns_once(
     assert "continuing in-memory only" in err
 
 
-def test_token_store_firestore_persist_now_propagates_failure(fake_firestore, monkeypatch):
+def test_token_store_firestore_persist_now_propagates_failure(
+    fake_firestore, monkeypatch
+):
     ref = ("oauth-state", "jquants")
     p = _provider(firestore_ref=ref)
     monkeypatch.setattr(
@@ -3195,25 +3222,40 @@ def test_token_store_firestore_persist_now_propagates_failure(fake_firestore, mo
         p.persist_now()
 
 
-def test_get_firestore_client_missing_package_raises_clear_error(monkeypatch):
+def test_get_firestore_client_missing_package_raises_clear_error(
+    fake_firestore, monkeypatch
+):
+    # Construct successfully with the fake module present (so __init__'s
+    # _load_state has something real to talk to), then discard the cached
+    # client and remove the fake module -- forcing the NEXT call to
+    # actually re-attempt the lazy `from google.cloud import firestore`
+    # import, hitting the ImportError path in isolation.
+    p = _provider(firestore_ref=("oauth-state", "jquants"))
+    p._firestore_client = None
     monkeypatch.delitem(sys.modules, "google.cloud.firestore", raising=False)
     monkeypatch.delitem(sys.modules, "google.cloud", raising=False)
     monkeypatch.delitem(sys.modules, "google", raising=False)
-    # Construction itself does not raise: _load_state soft-fails the same
-    # way an unreadable --token-store file does (a warning, empty start) --
-    # the missing-package error only propagates once something actually
-    # tries to use the (still uncached) client, which is what this test
-    # pins directly rather than relying on a specific caller.
-    p = _provider(firestore_ref=("oauth-state", "jquants"))
     with pytest.raises(RuntimeError, match=r"pip install mcp-stdio\[firestore\]"):
         p._get_firestore_client()
 
 
+def test_load_state_firestore_missing_package_raises_read_error(monkeypatch):
+    # The same missing-package condition, but hit during __init__ ->
+    # _load_state itself (no fake module ever installed): construction
+    # must raise, not silently start empty -- same R1F1 rationale as the
+    # transient-read-failure test above, just a different underlying cause.
+    monkeypatch.delitem(sys.modules, "google.cloud.firestore", raising=False)
+    monkeypatch.delitem(sys.modules, "google.cloud", raising=False)
+    monkeypatch.delitem(sys.modules, "google", raising=False)
+    with pytest.raises(
+        server._FirestoreReadError, match=r"pip install mcp-stdio\[firestore\]"
+    ):
+        _provider(firestore_ref=("oauth-state", "jquants"))
+
+
 def test_serve_main_token_store_firestore_requires_oauth():
     with pytest.raises(SystemExit):
-        server.serve_main(
-            ["--token-store-firestore", "coll/doc", "--", "true"]
-        )
+        server.serve_main(["--token-store-firestore", "coll/doc", "--", "true"])
 
 
 def test_serve_main_token_store_firestore_and_token_store_mutually_exclusive():
@@ -3231,6 +3273,33 @@ def test_serve_main_token_store_firestore_and_token_store_mutually_exclusive():
                 "true",
             ]
         )
+
+
+def test_serve_main_token_store_firestore_read_failure_aborts_startup(
+    fake_firestore, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        sys.modules["google.cloud.firestore"],
+        "Client",
+        lambda: _FakeFirestoreClient(
+            fake_firestore, fail_get_with=RuntimeError("boom")
+        ),
+    )
+    with pytest.raises(SystemExit):
+        server.serve_main(
+            [
+                "--enable-oauth",
+                "--dev-user",
+                "a",
+                "--token-store-firestore",
+                "oauth-state/jquants",
+                "--",
+                "true",
+            ]
+        )
+    err = capsys.readouterr().err
+    assert "--token-store-firestore" in err
+    assert "boom" in err
 
 
 @pytest.mark.parametrize("value", ["nocollectionslash", "coll/", "/doc", "a/b/c"])
