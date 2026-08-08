@@ -1,0 +1,17 @@
+name: PR Gate
+
+on:
+  pull_request_target:
+    types: [opened, reopened, closed]
+
+permissions:
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: pr-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    uses: shigechika/ai-review/.github/workflows/pr-gate.yml@v1
