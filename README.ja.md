@@ -361,8 +361,9 @@ open-gateway と共有 static-token principal は、いずれも本物の呼び�
 埋め込み AS 用: `--enable-oauth`、`--public-url URL`（issuer 固定・
 プロキシ背後で推奨）、`--trusted-user-header HEADER`、`--dev-user USER`
 （非セキュア・検証用）、`--access-token-ttl SECONDS`、`--allow-redirect-uri URL`
-（繰り返し指定可・後述）、`--token-store PATH`（後述）。`--token-store` なしの
-場合はインメモリのみで、再起動で発行済みトークンは失効します
+（繰り返し指定可・後述）、`--token-store PATH` または
+`--token-store-firestore COLLECTION/DOCUMENT`（互いに排他、後述）。
+どちらも指定しない場合はインメモリのみで、再起動で発行済みトークンは失効します
 （クライアントは `--oauth` を再実行）。バックエンド
 コマンドはオプションの後に置きます（`--` 区切りも可）。
 
@@ -390,6 +391,23 @@ open-gateway と共有 static-token principal は、いずれも本物の呼び�
     共有は発行済みトークンを静かに上書きし合うため）。またパスは起動時に
     probe 書き込みされるので、書き込めないパスの指定は永続化が静かに無効化
     される代わりに起動エラーになります。`--enable-oauth` が前提です（#277）。
+  - *再起動を生き延びるトークン（ローカルディスクなし）* —
+    `--token-store-firestore COLLECTION/DOCUMENT` は `--token-store` と
+    同じ状態（同じJSON形状のスナップショット、同じ起動時probe書き込みによる
+    fail-fast挙動）を、ローカルファイルの代わりに
+    [Firestore](https://cloud.google.com/firestore) の1ドキュメントへ永続化
+    します。Cloud Run 等、永続的なローカルディスクを持たないデプロイ向けです。
+    GCP プロジェクトは google-cloud の標準的な方法（`GOOGLE_CLOUD_PROJECT`
+    環境変数、または Cloud Run 上の ADC）で解決され、別途 `--project` フラグは
+    ありません。`google-cloud-firestore` パッケージ（`pip install
+    mcp-stdio[firestore]`、任意の extra——単純な `pip install mcp-stdio` では
+    不要）と `--enable-oauth` が前提です。**`--token-store` と異なり、2つの
+    プロセスが1つのドキュメントを共有することを防ぐロックはありません** ——
+    ある時点で厳密に1つの `serve` プロセスだけがそのドキュメントに書き込む
+    場合にのみ安全です（例: `min-instances=1` かつ `max-instances=1` の
+    Cloud Run）。2つの書き込み元が同時に存在すると、互いの発行済みトークンを
+    静かに last-writer-wins で上書きし合います。`--token-store` とは互いに
+    排他です。
   - *パススコープ issuer* — `--public-url` がパスを保持するので、1 ホスト配下で
     複数の `--enable-oauth` バックエンドをパスプレフィックスで多重化できる
     （例: `--public-url https://gw.example.org/team-a` で

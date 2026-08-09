@@ -53,6 +53,12 @@ integration = [
     "mcp>=2.0,<3",
     "uvicorn>=0.30",
 ]
+# --token-store-firestore only. NEVER a runtime dependency for the same
+# reason as `integration` above — [project].dependencies stays httpx-only.
+# server.py imports google.cloud.firestore lazily, inside the code path
+# that only runs when --token-store-firestore is actually passed, so a
+# plain `pip install mcp-stdio` never needs this package on disk.
+firestore = ["google-cloud-firestore>=2.0.0"]
 
 [tool.hatch.version]
 path = "src/mcp_stdio/__init__.py"
