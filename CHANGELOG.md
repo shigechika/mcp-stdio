@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.42.0](https://github.com/shigechika/mcp-stdio/compare/v0.41.0...v0.42.0) (2026-08-09)
+
+
+### Features
+
+* add --token-store-firestore for OAuth state persistence with no local disk ([#404](https://github.com/shigechika/mcp-stdio/issues/404)) ([bddc291](https://github.com/shigechika/mcp-stdio/commit/bddc291f260384722b379a1033667762bd841338))
+
 ## [0.41.0](https://github.com/shigechika/mcp-stdio/compare/v0.40.0...v0.41.0) (2026-08-08)
 
 
