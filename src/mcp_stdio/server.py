@@ -86,7 +86,10 @@ _SERVE_TOKEN_ENV = "MCP_STDIO_SERVE_TOKEN"
 # Host characters we allow when reflecting a (possibly proxy-supplied) Host /
 # X-Forwarded-Host into an absolute metadata URL. Restricting to this set keeps
 # a hostile Host header from injecting a quote/space into the quoted
-# ``resource_metadata`` challenge parameter or the JSON body.
+# ``resource_metadata`` challenge parameter or the JSON body -- CR/LF included,
+# which is why CodeQL alert #9 (py/http-response-splitting on the
+# WWW-Authenticate header built from this value) was dismissed as a false
+# positive.
 _HOST_ALLOWED = set(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-:[]"
 )
@@ -5153,6 +5156,11 @@ class _Handler(BaseHTTPRequestHandler):
         if backend is None:
             self._send_json(404, _error_body("unknown or expired session", req_id))
             return None
+        # registry.get() only returns non-None for an exact match against a
+        # key SessionRegistry itself minted via secrets.token_hex(16), so sid
+        # is provably clean (32 hex chars) by this point -- a CRLF-bearing
+        # value 404s above and never reaches send_header (CodeQL alerts #7/#15,
+        # dismissed as false positives).
         self._session_id = sid
         return backend
 
@@ -6442,6 +6450,10 @@ class _Handler(BaseHTTPRequestHandler):
         # shutdown() (terminate -> wait) runs after the dict pop, off the lock.
         backend.shutdown()
         log(f"session {sid_header[:8]}... terminated by client")
+        # Same invariant as _resolve_session above: registry.remove() only
+        # succeeds for an exact match against a server-minted key, so
+        # sid_header is provably clean here (CodeQL alert #16, dismissed as
+        # a false positive).
         self._session_id = sid_header
         self._send_empty(200)
 
