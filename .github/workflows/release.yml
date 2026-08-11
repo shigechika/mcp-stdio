@@ -10,6 +10,9 @@ on:
   release:
     types: [published]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
@@ -108,7 +111,12 @@ jobs:
   mcp-registry:
     needs: publish
     runs-on: ubuntu-latest
+    # Job-level permissions REPLACE the workflow-level default rather than
+    # merging with it, so this job needs contents: read spelled out
+    # explicitly alongside id-token: write — unlike testpypi/publish below,
+    # it does its own checkout.
     permissions:
+      contents: read
       id-token: write
     steps:
       - uses: actions/checkout@v7
