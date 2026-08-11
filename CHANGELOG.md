@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.42.1](https://github.com/shigechika/mcp-stdio/compare/v0.42.0...v0.42.1) (2026-08-11)
+
+
+### Bug Fixes
+
+* add explicit workflow permissions to test.yml and release.yml ([#407](https://github.com/shigechika/mcp-stdio/issues/407)) ([bcad3b4](https://github.com/shigechika/mcp-stdio/commit/bcad3b464603172f300dee9202b558ea53600d61))
+
 ## [0.42.0](https://github.com/shigechika/mcp-stdio/compare/v0.41.0...v0.42.0) (2026-08-09)
 
 
