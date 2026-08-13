@@ -39,11 +39,16 @@ below) and `CLAUDE.md`, both of which the reviewer also receives.
   blocking is dropping the check, not declining `_emit`.
 - **Breaking a protocol-era invariant (§6).** Wire-changing behavior
   reachable from a legacy request without an era gate, a new `-32002`,
-  or an invented code inside `-32020..-32099`. A **behavior** pull
-  request that also edits `tests_integration/test_serve_legacy_pin.py`
-  belongs here too, since that file is the pinned evidence the legacy
-  wire is byte-frozen. A purely mechanical edit to it — a helper
-  rename, an added case — breaks no freeze and is not this finding.
+  or an invented code inside `-32020..-32099`.
+- **Any diff at all to `tests_integration/test_serve_legacy_pin.py`.**
+  That file's own module docstring settles the scope: the zero-diff
+  claim is "LITERAL, with no exceptions carved into it", and tests
+  expected to move live in `test_serve_modern_before.py` precisely so
+  this invariant stays enforceable by a reviewer reading a diff rather
+  than a docstring. Report the edit and ask for the justification; a
+  deliberate, reviewed change is exactly what the rule wants surfaced,
+  so a legitimate one costs nothing. Do not narrow this to "behavior"
+  pull requests — the file is explicit that no such carve-out exists.
 
 ## Report even though the default focus would not
 
