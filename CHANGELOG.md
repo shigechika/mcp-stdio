@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.42.2](https://github.com/shigechika/mcp-stdio/compare/v0.42.1...v0.42.2) (2026-08-13)
+
+
+### Bug Fixes
+
+* make the poison-cancel tests independent of interpreter stack size ([#412](https://github.com/shigechika/mcp-stdio/issues/412)) ([032c662](https://github.com/shigechika/mcp-stdio/commit/032c6625ea5baa7d68b5b8d16d5a41ee9ef6cd46))
+
 ## [0.42.1](https://github.com/shigechika/mcp-stdio/compare/v0.42.0...v0.42.1) (2026-08-11)
 
 
