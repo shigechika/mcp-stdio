@@ -21,19 +21,29 @@ below) and `CLAUDE.md`, both of which the reviewer also receives.
   token, a client secret, a PKCE `code_verifier`, or a serve-mode
   bearer interpolated into a `log()` call or otherwise written out, at
   any level.
-- **A weakened serve-mode auth or session guard (§5).** A widened
-  `--token-store` mode, a relaxed token or PKCE check, one session's
-  backend child answering another session's request, a child leaked on
-  teardown, or the 404-on-unknown-session-id guard dropped.
-- **Bypassing the cancellation gate (§3).** A new direct `_write_line`
-  call for a response that should pass through `_emit` and
-  `_CancelTracker` — reconnect, retry and `-32000` synthesis paths
-  included. (`_error_response`'s existing direct write is the one
-  intentional bypass; see below.)
-- **Breaking a protocol-era invariant (§6).** Editing
-  `tests_integration/test_serve_legacy_pin.py` at all, wire-changing
-  behavior reachable from a legacy request without an era gate, a new
-  `-32002`, or an invented code inside `-32020..-32099`.
+- **A weakened serve-mode auth, isolation or session guard (§5).** A
+  widened `--token-store` mode, a relaxed token or PKCE check, weakened
+  Host-header sanitization, one session's backend child answering
+  another session's request, a child leaked on teardown, or the
+  404-on-unknown-session-id guard dropped. Isolation on the modern path
+  counts the same: `ModernBackendPool` is keyed on the authenticated
+  principal precisely so child state cannot cross an authorization
+  boundary, so re-keying or sharing it is this class too, not a lesser
+  one for lacking a session id.
+- **Bypassing the cancellation gate (§3).** A new response path that
+  neither goes through `_emit` nor consults `_CancelTracker` some other
+  way — reconnect, retry and `-32000` synthesis included. Consulting
+  the tracker directly is a legitimate form of the gate, not a bypass:
+  `_drain_pending` writes via `_error_response` and skips cancelled ids
+  through the deliberately non-consuming `tracker.contains`. What is
+  blocking is dropping the check, not declining `_emit`.
+- **Breaking a protocol-era invariant (§6).** Wire-changing behavior
+  reachable from a legacy request without an era gate, a new `-32002`,
+  or an invented code inside `-32020..-32099`. A **behavior** pull
+  request that also edits `tests_integration/test_serve_legacy_pin.py`
+  belongs here too, since that file is the pinned evidence the legacy
+  wire is byte-frozen. A purely mechanical edit to it — a helper
+  rename, an added case — breaks no freeze and is not this finding.
 
 ## Report even though the default focus would not
 
@@ -66,6 +76,9 @@ below) and `CLAUDE.md`, both of which the reviewer also receives.
 - Formatting, import order and style. Those belong to ruff in CI.
 - The relay's grandfathered cold-start `-32002` (§6) and
   `_error_response`'s direct `_write_line` (§3). Both are deliberate.
-- **Re-litigating** a decision the PR body's divergence ledger or a
-  linked design record already documents. The record is the answer;
-  reopening it in review is what is out of scope here, not the topic.
+- **Re-litigating** a decision the pull request description in front of
+  you already settles — this repository writes explicit divergence
+  ledgers and adopted-defaults sections. Judge that from the
+  description text you were actually given: it arrives truncated and
+  linked design records are not fetched, so never suppress a finding on
+  the assumption that a record you cannot see probably settles it.
