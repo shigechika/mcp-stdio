@@ -1,9 +1,10 @@
 # Review rules for this repository
 
-Severity rules for the AI reviewer. The reasoning behind each one lives
-in `.github/copilot-instructions.md` (its numbered sections are cited
-below) and `CLAUDE.md`, both of which the reviewer also receives — this
-file only decides what is blocking and what is noise.
+Severity rules for the AI reviewer. This file decides only how severely
+each class of finding is reported here, and which classes are noise.
+The reasoning behind the rules lives in
+`.github/copilot-instructions.md` (its numbered sections are cited
+below) and `CLAUDE.md`, both of which the reviewer also receives.
 
 ## Always blocking
 
@@ -64,6 +65,6 @@ file only decides what is blocking and what is noise.
 - Formatting, import order and style. Those belong to ruff in CI.
 - The relay's grandfathered cold-start `-32002` (§6) and
   `_error_response`'s direct `_write_line` (§3). Both are deliberate.
-- A decision the PR body's divergence ledger or a linked design record
-  already documents. Note a disagreement once at most, citing the
-  record; do not re-litigate it.
+- **Re-litigating** a decision the PR body's divergence ledger or a
+  linked design record already documents. The record is the answer;
+  reopening it in review is what is out of scope here, not the topic.
