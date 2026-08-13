@@ -1,6 +1,7 @@
 """Tests for mcp_stdio.relay module."""
 
 import base64
+import contextlib
 import copy
 import email.utils
 import json
@@ -16217,17 +16218,49 @@ class TestRunModernStdinHandoff:
     # --- #362 review finding 2: the reader's per-line resilience net ---
 
     def _poison_cancel_line(self):
-        """A well-formed cancel whose ``params`` nests deep enough that
-        ``json.loads`` raises ``RecursionError`` — which escapes
-        ``_extract_cancel_id``'s narrow ``(JSONDecodeError, TypeError)``
-        catch and, before the per-line net, killed the reader outright."""
-        depth = 100_000
+        """A cancel line whose detection is made to fail.
+
+        The line itself is an ordinary, valid ``notifications/cancelled``;
+        what makes it poison is ``_poison_cancel_detection`` below, which
+        forces ``_extract_cancel_id`` to raise past its own narrow
+        ``(JSONDecodeError, TypeError)`` catch — the failure mode that,
+        before the per-line net, killed the reader outright.
+
+        This used to be a real input: ``params.requestId`` nested 100,000
+        deep so ``json.loads`` blew the C stack. That stopped working on
+        CPython 3.14.7 (#411) and it turned out never to have worked for
+        the stated reason. Two independent problems. The line had two
+        ``{`` against one ``}``, so it was malformed JSON as well as
+        deep; ``RecursionError`` merely fired *before* the parser could
+        reach the end and say so. Given more stack the parser gets there
+        and raises ``JSONDecodeError``, which the narrow catch handles,
+        so nothing escapes and the handler under test never runs. Even
+        with the braces balanced, enough stack simply parses it. No fixed
+        nesting depth triggers this reliably, because the threshold is a
+        property of the interpreter's stack headroom, not of the input —
+        so the trigger is now injected rather than scraped out of the
+        parser.
+        """
         return (
             '{"jsonrpc":"2.0","method":"notifications/cancelled",'
-            '"params":{"requestId":' + "[" * depth + "]" * depth + "}\n"
+            '"params":{"requestId":1}}\n'
         )
 
-    def test_poison_cancel_line_does_not_kill_the_reader(self):
+    @contextlib.contextmanager
+    def _poison_cancel_detection(self):
+        """Make ``_extract_cancel_id`` raise past the reader's narrow catch.
+
+        ``RecursionError`` is what production actually hit, so it is what
+        is raised here — but any exception outside
+        ``(JSONDecodeError, TypeError)`` exercises the same net."""
+
+        def exploding(_line):
+            raise RecursionError("simulated cancel-detect blowup")
+
+        with patch("mcp_stdio.relay._extract_cancel_id", exploding):
+            yield
+
+    def test_poison_cancel_line_does_not_kill_the_reader(self, capsys):
         """One poison line costs only its own cancel detection — every
         line, the poison one included, is still delivered in order, and
         the reader keeps reading (#362 review finding 2).
@@ -16238,8 +16271,15 @@ class TestRunModernStdinHandoff:
         poison = self._poison_cancel_line()
         good = '{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n'
         lines: queue.SimpleQueue = queue.SimpleQueue()
-        with patch("sys.stdin", StringIO(poison + good + good)):
-            _stdin_reader_loop(lines=lines, on_cancel=lambda cid: None)
+        with self._poison_cancel_detection():
+            with patch("sys.stdin", StringIO(poison + good + good)):
+                _stdin_reader_loop(lines=lines, on_cancel=lambda cid: None)
+        # Assert the trigger actually fired BEFORE asserting delivery.
+        # Delivery holds whether or not cancel detection blew up, so on
+        # its own this test passes vacuously the moment the poison stops
+        # being poisonous — which is exactly how #411 hid here while the
+        # log-once test next door went red.
+        assert "cancel detection failed" in capsys.readouterr().err
         assert list(_iter_queued_stdin(lines)) == [poison, good, good]
 
     def test_on_cancel_raising_still_forwards_the_line(self):
@@ -16266,8 +16306,9 @@ class TestRunModernStdinHandoff:
         ``input_required_logged`` precedent)."""
         poison = self._poison_cancel_line()
         lines: queue.SimpleQueue = queue.SimpleQueue()
-        with patch("sys.stdin", StringIO(poison + poison + poison)):
-            _stdin_reader_loop(lines=lines, on_cancel=lambda cid: None)
+        with self._poison_cancel_detection():
+            with patch("sys.stdin", StringIO(poison + poison + poison)):
+                _stdin_reader_loop(lines=lines, on_cancel=lambda cid: None)
         err = capsys.readouterr().err
         assert err.count("cancel detection failed") == 1
 
