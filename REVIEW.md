@@ -1,8 +1,9 @@
 # Review rules for this repository
 
-Severity rules for the AI reviewer. This file decides only how severely
-each class of finding is reported here, and which classes are noise.
-The reasoning behind the rules lives in
+Review rules for this repository, on top of the reviewer's default
+focus. Three things: which findings are blocking here, which classes to
+report that the default focus would otherwise skip, and which are
+noise. The reasoning behind the rules lives in
 `.github/copilot-instructions.md` (its numbered sections are cited
 below) and `CLAUDE.md`, both of which the reviewer also receives.
 
