@@ -1035,7 +1035,10 @@ class TestBoundedReaders:
         payload = {"jsonrpc": "2.0", "result": {"ok": True}, "id": 1}
         httpx_mock.add_response(
             json=payload,
-            headers={"content-type": "application/json", "content-encoding": "identity"},
+            headers={
+                "content-type": "application/json",
+                "content-encoding": "identity",
+            },
         )
         client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
         with client.stream("POST", "https://example.com/mcp", content="{}") as resp:
@@ -5492,15 +5495,10 @@ class TestCheckConnection:
         """#417 review R1F3: --check is not a carve-out — an oversized
         response fails the probe under a small cap, same as the relay
         loop."""
-        body = json.dumps(
-            {"jsonrpc": "2.0", "id": 1, "result": {"big": "x" * 1000}}
-        )
-        httpx_mock.add_response(
-            text=body, headers={"content-type": "application/json"}
-        )
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"big": "x" * 1000}})
+        httpx_mock.add_response(text=body, headers={"content-type": "application/json"})
         assert (
-            check_connection(self.URL, dict(self.HEADERS), max_message_size=10)
-            is False
+            check_connection(self.URL, dict(self.HEADERS), max_message_size=10) is False
         )
 
     def test_check_sends_accept_encoding_identity(self, httpx_mock):

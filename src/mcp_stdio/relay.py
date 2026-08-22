@@ -2221,7 +2221,9 @@ def _reject_content_encoding(resp: httpx.Response) -> None:
     codings = [c for c in codings if c != "identity"]
     if not codings:
         return
-    weights = _parse_accept_encoding(resp.request.headers.get("accept-encoding", "identity"))
+    weights = _parse_accept_encoding(
+        resp.request.headers.get("accept-encoding", "identity")
+    )
     if all(_content_coding_is_negotiated(c, weights) for c in codings):
         return
     raise _MessageTooLargeError(
@@ -5907,7 +5909,7 @@ def _check_connection_sse(
         headers=_ACCEPT_ENCODING_IDENTITY,
         timeout=httpx.Timeout(
             connect=timeout_connect, read=timeout_read, write=30, pool=10
-        )
+        ),
     )
     setattr(client, _MAX_MESSAGE_SIZE_ATTR, max_message_size)
 
@@ -6083,7 +6085,7 @@ def check_connection(
         headers=_ACCEPT_ENCODING_IDENTITY,
         timeout=httpx.Timeout(
             connect=timeout_connect, read=timeout_read, write=30, pool=10
-        )
+        ),
     )
     setattr(client, _MAX_MESSAGE_SIZE_ATTR, max_message_size)
 
