@@ -1026,6 +1026,7 @@ def _main() -> None:
             timeout_connect=args.timeout_connect,
             timeout_read=args.timeout_read,
             transport=args.transport,
+            max_message_size=args.max_message_size,
         )
         sys.exit(0 if ok else 1)
 

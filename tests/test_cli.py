@@ -1154,6 +1154,25 @@ class TestClientMetadataUrlFlag:
             assert exc_info.value.code == 0
             assert mock_check.call_args.kwargs["transport"] == "sse"
 
+    def test_check_forwards_max_message_size(self):
+        """#417 review R1F3: --check is not a carve-out for --max-message-size."""
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "https://example.com/mcp",
+                    "--check",
+                    "--max-message-size",
+                    "1000",
+                ],
+            ),
+            patch("mcp_stdio.cli.check_connection", return_value=True) as mock_check,
+        ):
+            with pytest.raises(SystemExit):
+                main()
+            assert mock_check.call_args.kwargs["max_message_size"] == 1000
+
     def test_test_flag_deprecated_alias_works(self, capsys):
         """--test still works for backward compatibility but emits a deprecation warning."""
         with (

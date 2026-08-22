@@ -2083,12 +2083,23 @@ _DEFAULT_MAX_MESSAGE_SIZE = 10 * 1024 * 1024
 # MRTR retry closures, ...) — threading an explicit parameter through all
 # of those signatures just to carry one int would touch a large fraction
 # of this file for no behavioral reason. The one-shot ``--check`` clients
-# (check_connection/_check_connection_sse) never set this attribute, so
-# they read back 0 (unlimited) and are deliberately out of scope: they are
-# a manual, single-request diagnostic the user runs against a server they
-# already chose to connect to, not the long-running gateway's own attack
-# surface.
+# (check_connection/_check_connection_sse) also set this attribute, from
+# their own ``max_message_size`` parameter (#417 review R1F3) — the flag's
+# help text makes no ``--check``-specific exception, so it must not be the
+# one path where --max-message-size silently does nothing.
 _MAX_MESSAGE_SIZE_ATTR = "_mcp_stdio_max_message_size"
+
+# #417 review R1F2: httpx.Client() advertises "Accept-Encoding: gzip,
+# deflate" by default, and resp.iter_bytes()/resp.iter_text() decompress a
+# Content-Encoding body transparently BEFORE _read_bounded/_iter_text_bounded
+# ever see it — decompression can amplify a small compressed chunk into one
+# far larger than --max-message-size before the cap check runs on it (a
+# decompression bomb, CWE-409). Every httpx.Client this module builds for
+# real MCP traffic sends this instead, asking a compliant server not to
+# compress at all; _reject_content_encoding() then refuses outright (never
+# decodes) any response that carries Content-Encoding anyway. See #418 for
+# real bounded-decompression support instead of a blanket refusal.
+_ACCEPT_ENCODING_IDENTITY = {"accept-encoding": "identity"}
 
 
 class _MessageTooLargeError(httpx.TransportError):
@@ -2118,18 +2129,48 @@ def _client_max_message_size(client: httpx.Client) -> int:
     return getattr(client, _MAX_MESSAGE_SIZE_ATTR, 0)
 
 
+def _reject_content_encoding(resp: httpx.Response) -> None:
+    """Refuse a response httpx would transparently DECOMPRESS (#417 review R1F2).
+
+    ``resp.iter_bytes()``/``resp.iter_text()`` decode a ``Content-Encoding``
+    body (gzip/deflate/br/zstd) internally, chunk by chunk, BEFORE
+    ``_read_bounded``/``_iter_text_bounded`` ever see the decoded bytes to
+    count them — so a small compressed chunk that decompresses to far more
+    than ``--max-message-size`` (a decompression bomb, CWE-409) would already
+    be allocated by the time the cap check fires on it. Every client this
+    module builds sends ``Accept-Encoding: identity`` precisely so a
+    compliant server never compresses in the first place; a response that
+    carries ``Content-Encoding`` anyway is either non-compliant or hostile,
+    and is refused outright rather than decoded, regardless of whether a
+    size cap is even configured — this is a content-integrity check, not a
+    size check, so it runs even under ``--max-message-size 0``. See #418 for
+    real (bounded-decompression) support.
+    """
+    encoding = resp.headers.get("content-encoding", "").strip().lower()
+    if encoding and encoding != "identity":
+        raise _MessageTooLargeError(
+            f"response has Content-Encoding: {encoding!r}, which this relay "
+            "does not accept (Accept-Encoding: identity is always sent; see "
+            "#418); aborting"
+        )
+
+
 def _read_bounded(resp: httpx.Response, client: httpx.Client) -> None:
     """Drop-in replacement for ``resp.read()`` enforcing ``--max-message-size``.
 
     Raises ``_MessageTooLargeError`` the moment the accumulated body would
     exceed the cap, instead of buffering the whole body first regardless of
-    size (#416). On success this populates ``resp``'s private ``_content``
-    exactly as ``httpx.Response.read()`` does internally (``self._content =
+    size (#416) — and unconditionally rejects a compressed response before
+    reading any of it (see ``_reject_content_encoding``, #417 review R1F2).
+    On success this populates ``resp``'s private ``_content`` exactly as
+    ``httpx.Response.read()`` does internally (``self._content =
     b"".join(self.iter_bytes())``, per httpx's own implementation), so
     ``resp.text``/``resp.json()`` keep working for every existing caller
     exactly as before. A cap of ``0`` (unlimited, the default when unset)
-    delegates to the unmodified ``resp.read()``.
+    still enforces the Content-Encoding rejection, then delegates to the
+    unmodified ``resp.read()``.
     """
+    _reject_content_encoding(resp)
     max_bytes = _client_max_message_size(client)
     if max_bytes <= 0:
         resp.read()
@@ -2156,7 +2197,12 @@ def _iter_text_bounded(resp: httpx.Response, client: httpx.Client) -> Iterator[s
     ``_read_bounded`` this never touches ``resp._content``: every SSE
     caller in this module consumes the stream incrementally, line by line,
     and never reads ``.text``/``.content`` on the same response afterward.
+    Unconditionally rejects a compressed response before reading any of it
+    (see ``_reject_content_encoding``, #417 review R1F2) — an SSE stream is
+    long-lived, so the decompression-bomb risk this closes is not a one-shot
+    allocation but an unbounded one across the whole connection.
     """
+    _reject_content_encoding(resp)
     max_bytes = _client_max_message_size(client)
     if max_bytes <= 0:
         yield from resp.iter_text()
@@ -5750,6 +5796,7 @@ def _check_connection_sse(
     *,
     timeout_connect: float,
     timeout_read: float,
+    max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
 ) -> bool:
     """Check legacy SSE (2024-11-05) connectivity via the full handshake.
 
@@ -5760,6 +5807,11 @@ def _check_connection_sse(
     ``endpoint`` event, POST ``initialize`` to that endpoint, and read the
     response off the stream. Returns True if the server completes the
     handshake.
+
+    ``max_message_size`` (#417 review R1F3) applies the same
+    ``--max-message-size`` cap the user configured to this one-shot probe
+    too, so the flag's documented behavior is unqualified — there is no
+    carve-out for ``--check`` a user would have to discover the hard way.
     """
     initialize_msg = json.dumps(
         {
@@ -5775,10 +5827,12 @@ def _check_connection_sse(
     )
 
     client = httpx.Client(
+        headers=_ACCEPT_ENCODING_IDENTITY,
         timeout=httpx.Timeout(
             connect=timeout_connect, read=timeout_read, write=30, pool=10
         )
     )
+    setattr(client, _MAX_MESSAGE_SIZE_ATTR, max_message_size)
 
     # The GET stream read blocks in the main thread; the POST runs in a helper
     # thread. On a POST failure the helper closes the stream so the probe fails
@@ -5796,9 +5850,17 @@ def _check_connection_sse(
 
     def do_post(endpoint: str) -> None:
         try:
-            r = client.post(endpoint, content=initialize_msg, headers=headers)
-            if r.status_code not in (200, 202):
-                holder["post_error"] = f"HTTP {r.status_code}"
+            # Streamed (not the buffered client.post() convenience method) so
+            # _read_bounded can enforce --max-message-size on this response
+            # too (#417 review R1F3) — status_code is available before the
+            # body is read either way, same as every other streamed POST in
+            # this module.
+            with client.stream(
+                "POST", endpoint, content=initialize_msg, headers=headers
+            ) as r:
+                _read_bounded(r, client)
+                if r.status_code not in (200, 202):
+                    holder["post_error"] = f"HTTP {r.status_code}"
         except Exception as e:  # noqa: BLE001 — surfaced via holder below
             holder["post_error"] = str(e)
         if holder["post_error"] is not None:
@@ -5828,7 +5890,9 @@ def _check_connection_sse(
             log(f"✓ SSE stream open (HTTP {resp.status_code})")
 
             endpoint_seen = False
-            for event_type, data in _iter_sse_events(_iter_sse_lines(resp.iter_text())):
+            for event_type, data in _iter_sse_events(
+                _iter_sse_lines(_iter_text_bounded(resp, client))
+            ):
                 if event_type == "endpoint":
                     resolved = urljoin(url, data)
                     # Same cross-origin credential guard as the relay reader:
@@ -5882,6 +5946,7 @@ def check_connection(
     timeout_connect: float = 10,
     timeout_read: float = 120,
     transport: str = "streamable-http",
+    max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
 ) -> bool:
     """Check MCP server connectivity by sending an initialize request.
 
@@ -5889,6 +5954,11 @@ def check_connection(
     the probe: ``"streamable-http"`` (default) POSTs ``initialize`` directly,
     while ``"sse"`` runs the legacy GET/endpoint/POST handshake so the probe
     matches what ``run_sse`` would actually do.
+
+    ``max_message_size`` applies the same ``--max-message-size`` cap the
+    relay would use to this one-shot probe (#417 review R1F3) — the flag's
+    help text makes no ``--check``-specific exception, so this diagnostic
+    must not be the one path where it silently does nothing.
 
     On the Streamable HTTP path, a 400/404 response to the ``initialize``
     probe retries once with ``server/discover`` (spec rev 2026-07-28,
@@ -5916,6 +5986,7 @@ def check_connection(
             headers,
             timeout_connect=timeout_connect,
             timeout_read=timeout_read,
+            max_message_size=max_message_size,
         )
 
     initialize_msg = json.dumps(
@@ -5932,10 +6003,12 @@ def check_connection(
     )
 
     client = httpx.Client(
+        headers=_ACCEPT_ENCODING_IDENTITY,
         timeout=httpx.Timeout(
             connect=timeout_connect, read=timeout_read, write=30, pool=10
         )
     )
+    setattr(client, _MAX_MESSAGE_SIZE_ATTR, max_message_size)
 
     try:
         log(f"testing connection to {redact_url(url)}")
@@ -6380,6 +6453,7 @@ def run(
     protocol_version: str | None = None
     tracker: _CancelTracker | None = _CancelTracker() if cancel_filter else None
     client = httpx.Client(
+        headers=_ACCEPT_ENCODING_IDENTITY,
         transport=_make_httpx_transport(tcp_keepalive=tcp_keepalive),
         timeout=httpx.Timeout(
             connect=timeout_connect,
@@ -7697,6 +7771,7 @@ def run(
         so closing one at teardown cannot disturb the other.
         """
         listen_client = httpx.Client(
+            headers=_ACCEPT_ENCODING_IDENTITY,
             transport=_make_httpx_transport(tcp_keepalive=tcp_keepalive),
             timeout=httpx.Timeout(
                 connect=timeout_connect,
@@ -9160,6 +9235,7 @@ def run_sse(
     # use the separate timeout_read below.
     effective_sse_read = None if sse_read_timeout in (None, 0) else sse_read_timeout
     client = httpx.Client(
+        headers=_ACCEPT_ENCODING_IDENTITY,
         transport=_make_httpx_transport(tcp_keepalive=tcp_keepalive),
         timeout=httpx.Timeout(
             connect=timeout_connect,
