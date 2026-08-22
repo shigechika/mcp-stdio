@@ -1272,16 +1272,18 @@ class TestBoundedDecompression:
 
     def test_bounded_decompress_bytes_deflate_survives_random_fragmentation(self):
         """#418 review R2F1: property-style coverage beyond the two fixed
-        reproduction cases above — many random compressed streams (both
-        zlib-wrapped and raw), each split at random 1-5-byte boundaries,
+        reproduction cases above — many random PAYLOADS, compressed both
+        zlib-wrapped and raw, each split at random 1-5-byte boundaries,
         must all round-trip regardless of exactly where the header split
-        falls. A fixed seed keeps this deterministic across runs."""
+        falls (#418 review R5F1: varying the payload too, not just the
+        fragmentation, so a data-dependent decoder regression could not
+        pass unnoticed). A fixed seed keeps this deterministic."""
         import random
         import zlib
 
         rng = random.Random(20260822)
-        payload = b"The quick brown fox jumps over the lazy dog. " * 200
         for _ in range(50):
+            payload = bytes(rng.getrandbits(8) for _ in range(rng.randint(1, 2000)))
             compressed = (
                 _raw_deflate(payload)
                 if rng.choice([True, False])
