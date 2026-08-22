@@ -257,6 +257,10 @@ Options:
   --sse-read-timeout SEC Idle read timeout on the SSE GET stream
                          (default: 300; 0 disables; SSE transport only)
   --no-tcp-keepalive     Disable TCP keepalive on the HTTP socket
+  --max-message-size BYTES
+                         Cap on a single upstream response body (JSON or
+                         cumulative SSE stream) buffered before parsing
+                         (default: 10 MiB; 0 disables the cap; #416)
   --no-cancel-filter     Disable the cancel-aware response filter (drops late
                          responses for ids cancelled via notifications/cancelled)
   --no-normalize-arguments
@@ -360,7 +364,9 @@ not pin a slot; `0` = disabled, the default), and `--max-sessions-per-owner N`
 (on a new `initialize`, LRU-evict that OAuth user's older sessions down to `N`,
 reclaiming ghosts left by a client that reconnects without `DELETE`; `0` =
 disabled, the default; static-token and open-gateway sessions are exempt);
-`--user-env VAR` (inject the authenticated principal into each spawned
+`--max-message-size BYTES` (reject a request whose declared `Content-Length`
+exceeds this with `413`, before reading any of the body; default 10 MiB,
+`0` disables the cap; #416); `--user-env VAR` (inject the authenticated principal into each spawned
 child's environment under this name, so a multi-user-aware backend can read
 its caller's identity without its own OAuth stack — requires
 `--enable-oauth`; the open-gateway and shared static-token principals are
