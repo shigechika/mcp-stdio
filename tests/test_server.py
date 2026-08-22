@@ -602,11 +602,50 @@ def test_reap_idle_drops_dead_child_even_without_ttl():
         reg.shutdown_all()
 
 
-def test_start_reaper_noop_when_ttl_disabled():
+def test_start_reaper_starts_even_when_ttl_disabled():
+    """#385: the reaper thread must run even with --session-idle-ttl unset
+    (0, the default) — it still sweeps dead-child sessions unconditionally,
+    which used to have no production caller in the default deployment."""
     reg = server.SessionRegistry(_BACKEND, idle_ttl=0)
     reg.start_reaper()
-    assert reg._reaper is None  # no thread when eviction is disabled
-    reg.stop_reaper()  # safe no-op
+    try:
+        assert reg._reaper is not None
+    finally:
+        reg.shutdown_all()
+
+
+def test_reaper_thread_reaps_dead_child_even_with_ttl_disabled(monkeypatch):
+    """#385: with idle_ttl=0, the background reaper still sweeps a session
+    whose child has already exited — the exact gap this issue closed.
+    ``_MAX_REAP_INTERVAL_SECS`` is monkeypatched down so the test does not
+    have to wait out the real (60 s) fallback interval to observe a tick."""
+    monkeypatch.setattr(server, "_MAX_REAP_INTERVAL_SECS", 0.2)
+    reg = server.SessionRegistry(_BACKEND, idle_ttl=0)
+    reg.start_reaper()
+    try:
+        sid, backend = reg.create()
+        backend.shutdown()  # kills the child; backend.closed becomes True
+        deadline = time.time() + 5
+        while reg.count > 0 and time.time() < deadline:
+            time.sleep(0.05)
+        assert reg.count == 0, "dead-child session was never swept"
+    finally:
+        reg.shutdown_all()
+
+
+def test_reaper_thread_does_not_evict_idle_alive_session_when_ttl_disabled(monkeypatch):
+    """A merely-idle-but-ALIVE session must be left alone when the TTL is
+    unset — proves the #385 fix did not silently turn on full idle
+    eviction, only the unconditional dead-child sweep."""
+    monkeypatch.setattr(server, "_MAX_REAP_INTERVAL_SECS", 0.2)
+    reg = server.SessionRegistry(_BACKEND, idle_ttl=0)
+    reg.start_reaper()
+    try:
+        reg.create()
+        time.sleep(0.6)  # several ticks at the fast interval
+        assert reg.count == 1, "an idle but alive session was reaped with no TTL set"
+    finally:
+        reg.shutdown_all()
 
 
 def test_reaper_thread_evicts_idle_session():
