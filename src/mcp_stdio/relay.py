@@ -2129,8 +2129,35 @@ def _client_max_message_size(client: httpx.Client) -> int:
     return getattr(client, _MAX_MESSAGE_SIZE_ATTR, 0)
 
 
+def _accepted_content_codings(accept_encoding: str) -> set[str]:
+    """The coding tokens ``accept_encoding`` (an ``Accept-Encoding`` header
+    value) actually accepts, per RFC 9110 §12.5.3 — comma-separated
+    tokens, each optionally ``;q=VALUE``; a token whose weight parses to
+    ``0`` is explicitly EXCLUDED (rejects that coding), not just
+    unweighted. Malformed ``q`` defaults to accepting the token (``1``),
+    the same lenient-receiver posture this module takes elsewhere.
+    """
+    accepted: set[str] = set()
+    for part in accept_encoding.split(","):
+        token, _, params = part.strip().partition(";")
+        token = token.strip().lower()
+        if not token:
+            continue
+        weight = 1.0
+        for param in params.split(";"):
+            key, _, value = param.strip().partition("=")
+            if key.strip().lower() == "q":
+                try:
+                    weight = float(value.strip())
+                except ValueError:
+                    weight = 1.0
+        if weight > 0:
+            accepted.add(token)
+    return accepted
+
+
 def _reject_content_encoding(resp: httpx.Response) -> None:
-    """Refuse an UNEXPECTEDLY compressed response (#417 review R1F2).
+    """Refuse an UNNEGOTIATED ``Content-Encoding`` (#417 review R1F2/R3F1).
 
     ``resp.iter_bytes()``/``resp.iter_text()`` decode a ``Content-Encoding``
     body (gzip/deflate/br/zstd) internally, chunk by chunk, BEFORE
@@ -2143,33 +2170,37 @@ def _reject_content_encoding(resp: httpx.Response) -> None:
 
     That default can be overridden per request — ``-H 'Accept-Encoding:
     gzip'`` (or any header source ahead of it) wins over the client-level
-    default, same as every other header this relay lets the user set. In
-    that case a compressed reply is EXPECTED, not suspicious: this checks
-    what was actually SENT (``resp.request.headers``, the merged/effective
-    value — httpx always populates ``resp.request``), not what the client
-    merely defaults to, and lets an explicitly negotiated compressed
-    response through (#417 review R2F2) — ``_read_bounded``/
+    default, same as every other header this relay lets the user set. This
+    checks what was actually SENT (``resp.request.headers``, the
+    merged/effective value — httpx always populates ``resp.request``), not
+    what the client merely defaults to, and lets a response through ONLY
+    when its ``Content-Encoding`` is one of the codings that request's
+    ``Accept-Encoding`` actually names with a non-zero weight (#417 review
+    R3F1 — a request for ``br`` does not license a ``gzip`` reply just
+    because SOMETHING other than ``identity`` was asked for, and
+    ``gzip;q=0`` explicitly excludes ``gzip``). A genuinely negotiated
+    match is let through (#417 review R2F2) — ``_read_bounded``/
     ``_iter_text_bounded`` still count its DECOMPRESSED bytes against
     ``--max-message-size`` same as any other response, but a single
     amplifying chunk can still exceed the cap before that count catches up
     (the exact bypass this function otherwise closes, see #418): the user
-    who explicitly requested compression accepts that residual exposure.
-    Only a response that carries ``Content-Encoding`` despite an
-    ``identity`` request —
-    either non-compliant or hostile — is refused outright rather than
-    decoded, regardless of whether a size cap is even configured: this is a
+    who explicitly requested that coding accepts the residual exposure.
+    Anything else — the default ``identity`` request, or a coding the
+    request never named — is refused outright rather than decoded,
+    regardless of whether a size cap is even configured: this is a
     content-integrity check, not a size check, so it runs even under
     ``--max-message-size 0``.
     """
     encoding = resp.headers.get("content-encoding", "").strip().lower()
     if not encoding or encoding == "identity":
         return
-    requested = resp.request.headers.get("accept-encoding", "identity").strip().lower()
-    if requested != "identity":
+    requested = resp.request.headers.get("accept-encoding", "identity")
+    if encoding in _accepted_content_codings(requested):
         return
     raise _MessageTooLargeError(
-        f"response has Content-Encoding: {encoding!r} despite this request's "
-        "Accept-Encoding: identity; refusing to decode (see #418); aborting"
+        f"response has Content-Encoding: {encoding!r}, which this request's "
+        f"Accept-Encoding: {requested!r} did not negotiate; refusing to "
+        "decode (see #418); aborting"
     )
 
 

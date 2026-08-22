@@ -1066,6 +1066,46 @@ class TestBoundedReaders:
             _read_bounded(resp, client)
             assert resp.json() == payload
 
+    def test_read_bounded_rejects_unnegotiated_coding(self, httpx_mock):
+        """#417 review R3F1: requesting Accept-Encoding: br does not license
+        a gzip reply just because SOMETHING other than identity was asked
+        for — the returned coding must be one the request actually named."""
+        httpx_mock.add_response(
+            stream=IteratorStream([b"whatever"]),
+            headers={"content-type": "text/plain", "content-encoding": "gzip"},
+        )
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
+        with (
+            client.stream(
+                "POST",
+                "https://example.com/mcp",
+                content="{}",
+                headers={"Accept-Encoding": "br"},
+            ) as resp,
+            pytest.raises(_MessageTooLargeError, match="Accept-Encoding"),
+        ):
+            _read_bounded(resp, client)
+
+    def test_read_bounded_rejects_q_zero_coding(self, httpx_mock):
+        """#417 review R3F1: 'gzip;q=0' explicitly EXCLUDES gzip (RFC 9110
+        §12.5.3), not merely leaves it unweighted — a gzip reply must still
+        be refused."""
+        httpx_mock.add_response(
+            stream=IteratorStream([b"whatever"]),
+            headers={"content-type": "text/plain", "content-encoding": "gzip"},
+        )
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
+        with (
+            client.stream(
+                "POST",
+                "https://example.com/mcp",
+                content="{}",
+                headers={"Accept-Encoding": "gzip;q=0, br"},
+            ) as resp,
+            pytest.raises(_MessageTooLargeError, match="Accept-Encoding"),
+        ):
+            _read_bounded(resp, client)
+
 
 class TestSameOrigin:
     """RFC 6454 origin comparison used by the SSE cross-origin endpoint guard."""
