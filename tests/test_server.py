@@ -602,11 +602,70 @@ def test_reap_idle_drops_dead_child_even_without_ttl():
         reg.shutdown_all()
 
 
-def test_start_reaper_noop_when_ttl_disabled():
+def test_start_reaper_starts_even_when_ttl_disabled():
+    """#385: the reaper thread must run even with --session-idle-ttl unset
+    (0, the default) — it still sweeps dead-child sessions unconditionally,
+    which used to have no production caller in the default deployment."""
     reg = server.SessionRegistry(_BACKEND, idle_ttl=0)
     reg.start_reaper()
-    assert reg._reaper is None  # no thread when eviction is disabled
-    reg.stop_reaper()  # safe no-op
+    try:
+        assert reg._reaper is not None
+    finally:
+        reg.shutdown_all()
+
+
+def test_reaper_thread_reaps_dead_child_even_with_ttl_disabled(monkeypatch):
+    """#385: with idle_ttl=0, the background reaper still sweeps a session
+    whose child has already exited — the exact gap this issue closed.
+    ``_MAX_REAP_INTERVAL_SECS`` is monkeypatched down so the test does not
+    have to wait out the real (60 s) fallback interval to observe a tick."""
+    monkeypatch.setattr(server, "_MAX_REAP_INTERVAL_SECS", 0.2)
+    reg = server.SessionRegistry(_BACKEND, idle_ttl=0)
+    reg.start_reaper()
+    try:
+        sid, backend = reg.create()
+        backend.shutdown()  # kills the child; backend.closed becomes True
+        deadline = time.time() + 5
+        while reg.count > 0 and time.time() < deadline:
+            time.sleep(0.05)
+        assert reg.count == 0, "dead-child session was never swept"
+    finally:
+        reg.shutdown_all()
+
+
+def test_reaper_thread_does_not_evict_idle_alive_session_when_ttl_disabled(monkeypatch):
+    """A merely-idle-but-ALIVE session must be left alone when the TTL is
+    unset — proves the #385 fix did not silently turn on full idle
+    eviction, only the unconditional dead-child sweep.
+
+    A SEPARATE dead-child session is created alongside it and the test
+    waits for THAT one to actually be reaped before asserting the alive
+    one survived — proof the reaper thread genuinely ran and inspected
+    both sessions, not just an absence-of-eviction check that would pass
+    just the same if the daemon thread had silently died before ever
+    ticking (#385 review R1F2). Both sessions are created and the dead
+    one killed BEFORE ``start_reaper()`` runs, so the very first tick has
+    something to find — starting the reaper first would race it against
+    session creation, on a slow enough runner reaping the dead child (and
+    making the ``count == 2`` sanity check below flaky) before either
+    session finishes being set up (#385 review R2F1)."""
+    monkeypatch.setattr(server, "_MAX_REAP_INTERVAL_SECS", 0.2)
+    reg = server.SessionRegistry(_BACKEND, idle_ttl=0)
+    try:
+        alive_sid, _ = reg.create()
+        _, dead_backend = reg.create()
+        dead_backend.shutdown()
+        assert reg.count == 2
+        reg.start_reaper()
+        deadline = time.time() + 5
+        while reg.count > 1 and time.time() < deadline:
+            time.sleep(0.05)
+        assert reg.count == 1, "reaper never swept the dead-child session"
+        assert reg.get(alive_sid) is not None, (
+            "the idle-but-alive session was reaped too"
+        )
+    finally:
+        reg.shutdown_all()
 
 
 def test_reaper_thread_evicts_idle_session():

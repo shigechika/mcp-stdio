@@ -3454,11 +3454,13 @@ class SessionRegistry:
     down (``terminate()`` then ``wait``) — run OUTSIDE the lock; only the dict
     mutation is guarded, so one session's lifecycle never serializes another's.
 
-    When ``idle_ttl`` is set (``> 0``), a background reaper (started by
-    :meth:`start_reaper`) sweeps sessions whose last activity is older than the
-    TTL — and any whose child has already exited — so a client that disconnects
-    without DELETE does not pin a slot forever. ``now`` is injectable so tests
-    can drive eviction on a fake clock.
+    A background reaper (started by :meth:`start_reaper`) ALWAYS runs
+    (#385) sweeping any session whose child has already exited — a dead
+    child pins a slot forever otherwise, TTL or not — and additionally,
+    when ``idle_ttl`` is set (``> 0``), sessions whose last activity is
+    older than the TTL, so a client that disconnects without DELETE does
+    not pin a slot forever either. ``now`` is injectable so tests can
+    drive eviction on a fake clock.
     """
 
     def __init__(
@@ -3635,11 +3637,43 @@ class SessionRegistry:
         return _SSE_KEEPALIVE_SECS
 
     def start_reaper(self) -> None:
-        """Start the background idle-eviction thread (no-op if TTL disabled)."""
-        if self._idle_ttl <= 0 or self._reaper is not None:
+        """Start the background sweep thread.
+
+        #385: ``reap_idle`` already reaps two INDEPENDENT things —
+        ``backend.closed`` (a dead child, dropped UNCONDITIONALLY,
+        TTL-or-not) and idle-past-TTL (only when ``idle_ttl > 0``) — but
+        this method used to gate STARTING THE THREAD AT ALL on the TTL
+        alone. In the default deployment (``--session-idle-ttl`` unset,
+        ``0``) that meant the thread never started, so the unconditional
+        dead-child sweep — correctly written, and already covering every
+        code path that can leave a child dead, not just one handler — had
+        no production caller: a long-lived gateway on default settings
+        accumulated dead-child sessions with no way to shed them, eating
+        into ``--max-sessions`` until new ``initialize`` calls got `503`
+        against slots that were all corpses. Follows the SAME PATTERN as
+        the fix already applied to the modern pool's analogous reaper
+        (#390 R3F1, ``ModernBackendPool.start_reaper``) — separate "why
+        does the thread run" from "what does each tick actually evict",
+        since ``reap_idle`` was always correct on the latter — but the
+        RESULT is not identical: the modern pool's ``start_reaper`` still
+        gates on ``modern_idle_ttl > 0 or`` the MRTR bridge being enabled,
+        so a pure-default deployment (neither set) still never starts
+        that thread and still never sweeps a dead modern child. THIS
+        method now starts unconditionally, with no equivalent second gate
+        (#385 review R1F1).
+
+        So this now ALWAYS starts (no-op only on a second call): the tick
+        interval favors the idle TTL when one is configured (finer-grained
+        eviction), and falls back to sweeping for dead children alone,
+        at least once a minute, when it is not.
+        """
+        if self._reaper is not None:
             return
         self._reaper_stop.clear()  # allow a restart after a prior stop_reaper
-        interval = max(1.0, min(self._idle_ttl, _MAX_REAP_INTERVAL_SECS))
+        if self._idle_ttl > 0:
+            interval = max(1.0, min(self._idle_ttl, _MAX_REAP_INTERVAL_SECS))
+        else:
+            interval = _MAX_REAP_INTERVAL_SECS
 
         def _loop() -> None:
             while not self._reaper_stop.wait(interval):
@@ -6609,9 +6643,14 @@ def serve(
         user_env_var=user_env_var,
         max_message_size=max_message_size,
     )
+    # #385: the legacy reaper now always starts (it sweeps dead children
+    # unconditionally, not just idle-past-TTL ones), independent of
+    # whether --session-idle-ttl is set.
     registry.start_reaper()
-    # Its own thread, gated on its own TTL — the legacy reaper may well
-    # be disabled while this one runs, and vice versa.
+    # Its own thread. Unlike the legacy reaper above, the modern pool's
+    # can still be a no-op (no --modern-idle-ttl and the MRTR bridge
+    # disabled) — its dead-child sweep has the same residual gap #385
+    # closed here, just not this issue's scope.
     httpd.modern_pool.start_reaper()
 
     stopping = threading.Event()
