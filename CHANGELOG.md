@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.43.1](https://github.com/shigechika/mcp-stdio/compare/v0.43.0...v0.43.1) (2026-08-22)
+
+
+### Bug Fixes
+
+* give PR docs validation its own concurrency group ([#423](https://github.com/shigechika/mcp-stdio/issues/423)) ([264f166](https://github.com/shigechika/mcp-stdio/commit/264f166b807f9ce590f7945a514c51ca9e12fbd3))
+
 ## [0.43.0](https://github.com/shigechika/mcp-stdio/compare/v0.42.2...v0.43.0) (2026-08-22)
 
 
