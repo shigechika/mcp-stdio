@@ -1143,9 +1143,9 @@ def _post_probe(
     with client.stream("POST", url, content=content, headers=headers) as resp:
         if _is_sse_response(resp):
             return resp, _first_response_message(
-                _iter_sse_events(_iter_sse_lines(resp.iter_text()))
+                _iter_sse_events(_iter_sse_lines(_iter_text_bounded(resp, client)))
             )
-        resp.read()
+        _read_bounded(resp, client)
     return resp, _parse_streamable_response(resp)
 
 
@@ -2064,6 +2064,236 @@ def _error_response(
             "id": req_id,
         }
     )
+
+
+# --max-message-size (#416): bounds how much of an upstream response this
+# gateway will buffer before parsing it, so a malicious or misbehaving MCP
+# server cannot OOM the relay with an arbitrarily large body (CWE-770). Ten
+# MiB comfortably fits an ordinary tool result while sitting well under
+# python-sdk#3330's reported single-event amplification (21.9 MB -> 2.35 GB
+# RSS in that SDK's own unbounded read). ``0`` disables the cap.
+_DEFAULT_MAX_MESSAGE_SIZE = 10 * 1024 * 1024
+
+# Attribute name used to stash the configured cap on the httpx.Client that
+# will make the request, read back by _read_bounded/_iter_text_bounded.
+# ``client`` is already a parameter (or closure variable) at every one of
+# the ~10 resp.read()/resp.iter_text() call sites this module has, while
+# run()/run_sse() sit many frames higher in the call graph (through
+# _post_and_stream, _post_probe, _listen_stream_loop, _sse_reader_loop,
+# MRTR retry closures, ...) — threading an explicit parameter through all
+# of those signatures just to carry one int would touch a large fraction
+# of this file for no behavioral reason. The one-shot ``--check`` clients
+# (check_connection/_check_connection_sse) also set this attribute, from
+# their own ``max_message_size`` parameter (#417 review R1F3) — the flag's
+# help text makes no ``--check``-specific exception, so it must not be the
+# one path where --max-message-size silently does nothing.
+_MAX_MESSAGE_SIZE_ATTR = "_mcp_stdio_max_message_size"
+
+# #417 review R1F2: httpx.Client() advertises "Accept-Encoding: gzip,
+# deflate" by default, and resp.iter_bytes()/resp.iter_text() decompress a
+# Content-Encoding body transparently BEFORE _read_bounded/_iter_text_bounded
+# ever see it — decompression can amplify a small compressed chunk into one
+# far larger than --max-message-size before the cap check runs on it (a
+# decompression bomb, CWE-409). Every httpx.Client this module builds for
+# real MCP traffic sends this instead, asking a compliant server not to
+# compress at all; _reject_content_encoding() then refuses outright (never
+# decodes) any response that carries Content-Encoding anyway. See #418 for
+# real bounded-decompression support instead of a blanket refusal.
+_ACCEPT_ENCODING_IDENTITY = {"accept-encoding": "identity"}
+
+
+class _MessageTooLargeError(httpx.TransportError):
+    """A response exceeded ``--max-message-size`` while being read.
+
+    Deliberately a SUBCLASS of ``httpx.TransportError`` (itself an
+    ``httpx.HTTPError``), not a bare ``Exception``: every pre-existing
+    ``except httpx.HTTPError`` in this module already treats a read
+    failure as a soft-fail — a protocol-era probe degrades to legacy, a
+    discovery retry falls back — so this rides those paths unchanged with
+    zero call-site changes. The one place that DOES need to tell it apart,
+    ``_post_and_stream``, checks ``isinstance(e, _MessageTooLargeError)``
+    to skip the sleep-and-retry arm: unlike a transient network fault, an
+    oversized response is a deterministic property of the response itself
+    and will exceed the cap identically on every retry, so retrying only
+    spends ``MAX_RETRIES`` attempts re-fetching the same too-large body.
+    """
+
+
+def _client_max_message_size(client: httpx.Client) -> int:
+    """The ``--max-message-size`` cap stashed on ``client`` (0 = unlimited).
+
+    See ``_MAX_MESSAGE_SIZE_ATTR`` for why this rides on the client
+    instance instead of an explicit parameter threaded through every
+    intermediate call site.
+    """
+    return getattr(client, _MAX_MESSAGE_SIZE_ATTR, 0)
+
+
+def _parse_accept_encoding(accept_encoding: str) -> dict[str, float]:
+    """Map each coding token (RFC 9110 §12.5.3, including ``*``) named in
+    ``accept_encoding`` — an ``Accept-Encoding`` header value — to its
+    weight. Comma-separated tokens, each optionally ``;q=VALUE``; a token
+    whose weight parses to ``0`` is recorded (explicitly EXCLUDED, not
+    merely absent). Malformed ``q`` defaults to accepting the token
+    (``1``), the same lenient-receiver posture this module takes
+    elsewhere.
+    """
+    weights: dict[str, float] = {}
+    for part in accept_encoding.split(","):
+        token, _, params = part.strip().partition(";")
+        token = token.strip().lower()
+        if not token:
+            continue
+        weight = 1.0
+        for param in params.split(";"):
+            key, _, value = param.strip().partition("=")
+            if key.strip().lower() == "q":
+                try:
+                    parsed = float(value.strip())
+                except ValueError:
+                    parsed = 1.0
+                # RFC 9110 §12.4.2: qvalue is in [0, 1] — a value outside
+                # that range (negative, or NaN, which float() parses
+                # without raising and which every comparison against it
+                # is False for) is exactly as malformed as text float()
+                # rejects outright, so it gets the same accepting
+                # fallback (#417 review R5F1) rather than silently
+                # excluding the token via a failed "> 0" comparison.
+                weight = parsed if 0.0 <= parsed <= 1.0 else 1.0
+        weights[token] = weight
+    return weights
+
+
+def _content_coding_is_negotiated(coding: str, weights: dict[str, float]) -> bool:
+    """True iff one ``coding`` token from a (possibly STACKED, RFC 9110
+    §8.4.1) ``Content-Encoding`` value is acceptable per ``weights`` (from
+    ``_parse_accept_encoding``). An explicit entry for ``coding`` always
+    wins over ``*`` either way — RFC 9110 §12.5.3: "'*' matches any
+    content-coding not otherwise listed in the header field" — so
+    ``gzip;q=0, *`` still excludes ``gzip`` even though ``*`` is present
+    and non-zero (#417 review R4F1).
+    """
+    if coding in weights:
+        return weights[coding] > 0
+    return weights.get("*", 0.0) > 0
+
+
+def _reject_content_encoding(resp: httpx.Response) -> None:
+    """Refuse an UNNEGOTIATED ``Content-Encoding`` (#417 review R1F2/R3F1).
+
+    ``resp.iter_bytes()``/``resp.iter_text()`` decode a ``Content-Encoding``
+    body (gzip/deflate/br/zstd) internally, chunk by chunk, BEFORE
+    ``_read_bounded``/``_iter_text_bounded`` ever see the decoded bytes to
+    count them — so a small compressed chunk that decompresses to far more
+    than ``--max-message-size`` (a decompression bomb, CWE-409) would already
+    be allocated by the time the cap check fires on it. Every client this
+    module builds DEFAULTS to sending ``Accept-Encoding: identity`` so a
+    compliant server never compresses in the first place.
+
+    That default can be overridden per request — ``-H 'Accept-Encoding:
+    gzip'`` (or any header source ahead of it) wins over the client-level
+    default, same as every other header this relay lets the user set. This
+    checks what was actually SENT (``resp.request.headers``, the
+    merged/effective value — httpx always populates ``resp.request``), not
+    what the client merely defaults to, and lets a response through ONLY
+    when EVERY coding in its (possibly STACKED, RFC 9110 §8.4.1 — e.g.
+    ``Content-Encoding: gzip, br``) ``Content-Encoding`` is one that
+    request's ``Accept-Encoding`` actually negotiates, honoring ``*`` and
+    ``;q=0`` semantics via ``_content_coding_is_negotiated`` (#417 review
+    R3F1/R4F1 — a request for ``br`` does not license a ``gzip`` reply just
+    because SOMETHING other than ``identity`` was asked for, and a
+    genuinely stacked or wildcard-negotiated response is not penalized for
+    not being one single exact-string match). A genuinely negotiated
+    response is let through (#417 review R2F2) — ``_read_bounded``/
+    ``_iter_text_bounded`` still count its DECOMPRESSED bytes against
+    ``--max-message-size`` same as any other response, but a single
+    amplifying chunk can still exceed the cap before that count catches up
+    (the exact bypass this function otherwise closes, see #418): the user
+    who explicitly requested those codings accepts the residual exposure.
+    Anything else — the default ``identity`` request, or a coding the
+    request never negotiated — is refused outright rather than decoded,
+    regardless of whether a size cap is even configured: this is a
+    content-integrity check, not a size check, so it runs even under
+    ``--max-message-size 0``.
+    """
+    raw = resp.headers.get("content-encoding", "").strip()
+    codings = [c.strip().lower() for c in raw.split(",") if c.strip() != ""]
+    codings = [c for c in codings if c != "identity"]
+    if not codings:
+        return
+    weights = _parse_accept_encoding(
+        resp.request.headers.get("accept-encoding", "identity")
+    )
+    if all(_content_coding_is_negotiated(c, weights) for c in codings):
+        return
+    raise _MessageTooLargeError(
+        f"response has Content-Encoding: {raw!r}, which this request's "
+        f"Accept-Encoding did not negotiate; refusing to decode (see "
+        "#418); aborting"
+    )
+
+
+def _read_bounded(resp: httpx.Response, client: httpx.Client) -> None:
+    """Drop-in replacement for ``resp.read()`` enforcing ``--max-message-size``.
+
+    Raises ``_MessageTooLargeError`` the moment the accumulated body would
+    exceed the cap, instead of buffering the whole body first regardless of
+    size (#416) — and rejects an UNEXPECTEDLY compressed response before
+    reading any of it (see ``_reject_content_encoding``, #417 review
+    R1F2/R2F2). On success this populates ``resp``'s private ``_content``
+    exactly as ``httpx.Response.read()`` does internally (``self._content =
+    b"".join(self.iter_bytes())``, per httpx's own implementation), so
+    ``resp.text``/``resp.json()`` keep working for every existing caller
+    exactly as before. A cap of ``0`` (unlimited, the default when unset)
+    still runs the Content-Encoding check, then delegates to the unmodified
+    ``resp.read()``.
+    """
+    _reject_content_encoding(resp)
+    max_bytes = _client_max_message_size(client)
+    if max_bytes <= 0:
+        resp.read()
+        return
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in resp.iter_bytes():
+        total += len(chunk)
+        if total > max_bytes:
+            raise _MessageTooLargeError(
+                f"response exceeds --max-message-size ({max_bytes} bytes); aborting"
+            )
+        chunks.append(chunk)
+    resp._content = b"".join(chunks)  # mirrors httpx.Response.read()'s own side effect
+
+
+def _iter_text_bounded(resp: httpx.Response, client: httpx.Client) -> Iterator[str]:
+    """Drop-in replacement for ``resp.iter_text()`` enforcing ``--max-message-size``.
+
+    Used on every SSE-consuming path, where the response has no single
+    final size to check upfront — the cap instead bounds the CUMULATIVE
+    bytes read off one stream, so a server cannot evade it by trickling an
+    unbounded body across arbitrarily many small chunks (#416). Unlike
+    ``_read_bounded`` this never touches ``resp._content``: every SSE
+    caller in this module consumes the stream incrementally, line by line,
+    and never reads ``.text``/``.content`` on the same response afterward.
+    Rejects an UNEXPECTEDLY compressed response before reading any of it
+    (see ``_reject_content_encoding``, #417 review R1F2/R2F2) — an SSE
+    stream is long-lived, so the decompression-bomb risk this closes is not
+    a one-shot
+    allocation but an unbounded one across the whole connection.
+    """
+    _reject_content_encoding(resp)
+    max_bytes = _client_max_message_size(client)
+    if max_bytes <= 0:
+        yield from resp.iter_text()
+        return
+    total = 0
+    for chunk in resp.iter_text():
+        total += len(chunk.encode("utf-8", errors="surrogatepass"))
+        if total > max_bytes:
+            raise _MessageTooLargeError(
+                f"response exceeds --max-message-size ({max_bytes} bytes); aborting"
+            )
+        yield chunk
 
 
 def _parse_retry_after(value: str | None) -> float | None:
@@ -3075,7 +3305,7 @@ def _post_and_stream(
                 www_auth = resp.headers.get("www-authenticate")
 
                 if resp.status_code in _RETRYABLE_RATE_LIMIT_STATUSES:
-                    resp.read()
+                    _read_bounded(resp, client)
                     if _abort_requested(abort):
                         # The NON-200 half of the false-normal arm below
                         # (#362 review finding 1): a cancel that lands while
@@ -3113,7 +3343,7 @@ def _post_and_stream(
                     continue
 
                 if resp.status_code != 200:
-                    resp.read()
+                    _read_bounded(resp, client)
                     if _abort_requested(abort):
                         # Same non-200 half of the false-normal arm (#362
                         # review finding 1): without this check a cancelled
@@ -3134,7 +3364,7 @@ def _post_and_stream(
                 content_type = resp.headers.get("content-type", "")
                 if "text/event-stream" in content_type:
                     for event_type, payload in _iter_sse_events(
-                        _iter_sse_lines(resp.iter_text())
+                        _iter_sse_lines(_iter_text_bounded(resp, client))
                     ):
                         if event_type != "message":
                             continue
@@ -3156,7 +3386,7 @@ def _post_and_stream(
                         _emit(payload, tracker)
                         emitted = True
                 else:
-                    resp.read()
+                    _read_bounded(resp, client)
                     text = resp.text.strip()
                     if text:
                         if capture_init:
@@ -3264,6 +3494,15 @@ def _post_and_stream(
                 # (session/pv are bound here: emitted/swallowed both imply the
                 # loop ran past their assignment.)
                 return _StreamResult(session, 200, protocol_version=pv)
+            if isinstance(e, _MessageTooLargeError):
+                # #416: unlike every other httpx.HTTPError this loop retries,
+                # an oversized response is a deterministic property of the
+                # response itself — it will exceed --max-message-size again,
+                # identically, on every retry. Skip straight to the loop's
+                # normal exhausted-retries tail below (log + synthesize one
+                # error under req_id + return None) instead of burning
+                # MAX_RETRIES attempts re-fetching the same too-large body.
+                break
             if attempt < MAX_RETRIES:
                 if _abort_requested(abort):
                     # Required change 8, the pre-SLEEP half. The loop-top
@@ -3344,71 +3583,82 @@ def _post_parsed(
     last_error: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = client.post(url, content=content, headers=headers)
-            session = resp.headers.get("mcp-session-id")
-            www_auth = resp.headers.get("www-authenticate")
-            if resp.status_code in _RETRYABLE_RATE_LIMIT_STATUSES:
-                sleep_secs = _handle_rate_limit(resp.headers, attempt)
-                if sleep_secs is None:
-                    return None, _StreamResult(
-                        session,
-                        resp.status_code,
-                        www_auth,
-                        retry_after=_parse_retry_after(resp.headers.get("retry-after")),
+            # #416: was a buffered client.post() (which always fully reads
+            # the body internally before returning); now streamed so
+            # _read_bounded can enforce --max-message-size BEFORE the body
+            # is buffered, instead of after. _read_bounded still leaves
+            # resp.text/.content working exactly as before for every branch
+            # below, buffered just the same — only bounded.
+            with client.stream("POST", url, content=content, headers=headers) as resp:
+                session = resp.headers.get("mcp-session-id")
+                www_auth = resp.headers.get("www-authenticate")
+                _read_bounded(resp, client)
+                if resp.status_code in _RETRYABLE_RATE_LIMIT_STATUSES:
+                    sleep_secs = _handle_rate_limit(resp.headers, attempt)
+                    if sleep_secs is None:
+                        return None, _StreamResult(
+                            session,
+                            resp.status_code,
+                            www_auth,
+                            retry_after=_parse_retry_after(
+                                resp.headers.get("retry-after")
+                            ),
+                        )
+                    log(
+                        f"attempt {attempt}/{MAX_RETRIES} got HTTP "
+                        f"{resp.status_code}, sleeping {sleep_secs:.1f}s before retry"
                     )
-                log(
-                    f"attempt {attempt}/{MAX_RETRIES} got HTTP "
-                    f"{resp.status_code}, sleeping {sleep_secs:.1f}s before retry"
-                )
-                time.sleep(sleep_secs)
-                continue
-            if resp.status_code != 200:
-                return None, _StreamResult(session, resp.status_code, www_auth)
+                    time.sleep(sleep_secs)
+                    continue
+                if resp.status_code != 200:
+                    return None, _StreamResult(session, resp.status_code, www_auth)
 
-            content_type = resp.headers.get("content-type", "")
-            if "text/event-stream" in content_type:
-                # A spec-compliant server MAY interleave server-initiated
-                # requests and notifications on the POST's SSE stream BEFORE the
-                # actual JSON-RPC response. Return only the response object (one
-                # carrying ``result``/``error``); a bare notification has
-                # neither, and returning it would make the pagination merge treat
-                # it as the page result and drop the real list. Mirrors the
-                # keep-reading gate in _check_connection_sse.
-                #
-                # every NON-response message event (a server-
-                # initiated request / notification) must still be DELIVERED to
-                # stdout — _post_and_stream emits every message event, so the
-                # pagination path must too, or interleaved frames are silently
-                # dropped only on the paginated methods.
-                for event_type, payload in _iter_sse_events(_split_sse_text(resp.text)):
-                    if event_type != "message":
-                        continue
-                    try:
-                        parsed = json.loads(payload)
-                    except json.JSONDecodeError:
-                        # Non-JSON message: not the response object. Leave it to
-                        # trigger the parsed=None fallback (re-POST) rather than
-                        # forwarding garbage — the fallback re-fetches the real
-                        # result, so dropping the malformed frame loses nothing.
-                        continue
-                    if isinstance(parsed, dict) and (
-                        "result" in parsed or "error" in parsed
+                content_type = resp.headers.get("content-type", "")
+                if "text/event-stream" in content_type:
+                    # A spec-compliant server MAY interleave server-initiated
+                    # requests and notifications on the POST's SSE stream BEFORE the
+                    # actual JSON-RPC response. Return only the response object (one
+                    # carrying ``result``/``error``); a bare notification has
+                    # neither, and returning it would make the pagination merge treat
+                    # it as the page result and drop the real list. Mirrors the
+                    # keep-reading gate in _check_connection_sse.
+                    #
+                    # every NON-response message event (a server-
+                    # initiated request / notification) must still be DELIVERED to
+                    # stdout — _post_and_stream emits every message event, so the
+                    # pagination path must too, or interleaved frames are silently
+                    # dropped only on the paginated methods.
+                    for event_type, payload in _iter_sse_events(
+                        _split_sse_text(resp.text)
                     ):
-                        return parsed, _StreamResult(session, 200)
-                    # A well-formed but NON-response message (a server-initiated
-                    # request / notification interleaved before the response) must
-                    # be delivered, not dropped — _post_and_stream emits every
-                    # message event, so the pagination path must too.
-                    _emit(payload, tracker)
-                return None, _StreamResult(session, 200)
+                        if event_type != "message":
+                            continue
+                        try:
+                            parsed = json.loads(payload)
+                        except json.JSONDecodeError:
+                            # Non-JSON message: not the response object. Leave it to
+                            # trigger the parsed=None fallback (re-POST) rather than
+                            # forwarding garbage — the fallback re-fetches the real
+                            # result, so dropping the malformed frame loses nothing.
+                            continue
+                        if isinstance(parsed, dict) and (
+                            "result" in parsed or "error" in parsed
+                        ):
+                            return parsed, _StreamResult(session, 200)
+                        # A well-formed but NON-response message (a server-initiated
+                        # request / notification interleaved before the response) must
+                        # be delivered, not dropped — _post_and_stream emits every
+                        # message event, so the pagination path must too.
+                        _emit(payload, tracker)
+                    return None, _StreamResult(session, 200)
 
-            text = resp.text.strip()
-            if not text:
-                return None, _StreamResult(session, 200)
-            try:
-                return json.loads(text), _StreamResult(session, 200)
-            except json.JSONDecodeError:
-                return None, _StreamResult(session, 200)
+                text = resp.text.strip()
+                if not text:
+                    return None, _StreamResult(session, 200)
+                try:
+                    return json.loads(text), _StreamResult(session, 200)
+                except json.JSONDecodeError:
+                    return None, _StreamResult(session, 200)
         except httpx.HTTPError as e:
             # Broadest request-level supertype: covers every transient transport
             # failure AND DecodingError (a SIBLING of TransportError, not a
@@ -3419,6 +3669,11 @@ def _post_parsed(
             # propagate.
             last_error = e
             log(f"attempt {attempt}/{MAX_RETRIES} failed: {e}")
+            if isinstance(e, _MessageTooLargeError):
+                # #416: deterministic property of the response, not a
+                # transient fault — retrying re-fetches the same oversized
+                # body. Fall straight to the exhausted-retries tail below.
+                break
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY * attempt)
 
@@ -5066,7 +5321,7 @@ def _listen_stream_loop(
                 if publish_response is not None:
                     publish_response(resp)
                 if resp.status_code != 200:
-                    resp.read()
+                    _read_bounded(resp, client)
                     # #352 round-3 finding 1: classify the BODY before the
                     # status split. Round 2 read only a 404 body, so a
                     # reconnect answered e.g. HTTP 400 with a -32020
@@ -5146,7 +5401,7 @@ def _listen_stream_loop(
                         # cannot serve as the forwarding gate.
                         acked = False
                         for event_type, data in _iter_sse_events(
-                            _iter_sse_lines(resp.iter_text())
+                            _iter_sse_lines(_iter_text_bounded(resp, client))
                         ):
                             if stop.is_set():
                                 return
@@ -5187,7 +5442,7 @@ def _listen_stream_loop(
                                 return
                             log(f"{label} ended without a signal; reconnecting")
                     else:
-                        resp.read()
+                        _read_bounded(resp, client)
                         text = resp.text.strip()
                         # acked=False: a single-JSON-body 200 carries at
                         # most one message, which cannot have been preceded
@@ -5620,6 +5875,7 @@ def _check_connection_sse(
     *,
     timeout_connect: float,
     timeout_read: float,
+    max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
 ) -> bool:
     """Check legacy SSE (2024-11-05) connectivity via the full handshake.
 
@@ -5630,6 +5886,11 @@ def _check_connection_sse(
     ``endpoint`` event, POST ``initialize`` to that endpoint, and read the
     response off the stream. Returns True if the server completes the
     handshake.
+
+    ``max_message_size`` (#417 review R1F3) applies the same
+    ``--max-message-size`` cap the user configured to this one-shot probe
+    too, so the flag's documented behavior is unqualified — there is no
+    carve-out for ``--check`` a user would have to discover the hard way.
     """
     initialize_msg = json.dumps(
         {
@@ -5645,10 +5906,12 @@ def _check_connection_sse(
     )
 
     client = httpx.Client(
+        headers=_ACCEPT_ENCODING_IDENTITY,
         timeout=httpx.Timeout(
             connect=timeout_connect, read=timeout_read, write=30, pool=10
-        )
+        ),
     )
+    setattr(client, _MAX_MESSAGE_SIZE_ATTR, max_message_size)
 
     # The GET stream read blocks in the main thread; the POST runs in a helper
     # thread. On a POST failure the helper closes the stream so the probe fails
@@ -5666,9 +5929,17 @@ def _check_connection_sse(
 
     def do_post(endpoint: str) -> None:
         try:
-            r = client.post(endpoint, content=initialize_msg, headers=headers)
-            if r.status_code not in (200, 202):
-                holder["post_error"] = f"HTTP {r.status_code}"
+            # Streamed (not the buffered client.post() convenience method) so
+            # _read_bounded can enforce --max-message-size on this response
+            # too (#417 review R1F3) — status_code is available before the
+            # body is read either way, same as every other streamed POST in
+            # this module.
+            with client.stream(
+                "POST", endpoint, content=initialize_msg, headers=headers
+            ) as r:
+                _read_bounded(r, client)
+                if r.status_code not in (200, 202):
+                    holder["post_error"] = f"HTTP {r.status_code}"
         except Exception as e:  # noqa: BLE001 — surfaced via holder below
             holder["post_error"] = str(e)
         if holder["post_error"] is not None:
@@ -5698,7 +5969,9 @@ def _check_connection_sse(
             log(f"✓ SSE stream open (HTTP {resp.status_code})")
 
             endpoint_seen = False
-            for event_type, data in _iter_sse_events(_iter_sse_lines(resp.iter_text())):
+            for event_type, data in _iter_sse_events(
+                _iter_sse_lines(_iter_text_bounded(resp, client))
+            ):
                 if event_type == "endpoint":
                     resolved = urljoin(url, data)
                     # Same cross-origin credential guard as the relay reader:
@@ -5752,6 +6025,7 @@ def check_connection(
     timeout_connect: float = 10,
     timeout_read: float = 120,
     transport: str = "streamable-http",
+    max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
 ) -> bool:
     """Check MCP server connectivity by sending an initialize request.
 
@@ -5759,6 +6033,11 @@ def check_connection(
     the probe: ``"streamable-http"`` (default) POSTs ``initialize`` directly,
     while ``"sse"`` runs the legacy GET/endpoint/POST handshake so the probe
     matches what ``run_sse`` would actually do.
+
+    ``max_message_size`` applies the same ``--max-message-size`` cap the
+    relay would use to this one-shot probe (#417 review R1F3) — the flag's
+    help text makes no ``--check``-specific exception, so this diagnostic
+    must not be the one path where it silently does nothing.
 
     On the Streamable HTTP path, a 400/404 response to the ``initialize``
     probe retries once with ``server/discover`` (spec rev 2026-07-28,
@@ -5786,6 +6065,7 @@ def check_connection(
             headers,
             timeout_connect=timeout_connect,
             timeout_read=timeout_read,
+            max_message_size=max_message_size,
         )
 
     initialize_msg = json.dumps(
@@ -5802,10 +6082,12 @@ def check_connection(
     )
 
     client = httpx.Client(
+        headers=_ACCEPT_ENCODING_IDENTITY,
         timeout=httpx.Timeout(
             connect=timeout_connect, read=timeout_read, write=30, pool=10
-        )
+        ),
     )
+    setattr(client, _MAX_MESSAGE_SIZE_ATTR, max_message_size)
 
     try:
         log(f"testing connection to {redact_url(url)}")
@@ -6015,6 +6297,7 @@ def run(
     cold_start_login: Any = None,
     protocol_era: str = "legacy",
     listen_read_timeout: float = 300.0,
+    max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
 ) -> None:
     """Run the stdio-to-HTTP relay loop.
 
@@ -6110,6 +6393,17 @@ def run(
             honored here: the spec says clients SHOULD always enforce a
             maximum timeout, and the CLI flag (``--listen-read-timeout``)
             rejects 0 by construction.
+        max_message_size: Cap in bytes on a single upstream response body
+            (JSON or cumulative SSE stream) this relay will buffer before
+            parsing it (#416, CWE-770) — a malicious or misbehaving MCP
+            server otherwise has no limit on how much memory a single
+            oversized response can make the relay allocate. Default 10 MiB
+            (``_DEFAULT_MAX_MESSAGE_SIZE``); ``0`` disables the cap. On
+            trip, the in-flight request gets one synthesized JSON-RPC error
+            (never retried — an oversized response is deterministic, not
+            transient) and long-lived streams (the legacy SSE reader, the
+            modern era's ``subscriptions/listen``) reconnect like any other
+            dropped connection. See ``--max-message-size``.
 
     Limitation — JSON-RPC batches: a top-level array (a batch) is
     treated like a notification for error synthesis. ``_extract_id_and_presence``
@@ -6238,6 +6532,7 @@ def run(
     protocol_version: str | None = None
     tracker: _CancelTracker | None = _CancelTracker() if cancel_filter else None
     client = httpx.Client(
+        headers=_ACCEPT_ENCODING_IDENTITY,
         transport=_make_httpx_transport(tcp_keepalive=tcp_keepalive),
         timeout=httpx.Timeout(
             connect=timeout_connect,
@@ -6246,6 +6541,10 @@ def run(
             pool=10,
         ),
     )
+    # See _MAX_MESSAGE_SIZE_ATTR: stashed on the client rather than
+    # threaded as a parameter through every resp.read()/resp.iter_text()
+    # call site between here and _post_and_stream/_post_probe/etc.
+    setattr(client, _MAX_MESSAGE_SIZE_ATTR, max_message_size)
 
     # ``run``'s own request handling is single-threaded (the modern era's
     # stdin reader, #270 PR D, only enqueues — it never prepares or sends a
@@ -7550,7 +7849,8 @@ def run(
         pool=10 connections either. One per stream (#270 Phase 2 PR B),
         so closing one at teardown cannot disturb the other.
         """
-        return httpx.Client(
+        listen_client = httpx.Client(
+            headers=_ACCEPT_ENCODING_IDENTITY,
             transport=_make_httpx_transport(tcp_keepalive=tcp_keepalive),
             timeout=httpx.Timeout(
                 connect=timeout_connect,
@@ -7559,6 +7859,10 @@ def run(
                 pool=10,
             ),
         )
+        # Same cap as the shared client above (closes over run()'s own
+        # max_message_size parameter) — see _MAX_MESSAGE_SIZE_ATTR.
+        setattr(listen_client, _MAX_MESSAGE_SIZE_ATTR, max_message_size)
+        return listen_client
 
     # Per-request timeout override, built like run_sse's post_timeout:
     # same connect/write/pool, but the READ timeout is the dedicated
@@ -8835,7 +9139,7 @@ def _sse_reader_loop(
                     continue
 
                 for event_type, data in _iter_sse_events(
-                    _iter_sse_lines(resp.iter_text())
+                    _iter_sse_lines(_iter_text_bounded(resp, client))
                 ):
                     if state.stop.is_set():
                         return
@@ -8933,6 +9237,7 @@ def run_sse(
     token_expiry_getter: Any = None,
     proactive_refresh: bool = True,
     refresh_leeway: float = 60.0,
+    max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
 ) -> None:
     """Run the stdio-to-SSE relay loop (MCP 2024-11-05 legacy transport).
 
@@ -8985,6 +9290,11 @@ def run_sse(
             challenge on POST. Receives the scope string from the
             challenge and returns updated headers containing a
             broader-scope token, or None on failure. See #17.
+        max_message_size: Cap in bytes on a single upstream response body
+            (the POST reply, or the cumulative SSE GET stream) this relay
+            will buffer before parsing it (#416, CWE-770). Default 10 MiB
+            (``_DEFAULT_MAX_MESSAGE_SIZE``); ``0`` disables the cap. See
+            ``run``'s matching parameter for the full rationale.
     """
 
     def _shutdown(signum: int, _: Any) -> None:
@@ -9004,6 +9314,7 @@ def run_sse(
     # use the separate timeout_read below.
     effective_sse_read = None if sse_read_timeout in (None, 0) else sse_read_timeout
     client = httpx.Client(
+        headers=_ACCEPT_ENCODING_IDENTITY,
         transport=_make_httpx_transport(tcp_keepalive=tcp_keepalive),
         timeout=httpx.Timeout(
             connect=timeout_connect,
@@ -9012,6 +9323,9 @@ def run_sse(
             pool=10,
         ),
     )
+    # See _MAX_MESSAGE_SIZE_ATTR: stashed on the client rather than
+    # threaded as a parameter through every resp.iter_text() call site.
+    setattr(client, _MAX_MESSAGE_SIZE_ATTR, max_message_size)
 
     tracker: _CancelTracker | None = _CancelTracker() if cancel_filter else None
     state = _SseState()

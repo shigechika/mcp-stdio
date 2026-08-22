@@ -469,6 +469,60 @@ class TestMain:
             main()
             assert mock_run.call_args.kwargs["listen_read_timeout"] == 42.5
 
+    def test_max_message_size_default_and_passthrough(self):
+        """#416: --max-message-size defaults to 10 MiB and reaches both
+        run() (Streamable HTTP) and run_sse() (legacy SSE) — it is a
+        client-side cap, so it applies to either transport."""
+        from mcp_stdio.relay import _DEFAULT_MAX_MESSAGE_SIZE
+
+        with (
+            patch("sys.argv", ["mcp-stdio", "https://example.com/mcp"]),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+            assert (
+                mock_run.call_args.kwargs["max_message_size"]
+                == _DEFAULT_MAX_MESSAGE_SIZE
+            )
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--transport",
+                    "sse",
+                    "--max-message-size",
+                    "1000",
+                    "https://example.com/mcp",
+                ],
+            ),
+            patch("mcp_stdio.cli.run_sse") as mock_run_sse,
+        ):
+            main()
+            assert mock_run_sse.call_args.kwargs["max_message_size"] == 1000
+
+    def test_max_message_size_zero_means_unlimited(self):
+        """0 disables the cap, same convention as --session-idle-ttl etc."""
+        with (
+            patch(
+                "sys.argv",
+                ["mcp-stdio", "--max-message-size", "0", "https://example.com/mcp"],
+            ),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+            assert mock_run.call_args.kwargs["max_message_size"] == 0
+
+    def test_max_message_size_negative_rejected(self, capsys):
+        with patch(
+            "sys.argv",
+            ["mcp-stdio", "--max-message-size", "-1", "https://example.com/mcp"],
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 2
+        assert "must be >= 0" in capsys.readouterr().err
+
     def test_oauth_refresh_leeway_invalid_env_var_rejected(self, monkeypatch, capsys):
         """#56: invalid env var values surface as argparse errors, not ValueError."""
         monkeypatch.setenv("MCP_OAUTH_REFRESH_LEEWAY", "not-a-number")
@@ -1099,6 +1153,25 @@ class TestClientMetadataUrlFlag:
                 main()
             assert exc_info.value.code == 0
             assert mock_check.call_args.kwargs["transport"] == "sse"
+
+    def test_check_forwards_max_message_size(self):
+        """#417 review R1F3: --check is not a carve-out for --max-message-size."""
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "https://example.com/mcp",
+                    "--check",
+                    "--max-message-size",
+                    "1000",
+                ],
+            ),
+            patch("mcp_stdio.cli.check_connection", return_value=True) as mock_check,
+        ):
+            with pytest.raises(SystemExit):
+                main()
+            assert mock_check.call_args.kwargs["max_message_size"] == 1000
 
     def test_test_flag_deprecated_alias_works(self, capsys):
         """--test still works for backward compatibility but emits a deprecation warning."""

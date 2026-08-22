@@ -38,6 +38,7 @@ Arguments:
 | `--timeout-read SEC` | 120 | 読み取りタイムアウト（秒） |
 | `--sse-read-timeout SEC` | 300 | SSE GET ストリームのアイドル読み取りタイムアウト（SSE トランスポートのみ; 0 で無効化） |
 | `--no-tcp-keepalive` | — | HTTP ソケット上の TCP キープアライブを無効化 |
+| `--max-message-size BYTES` | 10 MiB | パース前にバッファする上流レスポンス本文（JSON または累積 SSE ストリーム）の上限。0 で無効化。`Accept-Encoding: identity` を送信し、それでも圧縮されて返ってきたレスポンスは拒否する（展開処理が上限をすり抜けうるため、#416、#417）。圧縮が必須のサーバーには `-H 'Accept-Encoding: <encoding>'` でオプトインできる（本来の展開サイズ上限対応は #418 で追跡） |
 
 <a id="modern-era-client"></a>
 
@@ -105,6 +106,7 @@ Arguments:
 | `--host HOST` | `127.0.0.1` | バインドアドレス |
 | `--port PORT` | `8080` | バインドポート |
 | `--path PATH` | `/mcp` | HTTP エンドポイントパス |
+| `--max-message-size BYTES` | 10 MiB | 宣言された `Content-Length` がこれを超えるリクエストを、本文を読む前に `413` で拒否する。0 で無効化（#416） |
 
 ### 認証
 

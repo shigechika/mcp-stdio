@@ -21,16 +21,19 @@ from mcp_stdio.relay import (
     MAX_LIST_PAGES,
     MAX_RETRIES,
     PAGINATED_LIST_METHODS,
+    _ACCEPT_ENCODING_IDENTITY,
     _COLD_START_LIST_CHANGED,
     _LISTEN_FORWARDED_NOTIFICATIONS,
     _LISTEN_ID_PREFIX,
     _LISTEN_MAX_SUBSCRIPTIONS,
     _LISTEN_RES_ID_PREFIX,
+    _MAX_MESSAGE_SIZE_ATTR,
     _RELAY_ID_NAMESPACE,
     _RESOURCE_UPDATED_METHOD,
     _STDIN_READER_THREAD_NAME,
     _CancelTracker,
     _InFlightPost,
+    _MessageTooLargeError,
     _ModernState,
     _ResourceSubscriptions,
     _SseState,
@@ -64,6 +67,7 @@ from mcp_stdio.relay import (
     _iter_queued_stdin,
     _iter_sse_events,
     _iter_sse_lines,
+    _iter_text_bounded,
     _looks_like_initialize,
     _make_httpx_transport,
     _mcp_request_headers,
@@ -75,6 +79,8 @@ from mcp_stdio.relay import (
     _parse_www_authenticate_scope,
     _post_and_stream,
     _probe_protocol_era,
+    _read_bounded,
+    _reject_content_encoding,
     _cold_start_loop,
     _cold_start_response,
     _proactive_refresh_loop,
@@ -854,6 +860,329 @@ class TestPostAndStream:
                 has_id=False,
             )
         assert stdout.getvalue() == ""
+
+    def test_oversized_json_response_synthesizes_error_no_retry(self, httpx_mock):
+        """--max-message-size trips on the JSON (non-SSE) response path: the
+        request is answered with exactly one synthesized error and the POST
+        is never retried — an oversized response is a deterministic property
+        of the response and will trip the cap again, identically, on every
+        retry (#416)."""
+        httpx_mock.add_response(
+            text=json.dumps({"jsonrpc": "2.0", "result": {"big": "x" * 100}, "id": 5}),
+            headers={"content-type": "application/json"},
+        )
+        client = httpx.Client()
+        setattr(client, _MAX_MESSAGE_SIZE_ATTR, 10)
+        stdout = StringIO()
+        with (
+            patch("sys.stdout", stdout),
+            patch("mcp_stdio.relay.time.sleep") as sleep_mock,
+        ):
+            result = _post_and_stream(
+                client, "https://example.com/mcp", '{"id":5}', {}, 5
+            )
+        assert len(httpx_mock.get_requests()) == 1  # never retried
+        sleep_mock.assert_not_called()
+        assert result is None
+        err = json.loads(stdout.getvalue().strip())
+        assert err["id"] == 5
+        assert err["error"]["code"] == -32000
+        assert "max-message-size" in err["error"]["message"]
+
+    def test_oversized_sse_response_synthesizes_error_no_retry(self, httpx_mock):
+        """Same cap, on the SSE streaming path — bounds CUMULATIVE bytes
+        across the stream (there is no single Content-Length on a live SSE
+        body to check upfront)."""
+
+        def gen():
+            yield f"event: message\ndata: {'x' * 100}\n\n".encode()
+
+        httpx_mock.add_response(
+            stream=IteratorStream(gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+        client = httpx.Client()
+        setattr(client, _MAX_MESSAGE_SIZE_ATTR, 10)
+        stdout = StringIO()
+        with (
+            patch("sys.stdout", stdout),
+            patch("mcp_stdio.relay.time.sleep") as sleep_mock,
+        ):
+            result = _post_and_stream(
+                client, "https://example.com/mcp", '{"id":6}', {}, 6
+            )
+        assert len(httpx_mock.get_requests()) == 1
+        sleep_mock.assert_not_called()
+        assert result is None
+        err = json.loads(stdout.getvalue().strip())
+        assert err["id"] == 6
+        assert err["error"]["code"] == -32000
+        assert "max-message-size" in err["error"]["message"]
+
+    def test_default_client_has_no_cap(self, httpx_mock):
+        """A plain httpx.Client() (no _MAX_MESSAGE_SIZE_ATTR set — e.g. the
+        one-shot --check clients) reads an oversized-by-test-standards body
+        without tripping anything: unset means unlimited, same as 0."""
+        httpx_mock.add_response(
+            text=json.dumps({"jsonrpc": "2.0", "result": {"big": "x" * 1000}, "id": 7}),
+            headers={"content-type": "application/json"},
+        )
+        client = httpx.Client()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            result = _post_and_stream(
+                client, "https://example.com/mcp", '{"id":7}', {}, 7
+            )
+        assert result is not None and result.status_code == 200
+        assert json.loads(stdout.getvalue().strip())["result"]["big"] == "x" * 1000
+
+
+class TestBoundedReaders:
+    """Unit coverage for _read_bounded/_iter_text_bounded (#416) below the
+    level of a full _post_and_stream dispatch — specifically the WITHIN-cap
+    success path, which the rest of the suite never exercises directly
+    (every pre-existing test either sets no cap at all, or a test above
+    exercises the OVER-cap path via _post_and_stream)."""
+
+    def test_read_bounded_within_cap_preserves_text_and_json(self, httpx_mock):
+        payload = {"jsonrpc": "2.0", "result": {"ok": True}, "id": 1}
+        httpx_mock.add_response(
+            json=payload, headers={"content-type": "application/json"}
+        )
+        client = httpx.Client()
+        with client.stream("POST", "https://example.com/mcp", content="{}") as resp:
+            _read_bounded(resp, client)  # unset cap -> delegates to resp.read()
+            assert resp.json() == payload
+        client2 = httpx.Client()
+        setattr(client2, _MAX_MESSAGE_SIZE_ATTR, 10_000)  # well within cap
+        httpx_mock.add_response(
+            json=payload, headers={"content-type": "application/json"}
+        )
+        with client2.stream("POST", "https://example.com/mcp", content="{}") as resp:
+            _read_bounded(resp, client2)
+            # .text/.json() must keep working exactly as after a plain
+            # resp.read() — this is the manual iter_bytes()+_content path,
+            # not the delegated one.
+            assert resp.json() == payload
+            assert json.loads(resp.text) == payload
+
+    def test_read_bounded_raises_when_exceeded(self, httpx_mock):
+        httpx_mock.add_response(text="x" * 100, headers={"content-type": "text/plain"})
+        client = httpx.Client()
+        setattr(client, _MAX_MESSAGE_SIZE_ATTR, 10)
+        with (
+            client.stream("POST", "https://example.com/mcp", content="{}") as resp,
+            pytest.raises(_MessageTooLargeError, match="max-message-size"),
+        ):
+            _read_bounded(resp, client)
+
+    def test_iter_text_bounded_raises_when_exceeded(self, httpx_mock):
+        httpx_mock.add_response(text="x" * 100, headers={"content-type": "text/plain"})
+        client = httpx.Client()
+        setattr(client, _MAX_MESSAGE_SIZE_ATTR, 10)
+        with client.stream("POST", "https://example.com/mcp", content="{}") as resp:
+            with pytest.raises(_MessageTooLargeError, match="max-message-size"):
+                for _ in _iter_text_bounded(resp, client):
+                    pass
+
+    def test_iter_text_bounded_unlimited_matches_plain_iter_text(self, httpx_mock):
+        httpx_mock.add_response(text="hello", headers={"content-type": "text/plain"})
+        client = httpx.Client()
+        with client.stream("POST", "https://example.com/mcp", content="{}") as resp:
+            assert "".join(_iter_text_bounded(resp, client)) == "hello"
+
+    def test_read_bounded_rejects_content_encoding_even_unlimited(self, httpx_mock):
+        """#417 review R1F2: a compressed response is refused regardless of
+        the configured cap — this is a content-integrity check, not a size
+        check, so it fires even under --max-message-size 0 (unset cap).
+
+        ``stream=`` (not ``text=``) so pytest_httpx does not eagerly build
+        and decode a real ``httpx.Response`` at mock-registration time —
+        that would fail on this deliberately-invalid gzip body before
+        ``_read_bounded`` (which must reject BEFORE any decode is
+        attempted) ever runs. A real network response is exactly the same:
+        undecoded bytes on the wire until something reads/decodes them.
+        """
+        httpx_mock.add_response(
+            stream=IteratorStream([b"whatever"]),
+            headers={"content-type": "text/plain", "content-encoding": "gzip"},
+        )
+        # Built the SAME way every real relay client is (Accept-Encoding:
+        # identity by default) — a hostile/non-compliant server compressing
+        # anyway is exactly the scenario _reject_content_encoding closes.
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)  # unlimited cap
+        with (
+            client.stream("POST", "https://example.com/mcp", content="{}") as resp,
+            pytest.raises(_MessageTooLargeError, match="Content-Encoding"),
+        ):
+            _read_bounded(resp, client)
+
+    def test_iter_text_bounded_rejects_content_encoding(self, httpx_mock):
+        httpx_mock.add_response(
+            stream=IteratorStream([b"whatever"]),
+            headers={"content-type": "text/plain", "content-encoding": "br"},
+        )
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
+        setattr(client, _MAX_MESSAGE_SIZE_ATTR, 10_000)
+        with client.stream("POST", "https://example.com/mcp", content="{}") as resp:
+            with pytest.raises(_MessageTooLargeError, match="Content-Encoding"):
+                for _ in _iter_text_bounded(resp, client):
+                    pass
+
+    def test_read_bounded_accepts_identity_content_encoding(self, httpx_mock):
+        """An explicit ``Content-Encoding: identity`` is the no-op case per
+        RFC 9110 §8.4.1 — must not be rejected."""
+        payload = {"jsonrpc": "2.0", "result": {"ok": True}, "id": 1}
+        httpx_mock.add_response(
+            json=payload,
+            headers={
+                "content-type": "application/json",
+                "content-encoding": "identity",
+            },
+        )
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
+        with client.stream("POST", "https://example.com/mcp", content="{}") as resp:
+            _read_bounded(resp, client)
+            assert resp.json() == payload
+
+    def test_read_bounded_allows_explicitly_requested_compression(self, httpx_mock):
+        """#417 review R2F2: a per-request ``Accept-Encoding`` override (e.g.
+        ``-H 'Accept-Encoding: gzip'``) means the caller asked for a
+        compressed reply — _reject_content_encoding must let it through and
+        the response must decode normally, not be treated as suspicious."""
+        import gzip
+
+        payload = {"jsonrpc": "2.0", "result": {"ok": True}, "id": 1}
+        compressed = gzip.compress(json.dumps(payload).encode())
+        httpx_mock.add_response(
+            stream=IteratorStream([compressed]),
+            headers={"content-type": "application/json", "content-encoding": "gzip"},
+        )
+        # Client defaults to identity, but THIS request overrides it —
+        # exactly the -H override path.
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
+        with client.stream(
+            "POST",
+            "https://example.com/mcp",
+            content="{}",
+            headers={"Accept-Encoding": "gzip"},
+        ) as resp:
+            _read_bounded(resp, client)
+            assert resp.json() == payload
+
+    def test_read_bounded_rejects_unnegotiated_coding(self, httpx_mock):
+        """#417 review R3F1: requesting Accept-Encoding: br does not license
+        a gzip reply just because SOMETHING other than identity was asked
+        for — the returned coding must be one the request actually named."""
+        httpx_mock.add_response(
+            stream=IteratorStream([b"whatever"]),
+            headers={"content-type": "text/plain", "content-encoding": "gzip"},
+        )
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
+        with (
+            client.stream(
+                "POST",
+                "https://example.com/mcp",
+                content="{}",
+                headers={"Accept-Encoding": "br"},
+            ) as resp,
+            pytest.raises(_MessageTooLargeError, match="Accept-Encoding"),
+        ):
+            _read_bounded(resp, client)
+
+    def test_read_bounded_rejects_q_zero_coding(self, httpx_mock):
+        """#417 review R3F1: 'gzip;q=0' explicitly EXCLUDES gzip (RFC 9110
+        §12.5.3), not merely leaves it unweighted — a gzip reply must still
+        be refused."""
+        httpx_mock.add_response(
+            stream=IteratorStream([b"whatever"]),
+            headers={"content-type": "text/plain", "content-encoding": "gzip"},
+        )
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
+        with (
+            client.stream(
+                "POST",
+                "https://example.com/mcp",
+                content="{}",
+                headers={"Accept-Encoding": "gzip;q=0, br"},
+            ) as resp,
+            pytest.raises(_MessageTooLargeError, match="Accept-Encoding"),
+        ):
+            _read_bounded(resp, client)
+
+    def test_read_bounded_allows_stacked_negotiated_codings(self, httpx_mock):
+        """#417 review R4F1: a STACKED Content-Encoding (RFC 9110 §8.4.1,
+        e.g. 'gzip, br' — codings applied in sequence) is negotiated when
+        EVERY coding in it was requested, not just the combined string as
+        one token."""
+        httpx_mock.add_response(
+            stream=IteratorStream([b"whatever"]),
+            headers={"content-type": "text/plain", "content-encoding": "gzip, br"},
+        )
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
+        with client.stream(
+            "POST",
+            "https://example.com/mcp",
+            content="{}",
+            headers={"Accept-Encoding": "gzip, br"},
+        ) as resp:
+            _reject_content_encoding(resp)  # must not raise
+
+    def test_read_bounded_allows_wildcard_negotiated_coding(self, httpx_mock):
+        """#417 review R4F1: Accept-Encoding: * matches any coding not
+        otherwise explicitly listed (RFC 9110 §12.5.3)."""
+        httpx_mock.add_response(
+            stream=IteratorStream([b"whatever"]),
+            headers={"content-type": "text/plain", "content-encoding": "gzip"},
+        )
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
+        with client.stream(
+            "POST",
+            "https://example.com/mcp",
+            content="{}",
+            headers={"Accept-Encoding": "*"},
+        ) as resp:
+            _reject_content_encoding(resp)  # must not raise
+
+    def test_read_bounded_explicit_q_zero_overrides_wildcard(self, httpx_mock):
+        """#417 review R4F1: an explicit 'gzip;q=0' excludes gzip even when
+        '*' is also present and non-zero — explicit listing wins over the
+        wildcard (RFC 9110 §12.5.3)."""
+        httpx_mock.add_response(
+            stream=IteratorStream([b"whatever"]),
+            headers={"content-type": "text/plain", "content-encoding": "gzip"},
+        )
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
+        with (
+            client.stream(
+                "POST",
+                "https://example.com/mcp",
+                content="{}",
+                headers={"Accept-Encoding": "*, gzip;q=0"},
+            ) as resp,
+            pytest.raises(_MessageTooLargeError, match="Accept-Encoding"),
+        ):
+            _read_bounded(resp, client)
+
+    def test_read_bounded_out_of_range_q_falls_back_to_accepting(self, httpx_mock):
+        """#417 review R5F1: a qvalue outside RFC 9110 §12.4.2's [0, 1]
+        range (or NaN, which float() parses without raising and which every
+        comparison is False for) is exactly as malformed as unparseable
+        text — both get the documented accepting (1) fallback, not a
+        silent exclusion via a failed '> 0' comparison."""
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
+        for bad_q in ("gzip;q=-1", "gzip;q=nan", "gzip;q=2"):
+            httpx_mock.add_response(
+                stream=IteratorStream([b"whatever"]),
+                headers={"content-type": "text/plain", "content-encoding": "gzip"},
+            )
+            with client.stream(
+                "POST",
+                "https://example.com/mcp",
+                content="{}",
+                headers={"Accept-Encoding": bad_q},
+            ) as resp:
+                _reject_content_encoding(resp)  # must not raise
 
 
 class TestSameOrigin:
@@ -5162,6 +5491,41 @@ class TestCheckConnection:
         captured = capsys.readouterr()
         assert "sess-xyz" in captured.err
 
+    def test_check_respects_max_message_size(self, httpx_mock):
+        """#417 review R1F3: --check is not a carve-out — an oversized
+        response fails the probe under a small cap, same as the relay
+        loop."""
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"big": "x" * 1000}})
+        httpx_mock.add_response(text=body, headers={"content-type": "application/json"})
+        assert (
+            check_connection(self.URL, dict(self.HEADERS), max_message_size=10) is False
+        )
+
+    def test_check_sends_accept_encoding_identity(self, httpx_mock):
+        """#417 review R1F2: --check asks the server not to compress, same
+        as the relay loop, so a compliant server never has the chance to
+        trip the decompression-bomp guard on this path either."""
+        httpx_mock.add_response(
+            text=json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}),
+            headers={"content-type": "application/json"},
+        )
+        check_connection(self.URL, dict(self.HEADERS))
+        sent = httpx_mock.get_requests()[0]
+        assert sent.headers["accept-encoding"] == "identity"
+
+    def test_check_rejects_compressed_response(self, httpx_mock):
+        """#417 review R1F2: a response carrying Content-Encoding anyway
+        (a non-compliant or hostile server ignoring Accept-Encoding:
+        identity) fails the probe rather than being transparently
+        decompressed. ``stream=`` avoids pytest_httpx eagerly decoding this
+        deliberately-invalid gzip body at mock-registration time."""
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}).encode()
+        httpx_mock.add_response(
+            stream=IteratorStream([body]),
+            headers={"content-type": "application/json", "content-encoding": "gzip"},
+        )
+        assert check_connection(self.URL, dict(self.HEADERS)) is False
+
 
 class TestParseStreamableResponseTypeContract:
     """#350 review round 2/3: ``_parse_streamable_response`` is declared
@@ -5571,6 +5935,54 @@ class TestCheckConnectionSse:
         posts = [r for r in httpx_mock.get_requests() if r.method == "POST"]
         assert len(posts) == 1
         assert str(posts[0].url) == "https://example.com/messages"
+
+    def test_check_sse_respects_max_message_size(self, httpx_mock):
+        """#417 review R1F3: the SSE handshake path also honors the cap —
+        the small ``endpoint`` event fits (so the POST still fires), but the
+        larger init result trips it, so the probe reports failure instead of
+        True. The cap sits strictly between the two events' byte sizes."""
+        endpoint_event = b"event: endpoint\ndata: /messages\n\n"
+        init_event = f"event: message\ndata: {self._INIT_RESULT}\n\n".encode()
+        assert len(endpoint_event) < 40 < len(endpoint_event) + len(init_event)
+        httpx_mock.add_response(
+            url=self.SSE_URL,
+            method="GET",
+            stream=IteratorStream([endpoint_event, init_event]),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url="https://example.com/messages", method="POST", status_code=202
+        )
+        assert (
+            check_connection(
+                self.SSE_URL,
+                dict(self.HEADERS),
+                transport="sse",
+                max_message_size=40,
+            )
+            is False
+        )
+
+    def test_check_sse_sends_accept_encoding_identity(self, httpx_mock):
+        """#417 review R1F2: the SSE handshake's GET stream also asks the
+        server not to compress."""
+        httpx_mock.add_response(
+            url=self.SSE_URL,
+            method="GET",
+            stream=IteratorStream(
+                [
+                    b"event: endpoint\ndata: /messages\n\n",
+                    f"event: message\ndata: {self._INIT_RESULT}\n\n".encode(),
+                ]
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url="https://example.com/messages", method="POST", status_code=202
+        )
+        check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
+        gets = [r for r in httpx_mock.get_requests() if r.method == "GET"]
+        assert gets[0].headers["accept-encoding"] == "identity"
 
 
 # --- SSE transport ---

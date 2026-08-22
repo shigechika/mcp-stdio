@@ -251,6 +251,14 @@ mcp-stdio [OPTIONS] URL
   --sse-read-timeout SEC SSE GET ストリームのアイドル読み取りタイムアウト
                          （デフォルト: 300秒、0 で無効、SSE トランスポートのみ）
   --no-tcp-keepalive     HTTP ソケットの TCP keepalive を無効化する
+  --max-message-size BYTES
+                         パース前にバッファする上流レスポンス本文（JSON
+                         または累積 SSE ストリーム）の上限
+                         （デフォルト: 10 MiB、0 で無効化、#416）。
+                         Accept-Encoding: identity を送信し、それでも
+                         圧縮されて返ってきたレスポンスは拒否する（#417）
+                         — 圧縮が必須なら -H 'Accept-Encoding: <encoding>'
+                         でオプトイン可能（#418）
   --no-cancel-filter     cancel-aware レスポンスフィルタを無効化する
                          （notifications/cancelled でキャンセルされた id の
                          遅延レスポンスを drop する機能）
@@ -350,7 +358,9 @@ mcp-stdio --oauth http://127.0.0.1:8080/mcp
 セッション上限 `--max-sessions N`（既定 `100`、cap 超過の `initialize` は `503`）
 と `--session-idle-ttl SECONDS`（無活動がこの秒数続いたセッションと子プロセスを
 破棄。`DELETE` せず切断したクライアントが slot を占有し続けるのを防ぐ。`0`＝既定
-で無効）; `--user-env VAR`（認証済み principal を、spawn する子プロセスの環境変数
+で無効）; `--max-message-size BYTES`（宣言された `Content-Length` がこれを
+超えるリクエストを、本文を読む前に `413` で拒否する。既定 10 MiB、`0` で
+無効化、#416）; `--user-env VAR`（認証済み principal を、spawn する子プロセスの環境変数
 にこの名前で注入する。マルチユーザー対応のバックエンドが、自前の OAuth スタックを
 持たずに呼び出し元の identity を読めるようになる — HTTP境界ではなくプロセス
 spawn境界に trusted-header パターンを適用したもの。`--enable-oauth` が前提。
