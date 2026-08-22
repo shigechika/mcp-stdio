@@ -1270,6 +1270,31 @@ class TestBoundedDecompression:
         with pytest.raises(httpx.DecodingError, match="truncated"):
             _bounded_decompress_bytes([b"\x78"], "deflate", 1_000_000)
 
+    def test_bounded_decompress_bytes_deflate_survives_random_fragmentation(self):
+        """#418 review R2F1: property-style coverage beyond the two fixed
+        reproduction cases above — many random compressed streams (both
+        zlib-wrapped and raw), each split at random 1-5-byte boundaries,
+        must all round-trip regardless of exactly where the header split
+        falls. A fixed seed keeps this deterministic across runs."""
+        import random
+        import zlib
+
+        rng = random.Random(20260822)
+        payload = b"The quick brown fox jumps over the lazy dog. " * 200
+        for _ in range(50):
+            compressed = (
+                _raw_deflate(payload)
+                if rng.choice([True, False])
+                else zlib.compress(payload)
+            )
+            pieces = []
+            i = 0
+            while i < len(compressed):
+                step = rng.randint(1, 5)
+                pieces.append(compressed[i : i + step])
+                i += step
+            assert _bounded_decompress_bytes(pieces, "deflate", 10_000_000) == payload
+
     def test_bounded_decompress_bytes_trips_cap_on_amplifying_single_chunk(self):
         """The core #418 fix: a SINGLE compressed chunk (fed as one item —
         the worst case a real network read could deliver) that would
