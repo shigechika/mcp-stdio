@@ -80,6 +80,7 @@ from mcp_stdio.relay import (
     _post_and_stream,
     _probe_protocol_era,
     _read_bounded,
+    _reject_content_encoding,
     _cold_start_loop,
     _cold_start_response,
     _proactive_refresh_loop,
@@ -1101,6 +1102,60 @@ class TestBoundedReaders:
                 "https://example.com/mcp",
                 content="{}",
                 headers={"Accept-Encoding": "gzip;q=0, br"},
+            ) as resp,
+            pytest.raises(_MessageTooLargeError, match="Accept-Encoding"),
+        ):
+            _read_bounded(resp, client)
+
+    def test_read_bounded_allows_stacked_negotiated_codings(self, httpx_mock):
+        """#417 review R4F1: a STACKED Content-Encoding (RFC 9110 §8.4.1,
+        e.g. 'gzip, br' — codings applied in sequence) is negotiated when
+        EVERY coding in it was requested, not just the combined string as
+        one token."""
+        httpx_mock.add_response(
+            stream=IteratorStream([b"whatever"]),
+            headers={"content-type": "text/plain", "content-encoding": "gzip, br"},
+        )
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
+        with client.stream(
+            "POST",
+            "https://example.com/mcp",
+            content="{}",
+            headers={"Accept-Encoding": "gzip, br"},
+        ) as resp:
+            _reject_content_encoding(resp)  # must not raise
+
+    def test_read_bounded_allows_wildcard_negotiated_coding(self, httpx_mock):
+        """#417 review R4F1: Accept-Encoding: * matches any coding not
+        otherwise explicitly listed (RFC 9110 §12.5.3)."""
+        httpx_mock.add_response(
+            stream=IteratorStream([b"whatever"]),
+            headers={"content-type": "text/plain", "content-encoding": "gzip"},
+        )
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
+        with client.stream(
+            "POST",
+            "https://example.com/mcp",
+            content="{}",
+            headers={"Accept-Encoding": "*"},
+        ) as resp:
+            _reject_content_encoding(resp)  # must not raise
+
+    def test_read_bounded_explicit_q_zero_overrides_wildcard(self, httpx_mock):
+        """#417 review R4F1: an explicit 'gzip;q=0' excludes gzip even when
+        '*' is also present and non-zero — explicit listing wins over the
+        wildcard (RFC 9110 §12.5.3)."""
+        httpx_mock.add_response(
+            stream=IteratorStream([b"whatever"]),
+            headers={"content-type": "text/plain", "content-encoding": "gzip"},
+        )
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
+        with (
+            client.stream(
+                "POST",
+                "https://example.com/mcp",
+                content="{}",
+                headers={"Accept-Encoding": "*, gzip;q=0"},
             ) as resp,
             pytest.raises(_MessageTooLargeError, match="Accept-Encoding"),
         ):

@@ -2129,15 +2129,16 @@ def _client_max_message_size(client: httpx.Client) -> int:
     return getattr(client, _MAX_MESSAGE_SIZE_ATTR, 0)
 
 
-def _accepted_content_codings(accept_encoding: str) -> set[str]:
-    """The coding tokens ``accept_encoding`` (an ``Accept-Encoding`` header
-    value) actually accepts, per RFC 9110 §12.5.3 — comma-separated
-    tokens, each optionally ``;q=VALUE``; a token whose weight parses to
-    ``0`` is explicitly EXCLUDED (rejects that coding), not just
-    unweighted. Malformed ``q`` defaults to accepting the token (``1``),
-    the same lenient-receiver posture this module takes elsewhere.
+def _parse_accept_encoding(accept_encoding: str) -> dict[str, float]:
+    """Map each coding token (RFC 9110 §12.5.3, including ``*``) named in
+    ``accept_encoding`` — an ``Accept-Encoding`` header value — to its
+    weight. Comma-separated tokens, each optionally ``;q=VALUE``; a token
+    whose weight parses to ``0`` is recorded (explicitly EXCLUDED, not
+    merely absent). Malformed ``q`` defaults to accepting the token
+    (``1``), the same lenient-receiver posture this module takes
+    elsewhere.
     """
-    accepted: set[str] = set()
+    weights: dict[str, float] = {}
     for part in accept_encoding.split(","):
         token, _, params = part.strip().partition(";")
         token = token.strip().lower()
@@ -2151,9 +2152,22 @@ def _accepted_content_codings(accept_encoding: str) -> set[str]:
                     weight = float(value.strip())
                 except ValueError:
                     weight = 1.0
-        if weight > 0:
-            accepted.add(token)
-    return accepted
+        weights[token] = weight
+    return weights
+
+
+def _content_coding_is_negotiated(coding: str, weights: dict[str, float]) -> bool:
+    """True iff one ``coding`` token from a (possibly STACKED, RFC 9110
+    §8.4.1) ``Content-Encoding`` value is acceptable per ``weights`` (from
+    ``_parse_accept_encoding``). An explicit entry for ``coding`` always
+    wins over ``*`` either way — RFC 9110 §12.5.3: "'*' matches any
+    content-coding not otherwise listed in the header field" — so
+    ``gzip;q=0, *`` still excludes ``gzip`` even though ``*`` is present
+    and non-zero (#417 review R4F1).
+    """
+    if coding in weights:
+        return weights[coding] > 0
+    return weights.get("*", 0.0) > 0
 
 
 def _reject_content_encoding(resp: httpx.Response) -> None:
@@ -2174,33 +2188,38 @@ def _reject_content_encoding(resp: httpx.Response) -> None:
     checks what was actually SENT (``resp.request.headers``, the
     merged/effective value — httpx always populates ``resp.request``), not
     what the client merely defaults to, and lets a response through ONLY
-    when its ``Content-Encoding`` is one of the codings that request's
-    ``Accept-Encoding`` actually names with a non-zero weight (#417 review
-    R3F1 — a request for ``br`` does not license a ``gzip`` reply just
-    because SOMETHING other than ``identity`` was asked for, and
-    ``gzip;q=0`` explicitly excludes ``gzip``). A genuinely negotiated
-    match is let through (#417 review R2F2) — ``_read_bounded``/
+    when EVERY coding in its (possibly STACKED, RFC 9110 §8.4.1 — e.g.
+    ``Content-Encoding: gzip, br``) ``Content-Encoding`` is one that
+    request's ``Accept-Encoding`` actually negotiates, honoring ``*`` and
+    ``;q=0`` semantics via ``_content_coding_is_negotiated`` (#417 review
+    R3F1/R4F1 — a request for ``br`` does not license a ``gzip`` reply just
+    because SOMETHING other than ``identity`` was asked for, and a
+    genuinely stacked or wildcard-negotiated response is not penalized for
+    not being one single exact-string match). A genuinely negotiated
+    response is let through (#417 review R2F2) — ``_read_bounded``/
     ``_iter_text_bounded`` still count its DECOMPRESSED bytes against
     ``--max-message-size`` same as any other response, but a single
     amplifying chunk can still exceed the cap before that count catches up
     (the exact bypass this function otherwise closes, see #418): the user
-    who explicitly requested that coding accepts the residual exposure.
+    who explicitly requested those codings accepts the residual exposure.
     Anything else — the default ``identity`` request, or a coding the
-    request never named — is refused outright rather than decoded,
+    request never negotiated — is refused outright rather than decoded,
     regardless of whether a size cap is even configured: this is a
     content-integrity check, not a size check, so it runs even under
     ``--max-message-size 0``.
     """
-    encoding = resp.headers.get("content-encoding", "").strip().lower()
-    if not encoding or encoding == "identity":
+    raw = resp.headers.get("content-encoding", "").strip()
+    codings = [c.strip().lower() for c in raw.split(",") if c.strip() != ""]
+    codings = [c for c in codings if c != "identity"]
+    if not codings:
         return
-    requested = resp.request.headers.get("accept-encoding", "identity")
-    if encoding in _accepted_content_codings(requested):
+    weights = _parse_accept_encoding(resp.request.headers.get("accept-encoding", "identity"))
+    if all(_content_coding_is_negotiated(c, weights) for c in codings):
         return
     raise _MessageTooLargeError(
-        f"response has Content-Encoding: {encoding!r}, which this request's "
-        f"Accept-Encoding: {requested!r} did not negotiate; refusing to "
-        "decode (see #418); aborting"
+        f"response has Content-Encoding: {raw!r}, which this request's "
+        f"Accept-Encoding did not negotiate; refusing to decode (see "
+        "#418); aborting"
     )
 
 
