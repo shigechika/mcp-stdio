@@ -38,7 +38,7 @@ Arguments:
 | `--timeout-read SEC` | 120 | Read timeout in seconds |
 | `--sse-read-timeout SEC` | 300 | Idle read timeout on the SSE GET stream (SSE transport only; 0 disables) |
 | `--no-tcp-keepalive` | — | Disable TCP keepalive on the HTTP socket |
-| `--max-message-size BYTES` | 10 MiB | Cap on a single upstream response body (JSON or cumulative SSE stream) buffered before parsing; 0 disables the cap. Also sends `Accept-Encoding: identity` and refuses any response that is compressed anyway, since decompression can bypass the cap (#416, #417) — a server that requires compression needs `-H 'Accept-Encoding: <encoding>'` to opt back in (#418 tracks real bounded-decompression support) |
+| `--max-message-size BYTES` | 10 MiB | Cap on a single upstream response body (JSON or cumulative SSE stream) buffered before parsing; 0 disables the cap. Also sends `Accept-Encoding: identity` by default (#416, #417); `-H 'Accept-Encoding: gzip'`/`deflate` opts back in and decodes through a genuinely size-bounded decompressor (#418) — any other negotiated coding (stacked, or one this relay has no bounded decoder for) needs `--max-message-size 0` to be accepted at all |
 
 <a id="modern-era-client"></a>
 

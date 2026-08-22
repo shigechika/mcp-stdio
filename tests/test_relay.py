@@ -37,6 +37,8 @@ from mcp_stdio.relay import (
     _ModernState,
     _ResourceSubscriptions,
     _SseState,
+    _bounded_decompress_bytes,
+    _bounded_decompress_text,
     _build_discover_probe_request,
     _build_listen_params,
     _consume_restart,
@@ -1183,6 +1185,182 @@ class TestBoundedReaders:
                 headers={"Accept-Encoding": bad_q},
             ) as resp:
                 _reject_content_encoding(resp)  # must not raise
+
+
+class TestBoundedDecompression:
+    """#418: a negotiated single gzip/deflate coding is decoded through a
+    genuinely SIZE-BOUNDED path, closing the residual gap #417 review
+    R2F2 documented (a negotiated compressed response counted its
+    decompressed bytes AFTER httpx had already fully decoded them)."""
+
+    def _gzip_response(self, httpx_mock, payload: bytes) -> None:
+        import gzip
+
+        httpx_mock.add_response(
+            stream=IteratorStream([gzip.compress(payload)]),
+            headers={
+                "content-type": "application/octet-stream",
+                "content-encoding": "gzip",
+            },
+        )
+
+    def test_bounded_decompress_bytes_gzip_round_trips(self):
+        import gzip
+
+        payload = b'{"jsonrpc": "2.0", "result": {"ok": true}, "id": 1}' * 20
+        compressed = gzip.compress(payload)
+        assert _bounded_decompress_bytes([compressed], "gzip", 1_000_000) == payload
+
+    def test_bounded_decompress_bytes_deflate_zlib_wrapped_round_trips(self):
+        import zlib
+
+        payload = b"hello world" * 100
+        compressed = zlib.compress(payload)
+        assert _bounded_decompress_bytes([compressed], "deflate", 1_000_000) == payload
+
+    def test_bounded_decompress_bytes_deflate_raw_round_trips(self):
+        """Some servers send RFC 1951 raw deflate despite the header
+        nominally meaning RFC 1950 zlib-wrapped — httpx's own
+        DeflateDecoder falls back to this on the first chunk, and
+        _BoundedDeflateDecoder must match that exactly."""
+        import zlib
+
+        payload = b"hello world" * 100
+        co = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+        compressed = co.compress(payload) + co.flush()
+        assert _bounded_decompress_bytes([compressed], "deflate", 1_000_000) == payload
+
+    def test_bounded_decompress_bytes_trips_cap_on_amplifying_single_chunk(self):
+        """The core #418 fix: a SINGLE compressed chunk (fed as one item —
+        the worst case a real network read could deliver) that would
+        decompress to far more than the cap raises before that much
+        memory is ever held, not just after the fact."""
+        import gzip
+
+        bomb = gzip.compress(b"0" * 5_000_000)  # highly compressible
+        assert len(bomb) < 10_000  # confirms this really is amplifying
+        with pytest.raises(_MessageTooLargeError, match="max-message-size"):
+            _bounded_decompress_bytes([bomb], "gzip", 1_000_000)
+
+    def test_bounded_decompress_text_round_trips_multibyte_across_chunks(self):
+        """Multi-byte UTF-8 characters split across an arbitrary chunk
+        boundary must still decode correctly — the same guarantee
+        httpx.Response.iter_text() gives, now reproduced through the
+        bounded path via httpx's own TextDecoder."""
+        import gzip
+
+        text = 'event: message\ndata: {"greeting": "世界"}\n\n' * 30
+        compressed = gzip.compress(text.encode("utf-8"))
+        pieces = [compressed[i : i + 7] for i in range(0, len(compressed), 7)]
+        assert (
+            "".join(_bounded_decompress_text(pieces, "gzip", 1_000_000, "utf-8"))
+            == text
+        )
+
+    def test_read_bounded_decodes_negotiated_gzip_correctly(self, httpx_mock):
+        payload = {"jsonrpc": "2.0", "result": {"ok": True}, "id": 1}
+
+        self._gzip_response(httpx_mock, json.dumps(payload).encode())
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
+        with client.stream(
+            "POST",
+            "https://example.com/mcp",
+            content="{}",
+            headers={"Accept-Encoding": "gzip"},
+        ) as resp:
+            _read_bounded(resp, client)
+            assert resp.json() == payload
+
+    def test_read_bounded_negotiated_gzip_bomb_is_caught(self, httpx_mock):
+        """End-to-end proof #418 closes #417 review R1F2/R2F2's residual
+        gap: a negotiated gzip response that decompresses past the cap is
+        now caught, not silently allocated in full."""
+        self._gzip_response(httpx_mock, b"0" * 5_000_000)
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
+        setattr(client, _MAX_MESSAGE_SIZE_ATTR, 1_000_000)
+        with (
+            client.stream(
+                "POST",
+                "https://example.com/mcp",
+                content="{}",
+                headers={"Accept-Encoding": "gzip"},
+            ) as resp,
+            pytest.raises(_MessageTooLargeError, match="max-message-size"),
+        ):
+            _read_bounded(resp, client)
+
+    def test_read_bounded_rejects_stacked_negotiated_codings_under_cap(
+        self, httpx_mock
+    ):
+        """#418: stacked codings (RFC 9110 §8.4.1) are negotiation-valid
+        (_reject_content_encoding lets them through, #417 review R4F1) but
+        this module has no bounded decoder for a STACK — _read_bounded
+        must refuse them while the cap is active rather than fall back to
+        an unbounded decode."""
+        httpx_mock.add_response(
+            stream=IteratorStream([b"whatever"]),
+            headers={"content-type": "text/plain", "content-encoding": "gzip, deflate"},
+        )
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
+        setattr(client, _MAX_MESSAGE_SIZE_ATTR, 1_000_000)
+        with (
+            client.stream(
+                "POST",
+                "https://example.com/mcp",
+                content="{}",
+                headers={"Accept-Encoding": "gzip, deflate"},
+            ) as resp,
+            pytest.raises(_MessageTooLargeError, match="max-message-size 0"),
+        ):
+            _read_bounded(resp, client)
+
+    def test_read_bounded_allows_stacked_codings_when_cap_disabled(self, httpx_mock):
+        """--max-message-size 0 is a full opt-out: even a coding this
+        module cannot bound is let through exactly as httpx would decode
+        it natively, unchanged from #417's original behavior."""
+        import gzip
+        import zlib
+
+        payload = b"hello stacked world"
+        # Content-Encoding: gzip, deflate means gzip was APPLIED first,
+        # deflate second (RFC 9110 SS8.4.1: encodings listed in
+        # application order) — httpx's MultiDecoder decodes in REVERSE,
+        # so the outermost (last-applied, first-undone) layer on the wire
+        # is deflate, wrapping an inner gzip layer.
+        stacked = zlib.compress(gzip.compress(payload))
+        httpx_mock.add_response(
+            stream=IteratorStream([stacked]),
+            headers={"content-type": "text/plain", "content-encoding": "gzip, deflate"},
+        )
+        client = httpx.Client(
+            headers=_ACCEPT_ENCODING_IDENTITY
+        )  # no cap set -> 0/unlimited
+        with client.stream(
+            "POST",
+            "https://example.com/mcp",
+            content="{}",
+            headers={"Accept-Encoding": "gzip, deflate"},
+        ) as resp:
+            _read_bounded(resp, client)
+            assert resp.content == payload
+
+    def test_iter_text_bounded_negotiated_gzip_bomb_is_caught(self, httpx_mock):
+        """Same #418 protection on the SSE-consuming path."""
+
+        self._gzip_response(httpx_mock, b"0" * 5_000_000)
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
+        setattr(client, _MAX_MESSAGE_SIZE_ATTR, 1_000_000)
+        with (
+            client.stream(
+                "POST",
+                "https://example.com/mcp",
+                content="{}",
+                headers={"Accept-Encoding": "gzip"},
+            ) as resp,
+            pytest.raises(_MessageTooLargeError, match="max-message-size"),
+        ):
+            for _ in _iter_text_bounded(resp, client):
+                pass
 
 
 class TestSameOrigin:

@@ -15,6 +15,7 @@ import socket
 import sys
 import threading
 import time
+import zlib
 from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime, timezone
 from typing import Any
@@ -2097,8 +2098,11 @@ _MAX_MESSAGE_SIZE_ATTR = "_mcp_stdio_max_message_size"
 # decompression bomb, CWE-409). Every httpx.Client this module builds for
 # real MCP traffic sends this instead, asking a compliant server not to
 # compress at all; _reject_content_encoding() then refuses outright (never
-# decodes) any response that carries Content-Encoding anyway. See #418 for
-# real bounded-decompression support instead of a blanket refusal.
+# decodes) any response that carries Content-Encoding anyway — unless it
+# was itself explicitly negotiated (a per-request override wins over this
+# default, same as any other header), in which case a single gzip/deflate
+# coding is decoded through a genuinely size-bounded decompressor instead
+# of a blanket refusal (#418; see _BOUNDED_DECODABLE_CODINGS).
 _ACCEPT_ENCODING_IDENTITY = {"accept-encoding": "identity"}
 
 
@@ -2178,6 +2182,17 @@ def _content_coding_is_negotiated(coding: str, weights: dict[str, float]) -> boo
     return weights.get("*", 0.0) > 0
 
 
+def _content_encoding_codings(resp: httpx.Response) -> list[str]:
+    """The (possibly STACKED, RFC 9110 §8.4.1) coding tokens named in
+    ``resp``'s ``Content-Encoding`` header, lowercased, with a redundant
+    explicit ``identity`` filtered out (it is a no-op coding). Empty when
+    the header is absent or names only ``identity``.
+    """
+    raw = resp.headers.get("content-encoding", "").strip()
+    codings = [c.strip().lower() for c in raw.split(",") if c.strip() != ""]
+    return [c for c in codings if c != "identity"]
+
+
 def _reject_content_encoding(resp: httpx.Response) -> None:
     """Refuse an UNNEGOTIATED ``Content-Encoding`` (#417 review R1F2/R3F1).
 
@@ -2196,29 +2211,29 @@ def _reject_content_encoding(resp: httpx.Response) -> None:
     checks what was actually SENT (``resp.request.headers``, the
     merged/effective value — httpx always populates ``resp.request``), not
     what the client merely defaults to, and lets a response through ONLY
-    when EVERY coding in its (possibly STACKED, RFC 9110 §8.4.1 — e.g.
-    ``Content-Encoding: gzip, br``) ``Content-Encoding`` is one that
-    request's ``Accept-Encoding`` actually negotiates, honoring ``*`` and
-    ``;q=0`` semantics via ``_content_coding_is_negotiated`` (#417 review
-    R3F1/R4F1 — a request for ``br`` does not license a ``gzip`` reply just
-    because SOMETHING other than ``identity`` was asked for, and a
-    genuinely stacked or wildcard-negotiated response is not penalized for
-    not being one single exact-string match). A genuinely negotiated
-    response is let through (#417 review R2F2) — ``_read_bounded``/
-    ``_iter_text_bounded`` still count its DECOMPRESSED bytes against
-    ``--max-message-size`` same as any other response, but a single
-    amplifying chunk can still exceed the cap before that count catches up
-    (the exact bypass this function otherwise closes, see #418): the user
-    who explicitly requested those codings accepts the residual exposure.
-    Anything else — the default ``identity`` request, or a coding the
-    request never negotiated — is refused outright rather than decoded,
-    regardless of whether a size cap is even configured: this is a
-    content-integrity check, not a size check, so it runs even under
-    ``--max-message-size 0``.
+    when EVERY coding in its ``Content-Encoding`` is one that request's
+    ``Accept-Encoding`` actually negotiates, honoring ``*`` and ``;q=0``
+    semantics via ``_content_coding_is_negotiated`` (#417 review R3F1/R4F1
+    — a request for ``br`` does not license a ``gzip`` reply just because
+    SOMETHING other than ``identity`` was asked for, and a genuinely
+    stacked or wildcard-negotiated response is not penalized for not being
+    one single exact-string match).
+
+    This function ONLY validates negotiation — it does not decide HOW a
+    negotiated response gets decoded. That is ``_read_bounded``'s/
+    ``_iter_text_bounded``'s job (#418): a single negotiated ``gzip`` or
+    ``deflate`` coding is decoded through a genuinely SIZE-BOUNDED path
+    (``_bounded_decompress_bytes``/``_bounded_decompress_text``); anything
+    else negotiated (stacked codings, or a coding this module has no
+    bounded decoder for, e.g. ``br``/``zstd``) is refused UNLESS
+    ``--max-message-size 0`` — the whole point of #418 was closing the
+    residual "negotiated but unbounded" gap #417 review R2F2 left open by
+    design, not leaving it in place for every negotiated coding forever.
+    Anything NOT negotiated at all is refused regardless of the cap: this
+    first check is a content-integrity check, not a size check, so it runs
+    even under ``--max-message-size 0``.
     """
-    raw = resp.headers.get("content-encoding", "").strip()
-    codings = [c.strip().lower() for c in raw.split(",") if c.strip() != ""]
-    codings = [c for c in codings if c != "identity"]
+    codings = _content_encoding_codings(resp)
     if not codings:
         return
     weights = _parse_accept_encoding(
@@ -2227,10 +2242,200 @@ def _reject_content_encoding(resp: httpx.Response) -> None:
     if all(_content_coding_is_negotiated(c, weights) for c in codings):
         return
     raise _MessageTooLargeError(
-        f"response has Content-Encoding: {raw!r}, which this request's "
-        f"Accept-Encoding did not negotiate; refusing to decode (see "
-        "#418); aborting"
+        f"response has Content-Encoding: {resp.headers.get('content-encoding')!r}, "
+        "which this request's Accept-Encoding did not negotiate; refusing "
+        "to decode (see #418); aborting"
     )
+
+
+# Codings #418's bounded decompressors actually support. Deliberately just
+# these two: they are the only codings httpx itself can decode without an
+# optional third-party dependency (httpx._decoders.SUPPORTED_DECODERS is
+# {"identity", "gzip", "deflate"} unless "brotli"/"brotlicffi"/"zstandard"
+# happens to be installed — verified against httpx 0.28.1) — so within
+# mcp-stdio's own dependency footprint (httpx-only, no compression
+# extras), a negotiated coding this set excludes could never have actually
+# been decoded by httpx anyway, bounded or not.
+_BOUNDED_DECODABLE_CODINGS = frozenset({"gzip", "deflate"})
+
+# Cap on a SINGLE decompress() call's output, independent of
+# --max-message-size's cumulative total: bounds how much one compressed
+# chunk can amplify to in a single step (#418), which is exactly the gap
+# httpx's own (unbounded) decoder chunk-at-a-time design leaves open — the
+# cumulative check below only fires AFTER a chunk's full output already
+# exists. 1 MiB matches the reference point python-sdk's own SSE client
+# library defaults to for one event's size.
+_DECOMPRESS_CHUNK_CAP = 1024 * 1024
+
+
+class _BoundedGZipDecoder:
+    """Reimplements ``httpx._decoders.GZipDecoder.decode()`` with a hard
+    cap on OUTPUT bytes per call (via ``zlib``'s ``max_length``), so one
+    compressed chunk cannot decompress to an unbounded amount in a single
+    step (#418). Same ``wbits`` (``zlib.MAX_WBITS | 16``) as httpx's own
+    ``GZipDecoder`` — verified against httpx 0.28.1's source.
+    """
+
+    def __init__(self) -> None:
+        self._z = zlib.decompressobj(zlib.MAX_WBITS | 16)
+
+    def decode(self, data: bytes, max_output: int) -> list[bytes]:
+        pieces: list[bytes] = []
+        try:
+            while True:
+                out = self._z.decompress(data, max_output)
+                if out:
+                    pieces.append(out)
+                if not self._z.unconsumed_tail:
+                    break
+                data = self._z.unconsumed_tail
+        except zlib.error as exc:
+            raise httpx.DecodingError(str(exc)) from exc
+        return pieces
+
+    def flush(self) -> bytes:
+        try:
+            return self._z.flush()
+        except zlib.error as exc:  # pragma: no cover
+            raise httpx.DecodingError(str(exc)) from exc
+
+
+class _BoundedDeflateDecoder:
+    """Reimplements ``httpx._decoders.DeflateDecoder.decode()`` with the
+    same per-call output cap as ``_BoundedGZipDecoder`` (#418), including
+    the raw-vs-zlib-wrapped deflate fallback httpx's own decoder performs
+    on the FIRST chunk only (some servers send RFC 1951 raw deflate
+    despite the header nominally meaning RFC 1950 zlib-wrapped deflate) —
+    verified against httpx 0.28.1's source.
+    """
+
+    def __init__(self) -> None:
+        self._first_attempt = True
+        self._z = zlib.decompressobj()
+
+    def decode(self, data: bytes, max_output: int) -> list[bytes]:
+        was_first_attempt = self._first_attempt
+        self._first_attempt = False
+        try:
+            pieces: list[bytes] = []
+            while True:
+                out = self._z.decompress(data, max_output)
+                if out:
+                    pieces.append(out)
+                if not self._z.unconsumed_tail:
+                    break
+                data = self._z.unconsumed_tail
+            return pieces
+        except zlib.error:
+            if was_first_attempt:
+                self._z = zlib.decompressobj(-zlib.MAX_WBITS)
+                return self.decode(data, max_output)
+            raise
+
+    def flush(self) -> bytes:
+        try:
+            return self._z.flush()
+        except zlib.error as exc:  # pragma: no cover
+            raise httpx.DecodingError(str(exc)) from exc
+
+
+def _make_bounded_decoder(
+    coding: str,
+) -> "_BoundedGZipDecoder | _BoundedDeflateDecoder":
+    """``coding`` must be a member of ``_BOUNDED_DECODABLE_CODINGS`` —
+    enforced by every caller before this is reached, so an unrecognized
+    value here is an internal invariant violation, not a wire-input error.
+    """
+    if coding == "gzip":
+        return _BoundedGZipDecoder()
+    if coding == "deflate":
+        return _BoundedDeflateDecoder()
+    raise AssertionError(
+        f"not a bounded-decodable coding: {coding!r}"
+    )  # pragma: no cover
+
+
+def _bounded_decompress_bytes(
+    raw_chunks: Iterable[bytes], coding: str, max_bytes: int
+) -> bytes:
+    """Decompress ``raw_chunks`` (an iterable of RAW, pre-decode bytes —
+    e.g. ``resp.iter_raw()``) incrementally, bounding both a single
+    ``decode()`` call's output (``_DECOMPRESS_CHUNK_CAP``) and the
+    CUMULATIVE decompressed size (``max_bytes``, i.e.
+    ``--max-message-size``). Raises ``_MessageTooLargeError`` the moment
+    the cumulative bound would be exceeded — the same exception (and the
+    same never-retry handling in ``_post_and_stream``) as every other
+    ``--max-message-size`` trip, since this is equally a deterministic
+    property of the response. Raises ``httpx.DecodingError`` on genuinely
+    corrupt compressed data, the same exception type httpx's own decoder
+    raises for that case, so it rides the existing soft-fail handling
+    every ``except httpx.HTTPError`` in this module already has.
+    """
+    decoder = _make_bounded_decoder(coding)
+    out: list[bytes] = []
+    total = 0
+    for raw in raw_chunks:
+        for piece in decoder.decode(raw, _DECOMPRESS_CHUNK_CAP):
+            total += len(piece)
+            if total > max_bytes:
+                raise _MessageTooLargeError(
+                    f"decompressed response exceeds --max-message-size "
+                    f"({max_bytes} bytes); aborting"
+                )
+            out.append(piece)
+    tail = decoder.flush()
+    if tail:
+        total += len(tail)
+        if total > max_bytes:
+            raise _MessageTooLargeError(
+                f"decompressed response exceeds --max-message-size "
+                f"({max_bytes} bytes); aborting"
+            )
+        out.append(tail)
+    return b"".join(out)
+
+
+def _bounded_decompress_text(
+    raw_chunks: Iterable[bytes], coding: str, max_bytes: int, encoding: str | None
+) -> Iterator[str]:
+    """Same bounding as ``_bounded_decompress_bytes``, but yields TEXT
+    incrementally for the SSE-consuming path. Decodes via httpx's own
+    ``TextDecoder`` (``httpx._decoders`` — a private import, the same
+    reliance on httpx internals ``_read_bounded`` already has on
+    ``Response._content``, see that function's docstring) so multi-byte
+    characters split across a chunk boundary are handled identically to
+    ``httpx.Response.iter_text()``.
+    """
+    from httpx._decoders import TextDecoder
+
+    decoder = _make_bounded_decoder(coding)
+    text_decoder = TextDecoder(encoding=encoding or "utf-8")
+    total = 0
+    for raw in raw_chunks:
+        for piece in decoder.decode(raw, _DECOMPRESS_CHUNK_CAP):
+            total += len(piece)
+            if total > max_bytes:
+                raise _MessageTooLargeError(
+                    f"decompressed response exceeds --max-message-size "
+                    f"({max_bytes} bytes); aborting"
+                )
+            text = text_decoder.decode(piece)
+            if text:
+                yield text
+    tail = decoder.flush()
+    if tail:
+        total += len(tail)
+        if total > max_bytes:
+            raise _MessageTooLargeError(
+                f"decompressed response exceeds --max-message-size "
+                f"({max_bytes} bytes); aborting"
+            )
+        text = text_decoder.decode(tail)
+        if text:
+            yield text
+    text = text_decoder.flush()
+    if text:
+        yield text
 
 
 def _read_bounded(resp: httpx.Response, client: httpx.Client) -> None:
@@ -2238,21 +2443,40 @@ def _read_bounded(resp: httpx.Response, client: httpx.Client) -> None:
 
     Raises ``_MessageTooLargeError`` the moment the accumulated body would
     exceed the cap, instead of buffering the whole body first regardless of
-    size (#416) — and rejects an UNEXPECTEDLY compressed response before
-    reading any of it (see ``_reject_content_encoding``, #417 review
-    R1F2/R2F2). On success this populates ``resp``'s private ``_content``
+    size (#416) — and rejects an UNNEGOTIATED compressed response before
+    reading any of it (``_reject_content_encoding``, #417 review R1F2/R2F2).
+    A negotiated SINGLE ``gzip``/``deflate`` coding is decoded through the
+    genuinely size-bounded ``_bounded_decompress_bytes`` (#418); a
+    negotiated coding this module cannot bound (stacked codings, or one
+    outside ``_BOUNDED_DECODABLE_CODINGS``) is refused unless the cap is
+    disabled. On success this populates ``resp``'s private ``_content``
     exactly as ``httpx.Response.read()`` does internally (``self._content =
     b"".join(self.iter_bytes())``, per httpx's own implementation), so
     ``resp.text``/``resp.json()`` keep working for every existing caller
     exactly as before. A cap of ``0`` (unlimited, the default when unset)
-    still runs the Content-Encoding check, then delegates to the unmodified
-    ``resp.read()``.
+    still runs the Content-Encoding negotiation check, then delegates to
+    the unmodified ``resp.read()`` for everything else (no bounding, no
+    coding restriction — the user fully opted out).
     """
     _reject_content_encoding(resp)
     max_bytes = _client_max_message_size(client)
     if max_bytes <= 0:
         resp.read()
         return
+    codings = _content_encoding_codings(resp)
+    if codings:
+        if len(codings) == 1 and codings[0] in _BOUNDED_DECODABLE_CODINGS:
+            resp._content = _bounded_decompress_bytes(
+                resp.iter_raw(), codings[0], max_bytes
+            )
+            return
+        raise _MessageTooLargeError(
+            f"response has Content-Encoding: "
+            f"{resp.headers.get('content-encoding')!r}, which cannot be "
+            "safely size-bounded under --max-message-size (only a single "
+            "negotiated gzip or deflate coding can be); use "
+            "--max-message-size 0 to accept it anyway (#418); aborting"
+        )
     chunks: list[bytes] = []
     total = 0
     for chunk in resp.iter_bytes():
@@ -2275,17 +2499,34 @@ def _iter_text_bounded(resp: httpx.Response, client: httpx.Client) -> Iterator[s
     ``_read_bounded`` this never touches ``resp._content``: every SSE
     caller in this module consumes the stream incrementally, line by line,
     and never reads ``.text``/``.content`` on the same response afterward.
-    Rejects an UNEXPECTEDLY compressed response before reading any of it
-    (see ``_reject_content_encoding``, #417 review R1F2/R2F2) — an SSE
-    stream is long-lived, so the decompression-bomb risk this closes is not
-    a one-shot
-    allocation but an unbounded one across the whole connection.
+    Rejects an UNNEGOTIATED compressed response before reading any of it
+    (``_reject_content_encoding``, #417 review R1F2/R2F2) — an SSE stream
+    is long-lived, so the decompression-bomb risk this closes is not a
+    one-shot allocation but an unbounded one across the whole connection.
+    A negotiated SINGLE ``gzip``/``deflate`` coding streams through the
+    genuinely size-bounded ``_bounded_decompress_text`` (#418); anything
+    else negotiated this module cannot bound is refused unless the cap is
+    disabled, same posture as ``_read_bounded``.
     """
     _reject_content_encoding(resp)
     max_bytes = _client_max_message_size(client)
     if max_bytes <= 0:
         yield from resp.iter_text()
         return
+    codings = _content_encoding_codings(resp)
+    if codings:
+        if len(codings) == 1 and codings[0] in _BOUNDED_DECODABLE_CODINGS:
+            yield from _bounded_decompress_text(
+                resp.iter_raw(), codings[0], max_bytes, resp.encoding
+            )
+            return
+        raise _MessageTooLargeError(
+            f"response has Content-Encoding: "
+            f"{resp.headers.get('content-encoding')!r}, which cannot be "
+            "safely size-bounded under --max-message-size (only a single "
+            "negotiated gzip or deflate coding can be); use "
+            "--max-message-size 0 to accept it anyway (#418); aborting"
+        )
     total = 0
     for chunk in resp.iter_text():
         total += len(chunk.encode("utf-8", errors="surrogatepass"))
