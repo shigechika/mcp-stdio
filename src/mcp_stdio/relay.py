@@ -2316,32 +2316,37 @@ class _BoundedDeflateDecoder:
     """Reimplements ``httpx._decoders.DeflateDecoder.decode()`` with the
     same per-call output cap and generator shape as ``_BoundedGZipDecoder``
     (#418, review R1F1 — see that class's docstring), plus the
-    raw-vs-zlib-wrapped deflate fallback httpx's own decoder performs on
-    the FIRST chunk only (some servers send RFC 1951 raw deflate despite
-    the header nominally meaning RFC 1950 zlib-wrapped deflate) —
-    verified against httpx 0.28.1's source.
+    raw-vs-zlib-wrapped deflate fallback httpx's own decoder performs
+    (some servers send RFC 1951 raw deflate despite the header nominally
+    meaning RFC 1950 zlib-wrapped deflate) — verified against httpx
+    0.28.1's source.
 
-    The retry is scoped to ONLY the very first bounded ``decompress()``
-    sub-call of the FIRST ``decode()`` invocation, using the ORIGINAL
-    ``data`` passed to that call (not whatever ``unconsumed_tail`` a later
-    sub-call left behind): a zlib-wrapped-vs-raw mismatch is a header-level
-    ambiguity that always fails on the very first bytes processed, before
-    anything could have been yielded yet — so no already-yielded output can
-    ever be silently duplicated or invalidated by the retry re-decoding
-    the same bytes under the other interpretation. Any failure AFTER that
-    first sub-call — including one that surfaces while draining a later
-    ``unconsumed_tail`` remainder of that same first call — is genuine
-    corruption, not an encoding-mode ambiguity, and is not retried (#418
-    review R1F2: it now correctly raises ``httpx.DecodingError``, not a
-    bare ``zlib.error`` that would escape every ``except httpx.HTTPError``
-    this module relies on elsewhere).
+    httpx's own ``DeflateDecoder`` never has to worry about a FRAGMENTED
+    header: it is handed one whole HTTP chunk per ``decode()`` call and
+    either the zlib 2-byte header (CMF+FLG, RFC 1950 §2.2) it contains is
+    valid or it is not. This class calls ``zlib``'s ``decompress()`` with
+    ``max_length`` instead — bounding OUTPUT per call, never INPUT — so an
+    upstream network chunk boundary landing INSIDE those 2 header bytes is
+    possible (a 1-byte-then-rest split, say). Deciding the mode from an
+    incomplete header (#418 review R2F1) can silently commit to the wrong
+    one and then reject a perfectly valid raw-deflate response once the
+    rest of the header arrives. So no zlib call is made at all — and no
+    mode decision taken — until at least ``_HEADER_BYTES`` (2) bytes have
+    been accumulated across ``decode()`` calls; only then does the SAME
+    try-zlib-wrapped-then-fall-back-to-raw attempt httpx performs run,
+    exactly once, on that first now-header-complete buffer. From that
+    point on this decoder is in one fixed, confirmed mode for the rest of
+    the stream — no further retries, no further buffering.
     """
 
+    _HEADER_BYTES = 2  # RFC 1950 SS2.2: CMF (1 byte) + FLG (1 byte)
+
     def __init__(self) -> None:
-        self._first_call = True
-        self._z = zlib.decompressobj()
+        self._z: zlib._Decompress | None = None  # set once the mode is decided
+        self._pending = b""  # bytes accumulated while still undecided
 
     def _step(self, data: bytes, max_output: int) -> bytes:
+        assert self._z is not None
         try:
             return self._z.decompress(data, max_output)
         except zlib.error as exc:
@@ -2353,26 +2358,44 @@ class _BoundedDeflateDecoder:
             if out:
                 yield out
 
-    def decode(self, data: bytes, max_output: int) -> Iterator[bytes]:
-        if self._first_call:
-            self._first_call = False
-            try:
-                first = self._step(data, max_output)
-            except httpx.DecodingError:
-                self._z = zlib.decompressobj(-zlib.MAX_WBITS)
-                first = self._step(
-                    data, max_output
-                )  # not first_call anymore -> a second failure here propagates
-            if first:
-                yield first
-            yield from self._drain_tail(max_output)
-            return
-        first = self._step(data, max_output)
-        if first:
-            yield first
+    def _decide_and_start(
+        self, header_complete_data: bytes, max_output: int
+    ) -> Iterator[bytes]:
+        self._z = zlib.decompressobj()
+        try:
+            out = self._step(header_complete_data, max_output)
+        except httpx.DecodingError:
+            self._z = zlib.decompressobj(-zlib.MAX_WBITS)
+            out = self._step(header_complete_data, max_output)  # a second
+            # failure now propagates as httpx.DecodingError — the mode is
+            # confirmed either way, no more retries after this point.
+        if out:
+            yield out
         yield from self._drain_tail(max_output)
 
+    def decode(self, data: bytes, max_output: int) -> Iterator[bytes]:
+        if self._z is not None:
+            out = self._step(data, max_output)
+            if out:
+                yield out
+            yield from self._drain_tail(max_output)
+            return
+        self._pending += data
+        if len(self._pending) < self._HEADER_BYTES:
+            return  # still can't even validate the header; wait for more
+        header_complete_data, self._pending = self._pending, b""
+        yield from self._decide_and_start(header_complete_data, max_output)
+
     def flush(self) -> bytes:
+        if self._z is None:
+            # Fewer than _HEADER_BYTES ever arrived in total: the stream
+            # ended before the mode could even be decided, i.e. the body
+            # was truncated before a complete zlib/raw-deflate header —
+            # genuinely malformed, not a "nothing to flush" no-op.
+            raise httpx.DecodingError(
+                "truncated deflate response: fewer than "
+                f"{self._HEADER_BYTES} bytes received"
+            )
         try:
             return self._z.flush()
         except zlib.error as exc:  # pragma: no cover

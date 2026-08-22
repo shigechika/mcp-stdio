@@ -1187,6 +1187,15 @@ class TestBoundedReaders:
                 _reject_content_encoding(resp)  # must not raise
 
 
+def _raw_deflate(payload: bytes) -> bytes:
+    """RFC 1951 raw deflate (no zlib wrapper) of ``payload``, for tests
+    exercising _BoundedDeflateDecoder's raw-vs-wrapped fallback."""
+    import zlib
+
+    co = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+    return co.compress(payload) + co.flush()
+
+
 class TestBoundedDecompression:
     """#418: a negotiated single gzip/deflate coding is decoded through a
     genuinely SIZE-BOUNDED path, closing the residual gap #417 review
@@ -1229,6 +1238,37 @@ class TestBoundedDecompression:
         co = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
         compressed = co.compress(payload) + co.flush()
         assert _bounded_decompress_bytes([compressed], "deflate", 1_000_000) == payload
+
+    def test_bounded_decompress_bytes_deflate_raw_fragmented_header_round_trips(self):
+        """#418 review R2F1: a valid raw-deflate response whose first RAW
+        chunk is fewer than the 2-byte zlib header (CMF+FLG) must still
+        decode correctly once the rest arrives — deciding the
+        wrapped-vs-raw mode from an incomplete header must not happen."""
+        import zlib
+
+        payload = b"hello raw deflate world" * 50
+        co = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+        compressed = co.compress(payload) + co.flush()
+        pieces = [compressed[:1], compressed[1:]]
+        assert _bounded_decompress_bytes(pieces, "deflate", 1_000_000) == payload
+
+    def test_bounded_decompress_bytes_deflate_byte_by_byte_round_trips(self):
+        """Extreme case of the same fragmentation: one byte per raw chunk
+        for the whole stream, both zlib-wrapped and raw."""
+        import zlib
+
+        payload = b"byte at a time" * 30
+        for compressed in (zlib.compress(payload), _raw_deflate(payload)):
+            pieces = [compressed[i : i + 1] for i in range(len(compressed))]
+            assert _bounded_decompress_bytes(pieces, "deflate", 1_000_000) == payload
+
+    def test_bounded_decompress_bytes_deflate_truncated_before_header_raises(self):
+        """#418 review R2F1: a response that ends before even 2 bytes
+        arrived (too short to ever validate a header) must raise
+        httpx.DecodingError from flush(), not crash with AttributeError on
+        a decoder that was never actually created."""
+        with pytest.raises(httpx.DecodingError, match="truncated"):
+            _bounded_decompress_bytes([b"\x78"], "deflate", 1_000_000)
 
     def test_bounded_decompress_bytes_trips_cap_on_amplifying_single_chunk(self):
         """The core #418 fix: a SINGLE compressed chunk (fed as one item —
