@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.43.0](https://github.com/shigechika/mcp-stdio/compare/v0.42.2...v0.43.0) (2026-08-22)
+
+
+### Features
+
+* add --max-message-size to bound relay/serve response reads ([#417](https://github.com/shigechika/mcp-stdio/issues/417)) ([49272b0](https://github.com/shigechika/mcp-stdio/commit/49272b01ce2820f6363c2c01809a2fff765d1a9d))
+* add bounded gzip/deflate decompression for --max-message-size ([#421](https://github.com/shigechika/mcp-stdio/issues/421)) ([d0a33ad](https://github.com/shigechika/mcp-stdio/commit/d0a33ad6657a2b205d81dedf0069463a051b3d9a))
+* extend --max-message-size to cover OAuth HTTP traffic ([#422](https://github.com/shigechika/mcp-stdio/issues/422)) ([d9f2ce0](https://github.com/shigechika/mcp-stdio/commit/d9f2ce0a8195c456e45eb61d32f26ff74aa032e0))
+
 ## [0.42.2](https://github.com/shigechika/mcp-stdio/compare/v0.42.1...v0.42.2) (2026-08-13)
 
 
