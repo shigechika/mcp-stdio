@@ -1242,6 +1242,42 @@ class TestBoundedDecompression:
         with pytest.raises(_MessageTooLargeError, match="max-message-size"):
             _bounded_decompress_bytes([bomb], "gzip", 1_000_000)
 
+    def test_bounded_decompress_bytes_peak_memory_stays_bounded(self):
+        """#418 review R1F1: the FIRST implementation of the bounded
+        decoders returned a fully-materialized list from one decode()
+        call, so the cumulative cap check only ran AFTER a whole
+        (possibly gigabytes-large) chunk was already resident in memory —
+        silently defeating the per-call bound. Reproduces the review's
+        exact repro (200 MB decompressed, 1 MB cap, fed as one chunk) and
+        asserts PEAK TRACED MEMORY stays in the single-digit MB range,
+        not hundreds of MB — a regression here would still raise
+        _MessageTooLargeError (the exception-only test above would not
+        catch it), only much later and after the damage is done."""
+        import gzip
+        import tracemalloc
+
+        bomb = gzip.compress(b"0" * 200_000_000)
+        tracemalloc.start()
+        try:
+            with pytest.raises(_MessageTooLargeError, match="max-message-size"):
+                _bounded_decompress_bytes([bomb], "gzip", 1_000_000)
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert peak < 20_000_000, f"peak traced memory was {peak} bytes"
+
+    def test_bounded_decompress_bytes_corrupt_deflate_raises_decoding_error(self):
+        """#418 review R1F2: corrupt data that fails BOTH the zlib-wrapped
+        attempt and the raw-deflate fallback must surface as
+        httpx.DecodingError (the same type httpx's own decoder raises for
+        this case, and what every existing `except httpx.HTTPError` in
+        this module already expects) — not a bare zlib.error, which would
+        escape that handling entirely."""
+        with pytest.raises(httpx.DecodingError):
+            _bounded_decompress_bytes(
+                [b"\x06\x00not deflate at all"], "deflate", 1_000_000
+            )
+
     def test_bounded_decompress_text_round_trips_multibyte_across_chunks(self):
         """Multi-byte UTF-8 characters split across an arbitrary chunk
         boundary must still decode correctly — the same guarantee

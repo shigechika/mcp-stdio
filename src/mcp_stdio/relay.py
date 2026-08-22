@@ -2274,24 +2274,36 @@ class _BoundedGZipDecoder:
     compressed chunk cannot decompress to an unbounded amount in a single
     step (#418). Same ``wbits`` (``zlib.MAX_WBITS | 16``) as httpx's own
     ``GZipDecoder`` — verified against httpx 0.28.1's source.
+
+    ``decode()`` is a GENERATOR that yields one ``<= max_output``-byte
+    piece per ``zlib`` call — not a function that decompresses ``data`` to
+    completion and returns the accumulated list (#418 review R1F1: that
+    shape lets the caller's cumulative ``--max-message-size`` check run
+    only AFTER the entire chunk — which can be a decompression bomb
+    amplifying to gigabytes — is already fully resident in memory,
+    silently defeating the per-call bound this class exists to provide).
+    Because the caller (``_bounded_decompress_bytes``/
+    ``_bounded_decompress_text``) checks the cumulative total between
+    every ``yield`` and raises before asking for the next one, peak memory
+    for one raw chunk is bounded by ``max_output`` beyond whatever the
+    cumulative check had already accepted — not by how large that one raw
+    chunk could amplify to.
     """
 
     def __init__(self) -> None:
         self._z = zlib.decompressobj(zlib.MAX_WBITS | 16)
 
-    def decode(self, data: bytes, max_output: int) -> list[bytes]:
-        pieces: list[bytes] = []
-        try:
-            while True:
+    def decode(self, data: bytes, max_output: int) -> Iterator[bytes]:
+        while True:
+            try:
                 out = self._z.decompress(data, max_output)
-                if out:
-                    pieces.append(out)
-                if not self._z.unconsumed_tail:
-                    break
-                data = self._z.unconsumed_tail
-        except zlib.error as exc:
-            raise httpx.DecodingError(str(exc)) from exc
-        return pieces
+            except zlib.error as exc:
+                raise httpx.DecodingError(str(exc)) from exc
+            if out:
+                yield out
+            if not self._z.unconsumed_tail:
+                break
+            data = self._z.unconsumed_tail
 
     def flush(self) -> bytes:
         try:
@@ -2302,35 +2314,63 @@ class _BoundedGZipDecoder:
 
 class _BoundedDeflateDecoder:
     """Reimplements ``httpx._decoders.DeflateDecoder.decode()`` with the
-    same per-call output cap as ``_BoundedGZipDecoder`` (#418), including
-    the raw-vs-zlib-wrapped deflate fallback httpx's own decoder performs
-    on the FIRST chunk only (some servers send RFC 1951 raw deflate
-    despite the header nominally meaning RFC 1950 zlib-wrapped deflate) —
+    same per-call output cap and generator shape as ``_BoundedGZipDecoder``
+    (#418, review R1F1 — see that class's docstring), plus the
+    raw-vs-zlib-wrapped deflate fallback httpx's own decoder performs on
+    the FIRST chunk only (some servers send RFC 1951 raw deflate despite
+    the header nominally meaning RFC 1950 zlib-wrapped deflate) —
     verified against httpx 0.28.1's source.
+
+    The retry is scoped to ONLY the very first bounded ``decompress()``
+    sub-call of the FIRST ``decode()`` invocation, using the ORIGINAL
+    ``data`` passed to that call (not whatever ``unconsumed_tail`` a later
+    sub-call left behind): a zlib-wrapped-vs-raw mismatch is a header-level
+    ambiguity that always fails on the very first bytes processed, before
+    anything could have been yielded yet — so no already-yielded output can
+    ever be silently duplicated or invalidated by the retry re-decoding
+    the same bytes under the other interpretation. Any failure AFTER that
+    first sub-call — including one that surfaces while draining a later
+    ``unconsumed_tail`` remainder of that same first call — is genuine
+    corruption, not an encoding-mode ambiguity, and is not retried (#418
+    review R1F2: it now correctly raises ``httpx.DecodingError``, not a
+    bare ``zlib.error`` that would escape every ``except httpx.HTTPError``
+    this module relies on elsewhere).
     """
 
     def __init__(self) -> None:
-        self._first_attempt = True
+        self._first_call = True
         self._z = zlib.decompressobj()
 
-    def decode(self, data: bytes, max_output: int) -> list[bytes]:
-        was_first_attempt = self._first_attempt
-        self._first_attempt = False
+    def _step(self, data: bytes, max_output: int) -> bytes:
         try:
-            pieces: list[bytes] = []
-            while True:
-                out = self._z.decompress(data, max_output)
-                if out:
-                    pieces.append(out)
-                if not self._z.unconsumed_tail:
-                    break
-                data = self._z.unconsumed_tail
-            return pieces
-        except zlib.error:
-            if was_first_attempt:
+            return self._z.decompress(data, max_output)
+        except zlib.error as exc:
+            raise httpx.DecodingError(str(exc)) from exc
+
+    def _drain_tail(self, max_output: int) -> Iterator[bytes]:
+        while self._z.unconsumed_tail:
+            out = self._step(self._z.unconsumed_tail, max_output)
+            if out:
+                yield out
+
+    def decode(self, data: bytes, max_output: int) -> Iterator[bytes]:
+        if self._first_call:
+            self._first_call = False
+            try:
+                first = self._step(data, max_output)
+            except httpx.DecodingError:
                 self._z = zlib.decompressobj(-zlib.MAX_WBITS)
-                return self.decode(data, max_output)
-            raise
+                first = self._step(
+                    data, max_output
+                )  # not first_call anymore -> a second failure here propagates
+            if first:
+                yield first
+            yield from self._drain_tail(max_output)
+            return
+        first = self._step(data, max_output)
+        if first:
+            yield first
+        yield from self._drain_tail(max_output)
 
     def flush(self) -> bytes:
         try:
