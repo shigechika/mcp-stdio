@@ -1161,6 +1161,26 @@ class TestBoundedReaders:
         ):
             _read_bounded(resp, client)
 
+    def test_read_bounded_out_of_range_q_falls_back_to_accepting(self, httpx_mock):
+        """#417 review R5F1: a qvalue outside RFC 9110 §12.4.2's [0, 1]
+        range (or NaN, which float() parses without raising and which every
+        comparison is False for) is exactly as malformed as unparseable
+        text — both get the documented accepting (1) fallback, not a
+        silent exclusion via a failed '> 0' comparison."""
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
+        for bad_q in ("gzip;q=-1", "gzip;q=nan", "gzip;q=2"):
+            httpx_mock.add_response(
+                stream=IteratorStream([b"whatever"]),
+                headers={"content-type": "text/plain", "content-encoding": "gzip"},
+            )
+            with client.stream(
+                "POST",
+                "https://example.com/mcp",
+                content="{}",
+                headers={"Accept-Encoding": bad_q},
+            ) as resp:
+                _reject_content_encoding(resp)  # must not raise
+
 
 class TestSameOrigin:
     """RFC 6454 origin comparison used by the SSE cross-origin endpoint guard."""

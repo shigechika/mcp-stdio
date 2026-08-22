@@ -2149,9 +2149,17 @@ def _parse_accept_encoding(accept_encoding: str) -> dict[str, float]:
             key, _, value = param.strip().partition("=")
             if key.strip().lower() == "q":
                 try:
-                    weight = float(value.strip())
+                    parsed = float(value.strip())
                 except ValueError:
-                    weight = 1.0
+                    parsed = 1.0
+                # RFC 9110 §12.4.2: qvalue is in [0, 1] — a value outside
+                # that range (negative, or NaN, which float() parses
+                # without raising and which every comparison against it
+                # is False for) is exactly as malformed as text float()
+                # rejects outright, so it gets the same accepting
+                # fallback (#417 review R5F1) rather than silently
+                # excluding the token via a failed "> 0" comparison.
+                weight = parsed if 0.0 <= parsed <= 1.0 else 1.0
         weights[token] = weight
     return weights
 
