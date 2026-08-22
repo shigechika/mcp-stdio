@@ -2321,18 +2321,20 @@ class _BoundedDeflateDecoder:
     meaning RFC 1950 zlib-wrapped deflate) — verified against httpx
     0.28.1's source.
 
-    httpx's own ``DeflateDecoder`` never has to worry about a FRAGMENTED
-    header: it is handed one whole HTTP chunk per ``decode()`` call and
-    either the zlib 2-byte header (CMF+FLG, RFC 1950 §2.2) it contains is
-    valid or it is not. This class calls ``zlib``'s ``decompress()`` with
-    ``max_length`` instead — bounding OUTPUT per call, never INPUT — so an
-    upstream network chunk boundary landing INSIDE those 2 header bytes is
-    possible (a 1-byte-then-rest split, say). Deciding the mode from an
-    incomplete header (#418 review R2F1) can silently commit to the wrong
-    one and then reject a perfectly valid raw-deflate response once the
-    rest of the header arrives. So no zlib call is made at all — and no
-    mode decision taken — until at least ``_HEADER_BYTES`` (2) bytes have
-    been accumulated across ``decode()`` calls; only then does the SAME
+    ``decode()`` here is fed the exact same raw, wire-fragmented chunks
+    (``resp.iter_raw()``) that httpx's OWN unbounded ``DeflateDecoder``
+    is — an HTTP chunk or HTTP/2 DATA frame is free to split the zlib
+    2-byte header (CMF+FLG, RFC 1950 §2.2) across two deliveries (a
+    1-byte-then-rest split, say), and ``max_length`` bounds ``zlib``'s
+    OUTPUT per call, never how much of the caller-supplied INPUT chunk
+    boundary landed where. Deciding the wrapped-vs-raw mode from an
+    incomplete header (#418 review R2F1/R3F1) can silently commit to the
+    wrong one and then reject a perfectly valid raw-deflate response once
+    the rest of the header arrives — whether or not httpx's own decoder
+    happens to share this exposure is not this class's concern; it must
+    not have it regardless. So no zlib call is made at all — and no mode
+    decision taken — until at least ``_HEADER_BYTES`` (2) bytes have been
+    accumulated across ``decode()`` calls; only then does the SAME
     try-zlib-wrapped-then-fall-back-to-raw attempt httpx performs run,
     exactly once, on that first now-header-complete buffer. From that
     point on this decoder is in one fixed, confirmed mode for the rest of
