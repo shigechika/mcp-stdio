@@ -254,7 +254,11 @@ mcp-stdio [OPTIONS] URL
   --max-message-size BYTES
                          パース前にバッファする上流レスポンス本文（JSON
                          または累積 SSE ストリーム）の上限
-                         （デフォルト: 10 MiB、0 で無効化、#416）
+                         （デフォルト: 10 MiB、0 で無効化、#416）。
+                         Accept-Encoding: identity を送信し、それでも
+                         圧縮されて返ってきたレスポンスは拒否する（#417）
+                         — 圧縮が必須なら -H 'Accept-Encoding: <encoding>'
+                         でオプトイン可能（#418）
   --no-cancel-filter     cancel-aware レスポンスフィルタを無効化する
                          （notifications/cancelled でキャンセルされた id の
                          遅延レスポンスを drop する機能）

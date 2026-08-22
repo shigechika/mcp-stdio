@@ -2130,7 +2130,7 @@ def _client_max_message_size(client: httpx.Client) -> int:
 
 
 def _reject_content_encoding(resp: httpx.Response) -> None:
-    """Refuse a response httpx would transparently DECOMPRESS (#417 review R1F2).
+    """Refuse an UNEXPECTEDLY compressed response (#417 review R1F2).
 
     ``resp.iter_bytes()``/``resp.iter_text()`` decode a ``Content-Encoding``
     body (gzip/deflate/br/zstd) internally, chunk by chunk, BEFORE
@@ -2138,21 +2138,39 @@ def _reject_content_encoding(resp: httpx.Response) -> None:
     count them — so a small compressed chunk that decompresses to far more
     than ``--max-message-size`` (a decompression bomb, CWE-409) would already
     be allocated by the time the cap check fires on it. Every client this
-    module builds sends ``Accept-Encoding: identity`` precisely so a
-    compliant server never compresses in the first place; a response that
-    carries ``Content-Encoding`` anyway is either non-compliant or hostile,
-    and is refused outright rather than decoded, regardless of whether a
-    size cap is even configured — this is a content-integrity check, not a
-    size check, so it runs even under ``--max-message-size 0``. See #418 for
-    real (bounded-decompression) support.
+    module builds DEFAULTS to sending ``Accept-Encoding: identity`` so a
+    compliant server never compresses in the first place.
+
+    That default can be overridden per request — ``-H 'Accept-Encoding:
+    gzip'`` (or any header source ahead of it) wins over the client-level
+    default, same as every other header this relay lets the user set. In
+    that case a compressed reply is EXPECTED, not suspicious: this checks
+    what was actually SENT (``resp.request.headers``, the merged/effective
+    value — httpx always populates ``resp.request``), not what the client
+    merely defaults to, and lets an explicitly negotiated compressed
+    response through (#417 review R2F2) — ``_read_bounded``/
+    ``_iter_text_bounded`` still count its DECOMPRESSED bytes against
+    ``--max-message-size`` same as any other response, but a single
+    amplifying chunk can still exceed the cap before that count catches up
+    (the exact bypass this function otherwise closes, see #418): the user
+    who explicitly requested compression accepts that residual exposure.
+    Only a response that carries ``Content-Encoding`` despite an
+    ``identity`` request —
+    either non-compliant or hostile — is refused outright rather than
+    decoded, regardless of whether a size cap is even configured: this is a
+    content-integrity check, not a size check, so it runs even under
+    ``--max-message-size 0``.
     """
     encoding = resp.headers.get("content-encoding", "").strip().lower()
-    if encoding and encoding != "identity":
-        raise _MessageTooLargeError(
-            f"response has Content-Encoding: {encoding!r}, which this relay "
-            "does not accept (Accept-Encoding: identity is always sent; see "
-            "#418); aborting"
-        )
+    if not encoding or encoding == "identity":
+        return
+    requested = resp.request.headers.get("accept-encoding", "identity").strip().lower()
+    if requested != "identity":
+        return
+    raise _MessageTooLargeError(
+        f"response has Content-Encoding: {encoding!r} despite this request's "
+        "Accept-Encoding: identity; refusing to decode (see #418); aborting"
+    )
 
 
 def _read_bounded(resp: httpx.Response, client: httpx.Client) -> None:
@@ -2160,15 +2178,15 @@ def _read_bounded(resp: httpx.Response, client: httpx.Client) -> None:
 
     Raises ``_MessageTooLargeError`` the moment the accumulated body would
     exceed the cap, instead of buffering the whole body first regardless of
-    size (#416) — and unconditionally rejects a compressed response before
-    reading any of it (see ``_reject_content_encoding``, #417 review R1F2).
-    On success this populates ``resp``'s private ``_content`` exactly as
-    ``httpx.Response.read()`` does internally (``self._content =
+    size (#416) — and rejects an UNEXPECTEDLY compressed response before
+    reading any of it (see ``_reject_content_encoding``, #417 review
+    R1F2/R2F2). On success this populates ``resp``'s private ``_content``
+    exactly as ``httpx.Response.read()`` does internally (``self._content =
     b"".join(self.iter_bytes())``, per httpx's own implementation), so
     ``resp.text``/``resp.json()`` keep working for every existing caller
     exactly as before. A cap of ``0`` (unlimited, the default when unset)
-    still enforces the Content-Encoding rejection, then delegates to the
-    unmodified ``resp.read()``.
+    still runs the Content-Encoding check, then delegates to the unmodified
+    ``resp.read()``.
     """
     _reject_content_encoding(resp)
     max_bytes = _client_max_message_size(client)
@@ -2197,9 +2215,10 @@ def _iter_text_bounded(resp: httpx.Response, client: httpx.Client) -> Iterator[s
     ``_read_bounded`` this never touches ``resp._content``: every SSE
     caller in this module consumes the stream incrementally, line by line,
     and never reads ``.text``/``.content`` on the same response afterward.
-    Unconditionally rejects a compressed response before reading any of it
-    (see ``_reject_content_encoding``, #417 review R1F2) — an SSE stream is
-    long-lived, so the decompression-bomb risk this closes is not a one-shot
+    Rejects an UNEXPECTEDLY compressed response before reading any of it
+    (see ``_reject_content_encoding``, #417 review R1F2/R2F2) — an SSE
+    stream is long-lived, so the decompression-bomb risk this closes is not
+    a one-shot
     allocation but an unbounded one across the whole connection.
     """
     _reject_content_encoding(resp)

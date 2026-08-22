@@ -260,7 +260,10 @@ Options:
   --max-message-size BYTES
                          Cap on a single upstream response body (JSON or
                          cumulative SSE stream) buffered before parsing
-                         (default: 10 MiB; 0 disables the cap; #416)
+                         (default: 10 MiB; 0 disables the cap; #416).
+                         Also sends Accept-Encoding: identity and refuses
+                         a compressed response anyway (#417) — opt back
+                         in with -H 'Accept-Encoding: <encoding>' (#418)
   --no-cancel-filter     Disable the cancel-aware response filter (drops late
                          responses for ids cancelled via notifications/cancelled)
   --no-normalize-arguments

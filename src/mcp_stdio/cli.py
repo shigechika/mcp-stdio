@@ -667,7 +667,13 @@ def _main() -> None:
             f"cumulative SSE stream) buffered before parsing (default: "
             f"{_DEFAULT_MAX_MESSAGE_SIZE}, 10 MiB; 0 disables the cap). "
             "Protects against a malicious or misbehaving MCP server making "
-            "this relay allocate an unbounded amount of memory (#416)."
+            "this relay allocate an unbounded amount of memory (#416). "
+            "This relay also sends Accept-Encoding: identity by default and "
+            "refuses any response that is compressed anyway, since a small "
+            "compressed body can decompress past this cap before it is "
+            "measured (#417); a server that only ever returns a compressed "
+            "response needs -H 'Accept-Encoding: <encoding>' to opt back in "
+            "(bounded-decompression support is tracked in #418)."
         ),
     )
     parser.add_argument(

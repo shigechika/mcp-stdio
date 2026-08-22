@@ -21,6 +21,7 @@ from mcp_stdio.relay import (
     MAX_LIST_PAGES,
     MAX_RETRIES,
     PAGINATED_LIST_METHODS,
+    _ACCEPT_ENCODING_IDENTITY,
     _COLD_START_LIST_CHANGED,
     _LISTEN_FORWARDED_NOTIFICATIONS,
     _LISTEN_ID_PREFIX,
@@ -1005,7 +1006,10 @@ class TestBoundedReaders:
             stream=IteratorStream([b"whatever"]),
             headers={"content-type": "text/plain", "content-encoding": "gzip"},
         )
-        client = httpx.Client()  # no cap set at all (unlimited)
+        # Built the SAME way every real relay client is (Accept-Encoding:
+        # identity by default) — a hostile/non-compliant server compressing
+        # anyway is exactly the scenario _reject_content_encoding closes.
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)  # unlimited cap
         with (
             client.stream("POST", "https://example.com/mcp", content="{}") as resp,
             pytest.raises(_MessageTooLargeError, match="Content-Encoding"),
@@ -1017,7 +1021,7 @@ class TestBoundedReaders:
             stream=IteratorStream([b"whatever"]),
             headers={"content-type": "text/plain", "content-encoding": "br"},
         )
-        client = httpx.Client()
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
         setattr(client, _MAX_MESSAGE_SIZE_ATTR, 10_000)
         with client.stream("POST", "https://example.com/mcp", content="{}") as resp:
             with pytest.raises(_MessageTooLargeError, match="Content-Encoding"):
@@ -1032,8 +1036,33 @@ class TestBoundedReaders:
             json=payload,
             headers={"content-type": "application/json", "content-encoding": "identity"},
         )
-        client = httpx.Client()
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
         with client.stream("POST", "https://example.com/mcp", content="{}") as resp:
+            _read_bounded(resp, client)
+            assert resp.json() == payload
+
+    def test_read_bounded_allows_explicitly_requested_compression(self, httpx_mock):
+        """#417 review R2F2: a per-request ``Accept-Encoding`` override (e.g.
+        ``-H 'Accept-Encoding: gzip'``) means the caller asked for a
+        compressed reply — _reject_content_encoding must let it through and
+        the response must decode normally, not be treated as suspicious."""
+        import gzip
+
+        payload = {"jsonrpc": "2.0", "result": {"ok": True}, "id": 1}
+        compressed = gzip.compress(json.dumps(payload).encode())
+        httpx_mock.add_response(
+            stream=IteratorStream([compressed]),
+            headers={"content-type": "application/json", "content-encoding": "gzip"},
+        )
+        # Client defaults to identity, but THIS request overrides it —
+        # exactly the -H override path.
+        client = httpx.Client(headers=_ACCEPT_ENCODING_IDENTITY)
+        with client.stream(
+            "POST",
+            "https://example.com/mcp",
+            content="{}",
+            headers={"Accept-Encoding": "gzip"},
+        ) as resp:
             _read_bounded(resp, client)
             assert resp.json() == payload
 
