@@ -498,7 +498,7 @@ Notes:
 
 ## Workarounds
 
-See [WORKAROUNDS.md](WORKAROUNDS.md) for known issues in Claude Code, mcp-remote, the MCP SDKs, and Windows that mcp-stdio addresses.
+See [WORKAROUNDS.md](WORKAROUNDS.md) for known issues in Claude Code, Claude Desktop, mcp-remote, the MCP SDKs, and Windows that mcp-stdio addresses.
 
 ## How It Works
 

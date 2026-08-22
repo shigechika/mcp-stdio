@@ -1,6 +1,6 @@
 # トラブルシューティング
 
-よくある問題と解決方法です。Claude Code、mcp-remote、MCP SDK の既知の回避方法の完全なリストは [WORKAROUNDS.md](https://github.com/shigechika/mcp-stdio/blob/main/WORKAROUNDS.md) を参照してください。
+よくある問題と解決方法です。Claude Code、Claude Desktop、mcp-remote、MCP SDK の既知の回避方法の完全なリストは [WORKAROUNDS.md](https://github.com/shigechika/mcp-stdio/blob/main/WORKAROUNDS.md) を参照してください。
 
 ## 接続の問題
 

@@ -233,11 +233,12 @@ mcp-stdio は以下の仕様を実装しています：
 以下の既知の問題については [WORKAROUNDS.md](https://github.com/shigechika/mcp-stdio/blob/main/WORKAROUNDS.md) を参照してください：
 
 - Claude Code の HTTP トランスポート
+- Claude Desktop の stdio 起動挙動（Cowork/Code の sibling probe）
 - mcp-remote（TypeScript MCP クライアント）
 - MCP SDK（TypeScript & Python）
 - Windows stdio 処理
 
-mcp-stdio は可能な限りワイヤーレベルでこれらの問題を回避します。
+mcp-stdio は可能な限りワイヤーレベル、あるいは代替デプロイ手段としての `serve` によってこれらの問題を回避します。
 
 ---
 

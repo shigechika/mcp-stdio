@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Common issues and how to resolve them. For the full list of known workarounds in Claude Code, mcp-remote, and the MCP SDKs, see [WORKAROUNDS.md](https://github.com/shigechika/mcp-stdio/blob/main/WORKAROUNDS.md).
+Common issues and how to resolve them. For the full list of known workarounds in Claude Code, Claude Desktop, mcp-remote, and the MCP SDKs, see [WORKAROUNDS.md](https://github.com/shigechika/mcp-stdio/blob/main/WORKAROUNDS.md).
 
 ## Connection issues
 

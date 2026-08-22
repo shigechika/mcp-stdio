@@ -181,7 +181,11 @@ mcp-stdio serve -- python -m my_mcp_server
 
 新しいクライアント向けには、認証ユーザーごとに 1 つ（認証なしで動かして
 いる場合は共有の 1 つ）あなたのサーバーを起動します。そうしたクライアント
-には、プロセスを紐づけるためのセッションが無いからです。
+には、プロセスを紐づけるためのセッションが無いからです。これは、同時に
+2 つのインスタンスを実行できないバックエンドでも、任意の数の呼び出し元
+と安全に共有できることを意味します。具体例は
+[WORKAROUNDS.md の Claude Desktop の項](https://github.com/shigechika/mcp-stdio/blob/main/WORKAROUNDS.md#claude-desktop)
+を参照してください。
 
 <a id="listchanged-serve"></a>
 
