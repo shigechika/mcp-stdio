@@ -636,12 +636,9 @@ def _fetch_authorization_server_metadata(
         try:
             with client.stream("GET", well_known) as resp:
                 _read_bounded(resp, client)
-        except Exception:
-            continue
-        if resp.status_code != 200:
-            continue
-        try:
-            data = resp.json()
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
         except Exception:
             continue
         meta = _parse_as_metadata_response(data, auth_server_base)
@@ -700,12 +697,9 @@ def discover_oauth_metadata(
         try:
             with client.stream("GET", prm_url) as resp:
                 _read_bounded(resp, client)
-        except Exception:
-            continue
-        if resp.status_code != 200:
-            continue
-        try:
-            prm_data = resp.json()
+                if resp.status_code != 200:
+                    continue
+                prm_data = resp.json()
         except Exception:
             continue
         # The PRM document is fully MCP-server-controlled. A non-object body
