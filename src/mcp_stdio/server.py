@@ -479,6 +479,15 @@ _MODERN_CHILD_HANDSHAKE_VERSION = "2025-06-18"
 _DEFAULT_CACHE_TTL_MS = 60000
 _CACHE_SCOPE = "private"
 
+# --max-message-size (#416, CWE-770): caps the declared Content-Length this
+# gateway will read into memory for one request body, so a client cannot
+# make it allocate an arbitrary amount of memory just by declaring a huge
+# body. Same 10 MiB default as the client-side relay's matching cap
+# (relay.py's _DEFAULT_MAX_MESSAGE_SIZE) — kept as an independent constant
+# rather than a cross-module import so serve's only runtime dependency stays
+# stdlib (importing relay.py would pull in httpx). 0 disables the cap.
+_DEFAULT_MAX_MESSAGE_SIZE = 10 * 1024 * 1024
+
 # The six operations spec rev 2026-07-28 requires caching hints on.
 # `tools/call` is deliberately ABSENT — `CallToolResult` is not a
 # CacheableResult, and the v2 client's model has no ttlMs/cacheScope
@@ -6155,6 +6164,23 @@ class _Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             self._send_json(400, _error_body("invalid Content-Length"))
             return
+        # #416: reject an oversized body by its DECLARED length, before
+        # reading a single byte of it — draining it first (to keep the
+        # connection alive for the next request, the usual rule above)
+        # would defeat the cap by allocating the very memory it exists to
+        # bound. RFC 9110 §15.5.14 "Content Too Large"; the connection is
+        # closed rather than reused since the client's oversized body is
+        # still sitting unread in the socket.
+        if self.max_message_size > 0 and length > self.max_message_size:
+            self.close_connection = True
+            self._send_json(
+                413,
+                _error_body(
+                    f"request body exceeds --max-message-size "
+                    f"({self.max_message_size} bytes)"
+                ),
+            )
+            return
         raw = self.rfile.read(length) if length > 0 else b""
         if self.oauth is not None:
             # AS POST endpoints (DCR + token) bootstrap the token, exempt from
@@ -6473,6 +6499,7 @@ def build_server(
     modern_idle_ttl: float = 0.0,
     modern_only: bool = False,
     user_env_var: str | None = None,
+    max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
 ) -> tuple[ThreadingHTTPServer, SessionRegistry]:
     """Construct the HTTP server and session registry without running the loop.
 
@@ -6491,7 +6518,9 @@ def build_server(
     variable name (see :func:`_user_env_value`) -- both the per-session
     (legacy) and per-principal (modern) pools spawn one child per real
     identity already, so this is purely an env-injection concern, not a
-    pooling-strategy change.
+    pooling-strategy change. ``max_message_size`` (bytes, ``0`` = unlimited,
+    default 10 MiB) rejects a request whose declared ``Content-Length``
+    exceeds it with ``413`` before reading any of the body (#416, CWE-770).
     """
     registry = SessionRegistry(
         command,
@@ -6522,6 +6551,7 @@ def build_server(
             "oauth": oauth,
             "cache_ttl_ms": cache_ttl_ms,
             "modern_only": modern_only,
+            "max_message_size": max_message_size,
         },
     )
     httpd = ThreadingHTTPServer((host, port), handler)
@@ -6550,6 +6580,7 @@ def serve(
     modern_idle_ttl: float = 0.0,
     modern_only: bool = False,
     user_env_var: str | None = None,
+    max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
 ) -> None:
     """Run the reverse gateway until interrupted.
 
@@ -6559,7 +6590,8 @@ def serve(
     ``oauth`` enables the embedded Authorization Server. ``max_sessions`` caps
     concurrent sessions; ``idle_ttl`` (when ``> 0``) evicts idle sessions.
     ``user_env_var`` injects the authenticated principal into each spawned
-    child's environment (see :func:`build_server`).
+    child's environment (see :func:`build_server`). ``max_message_size``
+    bounds a single request body (see :func:`build_server`).
     """
     httpd, registry = build_server(
         command,
@@ -6575,6 +6607,7 @@ def serve(
         modern_idle_ttl=modern_idle_ttl,
         modern_only=modern_only,
         user_env_var=user_env_var,
+        max_message_size=max_message_size,
     )
     registry.start_reaper()
     # Its own thread, gated on its own TTL — the legacy reaper may well
@@ -6833,6 +6866,19 @@ def serve_main(argv: list[str]) -> None:
         ),
     )
     parser.add_argument(
+        "--max-message-size",
+        type=int,
+        default=_DEFAULT_MAX_MESSAGE_SIZE,
+        metavar="BYTES",
+        help=(
+            "Reject a request whose declared Content-Length exceeds this "
+            "many bytes with 413, before reading any of the body "
+            f"(default: {_DEFAULT_MAX_MESSAGE_SIZE}, 10 MiB; 0 disables the "
+            "cap). Bounds how much memory one oversized request body can "
+            "make the gateway allocate (#416)."
+        ),
+    )
+    parser.add_argument(
         "--modern-only",
         action="store_true",
         help=(
@@ -6930,6 +6976,8 @@ def serve_main(argv: list[str]) -> None:
         # The spec's only constraint on the value: "Servers MUST provide a
         # ttlMs value that is >= 0."
         parser.error("--cache-ttl-ms must be >= 0")
+    if args.max_message_size < 0:
+        parser.error("--max-message-size must be >= 0")
     if args.max_sessions < 1:
         parser.error("--max-sessions must be >= 1")
     if args.session_idle_ttl < 0 or not math.isfinite(args.session_idle_ttl):
@@ -7067,4 +7115,5 @@ def serve_main(argv: list[str]) -> None:
         modern_idle_ttl=args.modern_idle_ttl,
         modern_only=args.modern_only,
         user_env_var=args.user_env,
+        max_message_size=args.max_message_size,
     )

@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 import httpx
 
 from . import __version__
-from .relay import check_connection, run, run_sse
+from .relay import _DEFAULT_MAX_MESSAGE_SIZE, check_connection, run, run_sse
 
 if TYPE_CHECKING:
     from .token_store import TokenData
@@ -37,6 +37,17 @@ def _non_negative_float(value: str) -> float:
     if f < 0:
         raise argparse.ArgumentTypeError(f"value must be >= 0 (got {f})")
     return f
+
+
+def _non_negative_int(value: str) -> int:
+    """argparse type for non-negative ints (--max-message-size: 0 = unlimited)."""
+    try:
+        i = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from exc
+    if i < 0:
+        raise argparse.ArgumentTypeError(f"value must be >= 0 (got {i})")
+    return i
 
 
 def _positive_float(value: str) -> float:
@@ -647,6 +658,19 @@ def _main() -> None:
         ),
     )
     parser.add_argument(
+        "--max-message-size",
+        type=_non_negative_int,
+        default=_DEFAULT_MAX_MESSAGE_SIZE,
+        metavar="BYTES",
+        help=(
+            "Cap in bytes on a single upstream response body (JSON or "
+            f"cumulative SSE stream) buffered before parsing (default: "
+            f"{_DEFAULT_MAX_MESSAGE_SIZE}, 10 MiB; 0 disables the cap). "
+            "Protects against a malicious or misbehaving MCP server making "
+            "this relay allocate an unbounded amount of memory (#416)."
+        ),
+    )
+    parser.add_argument(
         "--no-tcp-keepalive",
         action="store_true",
         help=(
@@ -1036,6 +1060,7 @@ def _main() -> None:
             token_expiry_getter=token_expiry_getter,
             proactive_refresh=proactive_refresh,
             refresh_leeway=args.oauth_refresh_leeway,
+            max_message_size=args.max_message_size,
         )
     else:
         run(
@@ -1054,6 +1079,7 @@ def _main() -> None:
             cold_start_login=cold_start_login,
             protocol_era=args.protocol_era,
             listen_read_timeout=args.listen_read_timeout,
+            max_message_size=args.max_message_size,
         )
 
 

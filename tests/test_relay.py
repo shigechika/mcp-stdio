@@ -26,11 +26,13 @@ from mcp_stdio.relay import (
     _LISTEN_ID_PREFIX,
     _LISTEN_MAX_SUBSCRIPTIONS,
     _LISTEN_RES_ID_PREFIX,
+    _MAX_MESSAGE_SIZE_ATTR,
     _RELAY_ID_NAMESPACE,
     _RESOURCE_UPDATED_METHOD,
     _STDIN_READER_THREAD_NAME,
     _CancelTracker,
     _InFlightPost,
+    _MessageTooLargeError,
     _ModernState,
     _ResourceSubscriptions,
     _SseState,
@@ -64,6 +66,7 @@ from mcp_stdio.relay import (
     _iter_queued_stdin,
     _iter_sse_events,
     _iter_sse_lines,
+    _iter_text_bounded,
     _looks_like_initialize,
     _make_httpx_transport,
     _mcp_request_headers,
@@ -75,6 +78,7 @@ from mcp_stdio.relay import (
     _parse_www_authenticate_scope,
     _post_and_stream,
     _probe_protocol_era,
+    _read_bounded,
     _cold_start_loop,
     _cold_start_response,
     _proactive_refresh_loop,
@@ -854,6 +858,136 @@ class TestPostAndStream:
                 has_id=False,
             )
         assert stdout.getvalue() == ""
+
+    def test_oversized_json_response_synthesizes_error_no_retry(self, httpx_mock):
+        """--max-message-size trips on the JSON (non-SSE) response path: the
+        request is answered with exactly one synthesized error and the POST
+        is never retried — an oversized response is a deterministic property
+        of the response and will trip the cap again, identically, on every
+        retry (#416)."""
+        httpx_mock.add_response(
+            text=json.dumps({"jsonrpc": "2.0", "result": {"big": "x" * 100}, "id": 5}),
+            headers={"content-type": "application/json"},
+        )
+        client = httpx.Client()
+        setattr(client, _MAX_MESSAGE_SIZE_ATTR, 10)
+        stdout = StringIO()
+        with (
+            patch("sys.stdout", stdout),
+            patch("mcp_stdio.relay.time.sleep") as sleep_mock,
+        ):
+            result = _post_and_stream(
+                client, "https://example.com/mcp", '{"id":5}', {}, 5
+            )
+        assert len(httpx_mock.get_requests()) == 1  # never retried
+        sleep_mock.assert_not_called()
+        assert result is None
+        err = json.loads(stdout.getvalue().strip())
+        assert err["id"] == 5
+        assert err["error"]["code"] == -32000
+        assert "max-message-size" in err["error"]["message"]
+
+    def test_oversized_sse_response_synthesizes_error_no_retry(self, httpx_mock):
+        """Same cap, on the SSE streaming path — bounds CUMULATIVE bytes
+        across the stream (there is no single Content-Length on a live SSE
+        body to check upfront)."""
+
+        def gen():
+            yield f"event: message\ndata: {'x' * 100}\n\n".encode()
+
+        httpx_mock.add_response(
+            stream=IteratorStream(gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+        client = httpx.Client()
+        setattr(client, _MAX_MESSAGE_SIZE_ATTR, 10)
+        stdout = StringIO()
+        with (
+            patch("sys.stdout", stdout),
+            patch("mcp_stdio.relay.time.sleep") as sleep_mock,
+        ):
+            result = _post_and_stream(
+                client, "https://example.com/mcp", '{"id":6}', {}, 6
+            )
+        assert len(httpx_mock.get_requests()) == 1
+        sleep_mock.assert_not_called()
+        assert result is None
+        err = json.loads(stdout.getvalue().strip())
+        assert err["id"] == 6
+        assert err["error"]["code"] == -32000
+        assert "max-message-size" in err["error"]["message"]
+
+    def test_default_client_has_no_cap(self, httpx_mock):
+        """A plain httpx.Client() (no _MAX_MESSAGE_SIZE_ATTR set — e.g. the
+        one-shot --check clients) reads an oversized-by-test-standards body
+        without tripping anything: unset means unlimited, same as 0."""
+        httpx_mock.add_response(
+            text=json.dumps({"jsonrpc": "2.0", "result": {"big": "x" * 1000}, "id": 7}),
+            headers={"content-type": "application/json"},
+        )
+        client = httpx.Client()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            result = _post_and_stream(
+                client, "https://example.com/mcp", '{"id":7}', {}, 7
+            )
+        assert result is not None and result.status_code == 200
+        assert json.loads(stdout.getvalue().strip())["result"]["big"] == "x" * 1000
+
+
+class TestBoundedReaders:
+    """Unit coverage for _read_bounded/_iter_text_bounded (#416) below the
+    level of a full _post_and_stream dispatch — specifically the WITHIN-cap
+    success path, which the rest of the suite never exercises directly
+    (every pre-existing test either sets no cap at all, or a test above
+    exercises the OVER-cap path via _post_and_stream)."""
+
+    def test_read_bounded_within_cap_preserves_text_and_json(self, httpx_mock):
+        payload = {"jsonrpc": "2.0", "result": {"ok": True}, "id": 1}
+        httpx_mock.add_response(
+            json=payload, headers={"content-type": "application/json"}
+        )
+        client = httpx.Client()
+        with client.stream("POST", "https://example.com/mcp", content="{}") as resp:
+            _read_bounded(resp, client)  # unset cap -> delegates to resp.read()
+            assert resp.json() == payload
+        client2 = httpx.Client()
+        setattr(client2, _MAX_MESSAGE_SIZE_ATTR, 10_000)  # well within cap
+        httpx_mock.add_response(
+            json=payload, headers={"content-type": "application/json"}
+        )
+        with client2.stream("POST", "https://example.com/mcp", content="{}") as resp:
+            _read_bounded(resp, client2)
+            # .text/.json() must keep working exactly as after a plain
+            # resp.read() — this is the manual iter_bytes()+_content path,
+            # not the delegated one.
+            assert resp.json() == payload
+            assert json.loads(resp.text) == payload
+
+    def test_read_bounded_raises_when_exceeded(self, httpx_mock):
+        httpx_mock.add_response(text="x" * 100, headers={"content-type": "text/plain"})
+        client = httpx.Client()
+        setattr(client, _MAX_MESSAGE_SIZE_ATTR, 10)
+        with (
+            client.stream("POST", "https://example.com/mcp", content="{}") as resp,
+            pytest.raises(_MessageTooLargeError, match="max-message-size"),
+        ):
+            _read_bounded(resp, client)
+
+    def test_iter_text_bounded_raises_when_exceeded(self, httpx_mock):
+        httpx_mock.add_response(text="x" * 100, headers={"content-type": "text/plain"})
+        client = httpx.Client()
+        setattr(client, _MAX_MESSAGE_SIZE_ATTR, 10)
+        with client.stream("POST", "https://example.com/mcp", content="{}") as resp:
+            with pytest.raises(_MessageTooLargeError, match="max-message-size"):
+                for _ in _iter_text_bounded(resp, client):
+                    pass
+
+    def test_iter_text_bounded_unlimited_matches_plain_iter_text(self, httpx_mock):
+        httpx_mock.add_response(text="hello", headers={"content-type": "text/plain"})
+        client = httpx.Client()
+        with client.stream("POST", "https://example.com/mcp", content="{}") as resp:
+            assert "".join(_iter_text_bounded(resp, client)) == "hello"
 
 
 class TestSameOrigin:

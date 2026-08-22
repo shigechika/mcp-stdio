@@ -3345,3 +3345,53 @@ def test_token_response_is_identity_encoded(oauth_gateway):
     assert tok.status_code == 200, tok.text
     assert "content-encoding" not in tok.headers
     assert tok.headers["content-type"] == "application/json"
+
+
+# --- --max-message-size (#416) ---
+
+
+class TestMaxMessageSize:
+    """A declared Content-Length over the cap is rejected with 413 before
+    any of the body is read — the whole point is to never allocate the
+    memory the cap exists to bound (CWE-770)."""
+
+    @pytest.fixture()
+    def capped(self):
+        httpd, registry = server.build_server(
+            _BACKEND, host="127.0.0.1", port=0, max_message_size=10
+        )
+        host, port = httpd.server_address[0], httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield f"http://{host}:{port}/mcp"
+        finally:
+            httpd.shutdown()
+            registry.shutdown_all()
+            httpd.modern_pool.shutdown_all()
+            httpd.server_close()
+
+    def test_oversized_body_gets_413_before_reaching_the_backend(self, capped):
+        url = capped
+        big = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": "init",
+                "method": "initialize",
+                "params": {"pad": "x" * 100},
+            }
+        )
+        assert len(big) > 10
+        resp = httpx.post(url, content=big, timeout=10)
+        assert resp.status_code == 413
+        assert resp.json()["error"]["message"].startswith(
+            "request body exceeds --max-message-size"
+        )
+
+    def test_default_cap_does_not_affect_ordinary_traffic(self, gateway):
+        # The shared `gateway` fixture uses the (generous, 10 MiB) default
+        # cap — an ordinary small request must be completely unaffected.
+        url, _ = gateway
+        sid, resp = _init(url)
+        assert resp.status_code == 200
+        assert sid
