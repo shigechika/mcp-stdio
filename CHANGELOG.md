@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.43.2](https://github.com/shigechika/mcp-stdio/compare/v0.43.1...v0.43.2) (2026-08-22)
+
+
+### Bug Fixes
+
+* reap dead-child sessions even when --session-idle-ttl is unset ([#425](https://github.com/shigechika/mcp-stdio/issues/425)) ([3ffda18](https://github.com/shigechika/mcp-stdio/commit/3ffda188d9af957907a05e0ed828012f132057a4))
+
 ## [0.43.1](https://github.com/shigechika/mcp-stdio/compare/v0.43.0...v0.43.1) (2026-08-22)
 
 
