@@ -3650,11 +3650,17 @@ class SessionRegistry:
         no production caller: a long-lived gateway on default settings
         accumulated dead-child sessions with no way to shed them, eating
         into ``--max-sessions`` until new ``initialize`` calls got `503`
-        against slots that were all corpses. Mirrors the identical fix
-        already applied to the modern pool's analogous reaper (#390 R3F1,
-        ``ModernBackendPool.start_reaper``) — separate "why does the
-        thread run" from "what does each tick actually evict", since
-        ``reap_idle`` was always correct on the latter.
+        against slots that were all corpses. Follows the SAME PATTERN as
+        the fix already applied to the modern pool's analogous reaper
+        (#390 R3F1, ``ModernBackendPool.start_reaper``) — separate "why
+        does the thread run" from "what does each tick actually evict",
+        since ``reap_idle`` was always correct on the latter — but the
+        RESULT is not identical: the modern pool's ``start_reaper`` still
+        gates on ``modern_idle_ttl > 0 or`` the MRTR bridge being enabled,
+        so a pure-default deployment (neither set) still never starts
+        that thread and still never sweeps a dead modern child. THIS
+        method now starts unconditionally, with no equivalent second gate
+        (#385 review R1F1).
 
         So this now ALWAYS starts (no-op only on a second call): the tick
         interval favors the idle TTL when one is configured (finer-grained
