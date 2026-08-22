@@ -44,7 +44,7 @@ jobs:
           # (cf. modelcontextprotocol/python-sdk#2433). One Python version is
           # sufficient since the bug is platform-level, not version-specific.
           - os: windows-latest
-            python-version: "3.12"
+            python-version: "3.x"
     steps:
       - uses: actions/checkout@v7
 
