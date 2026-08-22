@@ -22,7 +22,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: pages
+  # Deployments serialize on the single "pages" group (GitHub permits one
+  # in-flight Pages deployment). PR validation gets a per-ref group so a
+  # queued deploy is never evicted by a later PR event (#397): GitHub keeps
+  # only one PENDING run per group, and cancel-in-progress:false only
+  # protects the in-progress run, not the queue.
+  group: ${{ github.event_name == 'push' && 'pages' || format('pages-pr-{0}', github.ref) }}
   cancel-in-progress: false
 
 jobs:
