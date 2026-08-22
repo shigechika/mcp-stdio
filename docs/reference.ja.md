@@ -38,7 +38,7 @@ Arguments:
 | `--timeout-read SEC` | 120 | 読み取りタイムアウト（秒） |
 | `--sse-read-timeout SEC` | 300 | SSE GET ストリームのアイドル読み取りタイムアウト（SSE トランスポートのみ; 0 で無効化） |
 | `--no-tcp-keepalive` | — | HTTP ソケット上の TCP キープアライブを無効化 |
-| `--max-message-size BYTES` | 10 MiB | パース前にバッファする上流レスポンス本文（JSON または累積 SSE ストリーム）の上限。0 で無効化。`Accept-Encoding: identity` を送信し、それでも圧縮されて返ってきたレスポンスは拒否する（展開処理が上限をすり抜けうるため、#416、#417）。圧縮が必須のサーバーには `-H 'Accept-Encoding: <encoding>'` でオプトインできる（本来の展開サイズ上限対応は #418 で追跡） |
+| `--max-message-size BYTES` | 10 MiB | パース前にバッファする上流レスポンス本文（JSON または累積 SSE ストリーム）の上限。0 で無効化。デフォルトで `Accept-Encoding: identity` を送信する（#416、#417）。`-H 'Accept-Encoding: gzip'`／`deflate` でオプトインすると、本物のサイズ上限付き展開処理で復号する（#418）——それ以外の交渉済みコーディング（スタックされたもの、または本relayが上限付き展開器を持たないもの）を受け入れるには `--max-message-size 0` が必要 |
 
 <a id="modern-era-client"></a>
 

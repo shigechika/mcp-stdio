@@ -668,12 +668,12 @@ def _main() -> None:
             f"{_DEFAULT_MAX_MESSAGE_SIZE}, 10 MiB; 0 disables the cap). "
             "Protects against a malicious or misbehaving MCP server making "
             "this relay allocate an unbounded amount of memory (#416). "
-            "This relay also sends Accept-Encoding: identity by default and "
-            "refuses any response that is compressed anyway, since a small "
-            "compressed body can decompress past this cap before it is "
-            "measured (#417); a server that only ever returns a compressed "
-            "response needs -H 'Accept-Encoding: <encoding>' to opt back in "
-            "(bounded-decompression support is tracked in #418)."
+            "This relay sends Accept-Encoding: identity by default (#417); "
+            "-H 'Accept-Encoding: gzip' or 'deflate' opts back in and is "
+            "decoded through a genuinely size-bounded decompressor (#418) "
+            "— any other negotiated coding (stacked, or one this relay has "
+            "no bounded decoder for) needs --max-message-size 0 to be "
+            "accepted at all."
         ),
     )
     parser.add_argument(
