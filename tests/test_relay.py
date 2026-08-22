@@ -1213,6 +1213,40 @@ class TestBoundedDecompression:
             },
         )
 
+    def test_bounded_decompress_bytes_matches_real_httpx_decode(self):
+        """#418 code-review: _BoundedGZipDecoder/_BoundedDeflateDecoder are
+        REIMPLEMENTATIONS of httpx._decoders.GZipDecoder/DeflateDecoder
+        (private httpx internals, no version pin) — cross-check their
+        output against REAL httpx decoding of the identical bytes for a
+        variety of payloads/codings, so a future httpx internals change
+        this module has silently drifted from is caught by CI rather than
+        only by manual comparison against the source."""
+        import gzip
+        import zlib
+
+        payloads = [
+            b"",
+            b"x",
+            b'{"jsonrpc": "2.0", "result": {"ok": true}, "id": 1}',
+            ("日本語のテキストも含む混在ペイロード " * 100).encode("utf-8"),
+            bytes(range(256)) * 20,
+        ]
+        for payload in payloads:
+            for coding, compressed in (
+                ("gzip", gzip.compress(payload)),
+                ("deflate", zlib.compress(payload)),
+                ("deflate", _raw_deflate(payload)),
+            ):
+                real = httpx.Response(
+                    200,
+                    content=compressed,
+                    headers={"content-encoding": coding},
+                ).content
+                ours = _bounded_decompress_bytes([compressed], coding, 10_000_000)
+                assert ours == real == payload, (
+                    f"mismatch for coding={coding!r} payload={payload[:30]!r}..."
+                )
+
     def test_bounded_decompress_bytes_gzip_round_trips(self):
         import gzip
 
@@ -1269,6 +1303,17 @@ class TestBoundedDecompression:
         a decoder that was never actually created."""
         with pytest.raises(httpx.DecodingError, match="truncated"):
             _bounded_decompress_bytes([b"\x78"], "deflate", 1_000_000)
+
+    def test_bounded_decompress_bytes_deflate_empty_body_is_not_truncation(self):
+        """code-review (#418 follow-up): a legitimately EMPTY deflate body
+        (no bytes at all — e.g. a 0-byte 200 OK) is indistinguishable from
+        truncation only by whether anything was received in the first
+        place. Must return b"", matching gzip's sibling and real
+        httpx.DeflateDecoder — not raise, which (being httpx.DecodingError,
+        not _MessageTooLargeError) would previously have been retried
+        MAX_RETRIES times before surfacing as an error."""
+        assert _bounded_decompress_bytes([], "deflate", 1_000_000) == b""
+        assert _bounded_decompress_bytes([b""], "deflate", 1_000_000) == b""
 
     def test_bounded_decompress_bytes_deflate_survives_random_fragmentation(self):
         """#418 review R2F1: property-style coverage beyond the two fixed
