@@ -264,7 +264,8 @@ Options:
                          Sends Accept-Encoding: identity by default (#417);
                          -H 'Accept-Encoding: gzip'/deflate opts back in
                          with a genuinely size-bounded decoder (#418) —
-                         anything else needs --max-message-size 0
+                         anything else needs --max-message-size 0.
+                         Also covers this relay's own OAuth traffic (#419)
   --no-cancel-filter     Disable the cancel-aware response filter (drops late
                          responses for ids cancelled via notifications/cancelled)
   --no-normalize-arguments
