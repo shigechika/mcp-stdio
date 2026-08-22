@@ -1218,9 +1218,14 @@ class TestBoundedDecompression:
         REIMPLEMENTATIONS of httpx._decoders.GZipDecoder/DeflateDecoder
         (private httpx internals, no version pin) — cross-check their
         output against REAL httpx decoding of the identical bytes for a
-        variety of payloads/codings, so a future httpx internals change
-        this module has silently drifted from is caught by CI rather than
-        only by manual comparison against the source."""
+        variety of payloads/codings, so a future httpx internals change to
+        WHOLE-CHUNK decoding (wbits, the raw-vs-wrapped fallback, trailer
+        handling) is caught by CI rather than only by manual comparison
+        against the source. Scoped to whole-chunk parity specifically:
+        fragmentation/truncation behavior (this module's OWN addition over
+        httpx's shape, #418 review R2F1/R3F1) is covered separately above
+        and is not something httpx's single-shot decode() has an
+        equivalent for to compare against (#418 review R7F1)."""
         import gzip
         import zlib
 
