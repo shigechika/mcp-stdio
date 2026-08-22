@@ -28,7 +28,7 @@ from urllib.parse import (
 
 import httpx
 
-from .relay import _parse_auth_params, log
+from .relay import _read_bounded, _parse_auth_params, log
 from .token_store import TokenData, delete_token, load_token, save_token
 
 # ---------------------------------------------------------------------------
@@ -634,13 +634,11 @@ def _fetch_authorization_server_metadata(
             candidates.append(url)
     for well_known in candidates:
         try:
-            resp = client.get(well_known)
-        except Exception:
-            continue
-        if resp.status_code != 200:
-            continue
-        try:
-            data = resp.json()
+            with client.stream("GET", well_known) as resp:
+                _read_bounded(resp, client)
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
         except Exception:
             continue
         meta = _parse_as_metadata_response(data, auth_server_base)
@@ -697,13 +695,11 @@ def discover_oauth_metadata(
 
     for prm_url in prm_candidates:
         try:
-            resp = client.get(prm_url)
-        except Exception:
-            continue
-        if resp.status_code != 200:
-            continue
-        try:
-            prm_data = resp.json()
+            with client.stream("GET", prm_url) as resp:
+                _read_bounded(resp, client)
+                if resp.status_code != 200:
+                    continue
+                prm_data = resp.json()
         except Exception:
             continue
         # The PRM document is fully MCP-server-controlled. A non-object body
@@ -972,10 +968,12 @@ def register_client(
             "grant_types": ["authorization_code", "refresh_token"],
             "token_endpoint_auth_method": auth_method,
         }
-    resp = client.post(
+    with client.stream(
+        "POST",
         metadata.registration_endpoint,
         json=body,
-    )
+    ) as resp:
+        _read_bounded(resp, client)
     resp.raise_for_status()
     data = resp.json()
     # RFC 7591 §3.2.1: client_secret_expires_at = 0 means "never expires".
@@ -1344,11 +1342,13 @@ def exchange_code(
     if resource:
         data["resource"] = resource
 
-    resp = client.post(
+    with client.stream(
+        "POST",
         metadata.token_endpoint,
         data=data,
         headers=req_headers,
-    )
+    ) as resp:
+        _read_bounded(resp, client)
     return _parse_token_response(resp)
 
 
@@ -1391,11 +1391,13 @@ def refresh_access_token(
     if resource:
         data["resource"] = resource
 
-    resp = client.post(
+    with client.stream(
+        "POST",
         token_endpoint,
         data=data,
         headers=req_headers,
-    )
+    ) as resp:
+        _read_bounded(resp, client)
     return _parse_token_response(resp)
 
 
@@ -2088,11 +2090,13 @@ def _run_device_authorization_flow(
         if csecret:
             da_params["client_secret"] = csecret
 
-    da_resp = client.post(
+    with client.stream(
+        "POST",
         metadata.device_authorization_endpoint,
         data=da_params,
         headers=da_headers,
-    )
+    ) as da_resp:
+        _read_bounded(da_resp, client)
     da_resp.raise_for_status()
     da = da_resp.json()
     # A non-object device-authorization body would make da.get(...) below raise
@@ -2225,11 +2229,13 @@ def _run_device_authorization_flow(
                 poll_data["client_secret"] = csecret
 
         try:
-            tok_resp = client.post(
+            with client.stream(
+                "POST",
                 metadata.token_endpoint,
                 data=poll_data,
                 headers=poll_headers,
-            )
+            ) as tok_resp:
+                _read_bounded(tok_resp, client)
         except Exception as exc:
             # Sanitise like the refresh path: today's reachable
             # exception is an httpx transport error whose str() carries only the
@@ -2462,14 +2468,16 @@ def _probe_www_authenticate(server_url: str, client: httpx.Client) -> str | None
         '"clientInfo":{"name":"mcp-stdio-probe","version":"0"}}}'
     )
     try:
-        resp = client.post(
+        with client.stream(
+            "POST",
             server_url,
             content=probe_body,
             headers={"Content-Type": "application/json"},
             timeout=10.0,
-        )
-        if resp.status_code == 401:
-            return resp.headers.get("WWW-Authenticate")
+        ) as resp:
+            _read_bounded(resp, client)
+            if resp.status_code == 401:
+                return resp.headers.get("WWW-Authenticate")
     except Exception:
         pass
     return None

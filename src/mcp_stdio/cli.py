@@ -13,7 +13,14 @@ from urllib.parse import urlparse
 import httpx
 
 from . import __version__
-from .relay import _DEFAULT_MAX_MESSAGE_SIZE, check_connection, run, run_sse
+from .relay import (
+    _ACCEPT_ENCODING_IDENTITY,
+    _DEFAULT_MAX_MESSAGE_SIZE,
+    _MAX_MESSAGE_SIZE_ATTR,
+    check_connection,
+    run,
+    run_sse,
+)
 
 if TYPE_CHECKING:
     from .token_store import TokenData
@@ -205,11 +212,16 @@ def _build_token_refresher(
     timeout_read: float,
     *,
     use_id_token: bool = False,
+    max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
 ) -> Callable[[], dict[str, str] | None]:
     """Build a token refresher callback for the relay loop.
 
     Returns a callable that attempts to refresh the OAuth token
     and returns updated headers on success, or None on failure.
+    ``max_message_size`` bounds this OAuth client's own responses the same
+    way ``--max-message-size`` bounds the main MCP traffic (#419) — the
+    token endpoint is exactly as untrusted a network peer as the MCP
+    server itself.
     """
     # Freeze a private copy of the operator-supplied base headers at build time
     # . The relay passes the SAME live `headers` dict to both this
@@ -226,6 +238,7 @@ def _build_token_refresher(
         from .oauth import refresh_cached_token
 
         client = httpx.Client(
+            headers=_ACCEPT_ENCODING_IDENTITY,
             timeout=httpx.Timeout(
                 connect=timeout_connect, read=timeout_read, write=30, pool=10
             ),
@@ -236,6 +249,7 @@ def _build_token_refresher(
             # the safety cannot regress.
             follow_redirects=False,
         )
+        setattr(client, _MAX_MESSAGE_SIZE_ATTR, max_message_size)
         try:
             data = refresh_cached_token(server_url, client)
             if data is None:
@@ -267,6 +281,7 @@ def _build_scope_upgrader(
     oauth_timeout: float,
     *,
     use_id_token: bool = False,
+    max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
 ) -> Callable[[str], dict[str, str] | None]:
     """Build a scope-upgrade callback for the relay loop.
 
@@ -276,6 +291,8 @@ def _build_scope_upgrader(
     interactive wait (browser callback / device-code) the same way the
     cold-start ``ensure_token`` does, so ``--oauth-timeout`` applies to a
     mid-session step-up too, not just the initial authorization.
+    ``max_message_size`` bounds this OAuth client's own responses, same as
+    ``_build_token_refresher`` (#419).
     """
     # Freeze the operator-supplied base headers at build time; see
     # _build_token_refresher for why the live shared dict is not closed over.
@@ -285,6 +302,7 @@ def _build_scope_upgrader(
         from .oauth import step_up_authorize
 
         client = httpx.Client(
+            headers=_ACCEPT_ENCODING_IDENTITY,
             timeout=httpx.Timeout(
                 connect=timeout_connect, read=timeout_read, write=30, pool=10
             ),
@@ -295,6 +313,7 @@ def _build_scope_upgrader(
             # the safety cannot regress.
             follow_redirects=False,
         )
+        setattr(client, _MAX_MESSAGE_SIZE_ATTR, max_message_size)
         try:
             data = step_up_authorize(
                 server_url, client, required_scope, timeout=oauth_timeout
@@ -354,6 +373,7 @@ def _build_cold_start_login(
     timeout_connect: float,
     timeout_read: float,
     use_id_token: bool,
+    max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
 ) -> Callable[[], dict[str, str] | None]:
     """Build the cold-start background-OAuth callback for the relay (#296).
 
@@ -364,6 +384,8 @@ def _build_cold_start_login(
     does not block the locally-answered ``initialize``. Mirrors
     ``_build_token_refresher``: a frozen header snapshot, its own short-lived
     client with redirects pinned off, all exceptions degraded to None.
+    ``max_message_size`` bounds this OAuth client's own responses, same as
+    ``_build_token_refresher``/``_build_scope_upgrader`` (#419).
     """
     base_headers = dict(headers)
 
@@ -371,11 +393,13 @@ def _build_cold_start_login(
         from .oauth import ensure_token
 
         client = httpx.Client(
+            headers=_ACCEPT_ENCODING_IDENTITY,
             timeout=httpx.Timeout(
                 connect=timeout_connect, read=timeout_read, write=30, pool=10
             ),
             follow_redirects=False,
         )
+        setattr(client, _MAX_MESSAGE_SIZE_ATTR, max_message_size)
         try:
             data = ensure_token(
                 server_url,
@@ -673,7 +697,10 @@ def _main() -> None:
             "decoded through a genuinely size-bounded decompressor (#418) "
             "— any other negotiated coding (stacked, or one this relay has "
             "no bounded decoder for) needs --max-message-size 0 to be "
-            "accepted at all."
+            "accepted at all. Also applies to this relay's own OAuth HTTP "
+            "traffic (discovery, DCR, token exchange/refresh, device-flow "
+            "polling) — an authorization server is exactly as untrusted a "
+            "network peer as the MCP server itself (#419)."
         ),
     )
     parser.add_argument(
@@ -917,6 +944,7 @@ def _main() -> None:
             eager = False
 
         client = httpx.Client(
+            headers=_ACCEPT_ENCODING_IDENTITY,
             timeout=httpx.Timeout(
                 connect=args.timeout_connect,
                 read=args.timeout_read,
@@ -930,6 +958,7 @@ def _main() -> None:
             # False default so the safety cannot regress.
             follow_redirects=False,
         )
+        setattr(client, _MAX_MESSAGE_SIZE_ATTR, args.max_message_size)
         try:
             token_data = ensure_token(
                 args.url,
@@ -963,6 +992,7 @@ def _main() -> None:
                     timeout_connect=args.timeout_connect,
                     timeout_read=args.timeout_read,
                     use_id_token=args.oauth_use_id_token,
+                    max_message_size=args.max_message_size,
                 )
             else:
                 # WARM path (token available, or non-eager blocking flow). Drop
@@ -1001,6 +1031,7 @@ def _main() -> None:
                     args.timeout_connect,
                     args.timeout_read,
                     use_id_token=args.oauth_use_id_token,
+                    max_message_size=args.max_message_size,
                 )
                 scope_upgrader = _build_scope_upgrader(
                     args.url,
@@ -1009,6 +1040,7 @@ def _main() -> None:
                     args.timeout_read,
                     args.oauth_timeout,
                     use_id_token=args.oauth_use_id_token,
+                    max_message_size=args.max_message_size,
                 )
                 token_expiry_getter = _build_token_expiry_getter(args.url)
         except Exception as e:

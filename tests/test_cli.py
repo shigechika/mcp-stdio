@@ -14,6 +14,7 @@ from mcp_stdio.cli import (
     _parse_header,
     main,
 )
+from mcp_stdio.relay import _MAX_MESSAGE_SIZE_ATTR
 from mcp_stdio.token_store import TokenData
 
 
@@ -1040,6 +1041,30 @@ class TestClientMetadataUrlFlag:
             main()
         assert mock_ensure.call_args.kwargs["client_metadata_url"] == url
 
+    def test_max_message_size_forwarded_to_the_direct_oauth_client(self):
+        """#419: the client _main() builds itself for the initial
+        ensure_token() call (warm/--check path, not one of the
+        _build_*-wrapped background callbacks) also gets the configured
+        cap, not just --max-message-size's default."""
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--oauth",
+                    "--max-message-size",
+                    "1000",
+                    "https://example.com/mcp",
+                ],
+            ),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        client_arg = mock_ensure.call_args.args[1]
+        assert getattr(client_arg, _MAX_MESSAGE_SIZE_ATTR, None) == 1000
+
     def test_forwarded_to_cold_start_login(self):
         """#296 + #60: a cold cache defers to _build_cold_start_login, which
         must also receive client_metadata_url so the background login uses it."""
@@ -1063,6 +1088,53 @@ class TestClientMetadataUrlFlag:
             mock_builder.return_value = lambda: None
             main()
         assert mock_builder.call_args.kwargs["client_metadata_url"] == url
+
+    def test_max_message_size_forwarded_to_cold_start_login(self):
+        """#419: --max-message-size reaches the cold-start OAuth client too,
+        not just the main MCP traffic (#416/#417)."""
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--oauth",
+                    "--oauth-eager",
+                    "--max-message-size",
+                    "1000",
+                    "https://example.com/mcp",
+                ],
+            ),
+            patch("mcp_stdio.oauth.ensure_token", return_value=None),
+            patch("mcp_stdio.cli._build_cold_start_login") as mock_builder,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_builder.return_value = lambda: None
+            main()
+        assert mock_builder.call_args.kwargs["max_message_size"] == 1000
+
+    def test_max_message_size_forwarded_to_refresher_and_upgrader(self):
+        """#419: --max-message-size reaches the mid-session token-refresh
+        and scope-upgrade OAuth clients too."""
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "--oauth",
+                    "--max-message-size",
+                    "1000",
+                    "https://example.com/mcp",
+                ],
+            ),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch("mcp_stdio.cli._build_token_refresher") as mock_refresher,
+            patch("mcp_stdio.cli._build_scope_upgrader") as mock_upgrader,
+            patch("mcp_stdio.cli.run"),
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            main()
+        assert mock_refresher.call_args.kwargs["max_message_size"] == 1000
+        assert mock_upgrader.call_args.kwargs["max_message_size"] == 1000
 
     @pytest.mark.parametrize(
         "bad", ["tok\nInjected: x", "tok\rx", "tok\x00x", "tok\r\nInjected: x"]

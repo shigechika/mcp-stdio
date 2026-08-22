@@ -42,6 +42,7 @@ from mcp_stdio.oauth import (
     register_client,
     step_up_authorize,
 )
+from mcp_stdio.relay import _MAX_MESSAGE_SIZE_ATTR, _MessageTooLargeError
 from mcp_stdio.token_store import TokenData
 
 # OAuth discovery probes multiple fallback well-known URLs (RFC 8414, then the
@@ -450,6 +451,31 @@ class TestDiscoverMetadata:
         # #3: the default-path fallback must still pin an issuer (the base it
         # synthesised endpoints from) so the RFC 9207 iss check stays active.
         assert meta.issuer == "https://api.example.com"
+
+    def test_oversized_as_metadata_falls_through_to_default(self, httpx_mock):
+        """#419: --max-message-size applies to AS metadata discovery too
+        (both _fetch_authorization_server_metadata's and
+        discover_oauth_metadata's own client.get() sites). An oversized
+        candidate response is treated as a failed candidate — same as a
+        404 or connection error — and discovery falls through to the
+        default-path fallback rather than crashing."""
+        self._mock_no_prm(httpx_mock)
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-authorization-server",
+            json={"issuer": "https://api.example.com", "padding": "x" * 1000},
+        )
+        # Path-scoped probe (the other AS metadata candidate) also fails,
+        # so discovery reaches the synthesized-default-endpoints fallback
+        # (same as test_fallback_on_404).
+        httpx_mock.add_response(
+            url="https://api.example.com/.well-known/oauth-authorization-server/mcp",
+            status_code=404,
+        )
+        client = httpx.Client()
+        setattr(client, _MAX_MESSAGE_SIZE_ATTR, 10)
+        meta = discover_oauth_metadata("https://api.example.com/mcp", client)
+        assert meta.authorization_endpoint == "https://api.example.com/authorize"
+        assert meta.token_endpoint == "https://api.example.com/token"
 
     def test_fallback_on_connection_error(self, httpx_mock):
         # ConnectError for: path-aware PRM, host-root PRM, host-root AS, path-scoped AS
@@ -1260,23 +1286,27 @@ class TestDiscoverMetadata:
         path-append probe or the synthesized default endpoints (#13). Forces the
         OIDC path-append candidate to be the match so its construction is
         exercised directly."""
+        import contextlib
+
         from mcp_stdio.oauth import _fetch_authorization_server_metadata
 
         captured: dict = {}
 
         class _CaptureClient:
-            def get(self, url):
+            def stream(self, method, url, **kwargs):
                 captured.setdefault("urls", []).append(url)
-                req = httpx.Request("GET", url)
+                req = httpx.Request(method, url)
                 # Only the OIDC path-append candidate answers, with metadata that
                 # omits token_endpoint so a default is synthesized from the base.
                 if url.endswith("/oauth/.well-known/openid-configuration"):
-                    return httpx.Response(
+                    resp = httpx.Response(
                         200,
                         json={"issuer": "https://api.example.com/oauth"},
                         request=req,
                     )
-                return httpx.Response(404, request=req)
+                else:
+                    resp = httpx.Response(404, request=req)
+                return contextlib.nullcontext(resp)
 
         meta = _fetch_authorization_server_metadata(
             "https://user:pass@api.example.com/oauth", _CaptureClient()
@@ -1332,6 +1362,24 @@ class TestRegisterClient:
         reg = register_client(meta, "http://127.0.0.1:9999/callback", client)
         assert reg.client_id == "cid123"
         assert reg.client_secret is None
+
+    def test_respects_max_message_size(self, httpx_mock):
+        """#419: a malicious/misbehaving authorization server's DCR response
+        is bound by --max-message-size same as MCP traffic (#416/#417) —
+        the OAuth HTTP surface is exactly as untrusted a network peer."""
+        httpx_mock.add_response(
+            url="https://api.example.com/register",
+            json={"client_id": "cid123", "padding": "x" * 1000},
+        )
+        meta = OAuthMetadata(
+            authorization_endpoint="https://api.example.com/authorize",
+            token_endpoint="https://api.example.com/token",
+            registration_endpoint="https://api.example.com/register",
+        )
+        client = httpx.Client()
+        setattr(client, _MAX_MESSAGE_SIZE_ATTR, 10)
+        with pytest.raises(_MessageTooLargeError, match="max-message-size"):
+            register_client(meta, "http://127.0.0.1:9999/callback", client)
 
     def test_missing_client_id_raises_clear_error(self, httpx_mock):
         """A registration response without client_id → ValueError, not a bare
@@ -1750,6 +1798,30 @@ class TestExchangeCode:
                 "cid",
                 None,
                 "bad-code",
+                "verifier",
+                "http://127.0.0.1:9999/callback",
+                client,
+            )
+
+    def test_respects_max_message_size(self, httpx_mock):
+        """#419: a malicious/compromised token endpoint's response is bound
+        by --max-message-size, same as MCP traffic (#416/#417)."""
+        httpx_mock.add_response(
+            url="https://api.example.com/token",
+            json={"access_token": "at123", "padding": "x" * 1000},
+        )
+        meta = OAuthMetadata(
+            authorization_endpoint="https://api.example.com/authorize",
+            token_endpoint="https://api.example.com/token",
+        )
+        client = httpx.Client()
+        setattr(client, _MAX_MESSAGE_SIZE_ATTR, 10)
+        with pytest.raises(_MessageTooLargeError, match="max-message-size"):
+            exchange_code(
+                meta,
+                "cid",
+                None,
+                "code123",
                 "verifier",
                 "http://127.0.0.1:9999/callback",
                 client,

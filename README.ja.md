@@ -259,7 +259,8 @@ mcp-stdio [OPTIONS] URL
                          （#417）。-H 'Accept-Encoding: gzip'／deflate
                          でオプトインすると本物のサイズ上限付き展開器で
                          復号する（#418）— それ以外は
-                         --max-message-size 0 が必要
+                         --max-message-size 0 が必要。本relay自身の
+                         OAuth トラフィックにも適用される（#419）
   --no-cancel-filter     cancel-aware レスポンスフィルタを無効化する
                          （notifications/cancelled でキャンセルされた id の
                          遅延レスポンスを drop する機能）
