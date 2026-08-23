@@ -3454,6 +3454,61 @@ def test_merge_oauth_snapshots_tombstone_stores_union_too():
     }
 
 
+def test_merge_oauth_snapshots_tombstoned_key_does_not_survive_merge():
+    # The one thing a plain union CAN'T do on its own: a key live in remote
+    # but tombstoned by local (this side already consumed/rotated it) must
+    # not come back to life just because remote still has it live.
+    local = {
+        "version": 1,
+        "refresh": {},
+        "consumed_refresh": {"rt": {"family": "f1"}},
+        "codes": {},
+        "consumed_codes": {},
+    }
+    remote = {
+        "version": 1,
+        "refresh": {"rt": {"user": "stale-live-copy"}},
+        "consumed_refresh": {},
+        "codes": {},
+        "consumed_codes": {},
+    }
+    merged = server._merge_oauth_snapshots(remote, local)
+    assert "rt" not in merged["refresh"]
+    assert "rt" in merged["consumed_refresh"]
+
+
+def test_token_store_firestore_single_writer_rotation_is_a_real_deletion(
+    fake_firestore,
+):
+    # PR #429 review: an earlier version of this fix always read-merge-wrote,
+    # so even a LONE writer's own rotation would be resurrected by its own
+    # next persist (reading back its pre-rotation document), defeating RFC
+    # 9700 Sec. 4.14.2 replay detection with no concurrency required. The
+    # nonce-gated design must make a single writer's persist behave exactly
+    # like the pre-#406 blind .set(): a deletion is really deleted.
+    ref = ("oauth-state", "jquants")
+    p1 = _provider(firestore_ref=ref)
+    cid, tok = _direct_flow(p1)
+    rt = tok["refresh_token"]
+
+    status, rotated = p1.token(
+        {"grant_type": "refresh_token", "refresh_token": rt, "client_id": cid}
+    )
+    assert status == 200, rotated
+
+    persisted = fake_firestore[ref]
+    assert rt not in persisted["refresh"], "rotated-out token resurrected in Firestore"
+
+    # A fresh provider restored from that (correctly pruned) document must
+    # detect a replay of the spent token, not silently accept it.
+    p2 = _provider(firestore_ref=ref)
+    status, resp = p2.token(
+        {"grant_type": "refresh_token", "refresh_token": rt, "client_id": cid}
+    )
+    assert status == 400
+    assert resp["error"] == "invalid_grant"
+
+
 def test_token_store_firestore_concurrent_writers_both_survive(fake_firestore):
     # Two instances start from the SAME empty document (a Cloud Run revision
     # overlap): neither has seen the other's writes yet.
@@ -3475,6 +3530,11 @@ def test_token_store_firestore_concurrent_writers_both_survive(fake_firestore):
     p3 = _provider(firestore_ref=ref)
     assert p3.validate_access_token(tok1["access_token"]) is True
     assert p3.validate_access_token(tok2["access_token"]) is True
+
+    # p2 itself, WITHOUT restarting, must also recognize tok1 immediately:
+    # its merge-persist above adopted the merged document (including p1's
+    # tok1) into its own in-memory state, not just Firestore's.
+    assert p2.validate_access_token(tok1["access_token"]) is True
 
 
 # --- cross-SDK guard tests (#273) ---

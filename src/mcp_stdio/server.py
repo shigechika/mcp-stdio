@@ -4057,12 +4057,24 @@ _OAUTH_SNAPSHOT_DICT_KEYS = (
 )
 
 
+_OAUTH_TOMBSTONE_PAIRS = (
+    ("refresh", "consumed_refresh"),
+    ("codes", "consumed_codes"),
+)
+
+
 def _merge_oauth_snapshots(
     remote: dict[str, Any] | None, local: dict[str, Any]
 ) -> dict[str, Any]:
     """Union-merge a freshly read Firestore snapshot with the one about to
-    be written, so two concurrently overlapping ``--token-store-firestore``
-    writers do not silently discard each other's additions (#406).
+    be written, for the (genuinely concurrent) case where another writer
+    has committed since we last read/wrote this document -- see
+    ``_write_firestore_snapshot_locked``, which only calls this when its
+    nonce check detects that case; a lone writer instead does a plain
+    overwrite so an ordinary local deletion is not resurrected by this
+    function at all (#406's original fix mistakenly ran this path
+    unconditionally, which broke single-writer semantics -- see the PR
+    #429 review that caught it).
 
     Each of the six stores is merged key-by-key with LOCAL winning on
     collision: local is the freshest view of the keys it owns, since it is
@@ -4071,11 +4083,16 @@ def _merge_oauth_snapshots(
     SAME key is negligible -- in practice this is a conflict-free union of
     each side's additions, not a real merge decision.
 
-    This does NOT protect a bare (non-tombstoned) deletion: the only such
-    removal path is ``_revoke_family_locked``, whose bare ``del`` leaves
-    nothing here to distinguish "deliberately removed" from "never seen" --
-    a stale remote copy of a just-revoked token would survive the union.
-    That gap is deliberately out of scope for this fix; see #428.
+    A union alone still can't represent "this side deleted it" -- a key
+    the OTHER side removed but this side's local view never learned about
+    would otherwise survive. For the two stores that have a tombstone
+    (``refresh``/``consumed_refresh``, ``codes``/``consumed_codes``), that
+    is fixed here: after the union, any live key that also appears in the
+    merged tombstone store is dropped. There is no such tombstone for
+    ``access`` or for ``clients``, so a bare (non-tombstoned) removal from
+    those -- ``_revoke_family_locked``, cap eviction, client recycling --
+    can still be resurrected by a genuinely concurrent writer. That
+    residual is deliberately out of scope for this fix; see #428.
 
     ``remote`` is ``None`` (no document yet) or has a missing/mismatched
     ``version`` is treated as contributing nothing -- an absent or
@@ -4084,15 +4101,20 @@ def _merge_oauth_snapshots(
     """
     if not isinstance(remote, dict) or remote.get("version") != _STATE_VERSION:
         return local
-    merged: dict[str, Any] = dict(local)
+    merged: dict[str, Any] = {**remote, **local}
     for key in _OAUTH_SNAPSHOT_DICT_KEYS:
         remote_store = remote.get(key)
-        if not isinstance(remote_store, dict):
-            continue
         local_store = local.get(key)
+        if not isinstance(remote_store, dict):
+            remote_store = {}
         if not isinstance(local_store, dict):
             local_store = {}
         merged[key] = {**remote_store, **local_store}
+    for live_key, tomb_key in _OAUTH_TOMBSTONE_PAIRS:
+        tombstoned = merged[tomb_key].keys()
+        merged[live_key] = {
+            k: v for k, v in merged[live_key].items() if k not in tombstoned
+        }
     return merged
 
 
@@ -4178,6 +4200,12 @@ class _OAuthProvider:
         # store_path's lock.
         self._firestore_ref = firestore_ref
         self._firestore_client: Any = None
+        # The write_nonce of the last Firestore document we successfully
+        # read or wrote (see _write_firestore_snapshot_locked). None means
+        # "no document read yet" or "the read document had none" (a pre-#406
+        # document, or none at all) -- either way the next persist cannot
+        # assume it knows the current remote state, so it merges once.
+        self._known_nonce: str | None = None
         self._warned_persist_failure = False
         # serve_main parks the sidecar-lock fd here so the advisory lock
         # (which guards against two processes sharing one store) stays alive
@@ -4259,6 +4287,32 @@ class _OAuthProvider:
                 f"version {data.get('version')!r}; starting empty."
             )
             return
+        self._apply_state_locked(data, source_label, announce=True)
+        if self._firestore_ref is not None:
+            # Absent on a pre-#406 document -- None, same as a fresh start,
+            # so the first persist after this restore takes the merge path
+            # once (harmless: nothing else has necessarily changed) rather
+            # than assuming a plain overwrite is safe.
+            self._known_nonce = data.get("write_nonce")
+
+    def _apply_state_locked(
+        self, data: dict[str, Any], source_label: str, *, announce: bool
+    ) -> None:
+        """Parse, validate, and assign the six stores from an already
+        version-checked snapshot dict (``data.get("version") ==
+        _STATE_VERSION``).
+
+        Shared by two callers: ``_load_state`` (a file/document read at
+        startup, no lock held yet -- nothing else can be running) and the
+        Firestore merge-adopt path in ``_write_firestore_snapshot_locked``
+        (caller holds ``self._lock``), which applies a just-merged document
+        containing entries this process never itself shape-checked (written
+        by another instance) so it goes through the same validation a fresh
+        load would -- a record missing a field would otherwise only surface
+        as a crash deep in request handling. ``announce`` silences the
+        "restored/dropped" log lines for that second caller, where "loading"
+        language doesn't fit and firing on every persist would be noisy.
+        """
         now = self._now()
         dropped = 0
 
@@ -4275,6 +4329,7 @@ class _OAuthProvider:
                     dropped += 1
             return out
 
+        clients: dict[str, dict[str, Any]] = {}
         raw_clients = data.get("clients")
         if isinstance(raw_clients, dict):
             for cid, rec in raw_clients.items():
@@ -4300,23 +4355,28 @@ class _OAuthProvider:
                     # the affected remote client will look "connected with no
                     # tools" — give the operator a breadcrumb that points at
                     # the allowlist instead of a generic dropped-count.
-                    log(
-                        f"warning: dropping persisted client registration "
-                        f"{cid}: none of its redirect_uris match the loopback "
-                        "rule or the current --allow-redirect-uri allowlist"
-                    )
+                    if announce:
+                        log(
+                            f"warning: dropping persisted client registration "
+                            f"{cid}: none of its redirect_uris match the "
+                            "loopback rule or the current --allow-redirect-uri "
+                            "allowlist"
+                        )
                     dropped += 1
                     continue
-                self._clients[cid] = {
+                clients[cid] = {
                     "redirect_keys": keys,
                     "redirect_uris": list(rec["redirect_uris"]),
                     "created_at": rec["created_at"],
                 }
+        self._clients = clients
         self._codes = load("codes", _valid_code_record)
         self._access = load("access", _valid_grant_record)
         self._refresh = load("refresh", _valid_grant_record)
         self._consumed_codes = load("consumed_codes", _valid_tombstone_record)
         self._consumed_refresh = load("consumed_refresh", _valid_tombstone_record)
+        if not announce:
+            return
         if dropped:
             log(
                 f"note: dropped {dropped} expired or malformed entr"
@@ -4330,8 +4390,7 @@ class _OAuthProvider:
 
     def _snapshot_locked(self) -> dict[str, Any]:
         """The JSON-clean snapshot of all six stores (caller holds the lock)."""
-        return {
-            "version": _STATE_VERSION,
+        stores: dict[str, Any] = {
             # redirect_keys are intentionally NOT serialized (derived state,
             # recomputed on load — see _load_state).
             "clients": {
@@ -4347,6 +4406,12 @@ class _OAuthProvider:
             "consumed_codes": self._consumed_codes,
             "consumed_refresh": self._consumed_refresh,
         }
+        # A store added here but forgotten in _OAUTH_SNAPSHOT_DICT_KEYS would
+        # silently fall back to last-writer-wins in _merge_oauth_snapshots
+        # (which only merges keys it knows to look for) -- catch the drift
+        # immediately instead.
+        assert set(stores) == set(_OAUTH_SNAPSHOT_DICT_KEYS)
+        return {"version": _STATE_VERSION, **stores}
 
     def _write_snapshot_locked(self) -> None:
         """Write the current snapshot to whichever backend is configured
@@ -4360,24 +4425,43 @@ class _OAuthProvider:
             self._write_firestore_snapshot_locked()
 
     def _write_firestore_snapshot_locked(self) -> None:
-        """Write the snapshot to Firestore via a read-merge-write transaction
+        """Write the snapshot to Firestore via a nonce-gated transaction
         (caller holds ``self._lock``) instead of a blind ``.set()`` (#406).
 
         Two Cloud Run instances can briefly overlap during a revision
         cutover, each with its own in-memory view of the six stores. A blind
         overwrite from whichever instance persists last would silently
         discard whatever the other instance added in that window (e.g. a
-        token it issued or rotated). The transaction instead reads the
-        current document, merges it with the local snapshot via
-        :func:`_merge_oauth_snapshots` (union per store, local wins on key
-        collision -- see that function for why this is safe for additions),
-        and writes the merged result back; Firestore aborts and retries the
-        transaction if the document changes underneath it.
+        token it issued or rotated).
 
-        This does not close every gap: a bare (non-tombstoned) removal, the
-        one such path being ``_revoke_family_locked``, can still be
-        resurrected by a concurrently-stale writer within the same overlap
-        window. That is deliberately out of scope here -- see #428.
+        A naive fix -- always read-merge-write, unioning the remote
+        document into every write -- turned out to be WORSE than the bug it
+        fixed (caught by PR #429 review): a union cannot represent a
+        deletion, so even a LONE writer's own rotation/redemption of a
+        token would be resurrected by its own next persist, reading back
+        its own pre-mutation document. That defeated RFC 9700 / RFC 6749
+        replay detection on every restart, with no concurrency required.
+
+        The fix is to merge ONLY when a merge is actually needed. Every
+        snapshot this method writes carries a fresh ``write_nonce``, and
+        ``self._known_nonce`` tracks the nonce of the document we last
+        read or wrote. Inside the transaction: if the document does not
+        exist yet, or its nonce still matches ``self._known_nonce``, no
+        other writer has committed since we last saw this document -- our
+        local snapshot is a complete, authoritative replacement, so it is
+        written as a plain overwrite (identical to pre-#406 behavior,
+        deletions included). Only when the nonce has moved does another
+        writer's document need to be merged with ours, via
+        :func:`_merge_oauth_snapshots` (union per store, local wins on key
+        collision, tombstone-aware for the two stores that have one -- see
+        that function for exactly what it does and does not cover). When
+        that happens, the merged document -- which is richer than our own
+        local snapshot -- is also ADOPTED into local state (via
+        :meth:`_apply_state_locked`) before returning. Without that, the
+        very next persist would see its own nonce match, take the plain-
+        overwrite fast path with a local snapshot narrower than what is
+        actually in Firestore, and silently re-discard everything the
+        merge just pulled in.
 
         The transaction's network round-trip(s) run under ``self._lock``,
         so a retry on contention serializes AS requests for its duration
@@ -4389,14 +4473,34 @@ class _OAuthProvider:
 
         doc_ref = self._firestore_document()
         local_snapshot = self._snapshot_locked()
+        known_nonce = self._known_nonce
 
         @firestore.transactional
-        def _run(transaction: Any) -> None:
+        def _run(transaction: Any) -> tuple[str, dict[str, Any] | None]:
             remote_doc = doc_ref.get(transaction=transaction)
             remote = remote_doc.to_dict() if remote_doc.exists else None
-            transaction.set(doc_ref, _merge_oauth_snapshots(remote, local_snapshot))
+            adopt: dict[str, Any] | None = None
+            if remote is None or remote.get("write_nonce") == known_nonce:
+                written = dict(local_snapshot)
+            else:
+                written = _merge_oauth_snapshots(remote, local_snapshot)
+                adopt = written
+            nonce = secrets.token_hex(8)
+            written["write_nonce"] = nonce
+            transaction.set(doc_ref, written)
+            return nonce, adopt
 
-        _run(self._get_firestore_client().transaction())
+        # The return value, not a nonlocal, carries the result out: the SDK
+        # retries _run from scratch on contention, so only the final
+        # successful attempt's plain-vs-merge decision may be applied. An
+        # exception here (retries exhausted, or another failure) propagates
+        # before this line, same as the pre-#406 blind .set() -- a failed
+        # write must not advance what we believe is "known" about the
+        # remote document, nor adopt a document that was never written.
+        nonce, adopt = _run(self._get_firestore_client().transaction())
+        self._known_nonce = nonce
+        if adopt is not None:
+            self._apply_state_locked(adopt, "<Firestore merge>", announce=False)
 
     def persist_now(self) -> None:
         """Write the current state immediately, PROPAGATING any failure.
