@@ -3477,6 +3477,45 @@ def test_merge_oauth_snapshots_tombstoned_key_does_not_survive_merge():
     assert "rt" in merged["consumed_refresh"]
 
 
+def test_token_store_firestore_legacy_nonceless_writer_does_not_clobber(
+    fake_firestore,
+):
+    # PR #429 review round 2: known_nonce is None both when no document has
+    # ever been read (a brand new provider) AND when the last document read
+    # had no write_nonce field at all (an old-code / pre-#429 writer, which
+    # never sets one). Comparing `remote.get("write_nonce") == known_nonce`
+    # treats those two None-producing situations as if they matched -- so a
+    # SECOND, still-legacy writer's overwrite in between our read and our
+    # persist would be silently discarded via the plain-overwrite fast
+    # path, reintroducing #406 for a mixed-version rollout.
+    ref = ("oauth-state", "jquants")
+    legacy = server._OAuthProvider(
+        public_url=None, trusted_user_header=None, dev_user="alice"
+    )
+    fake_firestore[ref] = legacy._snapshot_locked()  # no write_nonce key
+
+    p1 = _provider(firestore_ref=ref)
+    assert p1._known_nonce is None
+
+    # A second, still-legacy (no write_nonce) writer overwrites the
+    # document with DIFFERENT content in between.
+    other = server._OAuthProvider(
+        public_url=None, trusted_user_header=None, dev_user="bob"
+    )
+    _, other_tok = _direct_flow(other)
+    fake_firestore[ref] = other._snapshot_locked()  # still no write_nonce
+
+    # p1 persists its own mutation. Its known_nonce (None) must not be
+    # treated as matching the still-nonce-less remote document.
+    _, tok1 = _direct_flow(p1)
+
+    persisted = fake_firestore[ref]
+    assert other_tok["access_token"] in persisted["access"], (
+        "the other (still-legacy) writer's token was silently clobbered"
+    )
+    assert tok1["access_token"] in persisted["access"]
+
+
 def test_token_store_firestore_single_writer_rotation_is_a_real_deletion(
     fake_firestore,
 ):

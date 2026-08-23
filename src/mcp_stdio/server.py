@@ -4296,10 +4296,13 @@ class _OAuthProvider:
             return
         self._apply_state_locked(data, source_label, announce=True)
         if self._firestore_ref is not None:
-            # Absent on a pre-#406 document -- None, same as a fresh start,
-            # so the first persist after this restore takes the merge path
-            # once (harmless: nothing else has necessarily changed) rather
-            # than assuming a plain overwrite is safe.
+            # Absent on a pre-#429 document -- None, same value a brand new
+            # provider starts with, but NOT the same code path: this branch
+            # only runs when a document already existed and was loaded, so
+            # _write_firestore_snapshot_locked's None-vs-None guard (see its
+            # docstring) makes the first persist after this restore take the
+            # merge path once (harmless: nothing else has necessarily
+            # changed) rather than assuming a plain overwrite is safe.
             self._known_nonce = data.get("write_nonce")
 
     def _apply_state_locked(
@@ -4491,7 +4494,20 @@ class _OAuthProvider:
             remote_doc = doc_ref.get(transaction=transaction)
             remote = remote_doc.to_dict() if remote_doc.exists else None
             adopt: dict[str, Any] | None = None
-            if remote is None or remote.get("write_nonce") == known_nonce:
+            # known_nonce is None both when no document has ever been read
+            # (remote is None, handled separately below) and when the last
+            # document read/written had no write_nonce field at all -- an
+            # old-code (pre-#429) writer never sets one. Those two None
+            # sources must NOT be treated as matching each other: comparing
+            # None == None here would wrongly treat "some other, still
+            # nonce-less writer just overwrote the document" the same as
+            # "confirmed nobody has written since we last saw this exact
+            # document" -- silently clobbering that other writer, exactly
+            # the bug this file exists to fix. Only a concrete matching
+            # nonce string proves that.
+            if remote is None or (
+                known_nonce is not None and remote.get("write_nonce") == known_nonce
+            ):
                 written = dict(local_snapshot)
             else:
                 written = _merge_oauth_snapshots(remote, local_snapshot)
