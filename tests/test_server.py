@@ -2261,6 +2261,209 @@ def test_store_cap_is_a_hard_bound(monkeypatch):
     assert len(prov._refresh) <= 5
 
 
+def test_evicted_access_token_is_tombstoned(monkeypatch):
+    # #433: cap-eviction of `access` must tombstone into `consumed_access` so
+    # a genuinely concurrent Firestore writer's stale local view can't
+    # resurrect it via the merge's tombstone filter. Safe only because
+    # consumed_access has no validation-path reader -- see the next test for
+    # why refresh/codes eviction must NOT get the same treatment.
+    monkeypatch.setattr(server, "_STORE_CAP", 5)
+    prov = _provider()
+    for i in range(30):
+        prov._issue(f"u{i}", "c", "", None)
+    assert len(prov._access) <= 5
+    assert len(prov._consumed_access) > 0
+
+
+def test_access_eviction_tombstone_survives_mixed_consumed_access(monkeypatch):
+    # code-review finding on PR #436: consumed_access is itself one of the
+    # `stores` capped in the SAME loop that tombstones an access eviction
+    # into it. If consumed_access is already holding longer-lived tombstones
+    # (e.g. from _revoke_family_locked, whose expires_at is the revoked
+    # token's own real expiry, not necessarily soon) and victim selection
+    # were by expires_at, the brand-new -- and typically soonest-expiring,
+    # since cap eviction picks the soonest-expiring live access token --
+    # tombstone could be evicted right back out in the very same _issue()
+    # call, defeating the protection before a concurrent writer ever gets a
+    # chance to observe it. Victim selection for consumed_access must be by
+    # consumed_at (write recency) so the just-written entry, always the
+    # newest, is never the minimum.
+    monkeypatch.setattr(server, "_STORE_CAP", 3)
+    prov = _provider()
+    now = prov._now()
+    # Pre-fill consumed_access to cap-1 with long-lived, old tombstones, all
+    # eviction-origin (isolating this test to the same-pass FIFO ordering
+    # question -- see the two tests below for the separate origin-priority
+    # question).
+    prov._consumed_access = {
+        "old-tombstone-1": {
+            "family": "f1",
+            "consumed_at": now - 1000,
+            "expires_at": now + 100_000,
+            "origin": "eviction",
+        },
+        "old-tombstone-2": {
+            "family": "f1",
+            "consumed_at": now - 900,
+            "expires_at": now + 100_000,
+            "origin": "eviction",
+        },
+    }
+    # Fill access to cap with soon-expiring tokens so the next _issue() call
+    # evicts one -- the eviction's own expires_at is far sooner than the
+    # pre-existing tombstones above.
+    prov._access = {
+        f"soon-expiring-{i}": {
+            "user": f"u{i}",
+            "client_id": "c",
+            "scope": "",
+            "resource": None,
+            "family": None,
+            "expires_at": now + 10 + i,
+        }
+        for i in range(3)
+    }
+    prov._refresh = {}
+
+    status, tok = prov._issue("new-user", "c", "", None)
+    assert status == 200
+
+    evicted_key = "soon-expiring-0"  # smallest expires_at among the three
+    assert evicted_key not in prov._access
+    assert evicted_key in prov._consumed_access, (
+        "the just-evicted access token's tombstone was itself evicted in "
+        "the same _issue() call -- protection defeated same-pass"
+    )
+
+
+def test_consumed_access_eviction_spares_revocation_tombstones(monkeypatch):
+    # ai-review R2F1 on PR #436: plain FIFO-by-consumed_at treats a
+    # security-critical revocation tombstone (_revoke_family_locked flagged
+    # this credential compromised) the same as a merely load-driven eviction
+    # tombstone. If the revocation tombstone happens to be older, pure FIFO
+    # evicts it first to make room for newer eviction tombstones -- letting
+    # a stale concurrent Firestore writer resurrect a token that MUST stay
+    # dead. Eviction-origin entries must always be preferred as victims over
+    # revocation-origin ones, regardless of relative age.
+    monkeypatch.setattr(server, "_STORE_CAP", 4)
+    prov = _provider()
+    now = prov._now()
+    # consumed_access starts at cap-1 (3): the access eviction below adds
+    # exactly one more, tipping it to cap and evicting exactly one victim.
+    prov._consumed_access = {
+        "revoked-token": {
+            "family": "compromised-family",
+            "consumed_at": now - 1000,  # oldest of the three
+            "expires_at": now + 100_000,
+            "origin": "revocation",
+        },
+        "capacity-evicted-1": {
+            "family": None,
+            "consumed_at": now - 500,
+            "expires_at": now + 500,
+            "origin": "eviction",
+        },
+        "capacity-evicted-2": {
+            "family": None,
+            "consumed_at": now - 400,
+            "expires_at": now + 500,
+            "origin": "eviction",
+        },
+    }
+    prov._access = {
+        f"soon-expiring-{i}": {
+            "user": f"u{i}",
+            "client_id": "c",
+            "scope": "",
+            "resource": None,
+            "family": None,
+            "expires_at": now + 10 + i,
+        }
+        for i in range(4)
+    }
+    prov._refresh = {}
+
+    status, tok = prov._issue("new-user", "c", "", None)
+    assert status == 200
+
+    assert "revoked-token" in prov._consumed_access, (
+        "a security-critical revocation tombstone was evicted ahead of a "
+        "merely load-driven eviction tombstone"
+    )
+    # The oldest eviction-origin entry is the one that made way, not the
+    # revocation-origin entry despite being newer.
+    assert "capacity-evicted-1" not in prov._consumed_access
+    assert "capacity-evicted-2" in prov._consumed_access
+
+
+def test_legacy_originless_consumed_access_entry_defaults_to_revocation(monkeypatch):
+    # ai-review R3F1 on PR #436: before this PR, _revoke_family_locked was
+    # the ONLY writer of consumed_access, so any entry loaded from an older
+    # deployment's Firestore document with no "origin" key IS a revocation
+    # tombstone -- it predates the field, not the security signal. Treating
+    # it as eviction-priority (evictable first) would misclassify it as
+    # expendable capacity housekeeping and let it be discarded ahead of a
+    # genuinely newer, merely load-driven eviction tombstone.
+    monkeypatch.setattr(server, "_STORE_CAP", 4)
+    prov = _provider()
+    now = prov._now()
+    prov._consumed_access = {
+        "legacy-revocation": {  # no "origin" key -- written by pre-#436 code
+            "family": "compromised-family",
+            "consumed_at": now - 1000,  # oldest of the three
+            "expires_at": now + 100_000,
+        },
+        "capacity-evicted-1": {
+            "family": None,
+            "consumed_at": now - 500,
+            "expires_at": now + 500,
+            "origin": "eviction",
+        },
+        "capacity-evicted-2": {
+            "family": None,
+            "consumed_at": now - 400,
+            "expires_at": now + 500,
+            "origin": "eviction",
+        },
+    }
+    prov._access = {
+        f"soon-expiring-{i}": {
+            "user": f"u{i}",
+            "client_id": "c",
+            "scope": "",
+            "resource": None,
+            "family": None,
+            "expires_at": now + 10 + i,
+        }
+        for i in range(4)
+    }
+    prov._refresh = {}
+
+    status, tok = prov._issue("new-user", "c", "", None)
+    assert status == 200
+
+    assert "legacy-revocation" in prov._consumed_access, (
+        "an origin-less legacy revocation tombstone was misclassified as "
+        "eviction-priority and evicted ahead of a newer capacity tombstone"
+    )
+    assert "capacity-evicted-1" not in prov._consumed_access
+    assert "capacity-evicted-2" in prov._consumed_access
+
+
+def test_evicted_refresh_token_is_not_tombstoned(monkeypatch):
+    # #433: refresh/codes eviction must stay a bare delete. consumed_refresh
+    # doubles as _token_refresh's replay-detection state, so tombstoning an
+    # ordinary capacity-driven eviction there would let load be misread as
+    # theft and trigger a bogus _revoke_family_locked against an innocent
+    # client still holding that (evicted, not compromised) refresh token.
+    monkeypatch.setattr(server, "_STORE_CAP", 5)
+    prov = _provider()
+    for i in range(30):
+        prov._issue(f"u{i}", "c", "", None)
+    assert len(prov._refresh) <= 5
+    assert len(prov._consumed_refresh) == 0
+
+
 def test_client_cap_recycles_not_bricks(monkeypatch):
     # /register must never permanently lock out: at the cap the oldest client
     # is recycled rather than rejected.

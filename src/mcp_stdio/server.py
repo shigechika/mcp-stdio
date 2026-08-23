@@ -4140,15 +4140,27 @@ def _merge_oauth_snapshots(
     triggered the revocation -- so family-wide revocation is protected by
     this filter too, the same as an individual rotation or code redemption.
 
-    What remains out of scope: cap-based eviction (``access``, via
-    ``_evict_to_capacity_locked``) and client recycling (``clients``, via
-    ``_recycle_clients_locked``) still bare-delete with no tombstone, so
-    those specific removals can still be resurrected by a genuinely
-    concurrent writer. Neither is a security-relevant revocation --
-    eviction is self-correcting (the next at-cap ``_issue()`` re-trims
-    locally, since a merge's result is adopted into local state) and a
-    recycled client was never flagged for cause -- so this is deliberately
-    left open; see the follow-up issue filed alongside this fix.
+    Cap-based eviction of ``access`` (via ``_evict_to_capacity_locked``) is
+    ALSO tombstoned into ``consumed_access`` (#433) and so is covered by the
+    same filter -- including against ``consumed_access``'s OWN cap-eviction
+    shedding that very tombstone in the same pass, which is why
+    ``consumed_access``'s eviction victim selection is by ``consumed_at``
+    (write recency) rather than ``expires_at``, AND why that FIFO order is
+    itself origin-aware -- an eviction-origin tombstone is always preferred
+    as a victim over a security-critical revocation-origin one, regardless
+    of relative age (see ``_evict_to_capacity_locked``'s docstring for both).
+    ``refresh``/``codes`` eviction is deliberately NOT tombstoned: their
+    tombstone stores double as replay-detection state (``_token_refresh``
+    consults ``consumed_refresh``), so tombstoning a capacity-driven eviction
+    there would let ordinary load be misread as token/code reuse and trigger
+    a bogus ``_revoke_family_locked`` against an innocent client -- worse
+    than the resurrection window it would close. Client recycling
+    (``clients``, via ``_recycle_clients_locked``) still bare-deletes too,
+    with no tombstone at all. Neither remaining gap is a security-relevant
+    revocation -- eviction is self-correcting (the next at-cap ``_issue()``
+    re-trims locally, since a merge's result is adopted into local state)
+    and a recycled client was never flagged for cause -- so both are
+    deliberately left open; see the follow-up issue filed alongside #428.
 
     ``remote`` is ``None`` (no document yet) or has a missing/mismatched
     ``version`` is treated as contributing nothing -- an absent or
@@ -5019,7 +5031,24 @@ class _OAuthProvider:
             if any(len(s) >= _STORE_CAP for s in stores):
                 self._gc_locked()
                 for s in stores:
-                    self._evict_to_capacity_locked(s, _STORE_CAP)
+                    self._evict_to_capacity_locked(
+                        s,
+                        _STORE_CAP,
+                        # consumed_access alone needs origin-aware FIFO: it is
+                        # the only store that can receive a same-pass write
+                        # (the access eviction below, via tombstone_into) AND
+                        # already holds security-critical revocation
+                        # tombstones from _revoke_family_locked. refresh/codes
+                        # eviction never writes into consumed_refresh/
+                        # consumed_codes this way, so their cap-eviction stays
+                        # on the original expires_at ordering, unchanged.
+                        victim_key="consumed_at"
+                        if s is self._consumed_access
+                        else "expires_at",
+                        tombstone_into=self._consumed_access
+                        if s is self._access
+                        else None,
+                    )
             self._access[access] = {
                 "user": user,
                 "client_id": client_id,
@@ -5106,17 +5135,91 @@ class _OAuthProvider:
         return entry.get("user") if entry is not None else None
 
     def _evict_to_capacity_locked(
-        self, store: dict[str, dict[str, Any]], cap: int
+        self,
+        store: dict[str, dict[str, Any]],
+        cap: int,
+        *,
+        victim_key: str = "expires_at",
+        tombstone_into: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         """Hard-bound a TTL store: if still at the cap after GC, evict the
-        soonest-expiring entries to make room. GC alone frees nothing when every
-        entry is still live, so without this the cap is not a real bound."""
+        lowest-``victim_key`` entries to make room. GC alone frees nothing
+        when every entry is still live, so without this the cap is not a
+        real bound.
+
+        ``victim_key`` selects what "soonest" means. For a live store
+        (``access``/``refresh``/``codes``) it must stay ``"expires_at"``:
+        evict the tokens closest to their own real expiry. For
+        ``consumed_access`` specifically it must be ``"consumed_at"``
+        instead -- true FIFO by write time. ``consumed_access``'s own
+        eviction runs in the SAME cap-check pass as any entry just written
+        into it this call (access eviction tombstoning into it below), and
+        sorting by the original token's ``expires_at`` there can pick that
+        brand-new entry right back out if a longer-lived tombstone already
+        occupies the store, defeating the protection in the same pass it
+        was added (code-review R1, PR #436). Sorting by ``consumed_at``
+        guarantees the just-written entry -- always the newest -- is never
+        the FIFO minimum.
+
+        Plain FIFO alone is not enough, though: ``consumed_access`` mixes
+        two origins with very different stakes -- ``"eviction"`` (capacity
+        housekeeping, no security signal, self-correcting) and
+        ``"revocation"`` (``_revoke_family_locked`` flagged this credential
+        compromised). Evicting the security-critical one just because it is
+        older would let a stale concurrent writer resurrect a token that
+        MUST stay dead (code-review R2F1, PR #436). So for
+        ``victim_key="consumed_at"`` the sort key is
+        ``(origin == "revocation", consumed_at)``: every eviction-origin
+        entry is preferred as a victim over every revocation-origin entry
+        regardless of relative age, and only once none remain does eviction
+        fall back to the oldest revocation-origin entry. An entry with no
+        ``"origin"`` key defaults to ``"revocation"``, NOT ``"eviction"``:
+        ``tombstone_into`` (this PR) is the FIRST code ever to write an
+        eviction-origin ``consumed_access`` entry, so any pre-existing
+        record loaded from an older deployment's Firestore document was, by
+        construction, written exclusively by ``_revoke_family_locked`` --
+        i.e. it IS a revocation tombstone, just from before this field
+        existed to say so. Defaulting it to eviction-priority would
+        misclassify every legacy revocation tombstone as expendable
+        capacity housekeeping (ai-review R3F1, PR #436).
+
+        ``tombstone_into``, when given, records each eviction there too (#433)
+        so a genuinely concurrent Firestore writer's stale local view can't
+        resurrect an evicted-but-still-live entry via the merge's tombstone
+        filter (``_OAUTH_TOMBSTONE_PAIRS``). Only safe for a store with no
+        validation-path tombstone reader: passing ``_consumed_refresh`` or
+        ``_consumed_codes`` here would let ordinary capacity pressure be
+        misread as token/code reuse and trigger a bogus
+        ``_revoke_family_locked`` on an innocent client (see #433). Only
+        ``_consumed_access`` qualifies today.
+        """
         overflow = len(store) - (cap - 1)
         if overflow <= 0:
             return
-        victims = sorted(store.items(), key=lambda kv: kv[1]["expires_at"])
-        for k, _ in victims[:overflow]:
+
+        def sort_key(kv: tuple[str, dict[str, Any]]) -> tuple[Any, ...]:
+            if victim_key == "consumed_at":
+                # Missing "origin" defaults to "revocation": before this PR,
+                # _revoke_family_locked was the ONLY writer of consumed_access,
+                # so any origin-less entry loaded from an older deployment IS
+                # a revocation tombstone (ai-review R3F1, PR #436).
+                return (
+                    kv[1].get("origin", "revocation") == "revocation",
+                    kv[1]["consumed_at"],
+                )
+            return (kv[1][victim_key],)
+
+        victims = sorted(store.items(), key=sort_key)
+        now = self._now()
+        for k, v in victims[:overflow]:
             del store[k]
+            if tombstone_into is not None:
+                tombstone_into[k] = {
+                    "family": v.get("family"),
+                    "consumed_at": now,
+                    "expires_at": v["expires_at"],
+                    "origin": "eviction",
+                }
 
     def _gc_locked(self) -> None:
         now = self._now()
@@ -5169,17 +5272,25 @@ class _OAuthProvider:
         if family is None:
             return
         now = self._now()
-        for store, tombstones in (
-            (self._access, self._consumed_access),
-            (self._refresh, self._consumed_refresh),
+        for store, tombstones, origin in (
+            (self._access, self._consumed_access, "revocation"),
+            (self._refresh, self._consumed_refresh, None),
         ):
             for k, v in [(k, v) for k, v in store.items() if v.get("family") == family]:
                 del store[k]
-                tombstones[k] = {
+                record = {
                     "family": family,
                     "consumed_at": now,
                     "expires_at": v["expires_at"],
                 }
+                if origin is not None:
+                    # consumed_access's own eviction (_evict_to_capacity_locked)
+                    # reads this to protect a revoked credential from being
+                    # evicted ahead of a merely capacity-driven tombstone
+                    # (code-review R2F1, PR #436). consumed_refresh's eviction
+                    # does not consult origin, so it is not stamped here.
+                    record["origin"] = origin
+                tombstones[k] = record
 
     def _recycle_clients_locked(self) -> None:
         # Clients carry no TTL: recycle the oldest at the cap so /register never
