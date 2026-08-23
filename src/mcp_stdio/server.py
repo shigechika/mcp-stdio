@@ -4095,9 +4095,16 @@ def _merge_oauth_snapshots(
     would otherwise survive. For the two stores that have a tombstone
     (``refresh``/``consumed_refresh``, ``codes``/``consumed_codes``), that
     is fixed here: after the union, any live key that also appears in the
-    merged tombstone store is dropped. There is no such tombstone for
-    ``access`` or for ``clients``, so a bare (non-tombstoned) removal from
-    those -- ``_revoke_family_locked``, cap eviction, client recycling --
+    merged tombstone store is dropped -- but ONLY for the individually
+    tombstoned key itself (rotation, code redemption). ``_revoke_family_locked``
+    bare-deletes every OTHER token sharing a compromised grant family
+    (potentially several, across both ``access`` and ``refresh``) without
+    tombstoning any of them -- only the single token whose reuse actually
+    triggered the family revocation was ever individually tombstoned, by
+    its own earlier rotation/redemption. So a family-wide revocation is
+    NOT protected by this filter for any of its sibling tokens, on either
+    store; nor is a bare removal from ``access`` (cap eviction) or
+    ``clients`` (recycling), which have no tombstone at all. All of that
     can still be resurrected by a genuinely concurrent writer. That
     residual is deliberately out of scope for this fix; see #428.
 
