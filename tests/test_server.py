@@ -2687,6 +2687,10 @@ def test_refresh_reuse_revokes_family():
             {"grant_type": "refresh_token", "refresh_token": rt1, "client_id": cid},
         )
         assert r3.status_code == 400
+        # #428: rt1 is now individually tombstoned by the family revocation
+        # (not just bare-deleted), so this specifically hits the tombstone
+        # branch rather than falling through to "unknown refresh_token".
+        assert r3.json()["error_description"] == "refresh_token already rotated"
 
 
 def _grace():
@@ -3477,6 +3481,24 @@ def test_merge_oauth_snapshots_tombstoned_key_does_not_survive_merge():
     assert "rt" in merged["consumed_refresh"]
 
 
+def test_merge_oauth_snapshots_tombstoned_access_key_does_not_survive_merge():
+    # #428: the access/consumed_access pair added for _revoke_family_locked
+    # protects the same way the refresh/codes pairs already did.
+    local = {
+        "version": 1,
+        "access": {},
+        "consumed_access": {"at": {"family": "f1"}},
+    }
+    remote = {
+        "version": 1,
+        "access": {"at": {"user": "stale-live-copy"}},
+        "consumed_access": {},
+    }
+    merged = server._merge_oauth_snapshots(remote, local)
+    assert "at" not in merged["access"]
+    assert "at" in merged["consumed_access"]
+
+
 def test_token_store_firestore_legacy_nonceless_writer_does_not_clobber(
     fake_firestore,
 ):
@@ -3546,6 +3568,58 @@ def test_token_store_firestore_single_writer_rotation_is_a_real_deletion(
     )
     assert status == 400
     assert resp["error"] == "invalid_grant"
+
+
+def test_token_store_firestore_family_revocation_siblings_not_resurrected(
+    fake_firestore,
+):
+    """#428: a genuinely concurrent writer must not resurrect the OTHER
+    tokens a family revocation killed, on either access or refresh.
+
+    p1 (instance A) rotates a refresh token, then detects a replay of the
+    now-spent original and revokes the whole family -- killing the
+    access/refresh pair the rotation minted. p2 (instance B) loaded state
+    right after the rotation but before the revocation, so its own
+    in-memory view still has that pair live and has no way to know A
+    revoked them. p2's next persist must not write them back."""
+    ref = ("oauth-state", "jquants")
+    clock = [1000.0]
+    p1 = _provider(firestore_ref=ref, now=lambda: clock[0])
+    cid, tok0 = _direct_flow(p1)
+    rt0 = tok0["refresh_token"]
+
+    status, rotated = p1.token(
+        {"grant_type": "refresh_token", "refresh_token": rt0, "client_id": cid}
+    )
+    assert status == 200, rotated
+    access1 = rotated["access_token"]
+    rt1 = rotated["refresh_token"]
+
+    # p2 loads state AFTER the rotation but BEFORE the revocation below --
+    # access1/rt1 are live in its own memory, and it never learns otherwise.
+    p2 = _provider(firestore_ref=ref, now=lambda: clock[0])
+    assert p2.validate_access_token(access1) is True
+
+    # Past the grace window, replaying rt0 is a theft signal -- revokes
+    # the whole family (access1, rt1), each now individually tombstoned.
+    clock[0] += server._REUSE_GRACE_SECS + 5
+    status, resp = p1.token(
+        {"grant_type": "refresh_token", "refresh_token": rt0, "client_id": cid}
+    )
+    assert status == 400
+    assert "reuse detected" in resp["error_description"]
+
+    # p2 does an unrelated mutation and persists, still unaware of the
+    # revocation. Its stale local view still has access1/rt1 live; the
+    # merge must not write them back.
+    _direct_flow(p2)
+
+    persisted = fake_firestore[ref]
+    assert access1 not in persisted["access"], "revoked access sibling resurrected"
+    assert rt1 not in persisted["refresh"], "revoked refresh sibling resurrected"
+    # Adoption must also heal p2's own in-memory view, not just the
+    # written document.
+    assert p2.validate_access_token(access1) is False
 
 
 def test_token_store_firestore_concurrent_writers_both_survive(fake_firestore):
