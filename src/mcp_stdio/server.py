@@ -4142,7 +4142,12 @@ def _merge_oauth_snapshots(
 
     Cap-based eviction of ``access`` (via ``_evict_to_capacity_locked``) is
     ALSO tombstoned into ``consumed_access`` (#433) and so is covered by the
-    same filter. ``refresh``/``codes`` eviction is deliberately NOT: their
+    same filter -- including against ``consumed_access``'s OWN cap-eviction
+    shedding that very tombstone in the same pass, which is why
+    ``consumed_access``'s eviction victim selection is by ``consumed_at``
+    (write recency) rather than ``expires_at`` (see
+    ``_evict_to_capacity_locked``'s docstring). ``refresh``/``codes``
+    eviction is deliberately NOT tombstoned: their
     tombstone stores double as replay-detection state (``_token_refresh``
     consults ``consumed_refresh``), so tombstoning a capacity-driven eviction
     there would let ordinary load be misread as token/code reuse and trigger
@@ -5027,6 +5032,19 @@ class _OAuthProvider:
                     self._evict_to_capacity_locked(
                         s,
                         _STORE_CAP,
+                        # Tombstone stores are evicted FIFO by consumed_at (write
+                        # recency), not by the original token's expires_at: a
+                        # store's own cap-eviction runs in this SAME loop, after
+                        # any entry this pass just wrote into it (e.g. access
+                        # eviction tombstoning into consumed_access below), and
+                        # sorting by expires_at can pick that brand-new entry
+                        # right back out if a longer-lived tombstone (e.g. from
+                        # _revoke_family_locked) already occupies the store --
+                        # defeating the protection in the same pass it was
+                        # added (code-review finding on PR #436).
+                        victim_key="consumed_at"
+                        if s is not self._access and s is not self._refresh
+                        else "expires_at",
                         tombstone_into=self._consumed_access
                         if s is self._access
                         else None,
@@ -5121,11 +5139,28 @@ class _OAuthProvider:
         store: dict[str, dict[str, Any]],
         cap: int,
         *,
+        victim_key: str = "expires_at",
         tombstone_into: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         """Hard-bound a TTL store: if still at the cap after GC, evict the
-        soonest-expiring entries to make room. GC alone frees nothing when every
-        entry is still live, so without this the cap is not a real bound.
+        lowest-``victim_key`` entries to make room. GC alone frees nothing
+        when every entry is still live, so without this the cap is not a
+        real bound.
+
+        ``victim_key`` selects what "soonest" means. For a live store
+        (``access``/``refresh``/``codes``) it must stay ``"expires_at"``:
+        evict the tokens closest to their own real expiry. For a tombstone
+        store (``consumed_*``) it must be ``"consumed_at"`` instead -- true
+        FIFO by write time. A tombstone store's own eviction runs in the
+        SAME cap-check pass as any entry just written into it this call
+        (e.g. access eviction tombstoning into ``consumed_access`` below);
+        sorting by the original token's ``expires_at`` there can pick that
+        brand-new entry right back out if a longer-lived tombstone (e.g.
+        from ``_revoke_family_locked``) already occupies the store,
+        defeating the protection in the same pass it was added
+        (code-review finding on PR #436). Sorting by ``consumed_at``
+        instead guarantees the just-written entry -- always the newest --
+        is never the minimum.
 
         ``tombstone_into``, when given, records each eviction there too (#433)
         so a genuinely concurrent Firestore writer's stale local view can't
@@ -5140,7 +5175,7 @@ class _OAuthProvider:
         overflow = len(store) - (cap - 1)
         if overflow <= 0:
             return
-        victims = sorted(store.items(), key=lambda kv: kv[1]["expires_at"])
+        victims = sorted(store.items(), key=lambda kv: kv[1][victim_key])
         now = self._now()
         for k, v in victims[:overflow]:
             del store[k]

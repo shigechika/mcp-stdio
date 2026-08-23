@@ -2275,6 +2275,64 @@ def test_evicted_access_token_is_tombstoned(monkeypatch):
     assert len(prov._consumed_access) > 0
 
 
+def test_access_eviction_tombstone_survives_mixed_consumed_access(monkeypatch):
+    # code-review finding on PR #436: consumed_access is itself one of the
+    # `stores` capped in the SAME loop that tombstones an access eviction
+    # into it. If consumed_access is already holding longer-lived tombstones
+    # (e.g. from _revoke_family_locked, whose expires_at is the revoked
+    # token's own real expiry, not necessarily soon) and victim selection
+    # were by expires_at, the brand-new -- and typically soonest-expiring,
+    # since cap eviction picks the soonest-expiring live access token --
+    # tombstone could be evicted right back out in the very same _issue()
+    # call, defeating the protection before a concurrent writer ever gets a
+    # chance to observe it. Victim selection for consumed_access must be by
+    # consumed_at (write recency) so the just-written entry, always the
+    # newest, is never the minimum.
+    monkeypatch.setattr(server, "_STORE_CAP", 3)
+    prov = _provider()
+    now = prov._now()
+    # Pre-fill consumed_access to cap-1 with long-lived, old tombstones (as
+    # _revoke_family_locked would leave behind for a freshly-issued,
+    # long-lived token that got caught in a family revocation).
+    prov._consumed_access = {
+        "old-tombstone-1": {
+            "family": "f1",
+            "consumed_at": now - 1000,
+            "expires_at": now + 100_000,
+        },
+        "old-tombstone-2": {
+            "family": "f1",
+            "consumed_at": now - 900,
+            "expires_at": now + 100_000,
+        },
+    }
+    # Fill access to cap with soon-expiring tokens so the next _issue() call
+    # evicts one -- the eviction's own expires_at is far sooner than the
+    # pre-existing tombstones above.
+    prov._access = {
+        f"soon-expiring-{i}": {
+            "user": f"u{i}",
+            "client_id": "c",
+            "scope": "",
+            "resource": None,
+            "family": None,
+            "expires_at": now + 10 + i,
+        }
+        for i in range(3)
+    }
+    prov._refresh = {}
+
+    status, tok = prov._issue("new-user", "c", "", None)
+    assert status == 200
+
+    evicted_key = "soon-expiring-0"  # smallest expires_at among the three
+    assert evicted_key not in prov._access
+    assert evicted_key in prov._consumed_access, (
+        "the just-evicted access token's tombstone was itself evicted in "
+        "the same _issue() call -- protection defeated same-pass"
+    )
+
+
 def test_evicted_refresh_token_is_not_tombstoned(monkeypatch):
     # #433: refresh/codes eviction must stay a bare delete. consumed_refresh
     # doubles as _token_refresh's replay-detection state, so tombstoning an
