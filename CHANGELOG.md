@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.43.5](https://github.com/shigechika/mcp-stdio/compare/v0.43.4...v0.43.5) (2026-08-23)
+
+
+### Bug Fixes
+
+* tombstone every token a family revocation kills, not just the trigger ([#434](https://github.com/shigechika/mcp-stdio/issues/434)) ([65eff56](https://github.com/shigechika/mcp-stdio/commit/65eff56e3e7c1d6fbbc732321381a2305cac7170))
+
 ## [0.43.4](https://github.com/shigechika/mcp-stdio/compare/v0.43.3...v0.43.4) (2026-08-23)
 
 
