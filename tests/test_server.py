@@ -2261,6 +2261,34 @@ def test_store_cap_is_a_hard_bound(monkeypatch):
     assert len(prov._refresh) <= 5
 
 
+def test_evicted_access_token_is_tombstoned(monkeypatch):
+    # #433: cap-eviction of `access` must tombstone into `consumed_access` so
+    # a genuinely concurrent Firestore writer's stale local view can't
+    # resurrect it via the merge's tombstone filter. Safe only because
+    # consumed_access has no validation-path reader -- see the next test for
+    # why refresh/codes eviction must NOT get the same treatment.
+    monkeypatch.setattr(server, "_STORE_CAP", 5)
+    prov = _provider()
+    for i in range(30):
+        prov._issue(f"u{i}", "c", "", None)
+    assert len(prov._access) <= 5
+    assert len(prov._consumed_access) > 0
+
+
+def test_evicted_refresh_token_is_not_tombstoned(monkeypatch):
+    # #433: refresh/codes eviction must stay a bare delete. consumed_refresh
+    # doubles as _token_refresh's replay-detection state, so tombstoning an
+    # ordinary capacity-driven eviction there would let load be misread as
+    # theft and trigger a bogus _revoke_family_locked against an innocent
+    # client still holding that (evicted, not compromised) refresh token.
+    monkeypatch.setattr(server, "_STORE_CAP", 5)
+    prov = _provider()
+    for i in range(30):
+        prov._issue(f"u{i}", "c", "", None)
+    assert len(prov._refresh) <= 5
+    assert len(prov._consumed_refresh) == 0
+
+
 def test_client_cap_recycles_not_bricks(monkeypatch):
     # /register must never permanently lock out: at the cap the oldest client
     # is recycled rather than rejected.

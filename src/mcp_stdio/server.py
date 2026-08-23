@@ -4140,15 +4140,20 @@ def _merge_oauth_snapshots(
     triggered the revocation -- so family-wide revocation is protected by
     this filter too, the same as an individual rotation or code redemption.
 
-    What remains out of scope: cap-based eviction (``access``, via
-    ``_evict_to_capacity_locked``) and client recycling (``clients``, via
-    ``_recycle_clients_locked``) still bare-delete with no tombstone, so
-    those specific removals can still be resurrected by a genuinely
-    concurrent writer. Neither is a security-relevant revocation --
-    eviction is self-correcting (the next at-cap ``_issue()`` re-trims
-    locally, since a merge's result is adopted into local state) and a
-    recycled client was never flagged for cause -- so this is deliberately
-    left open; see the follow-up issue filed alongside this fix.
+    Cap-based eviction of ``access`` (via ``_evict_to_capacity_locked``) is
+    ALSO tombstoned into ``consumed_access`` (#433) and so is covered by the
+    same filter. ``refresh``/``codes`` eviction is deliberately NOT: their
+    tombstone stores double as replay-detection state (``_token_refresh``
+    consults ``consumed_refresh``), so tombstoning a capacity-driven eviction
+    there would let ordinary load be misread as token/code reuse and trigger
+    a bogus ``_revoke_family_locked`` against an innocent client -- worse
+    than the resurrection window it would close. Client recycling
+    (``clients``, via ``_recycle_clients_locked``) still bare-deletes too,
+    with no tombstone at all. Neither remaining gap is a security-relevant
+    revocation -- eviction is self-correcting (the next at-cap ``_issue()``
+    re-trims locally, since a merge's result is adopted into local state)
+    and a recycled client was never flagged for cause -- so both are
+    deliberately left open; see the follow-up issue filed alongside #428.
 
     ``remote`` is ``None`` (no document yet) or has a missing/mismatched
     ``version`` is treated as contributing nothing -- an absent or
@@ -5019,7 +5024,13 @@ class _OAuthProvider:
             if any(len(s) >= _STORE_CAP for s in stores):
                 self._gc_locked()
                 for s in stores:
-                    self._evict_to_capacity_locked(s, _STORE_CAP)
+                    self._evict_to_capacity_locked(
+                        s,
+                        _STORE_CAP,
+                        tombstone_into=self._consumed_access
+                        if s is self._access
+                        else None,
+                    )
             self._access[access] = {
                 "user": user,
                 "client_id": client_id,
@@ -5106,17 +5117,39 @@ class _OAuthProvider:
         return entry.get("user") if entry is not None else None
 
     def _evict_to_capacity_locked(
-        self, store: dict[str, dict[str, Any]], cap: int
+        self,
+        store: dict[str, dict[str, Any]],
+        cap: int,
+        *,
+        tombstone_into: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         """Hard-bound a TTL store: if still at the cap after GC, evict the
         soonest-expiring entries to make room. GC alone frees nothing when every
-        entry is still live, so without this the cap is not a real bound."""
+        entry is still live, so without this the cap is not a real bound.
+
+        ``tombstone_into``, when given, records each eviction there too (#433)
+        so a genuinely concurrent Firestore writer's stale local view can't
+        resurrect an evicted-but-still-live entry via the merge's tombstone
+        filter (``_OAUTH_TOMBSTONE_PAIRS``). Only safe for a store with no
+        validation-path tombstone reader: passing ``_consumed_refresh`` or
+        ``_consumed_codes`` here would let ordinary capacity pressure be
+        misread as token/code reuse and trigger a bogus
+        ``_revoke_family_locked`` on an innocent client (see #433). Only
+        ``_consumed_access`` qualifies today.
+        """
         overflow = len(store) - (cap - 1)
         if overflow <= 0:
             return
         victims = sorted(store.items(), key=lambda kv: kv[1]["expires_at"])
-        for k, _ in victims[:overflow]:
+        now = self._now()
+        for k, v in victims[:overflow]:
             del store[k]
+            if tombstone_into is not None:
+                tombstone_into[k] = {
+                    "family": v.get("family"),
+                    "consumed_at": now,
+                    "expires_at": v["expires_at"],
+                }
 
     def _gc_locked(self) -> None:
         now = self._now()
