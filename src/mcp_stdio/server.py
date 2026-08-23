@@ -1329,26 +1329,40 @@ class ModernBackendPool:
         and coupling the pool into `SessionRegistry` to borrow it would
         buy nothing.
 
-        TWO INDEPENDENT REASONS TO RUN, and conflating them was #390's
-        R3F1. Idle eviction needs `--modern-idle-ttl`; sweeping abandoned
-        MRTR rounds needs only the bridge to be enabled. Gating the whole
-        thread on the TTL alone meant that in the DEFAULT deployment the
-        thread never started, so `reap_idle` — where the sweep lives,
-        correctly placed outside its own TTL check — was never called at
-        all. That is finding 1 again, one layer up: code with no
-        production caller.
+        THREE INDEPENDENT REASONS TO RUN, and conflating any of them is
+        how this method has twice ended up gating STARTING THE THREAD AT
+        ALL on a condition that only some of what `reap_idle` does
+        actually needs:
+
+        - Idle eviction needs `--modern-idle-ttl`.
+        - Sweeping abandoned MRTR rounds needs only the bridge enabled
+          (#390 R3F1 — conflating this with idle eviction was the first
+          version of this gap).
+        - The dead-child sweep (`backend.closed`) needs NEITHER: it is
+          unconditional in `reap_idle`, same as the legacy reaper's own
+          (#376 §2.3), so a long-lived pool on pure-default settings
+          (neither flag set) still accumulates dead children with
+          nothing to shed them — the SAME failure #385 fixed one layer
+          down in `SessionRegistry.start_reaper`, and #427 fixes here:
+          gating on `idle_ttl > 0 or bridge_enabled` covered the second
+          reason but still missed the third, so a pure-default
+          deployment still never started this thread at all.
 
         `reap_idle` already gates eviction internally, so a thread
-        started only for the bridge evicts nothing: `--modern-idle-ttl 0`
-        still means idle eviction is OFF, exactly as before.
+        started only for the dead-child sweep or the bridge evicts
+        nothing extra: `--modern-idle-ttl 0` still means idle eviction is
+        OFF, exactly as before. This method now ALWAYS starts (no-op only
+        on a second call); only the tick INTERVAL depends on which of the
+        three reasons apply.
 
-        The bridge flag gates STARTUP ONLY — see the comment below.
+        The bridge flag gates the interval choice only, not whether the
+        thread starts at all — see the comment below.
         """
-        # Read ONCE, here, so this decides whether the thread starts and
-        # nothing more. A previous version of this comment claimed the
-        # sweep "cannot outlive the thing it sweeps", which overstated
-        # it: clearing `MCP_STDIO_MRTR_REVERSE_ENABLE` afterwards does
-        # not stop a thread already running (#390 Copilot review).
+        # Read ONCE, here, so this decides the interval and nothing more.
+        # A previous version of this comment claimed the sweep "cannot
+        # outlive the thing it sweeps", which overstated it: clearing
+        # `MCP_STDIO_MRTR_REVERSE_ENABLE` afterwards does not stop a
+        # thread already running (#390 Copilot review).
         #
         # That is CORRECT rather than merely harmless, and worth saying
         # so nobody "fixes" it into a per-tick check. Rounds parked
@@ -1363,11 +1377,11 @@ class ModernBackendPool:
         # then finds nothing, which is the behaviour an operator
         # withdrawing the feature actually wants.
         bridge_enabled = bool(_modern_child_capabilities())
-        if (self._idle_ttl <= 0 and not bridge_enabled) or self._reaper is not None:
+        if self._reaper is not None:
             return
         if self._idle_ttl > 0:
             interval = max(1.0, min(self._idle_ttl, _MAX_REAP_INTERVAL_SECS))
-        else:
+        elif bridge_enabled:
             # Bridge-only: pace off the park deadline, as a RATIO rather
             # than a literal (the rule #388's review established), so a
             # change to the deadline cannot silently leave the sweep too
@@ -1375,6 +1389,12 @@ class ModernBackendPool:
             interval = max(
                 1.0, min(_MRTR_PARK_TIMEOUT_SECS / 4, _MAX_REAP_INTERVAL_SECS)
             )
+        else:
+            # Neither idle eviction nor the bridge is configured: still
+            # start, for the unconditional dead-child sweep alone (#427)
+            # — same fallback interval as the legacy reaper's equivalent
+            # case (#385).
+            interval = _MAX_REAP_INTERVAL_SECS
         # A FRESH stop event per thread (#379 Copilot review), not a
         # shared one cleared on restart: `stop_reaper` does not join —
         # the thread is a daemon parked in `wait(interval)` — so a
@@ -3654,13 +3674,12 @@ class SessionRegistry:
         the fix already applied to the modern pool's analogous reaper
         (#390 R3F1, ``ModernBackendPool.start_reaper``) — separate "why
         does the thread run" from "what does each tick actually evict",
-        since ``reap_idle`` was always correct on the latter — but the
-        RESULT is not identical: the modern pool's ``start_reaper`` still
-        gates on ``modern_idle_ttl > 0 or`` the MRTR bridge being enabled,
-        so a pure-default deployment (neither set) still never starts
-        that thread and still never sweeps a dead modern child. THIS
-        method now starts unconditionally, with no equivalent second gate
-        (#385 review R1F1).
+        since ``reap_idle`` was always correct on the latter. THIS method
+        now starts unconditionally, with no equivalent second gate (#385
+        review R1F1). ``ModernBackendPool.start_reaper`` closed the same
+        residual gap for itself one PR later (#427): it too now always
+        starts, falling back to sweeping for dead children alone when
+        neither ``modern_idle_ttl`` nor the MRTR bridge is configured.
 
         So this now ALWAYS starts (no-op only on a second call): the tick
         interval favors the idle TTL when one is configured (finer-grained
@@ -6875,10 +6894,9 @@ def serve(
     # unconditionally, not just idle-past-TTL ones), independent of
     # whether --session-idle-ttl is set.
     registry.start_reaper()
-    # Its own thread. Unlike the legacy reaper above, the modern pool's
-    # can still be a no-op (no --modern-idle-ttl and the MRTR bridge
-    # disabled) — its dead-child sweep has the same residual gap #385
-    # closed here, just not this issue's scope.
+    # Its own thread. #427 closed the modern pool's analogous gap: it now
+    # also always starts, for the same unconditional dead-child sweep,
+    # independent of --modern-idle-ttl and the MRTR bridge flag.
     httpd.modern_pool.start_reaper()
 
     stopping = threading.Event()
