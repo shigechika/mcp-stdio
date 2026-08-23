@@ -7054,7 +7054,11 @@ def serve_main(argv: list[str]) -> None:
             "through a read-merge-write Firestore transaction rather than a "
             "blind overwrite, so a brief overlap between two writers (e.g. a "
             "Cloud Run revision cutover) does not silently discard tokens "
-            "either side issued or rotated during the overlap."
+            "either side issued or rotated during the overlap. One gap "
+            "remains: a token revoked (replay detected) or evicted for "
+            "capacity during that same overlap can still be resurrected by "
+            "a concurrently-stale writer, since those removals carry no "
+            "tombstone."
         ),
     )
     parser.add_argument(

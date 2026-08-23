@@ -422,11 +422,14 @@ command follows the options (an optional `--` separator is supported).
     (`pip install mcp-stdio[firestore]`, an optional extra — plain
     `pip install mcp-stdio` never needs it) and `--enable-oauth`. **Unlike
     `--token-store` there is no lock against two processes sharing one
-    document** — safe ONLY when exactly one `serve` process ever writes to a
-    given document at a time (e.g. Cloud Run with `min-instances=1` and
-    `max-instances=1`); two concurrent writers silently last-writer-wins
-    clobber each other's issued tokens. Mutually exclusive with
-    `--token-store`.
+    document**, but each write goes through a read-merge-write transaction
+    rather than a blind overwrite (#406), so a brief overlap between two
+    writers (e.g. a Cloud Run revision cutover) does not silently discard
+    tokens either side issued or rotated during the overlap. One residual
+    gap remains: a token revoked (replay detected) or evicted for capacity
+    during that same overlap window can still be resurrected by a
+    concurrently-stale writer, since those removals carry no tombstone
+    (#428). Mutually exclusive with `--token-store`.
   - *Path-scoped issuer* — `--public-url` retains a path, so several
     `--enable-oauth` backends can share one host behind a reverse proxy, each
     under its own prefix (e.g. `--public-url https://gw.example.org/team-a`
