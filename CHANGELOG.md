@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.43.4](https://github.com/shigechika/mcp-stdio/compare/v0.43.3...v0.43.4) (2026-08-23)
+
+
+### Bug Fixes
+
+* start ModernBackendPool's reaper thread even with no ttl or bridge configured ([#427](https://github.com/shigechika/mcp-stdio/issues/427)) ([#431](https://github.com/shigechika/mcp-stdio/issues/431)) ([af265a5](https://github.com/shigechika/mcp-stdio/commit/af265a51b4f967e03d74b6842d65545fa8766a80))
+
 ## [0.43.3](https://github.com/shigechika/mcp-stdio/compare/v0.43.2...v0.43.3) (2026-08-23)
 
 
