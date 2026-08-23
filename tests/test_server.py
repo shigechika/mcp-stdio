@@ -3158,7 +3158,10 @@ class _FakeFirestoreDocument:
         self._fail_set_with = fail_set_with
         self._fail_get_with = fail_get_with
 
-    def get(self):
+    def get(self, transaction=None):
+        # `transaction` is accepted (and ignored) so the fake mirrors the
+        # real client's transactional get() signature -- the fake store has
+        # no real MVCC, so a transactional read just returns current state.
         if self._fail_get_with is not None:
             raise self._fail_get_with
         return _FakeFirestoreSnapshot(self._store.get(self._key))
@@ -3167,6 +3170,17 @@ class _FakeFirestoreDocument:
         if self._fail_set_with is not None:
             raise self._fail_set_with
         self._store[self._key] = data
+
+
+class _FakeFirestoreTransaction:
+    """Fakes just enough of google.cloud.firestore.Transaction for
+    _write_firestore_snapshot_locked: set() delegates straight to the
+    document (reusing its fail_set_with injection) since the fake store has
+    no real contention to retry on.
+    """
+
+    def set(self, doc_ref, data):
+        doc_ref.set(data)
 
 
 class _FakeFirestoreCollection:
@@ -3189,6 +3203,9 @@ class _FakeFirestoreClient:
     def collection(self, name):
         return _FakeFirestoreCollection(self._store, name, **self._doc_kwargs)
 
+    def transaction(self):
+        return _FakeFirestoreTransaction()
+
 
 @pytest.fixture()
 def fake_firestore(monkeypatch):
@@ -3201,6 +3218,9 @@ def fake_firestore(monkeypatch):
     store: dict[tuple[str, str], dict] = {}
     fake_module = types.ModuleType("google.cloud.firestore")
     fake_module.Client = lambda: _FakeFirestoreClient(store)  # type: ignore[attr-defined]
+    # transactional() just runs the wrapped function directly against the
+    # fake transaction -- the fake store has no real contention to retry.
+    fake_module.transactional = lambda fn: fn  # type: ignore[attr-defined]
     google_module = types.ModuleType("google")
     google_cloud_module = types.ModuleType("google.cloud")
     google_cloud_module.firestore = fake_module  # type: ignore[attr-defined]
@@ -3375,6 +3395,86 @@ def test_serve_main_token_store_firestore_malformed_ref_rejected(value):
                 "true",
             ]
         )
+
+
+# --- #406: concurrent Firestore writers no longer blind-overwrite ---
+
+
+def test_merge_oauth_snapshots_no_remote_returns_local_unchanged():
+    local = {"version": 1, "access": {"a": {"x": 1}}}
+    assert server._merge_oauth_snapshots(None, local) == local
+
+
+def test_merge_oauth_snapshots_version_mismatch_returns_local_unchanged():
+    local = {"version": 1, "access": {"a": {"x": 1}}}
+    remote = {"version": 999, "access": {"b": {"x": 2}}}
+    assert server._merge_oauth_snapshots(remote, local) == local
+
+
+def test_merge_oauth_snapshots_unions_disjoint_keys_per_store():
+    local = {
+        "version": 1,
+        "clients": {},
+        "codes": {},
+        "access": {"local-tok": {"user": "local"}},
+        "refresh": {},
+        "consumed_codes": {},
+        "consumed_refresh": {},
+    }
+    remote = {
+        "version": 1,
+        "clients": {},
+        "codes": {},
+        "access": {"remote-tok": {"user": "remote"}},
+        "refresh": {},
+        "consumed_codes": {},
+        "consumed_refresh": {},
+    }
+    merged = server._merge_oauth_snapshots(remote, local)
+    assert merged["access"] == {
+        "local-tok": {"user": "local"},
+        "remote-tok": {"user": "remote"},
+    }
+
+
+def test_merge_oauth_snapshots_local_wins_on_key_collision():
+    local = {"version": 1, "access": {"tok": {"user": "local-view"}}}
+    remote = {"version": 1, "access": {"tok": {"user": "remote-view"}}}
+    merged = server._merge_oauth_snapshots(remote, local)
+    assert merged["access"] == {"tok": {"user": "local-view"}}
+
+
+def test_merge_oauth_snapshots_tombstone_stores_union_too():
+    local = {"version": 1, "consumed_refresh": {"local-rt": {"family": "f1"}}}
+    remote = {"version": 1, "consumed_refresh": {"remote-rt": {"family": "f2"}}}
+    merged = server._merge_oauth_snapshots(remote, local)
+    assert merged["consumed_refresh"] == {
+        "local-rt": {"family": "f1"},
+        "remote-rt": {"family": "f2"},
+    }
+
+
+def test_token_store_firestore_concurrent_writers_both_survive(fake_firestore):
+    # Two instances start from the SAME empty document (a Cloud Run revision
+    # overlap): neither has seen the other's writes yet.
+    ref = ("oauth-state", "jquants")
+    p1 = _provider(firestore_ref=ref)
+    p2 = _provider(firestore_ref=ref)
+
+    # p1 persists first: the (still-empty) remote document merges with p1's
+    # snapshot and is written.
+    _, tok1 = _direct_flow(p1)
+
+    # p2 persists next, WITHOUT ever having seen p1's write locally -- a
+    # blind .set() here would discard tok1 entirely. The merge transaction
+    # must instead union p2's snapshot with the now-p1-containing remote
+    # document.
+    _, tok2 = _direct_flow(p2)
+
+    # A third "instance" restarting after both writes must see BOTH tokens.
+    p3 = _provider(firestore_ref=ref)
+    assert p3.validate_access_token(tok1["access_token"]) is True
+    assert p3.validate_access_token(tok2["access_token"]) is True
 
 
 # --- cross-SDK guard tests (#273) ---

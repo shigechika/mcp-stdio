@@ -4047,6 +4047,55 @@ def _acquire_store_lock(store_path: Path) -> Any:
         raise
 
 
+_OAUTH_SNAPSHOT_DICT_KEYS = (
+    "clients",
+    "codes",
+    "access",
+    "refresh",
+    "consumed_codes",
+    "consumed_refresh",
+)
+
+
+def _merge_oauth_snapshots(
+    remote: dict[str, Any] | None, local: dict[str, Any]
+) -> dict[str, Any]:
+    """Union-merge a freshly read Firestore snapshot with the one about to
+    be written, so two concurrently overlapping ``--token-store-firestore``
+    writers do not silently discard each other's additions (#406).
+
+    Each of the six stores is merged key-by-key with LOCAL winning on
+    collision: local is the freshest view of the keys it owns, since it is
+    what triggered this specific write. Every key in these stores is a
+    ``secrets.token_*``-derived value, so a cross-instance collision on the
+    SAME key is negligible -- in practice this is a conflict-free union of
+    each side's additions, not a real merge decision.
+
+    This does NOT protect a bare (non-tombstoned) deletion: the only such
+    removal path is ``_revoke_family_locked``, whose bare ``del`` leaves
+    nothing here to distinguish "deliberately removed" from "never seen" --
+    a stale remote copy of a just-revoked token would survive the union.
+    That gap is deliberately out of scope for this fix; see #428.
+
+    ``remote`` is ``None`` (no document yet) or has a missing/mismatched
+    ``version`` is treated as contributing nothing -- an absent or
+    incompatible remote document cannot be merged from, so ``local`` wins
+    outright.
+    """
+    if not isinstance(remote, dict) or remote.get("version") != _STATE_VERSION:
+        return local
+    merged: dict[str, Any] = dict(local)
+    for key in _OAUTH_SNAPSHOT_DICT_KEYS:
+        remote_store = remote.get(key)
+        if not isinstance(remote_store, dict):
+            continue
+        local_store = local.get(key)
+        if not isinstance(local_store, dict):
+            local_store = {}
+        merged[key] = {**remote_store, **local_store}
+    return merged
+
+
 class _FirestoreReadError(Exception):
     """Raised by _load_state when reading --token-store-firestore's document
     itself fails (network error, permission error, ...) -- as opposed to the
@@ -4121,10 +4170,12 @@ class _OAuthProvider:
         # keeps the pre-existing in-memory-only behavior.
         self._store_path = store_path
         # --token-store-firestore: same snapshot, written to one Firestore
-        # document instead. The CLI enforces store_path/firestore_ref are
-        # never both set. No sidecar lock exists for this backend (unlike
-        # store_path's _acquire_store_lock) — safe only with exactly one
-        # writer (see the flag's --help text).
+        # document instead via a read-merge-write transaction (#406, see
+        # _write_firestore_snapshot_locked). The CLI enforces store_path/
+        # firestore_ref are never both set. No sidecar lock exists for this
+        # backend (unlike store_path's _acquire_store_lock) -- concurrent
+        # writers are tolerated via the merge, not serialized like
+        # store_path's lock.
         self._firestore_ref = firestore_ref
         self._firestore_client: Any = None
         self._warned_persist_failure = False
@@ -4306,7 +4357,46 @@ class _OAuthProvider:
         if self._store_path is not None:
             _atomic_write_json_file(self._store_path, self._snapshot_locked())
         elif self._firestore_ref is not None:
-            self._firestore_document().set(self._snapshot_locked())
+            self._write_firestore_snapshot_locked()
+
+    def _write_firestore_snapshot_locked(self) -> None:
+        """Write the snapshot to Firestore via a read-merge-write transaction
+        (caller holds ``self._lock``) instead of a blind ``.set()`` (#406).
+
+        Two Cloud Run instances can briefly overlap during a revision
+        cutover, each with its own in-memory view of the six stores. A blind
+        overwrite from whichever instance persists last would silently
+        discard whatever the other instance added in that window (e.g. a
+        token it issued or rotated). The transaction instead reads the
+        current document, merges it with the local snapshot via
+        :func:`_merge_oauth_snapshots` (union per store, local wins on key
+        collision -- see that function for why this is safe for additions),
+        and writes the merged result back; Firestore aborts and retries the
+        transaction if the document changes underneath it.
+
+        This does not close every gap: a bare (non-tombstoned) removal, the
+        one such path being ``_revoke_family_locked``, can still be
+        resurrected by a concurrently-stale writer within the same overlap
+        window. That is deliberately out of scope here -- see #428.
+
+        The transaction's network round-trip(s) run under ``self._lock``,
+        so a retry on contention serializes AS requests for its duration
+        (bounded by the client's default retry count). This is a latency
+        cost, not a new correctness risk: the prior ``.set()`` already did
+        one network write under this same lock.
+        """
+        from google.cloud import firestore
+
+        doc_ref = self._firestore_document()
+        local_snapshot = self._snapshot_locked()
+
+        @firestore.transactional
+        def _run(transaction: Any) -> None:
+            remote_doc = doc_ref.get(transaction=transaction)
+            remote = remote_doc.to_dict() if remote_doc.exists else None
+            transaction.set(doc_ref, _merge_oauth_snapshots(remote, local_snapshot))
+
+        _run(self._get_firestore_client().transaction())
 
     def persist_now(self) -> None:
         """Write the current state immediately, PROPAGATING any failure.
@@ -6829,11 +6919,11 @@ def serve_main(argv: list[str]) -> None:
             "google-cloud-firestore package (`pip install "
             "mcp-stdio[firestore]`) and --enable-oauth. Mutually exclusive "
             "with --token-store. Unlike --token-store there is no lock "
-            "against two processes sharing one document — safe ONLY when "
-            "exactly one serve process ever writes to a given document at a "
-            "time (e.g. Cloud Run with min-instances=1 and max-instances=1); "
-            "two concurrent writers silently last-writer-wins clobber each "
-            "other's issued tokens."
+            "against two processes sharing one document, but each write goes "
+            "through a read-merge-write Firestore transaction rather than a "
+            "blind overwrite, so a brief overlap between two writers (e.g. a "
+            "Cloud Run revision cutover) does not silently discard tokens "
+            "either side issued or rotated during the overlap."
         ),
     )
     parser.add_argument(
@@ -7093,7 +7183,8 @@ def serve_main(argv: list[str]) -> None:
             log(
                 f"note: persisting issued OAuth state to Firestore "
                 f"{firestore_ref[0]}/{firestore_ref[1]} (credential "
-                "material; safe only with exactly one writer)"
+                "material; writes merge via a transaction, so brief "
+                "overlap between two writers is tolerated)"
             )
         try:
             oauth = _OAuthProvider(
