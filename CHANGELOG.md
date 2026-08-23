@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.43.3](https://github.com/shigechika/mcp-stdio/compare/v0.43.2...v0.43.3) (2026-08-23)
+
+
+### Bug Fixes
+
+* merge concurrent writes to --token-store-firestore instead of blind overwrite ([#429](https://github.com/shigechika/mcp-stdio/issues/429)) ([05beab3](https://github.com/shigechika/mcp-stdio/commit/05beab3f5db610905f351cba2214589156911ed1))
+
 ## [0.43.2](https://github.com/shigechika/mcp-stdio/compare/v0.43.1...v0.43.2) (2026-08-22)
 
 
