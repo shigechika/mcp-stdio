@@ -4047,6 +4047,13 @@ def _acquire_store_lock(store_path: Path) -> Any:
         raise
 
 
+# The six store names, also spelled out as dict-literal keys in
+# _snapshot_locked and as load() calls in _apply_state_locked -- not
+# unified into a single loop there because clients needs a bespoke
+# transform (redirect_keys) the other five don't. _snapshot_locked
+# instead asserts its dict literal's keys match this tuple, so a future
+# 7th store added there but forgotten here fails loudly (in tests) rather
+# than silently falling back to last-writer-wins in the merge.
 _OAUTH_SNAPSHOT_DICT_KEYS = (
     "clients",
     "codes",
@@ -4463,11 +4470,15 @@ class _OAuthProvider:
         actually in Firestore, and silently re-discard everything the
         merge just pulled in.
 
-        The transaction's network round-trip(s) run under ``self._lock``,
-        so a retry on contention serializes AS requests for its duration
-        (bounded by the client's default retry count). This is a latency
-        cost, not a new correctness risk: the prior ``.set()`` already did
-        one network write under this same lock.
+        The full read-then-commit transaction runs under ``self._lock``,
+        not just a single round trip: on contention Firestore aborts and
+        the client SDK retries the whole read+commit internally (bounded by
+        its default retry count, with backoff between attempts), so lock
+        hold time can multiply under contention, not just add one extra
+        round trip over the prior blind ``.set()``. That is a latency cost
+        under real write contention -- every other AS request blocks for
+        the duration -- not a new correctness risk, and it is scoped to
+        exactly the brief overlap window this fix targets.
         """
         from google.cloud import firestore
 
