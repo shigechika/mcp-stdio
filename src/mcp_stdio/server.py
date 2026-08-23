@@ -4084,6 +4084,23 @@ _OAUTH_SNAPSHOT_DICT_KEYS = (
 )
 
 
+# Adding a pair here protects only a writer running code that includes it.
+# During a mixed-version Cloud Run rollout, an OLDER instance's merge does
+# not know to filter a live key against a tombstone store this tuple did
+# not yet name when that instance was built -- it unions the stale live
+# entry back in. The tombstone DATA still survives that write (the
+# top-level `{**remote, **local}` spread in _merge_oauth_snapshots
+# preserves any store name it doesn't specifically recognize, tombstone
+# stores included), so the very next persist from a writer that DOES know
+# this pair re-applies the filter and strips the resurrected entry again.
+# Exposure is bounded to the deploy's old+new coexistence window -- the
+# same shape as every other residual in this file, just also requiring a
+# writer still running pre-this-pair code specifically. This is inherent
+# to any incremental addition to this tuple, not specific to one entry;
+# the ("access", "consumed_access") pair (#428) was the first one caught
+# by ai-review (PR #434 round 1, R1F1). The structural fix that removes
+# the whole category -- per-entry Firestore subcollections instead of one
+# JSON blob document -- is out of scope here; see #433's note.
 _OAUTH_TOMBSTONE_PAIRS = (
     ("refresh", "consumed_refresh"),
     ("codes", "consumed_codes"),
@@ -5123,14 +5140,27 @@ class _OAuthProvider:
         no-op. The caller already holds ``self._lock``.
 
         Each killed token is ALSO tombstoned into ``_consumed_refresh`` /
-        ``_consumed_access`` (#428) -- not for replay detection (an already-
-        deleted token cannot be replayed against the live-entry lookups that
-        actually gate `_token_refresh`/`validate_access_token`) but so the
-        Firestore merge's tombstone filter (`_OAUTH_TOMBSTONE_PAIRS`) can
-        keep it from being resurrected by a genuinely concurrent writer's
-        stale local view. Only the single token whose reuse triggered this
-        call was tombstoned before (by its own earlier rotation/redemption);
-        every OTHER family member used to be a bare, unprotected delete.
+        ``_consumed_access`` (#428), primarily so the Firestore merge's
+        tombstone filter (`_OAUTH_TOMBSTONE_PAIRS`) can keep it from being
+        resurrected by a genuinely concurrent writer's stale local view.
+        Only the single token whose reuse triggered this call was
+        tombstoned before (by its own earlier rotation/redemption); every
+        OTHER family member used to be a bare, unprotected delete.
+
+        The two stores differ in whether that tombstone ALSO does anything
+        at request time, since only refresh tokens have replay semantics:
+        `_token_refresh` falls through to `self._consumed_refresh.get(rt)`
+        whenever the live lookup misses, so a sibling refresh token killed
+        here is not just gone but now answers a later replay with "already
+        rotated" / "reuse detected" instead of the less informative
+        "unknown refresh_token" -- a behavior improvement, not merely a
+        merge-time artifact (see the strengthened assertion on
+        `test_refresh_reuse_revokes_family`). `_consumed_access` has no
+        such reader: access tokens carry no replay/single-use semantics in
+        this codebase (`validate_access_token`/`_live_entry` check
+        presence and expiry only), so that tombstone exists purely for the
+        merge filter above.
+
         The tombstone's ``expires_at`` is copied from the entry being
         deleted, not recomputed from a TTL constant -- it only needs to
         outlive the token it blocks, since expiry is independently
