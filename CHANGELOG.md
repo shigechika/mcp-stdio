@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.43.6](https://github.com/shigechika/mcp-stdio/compare/v0.43.5...v0.43.6) (2026-08-23)
+
+
+### Bug Fixes
+
+* tombstone cap-evicted access tokens ([#433](https://github.com/shigechika/mcp-stdio/issues/433) safe subset) ([#436](https://github.com/shigechika/mcp-stdio/issues/436)) ([5e6e6cc](https://github.com/shigechika/mcp-stdio/commit/5e6e6ccd1c75f8b5cebcff2bf546ea53577100d9))
+
 ## [0.43.5](https://github.com/shigechika/mcp-stdio/compare/v0.43.4...v0.43.5) (2026-08-23)
 
 
