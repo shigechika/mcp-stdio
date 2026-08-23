@@ -5173,9 +5173,15 @@ class _OAuthProvider:
         entry is preferred as a victim over every revocation-origin entry
         regardless of relative age, and only once none remain does eviction
         fall back to the oldest revocation-origin entry. An entry with no
-        ``"origin"`` (legacy/pre-this-fix data) sorts as eviction-origin --
-        the conservative default, since that's what every entry meant
-        before this field existed.
+        ``"origin"`` key defaults to ``"revocation"``, NOT ``"eviction"``:
+        ``tombstone_into`` (this PR) is the FIRST code ever to write an
+        eviction-origin ``consumed_access`` entry, so any pre-existing
+        record loaded from an older deployment's Firestore document was, by
+        construction, written exclusively by ``_revoke_family_locked`` --
+        i.e. it IS a revocation tombstone, just from before this field
+        existed to say so. Defaulting it to eviction-priority would
+        misclassify every legacy revocation tombstone as expendable
+        capacity housekeeping (ai-review R3F1, PR #436).
 
         ``tombstone_into``, when given, records each eviction there too (#433)
         so a genuinely concurrent Firestore writer's stale local view can't
@@ -5193,7 +5199,14 @@ class _OAuthProvider:
 
         def sort_key(kv: tuple[str, dict[str, Any]]) -> tuple[Any, ...]:
             if victim_key == "consumed_at":
-                return (kv[1].get("origin") == "revocation", kv[1]["consumed_at"])
+                # Missing "origin" defaults to "revocation": before this PR,
+                # _revoke_family_locked was the ONLY writer of consumed_access,
+                # so any origin-less entry loaded from an older deployment IS
+                # a revocation tombstone (ai-review R3F1, PR #436).
+                return (
+                    kv[1].get("origin", "revocation") == "revocation",
+                    kv[1]["consumed_at"],
+                )
             return (kv[1][victim_key],)
 
         victims = sorted(store.items(), key=sort_key)
