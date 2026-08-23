@@ -1661,16 +1661,22 @@ class TestModernPoolReaper:
         finally:
             pool.shutdown_all()
 
-    def test_the_reaper_thread_only_starts_when_the_ttl_is_set(self):
+    def test_the_reaper_thread_starts_even_when_the_ttl_is_unset(self):
+        """#427: the thread must start even with neither --modern-idle-ttl
+        nor the MRTR bridge configured — the pure-default deployment. It
+        still sweeps dead children unconditionally (reap_idle's own
+        `backend.closed` branch), which used to have no production caller
+        in that configuration, mirroring #385's fix to the legacy
+        reaper."""
         clock = [1000.0]
         off = self._pool(clock, idle_ttl=0.0)
         try:
             off.start_reaper()
-            assert not any(
-                t.name == "modern-pool-reaper" for t in threading.enumerate()
-            )
+            assert any(t.name == "modern-pool-reaper" for t in threading.enumerate())
         finally:
             off.shutdown_all()
+        # shutdown_all stops it; the daemon exits on its next tick.
+        assert off._reaper is None
 
         on = self._pool(clock, idle_ttl=30.0)
         try:
@@ -1678,8 +1684,32 @@ class TestModernPoolReaper:
             assert any(t.name == "modern-pool-reaper" for t in threading.enumerate())
         finally:
             on.shutdown_all()
-        # shutdown_all stops it; the daemon exits on its next tick.
         assert on._reaper is None
+
+    def test_reaper_thread_reaps_dead_child_even_with_ttl_and_bridge_disabled(
+        self, monkeypatch
+    ):
+        """#427: with idle_ttl=0 and the MRTR bridge disabled -- the pure-
+        default deployment -- the background reaper thread must still
+        sweep a pooled child whose process has already exited. Proves the
+        THREAD itself calls reap_idle in this configuration, not just that
+        reap_idle() is correct when called directly (see
+        test_a_dead_child_is_reaped_even_with_the_ttl_disabled above).
+        ``_MAX_REAP_INTERVAL_SECS`` is monkeypatched down so the test does
+        not have to wait out the real (60 s) fallback interval."""
+        monkeypatch.setattr(server, "_MAX_REAP_INTERVAL_SECS", 0.2)
+        clock = [1000.0]
+        pool = self._pool(clock, idle_ttl=0.0)
+        try:
+            backend, _ = _checkout_and_release(pool)
+            backend.shutdown()  # kills the child; backend.closed becomes True
+            pool.start_reaper()
+            deadline = time.monotonic() + 5
+            while pool.count() > 0 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert pool.count() == 0, "dead-child entry was never swept"
+        finally:
+            pool.shutdown_all()
 
 
 def test_build_server_threads_the_modern_idle_ttl_through():
