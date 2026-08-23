@@ -1,5 +1,5 @@
 """mcp-stdio: Stdio-to-HTTP relay for MCP servers."""
 
 # x-release-please-start-version
-__version__ = "0.43.3"
+__version__ = "0.43.4"
 # x-release-please-end
