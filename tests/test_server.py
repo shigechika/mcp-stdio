@@ -2333,6 +2333,66 @@ def test_access_eviction_tombstone_survives_mixed_consumed_access(monkeypatch):
     )
 
 
+def test_consumed_access_eviction_spares_revocation_tombstones(monkeypatch):
+    # ai-review R2F1 on PR #436: plain FIFO-by-consumed_at treats a
+    # security-critical revocation tombstone (_revoke_family_locked flagged
+    # this credential compromised) the same as a merely load-driven eviction
+    # tombstone. If the revocation tombstone happens to be older, pure FIFO
+    # evicts it first to make room for newer eviction tombstones -- letting
+    # a stale concurrent Firestore writer resurrect a token that MUST stay
+    # dead. Eviction-origin entries must always be preferred as victims over
+    # revocation-origin ones, regardless of relative age.
+    monkeypatch.setattr(server, "_STORE_CAP", 4)
+    prov = _provider()
+    now = prov._now()
+    # consumed_access starts at cap-1 (3): the access eviction below adds
+    # exactly one more, tipping it to cap and evicting exactly one victim.
+    prov._consumed_access = {
+        "revoked-token": {
+            "family": "compromised-family",
+            "consumed_at": now - 1000,  # oldest of the three
+            "expires_at": now + 100_000,
+            "origin": "revocation",
+        },
+        "capacity-evicted-1": {
+            "family": None,
+            "consumed_at": now - 500,
+            "expires_at": now + 500,
+            "origin": "eviction",
+        },
+        "capacity-evicted-2": {
+            "family": None,
+            "consumed_at": now - 400,
+            "expires_at": now + 500,
+            "origin": "eviction",
+        },
+    }
+    prov._access = {
+        f"soon-expiring-{i}": {
+            "user": f"u{i}",
+            "client_id": "c",
+            "scope": "",
+            "resource": None,
+            "family": None,
+            "expires_at": now + 10 + i,
+        }
+        for i in range(4)
+    }
+    prov._refresh = {}
+
+    status, tok = prov._issue("new-user", "c", "", None)
+    assert status == 200
+
+    assert "revoked-token" in prov._consumed_access, (
+        "a security-critical revocation tombstone was evicted ahead of a "
+        "merely load-driven eviction tombstone"
+    )
+    # The oldest eviction-origin entry is the one that made way, not the
+    # revocation-origin entry despite being newer.
+    assert "capacity-evicted-1" not in prov._consumed_access
+    assert "capacity-evicted-2" in prov._consumed_access
+
+
 def test_evicted_refresh_token_is_not_tombstoned(monkeypatch):
     # #433: refresh/codes eviction must stay a bare delete. consumed_refresh
     # doubles as _token_refresh's replay-detection state, so tombstoning an
