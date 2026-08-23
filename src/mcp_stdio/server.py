@@ -4366,7 +4366,7 @@ class _OAuthProvider:
     def _apply_state_locked(
         self, data: dict[str, Any], source_label: str, *, announce: bool
     ) -> None:
-        """Parse, validate, and assign the six stores from an already
+        """Parse, validate, and assign the seven stores from an already
         version-checked snapshot dict (``data.get("version") ==
         _STATE_VERSION``).
 
@@ -4499,7 +4499,7 @@ class _OAuthProvider:
         (caller holds ``self._lock``) instead of a blind ``.set()`` (#406).
 
         Two Cloud Run instances can briefly overlap during a revision
-        cutover, each with its own in-memory view of the six stores. A blind
+        cutover, each with its own in-memory view of the seven stores. A blind
         overwrite from whichever instance persists last would silently
         discard whatever the other instance added in that window (e.g. a
         token it issued or rotated).
@@ -4603,7 +4603,7 @@ class _OAuthProvider:
             self._write_snapshot_locked()
 
     def _persist_locked(self) -> None:
-        """Snapshot all six stores to the configured backend (caller holds
+        """Snapshot all seven stores to the configured backend (caller holds
         ``self._lock``, which makes the snapshot point-in-time consistent and
         serializes concurrent writers).
 
