@@ -4066,12 +4066,12 @@ def _acquire_store_lock(store_path: Path) -> Any:
         raise
 
 
-# The six store names, also spelled out as dict-literal keys in
+# The seven store names, also spelled out as dict-literal keys in
 # _snapshot_locked and as load() calls in _apply_state_locked -- not
 # unified into a single loop there because clients needs a bespoke
-# transform (redirect_keys) the other five don't. _snapshot_locked
+# transform (redirect_keys) the other six don't. _snapshot_locked
 # instead asserts its dict literal's keys match this tuple, so a future
-# 7th store added there but forgotten here fails loudly (in tests) rather
+# 8th store added there but forgotten here fails loudly (in tests) rather
 # than silently falling back to last-writer-wins in the merge.
 _OAUTH_SNAPSHOT_DICT_KEYS = (
     "clients",
@@ -4080,12 +4080,31 @@ _OAUTH_SNAPSHOT_DICT_KEYS = (
     "refresh",
     "consumed_codes",
     "consumed_refresh",
+    "consumed_access",
 )
 
 
+# Adding a pair here protects only a writer running code that includes it.
+# During a mixed-version Cloud Run rollout, an OLDER instance's merge does
+# not know to filter a live key against a tombstone store this tuple did
+# not yet name when that instance was built -- it unions the stale live
+# entry back in. The tombstone DATA still survives that write (the
+# top-level `{**remote, **local}` spread in _merge_oauth_snapshots
+# preserves any store name it doesn't specifically recognize, tombstone
+# stores included), so the very next persist from a writer that DOES know
+# this pair re-applies the filter and strips the resurrected entry again.
+# Exposure is bounded to the deploy's old+new coexistence window -- the
+# same shape as every other residual in this file, just also requiring a
+# writer still running pre-this-pair code specifically. This is inherent
+# to any incremental addition to this tuple, not specific to one entry;
+# the ("access", "consumed_access") pair (#428) was the first one caught
+# by ai-review (PR #434 round 1, R1F1). The structural fix that removes
+# the whole category -- per-entry Firestore subcollections instead of one
+# JSON blob document -- is out of scope here; see #433's note.
 _OAUTH_TOMBSTONE_PAIRS = (
     ("refresh", "consumed_refresh"),
     ("codes", "consumed_codes"),
+    ("access", "consumed_access"),
 )
 
 
@@ -4102,7 +4121,7 @@ def _merge_oauth_snapshots(
     unconditionally, which broke single-writer semantics -- see the PR
     #429 review that caught it).
 
-    Each of the six stores is merged key-by-key with LOCAL winning on
+    Each of the seven stores is merged key-by-key with LOCAL winning on
     collision: local is the freshest view of the keys it owns, since it is
     what triggered this specific write. Every key in these stores is a
     ``secrets.token_*``-derived value, so a cross-instance collision on the
@@ -4111,21 +4130,25 @@ def _merge_oauth_snapshots(
 
     A union alone still can't represent "this side deleted it" -- a key
     the OTHER side removed but this side's local view never learned about
-    would otherwise survive. For the two stores that have a tombstone
-    (``refresh``/``consumed_refresh``, ``codes``/``consumed_codes``), that
-    is fixed here: after the union, any live key that also appears in the
-    merged tombstone store is dropped -- but ONLY for the individually
-    tombstoned key itself (rotation, code redemption). ``_revoke_family_locked``
-    bare-deletes every OTHER token sharing a compromised grant family
-    (potentially several, across both ``access`` and ``refresh``) without
-    tombstoning any of them -- only the single token whose reuse actually
-    triggered the family revocation was ever individually tombstoned, by
-    its own earlier rotation/redemption. So a family-wide revocation is
-    NOT protected by this filter for any of its sibling tokens, on either
-    store; nor is a bare removal from ``access`` (cap eviction) or
-    ``clients`` (recycling), which have no tombstone at all. All of that
-    can still be resurrected by a genuinely concurrent writer. That
-    residual is deliberately out of scope for this fix; see #428.
+    would otherwise survive. For the three stores that have a tombstone
+    (``refresh``/``consumed_refresh``, ``codes``/``consumed_codes``,
+    ``access``/``consumed_access``), that is fixed here: after the union,
+    any live key that also appears in the merged tombstone store is
+    dropped. ``_revoke_family_locked`` (#428) now tombstones every sibling
+    token it bare-deletes from a compromised grant family, on both
+    ``access`` and ``refresh``, not just the single token whose reuse
+    triggered the revocation -- so family-wide revocation is protected by
+    this filter too, the same as an individual rotation or code redemption.
+
+    What remains out of scope: cap-based eviction (``access``, via
+    ``_evict_to_capacity_locked``) and client recycling (``clients``, via
+    ``_recycle_clients_locked``) still bare-delete with no tombstone, so
+    those specific removals can still be resurrected by a genuinely
+    concurrent writer. Neither is a security-relevant revocation --
+    eviction is self-correcting (the next at-cap ``_issue()`` re-trims
+    locally, since a merge's result is adopted into local state) and a
+    recycled client was never flagged for cause -- so this is deliberately
+    left open; see the follow-up issue filed alongside this fix.
 
     ``remote`` is ``None`` (no document yet) or has a missing/mismatched
     ``version`` is treated as contributing nothing -- an absent or
@@ -4219,7 +4242,16 @@ class _OAuthProvider:
         # TTL-bounded (GC'd in _gc_locked) and capped like the live stores.
         self._consumed_codes: dict[str, dict[str, Any]] = {}
         self._consumed_refresh: dict[str, dict[str, Any]] = {}
-        # --token-store: when set, every state mutation snapshots the six
+        # Tombstones for every access token _revoke_family_locked kills
+        # (#428): unlike _consumed_refresh/_consumed_codes this store has no
+        # validation-path reader — its only consumer is the Firestore merge's
+        # tombstone filter, so a family-revoked access token's sibling is not
+        # resurrected by a concurrent writer's stale local view (access
+        # tokens are self-checking on expiry regardless, so this exists
+        # purely to close that merge-resurrection window, not to gate
+        # validate_access_token).
+        self._consumed_access: dict[str, dict[str, Any]] = {}
+        # --token-store: when set, every state mutation snapshots the seven
         # stores to this JSON file (0o600) so issued tokens, tombstones, and
         # client registrations survive a process restart (issue #277). None
         # keeps the pre-existing in-memory-only behavior.
@@ -4334,7 +4366,7 @@ class _OAuthProvider:
     def _apply_state_locked(
         self, data: dict[str, Any], source_label: str, *, announce: bool
     ) -> None:
-        """Parse, validate, and assign the six stores from an already
+        """Parse, validate, and assign the seven stores from an already
         version-checked snapshot dict (``data.get("version") ==
         _STATE_VERSION``).
 
@@ -4411,6 +4443,7 @@ class _OAuthProvider:
         self._refresh = load("refresh", _valid_grant_record)
         self._consumed_codes = load("consumed_codes", _valid_tombstone_record)
         self._consumed_refresh = load("consumed_refresh", _valid_tombstone_record)
+        self._consumed_access = load("consumed_access", _valid_tombstone_record)
         if not announce:
             return
         if dropped:
@@ -4425,7 +4458,7 @@ class _OAuthProvider:
         )
 
     def _snapshot_locked(self) -> dict[str, Any]:
-        """The JSON-clean snapshot of all six stores (caller holds the lock)."""
+        """The JSON-clean snapshot of all seven stores (caller holds the lock)."""
         stores: dict[str, Any] = {
             # redirect_keys are intentionally NOT serialized (derived state,
             # recomputed on load — see _load_state).
@@ -4441,6 +4474,7 @@ class _OAuthProvider:
             "refresh": self._refresh,
             "consumed_codes": self._consumed_codes,
             "consumed_refresh": self._consumed_refresh,
+            "consumed_access": self._consumed_access,
         }
         # A store added here but forgotten in _OAUTH_SNAPSHOT_DICT_KEYS would
         # silently fall back to last-writer-wins in _merge_oauth_snapshots
@@ -4465,7 +4499,7 @@ class _OAuthProvider:
         (caller holds ``self._lock``) instead of a blind ``.set()`` (#406).
 
         Two Cloud Run instances can briefly overlap during a revision
-        cutover, each with its own in-memory view of the six stores. A blind
+        cutover, each with its own in-memory view of the seven stores. A blind
         overwrite from whichever instance persists last would silently
         discard whatever the other instance added in that window (e.g. a
         token it issued or rotated).
@@ -4569,7 +4603,7 @@ class _OAuthProvider:
             self._write_snapshot_locked()
 
     def _persist_locked(self) -> None:
-        """Snapshot all six stores to the configured backend (caller holds
+        """Snapshot all seven stores to the configured backend (caller holds
         ``self._lock``, which makes the snapshot point-in-time consistent and
         serializes concurrent writers).
 
@@ -4980,6 +5014,7 @@ class _OAuthProvider:
                 self._refresh,
                 self._consumed_codes,
                 self._consumed_refresh,
+                self._consumed_access,
             )
             if any(len(s) >= _STORE_CAP for s in stores):
                 self._gc_locked()
@@ -5091,6 +5126,7 @@ class _OAuthProvider:
             self._refresh,
             self._consumed_codes,
             self._consumed_refresh,
+            self._consumed_access,
         ):
             for k in [k for k, v in store.items() if v["expires_at"] < now]:
                 del store[k]
@@ -5102,12 +5138,48 @@ class _OAuthProvider:
         (RFC 6749 Sec. 4.1.2 / RFC 9700 Sec. 4.14.2). A ``None`` family (a token
         minted before family tagging, or a code that never issued a token) is a
         no-op. The caller already holds ``self._lock``.
+
+        Each killed token is ALSO tombstoned into ``_consumed_refresh`` /
+        ``_consumed_access`` (#428), primarily so the Firestore merge's
+        tombstone filter (`_OAUTH_TOMBSTONE_PAIRS`) can keep it from being
+        resurrected by a genuinely concurrent writer's stale local view.
+        Only the single token whose reuse triggered this call was
+        tombstoned before (by its own earlier rotation/redemption); every
+        OTHER family member used to be a bare, unprotected delete.
+
+        The two stores differ in whether that tombstone ALSO does anything
+        at request time, since only refresh tokens have replay semantics:
+        `_token_refresh` falls through to `self._consumed_refresh.get(rt)`
+        whenever the live lookup misses, so a sibling refresh token killed
+        here is not just gone but now answers a later replay with "already
+        rotated" / "reuse detected" instead of the less informative
+        "unknown refresh_token" -- a behavior improvement, not merely a
+        merge-time artifact (see the strengthened assertion on
+        `test_refresh_reuse_revokes_family`). `_consumed_access` has no
+        such reader: access tokens carry no replay/single-use semantics in
+        this codebase (`validate_access_token`/`_live_entry` check
+        presence and expiry only), so that tombstone exists purely for the
+        merge filter above.
+
+        The tombstone's ``expires_at`` is copied from the entry being
+        deleted, not recomputed from a TTL constant -- it only needs to
+        outlive the token it blocks, since expiry is independently
+        re-checked wherever a live entry is read.
         """
         if family is None:
             return
-        for store in (self._access, self._refresh):
-            for k in [k for k, v in store.items() if v.get("family") == family]:
+        now = self._now()
+        for store, tombstones in (
+            (self._access, self._consumed_access),
+            (self._refresh, self._consumed_refresh),
+        ):
+            for k, v in [(k, v) for k, v in store.items() if v.get("family") == family]:
                 del store[k]
+                tombstones[k] = {
+                    "family": family,
+                    "consumed_at": now,
+                    "expires_at": v["expires_at"],
+                }
 
     def _recycle_clients_locked(self) -> None:
         # Clients carry no TTL: recycle the oldest at the cap so /register never
