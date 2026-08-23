@@ -414,12 +414,15 @@ open-gateway と共有 static-token principal は、いずれも本物の呼び�
     ありません。`google-cloud-firestore` パッケージ（`pip install
     mcp-stdio[firestore]`、任意の extra——単純な `pip install mcp-stdio` では
     不要）と `--enable-oauth` が前提です。**`--token-store` と異なり、2つの
-    プロセスが1つのドキュメントを共有することを防ぐロックはありません** ——
-    ある時点で厳密に1つの `serve` プロセスだけがそのドキュメントに書き込む
-    場合にのみ安全です（例: `min-instances=1` かつ `max-instances=1` の
-    Cloud Run）。2つの書き込み元が同時に存在すると、互いの発行済みトークンを
-    静かに last-writer-wins で上書きし合います。`--token-store` とは互いに
-    排他です。
+    プロセスが1つのドキュメントを共有することを防ぐロックはありません**が、
+    各書き込みは blind overwrite ではなく read-merge-write トランザクションを
+    経由するため（#406）、2つの書き込み元が短時間重なる状況（Cloud Run の
+    リビジョン切り替え等）でも、どちらか一方がその重なりの間に発行・
+    ローテーションしたトークンが静かに失われることはありません。ただし
+    1点だけ残存する制約があります：その重なりの間にリプレイ検知による失効や
+    容量超過による退避が起きたトークンは、tombstone（失効マーカー）を
+    持たないため、遅れて書き込む側によって復活しうる可能性が残ります
+    （#428）。`--token-store` とは互いに排他です。
   - *パススコープ issuer* — `--public-url` がパスを保持するので、1 ホスト配下で
     複数の `--enable-oauth` バックエンドをパスプレフィックスで多重化できる
     （例: `--public-url https://gw.example.org/team-a` で
