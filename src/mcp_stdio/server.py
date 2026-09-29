@@ -2147,6 +2147,44 @@ _UNDELIVERABLE_NOTIFICATION_FLAGS: dict[str, tuple[str, ...]] = {
 }
 
 
+_MODERN_ENVELOPE_META_KEYS = (
+    "io.modelcontextprotocol/protocolVersion",
+    "io.modelcontextprotocol/clientInfo",
+    "io.modelcontextprotocol/clientCapabilities",
+)
+
+
+def _without_modern_envelope(msg: dict[str, Any]) -> dict[str, Any]:
+    """Copy of ``msg`` without the 2026-07-28 per-request envelope in ``params._meta``.
+
+    The gateway handshakes every child in the legacy era (``initialize`` at
+    ``_MODERN_CHILD_HANDSHAKE_VERSION``), so the child must be spoken to in that
+    era. Forwarding the client's per-request ``protocolVersion`` / ``clientInfo`` /
+    ``clientCapabilities`` verbatim was harmless to python-sdk 1.x children, which
+    ignore unknown ``_meta`` keys, but a python-sdk 2.x child refuses a request
+    carrying that envelope on a handshake-era connection ("this connection serves
+    the handshake protocol era; requests carrying the 2026-07-28 envelope are not
+    accepted on it"). Other ``_meta`` keys (``progressToken`` and the like) are kept.
+    The gateway reads the envelope from the original message, so only this
+    outbound copy is stripped. Never mutates ``msg``.
+    """
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return dict(msg)
+    meta = params.get("_meta")
+    if not isinstance(meta, dict) or not any(
+        k in meta for k in _MODERN_ENVELOPE_META_KEYS
+    ):
+        return dict(msg)
+    new_meta = {k: v for k, v in meta.items() if k not in _MODERN_ENVELOPE_META_KEYS}
+    new_params = {k: v for k, v in params.items() if k != "_meta"}
+    if new_meta:
+        new_params["_meta"] = new_meta
+    out = dict(msg)
+    out["params"] = new_params
+    return out
+
+
 def _strip_undeliverable_capability_flags(
     capabilities: Any, keep: frozenset[tuple[str, str]] = frozenset()
 ) -> dict[str, Any]:
@@ -6553,7 +6591,7 @@ class _Handler(BaseHTTPRequestHandler):
                     return
                 mrtr_claimed = True
 
-            outbound = dict(msg)
+            outbound = _without_modern_envelope(msg)
             outbound["id"] = upstream_id
             line = backend.send_request(
                 json.dumps(outbound), upstream_id, _BACKEND_RESPONSE_TIMEOUT_SECS
