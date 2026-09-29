@@ -2147,6 +2147,11 @@ _UNDELIVERABLE_NOTIFICATION_FLAGS: dict[str, tuple[str, ...]] = {
 }
 
 
+# What refuses a request on a handshake-era connection is python-sdk 2.x's
+# `_has_modern_envelope` (mcp/server/runner.py): the PRESENCE of the protocolVersion
+# key. The other two are the rest of the same required envelope, removed with it.
+# `io.modelcontextprotocol/logLevel` (optional, per request) is not checked there, so it
+# is left alone.
 _MODERN_ENVELOPE_META_KEYS = (
     "io.modelcontextprotocol/protocolVersion",
     "io.modelcontextprotocol/clientInfo",
