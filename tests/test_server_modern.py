@@ -573,6 +573,55 @@ class TestModernDispatch:
         # has no such fields, so stamping them would invent wire data.
         assert "ttlMs" not in result and "cacheScope" not in result
 
+    def test_the_modern_envelope_is_not_forwarded_to_the_legacy_handshaken_child(
+        self, gateway
+    ):
+        """The child was handshaken in the legacy era, so the per-request envelope
+        stays at the gateway. A python-sdk 2.x child rejects a request carrying
+        it on a handshake-era connection; a 1.x child ignored it. Other `_meta`
+        keys (progressToken) still reach the child."""
+        meta = {**_meta(), "progressToken": "tok-1"}
+        body = _modern_body("echo", params={"x": 1}, meta=meta)
+        resp = _post(gateway, body, _modern_headers("echo"))
+        assert resp.status_code == 200
+        echoed = resp.json()["result"]["echoed"]
+        assert echoed["x"] == 1
+        assert echoed["_meta"] == {"progressToken": "tok-1"}
+
+    def test_the_modern_envelope_is_not_forwarded_on_a_notification_either(
+        self, gateway
+    ):
+        """A one-way message goes to the same handshake-era child, so it gets the
+        same treatment as a request."""
+        sent: list[dict] = []
+        real = server.BackendProcess.send_oneway
+
+        def record(self_, line):
+            sent.append(json.loads(line))
+            return real(self_, line)
+
+        body = _modern_body(
+            "notifications/cancelled",
+            params={"requestId": 9},
+            meta={**_meta(), "progressToken": "tok-2"},
+            notification=True,
+        )
+        with patch.object(server.BackendProcess, "send_oneway", record):
+            resp = _post(gateway, body)
+        assert resp.status_code == 202
+        forwarded = [m for m in sent if m.get("method") == "notifications/cancelled"]
+        assert len(forwarded) == 1
+        assert forwarded[0]["params"]["_meta"] == {"progressToken": "tok-2"}
+        assert forwarded[0]["params"]["requestId"] == 9
+
+    def test_a_request_whose_meta_is_only_the_envelope_reaches_the_child_without_meta(
+        self, gateway
+    ):
+        body = _modern_body("echo", params={"x": 2}, meta=_meta())
+        resp = _post(gateway, body, _modern_headers("echo"))
+        assert resp.status_code == 200
+        assert "_meta" not in resp.json()["result"]["echoed"]
+
     def test_discover_is_answered_by_serve_not_the_child(self, gateway):
         """The child has never heard of `server/discover` and would answer
         -32601; serve owns the answer, sourced from the handshake it
@@ -5800,3 +5849,35 @@ class TestMrtrErrorObjectValidation:
         assert sent, "the child was never unblocked"
         child_code = json.loads(sent[0])["error"]["code"]
         assert child_code == client_code, (child_code, client_code)
+
+
+class TestWithoutModernEnvelope:
+    def test_removes_only_the_envelope_keys_and_never_mutates(self):
+        env = server._MODERN_ENVELOPE_META_KEYS
+        msg = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "t",
+                "_meta": {**{k: "v" for k in env}, "progressToken": "p"},
+            },
+        }
+        out = server._without_modern_envelope(msg)
+        assert out["params"]["_meta"] == {"progressToken": "p"}
+        assert out["params"]["name"] == "t"
+        assert all(
+            k in msg["params"]["_meta"] for k in env
+        )  # the original is untouched
+
+    def test_drops_an_empty_meta_and_passes_other_shapes_through(self):
+        env = server._MODERN_ENVELOPE_META_KEYS
+        only_env = {"method": "m", "params": {"_meta": {k: 1 for k in env}, "a": 1}}
+        assert server._without_modern_envelope(only_env)["params"] == {"a": 1}
+        for msg in (
+            {"method": "m"},
+            {"method": "m", "params": "oops"},
+            {"method": "m", "params": {"_meta": "oops"}},
+            {"method": "m", "params": {"_meta": {"progressToken": "p"}}},
+        ):
+            assert server._without_modern_envelope(msg) == msg
