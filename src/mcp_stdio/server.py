@@ -6402,7 +6402,7 @@ class _Handler(BaseHTTPRequestHandler):
                         ),
                     )
                     return
-                backend.send_oneway(json.dumps(msg))
+                backend.send_oneway(json.dumps(_without_modern_envelope(msg)))
                 self._send_empty(202)
                 return
 

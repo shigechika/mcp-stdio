@@ -588,6 +588,32 @@ class TestModernDispatch:
         assert echoed["x"] == 1
         assert echoed["_meta"] == {"progressToken": "tok-1"}
 
+    def test_the_modern_envelope_is_not_forwarded_on_a_notification_either(
+        self, gateway
+    ):
+        """A one-way message goes to the same handshake-era child, so it gets the
+        same treatment as a request."""
+        sent: list[dict] = []
+        real = server.BackendProcess.send_oneway
+
+        def record(self_, line):
+            sent.append(json.loads(line))
+            return real(self_, line)
+
+        body = _modern_body(
+            "notifications/cancelled",
+            params={"requestId": 9},
+            meta={**_meta(), "progressToken": "tok-2"},
+            notification=True,
+        )
+        with patch.object(server.BackendProcess, "send_oneway", record):
+            resp = _post(gateway, body)
+        assert resp.status_code == 202
+        forwarded = [m for m in sent if m.get("method") == "notifications/cancelled"]
+        assert len(forwarded) == 1
+        assert forwarded[0]["params"]["_meta"] == {"progressToken": "tok-2"}
+        assert forwarded[0]["params"]["requestId"] == 9
+
     def test_a_request_whose_meta_is_only_the_envelope_reaches_the_child_without_meta(
         self, gateway
     ):
