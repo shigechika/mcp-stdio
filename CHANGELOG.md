@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.43.7](https://github.com/shigechika/mcp-stdio/compare/v0.43.6...v0.43.7) (2026-09-29)
+
+
+### Bug Fixes
+
+* do not forward the 2026-07-28 request envelope to a legacy-handshaken child ([#441](https://github.com/shigechika/mcp-stdio/issues/441)) ([314a801](https://github.com/shigechika/mcp-stdio/commit/314a801561d9e587041c53a99d01de61f9b322bc))
+
 ## [0.43.6](https://github.com/shigechika/mcp-stdio/compare/v0.43.5...v0.43.6) (2026-08-23)
 
 
