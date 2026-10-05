@@ -915,12 +915,20 @@ class _ModernState:
     handoff. What that PR moved to a second thread is READING stdin, not
     dispatching from it: the reader enqueues every line unchanged and
     acts out-of-band on exactly one thing, closing the published
-    in-flight response when a ``notifications/cancelled`` names it (the
-    cancellation signal on this transport — see ``_InFlightPost``). Every
+    in-flight response (or a client listen stream, below) when a
+    ``notifications/cancelled`` names it (the cancellation signal on this
+    transport — see ``_InFlightPost``). Every
     single-writer invariant this note used to protect —
     ``protocol_version``, the 401/403/404 recovery ladder, the MRTR
     dicts, and this object — still has exactly one mutator, the consumer,
     which is why the handoff needed no re-audit of them.
+
+    One dispatch is NOT synchronous (#446): a ``subscriptions/listen`` a
+    modern stdio client sends runs on its own thread, because its stream
+    never ends. That thread touches none of this state — its headers are
+    built on the consumer before it starts, and it only writes to stdout
+    through ``_emit`` and reads the thread-safe cancel tracker — so the
+    single-mutator invariant above still holds.
     """
 
     __slots__ = (
@@ -6730,8 +6738,9 @@ class _ClientListens:
     ``subscriptions/listen``. Its response stream never ends on its own, so
     it cannot go through run()'s single-dispatch consumer, which would then
     never reach the next request. Each one runs on its own daemon thread
-    with a dedicated ``httpx.Client``; this registry is how the stdin reader
-    thread's cancel and run()'s teardown reach it.
+    with a dedicated ``httpx.Client``; this registry is how a cancel (the
+    stdin reader's out-of-band one, and the consumer's for a listen that
+    started after the reader saw the cancel) and run()'s teardown reach it.
 
     Kept apart from ``_InFlightPost``, which is by design the ONE request a
     cancel may abort. Here closing the CLIENT is correct: it belongs to the
@@ -6806,8 +6815,9 @@ def _client_listen_loop(
     re-listening is the client's decision ("clients MUST re-issue with a
     new request ID" after a broken stream).
 
-    Exactly one answer under ``req_id`` reaches the client unless it
-    cancelled or the relay is shutting down (``aborted``): the server's own
+    Once ``aborted`` is set (a cancel or teardown) nothing more is
+    forwarded. Otherwise exactly one answer under ``req_id`` reaches the
+    client: the server's own
     final response, or a synthesized ``-32000`` when the stream ends
     without one (a non-200 status, a transport error, or an abrupt close).
     Synthesized errors skip an id the client already cancelled through the
@@ -6827,6 +6837,8 @@ def _client_listen_loop(
             if resp.status_code != 200:
                 _read_bounded(resp, client)
                 body = resp.text.strip()
+                if aborted.is_set():
+                    return
                 if body and _is_pure_response_for(body, req_id):
                     _emit(body, tracker)
                 else:
@@ -6838,13 +6850,19 @@ def _client_listen_loop(
                 ):
                     if event_type != "message":
                         continue
+                    # A cancel sets ``aborted`` on the reader thread before
+                    # the consumer records it in the tracker, so the event
+                    # is the only gate that closes that window for frames
+                    # already buffered when the stream was closed.
+                    if aborted.is_set():
+                        return
                     _emit(payload, tracker)
                     if _is_pure_response_for(payload, req_id):
                         answered = True
             else:
                 _read_bounded(resp, client)
                 body = resp.text.strip()
-                if body:
+                if body and not aborted.is_set():
                     _emit(body, tracker)
                     answered = _is_pure_response_for(body, req_id)
         if not answered:
@@ -8492,6 +8510,8 @@ def run(
         )
         if not client_listens.open(req_id, listen_client, aborted, thread):
             listen_client.close()
+            if tracker is not None and tracker.contains(req_id):
+                return
             _write_line(
                 _error_response(
                     "a subscriptions/listen with this id is already open",
@@ -8762,6 +8782,15 @@ def run(
                             tracker.add(cid)
                         if era == "modern":
                             _mrtr_handle_cancel(cid)
+                        # #446: the reader's out-of-band abort misses a
+                        # listen the consumer had not started yet (it was
+                        # still queued behind a slow request); by the time
+                        # this cancel line is dequeued it has started, so
+                        # end it here. A no-op when the reader got it.
+                        if client_listens is not None and client_listens.abort(cid):
+                            log(
+                                f"cancelling id {cid!r}: closing the client's listen stream"
+                            )
 
                 # Derive both the id value and its presence from one parse (the
                 # hot path). A notification (no id) must never receive a response —
