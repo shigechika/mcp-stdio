@@ -3903,8 +3903,9 @@ def _log_safe_uri(value: Any, *, max_len: int = 200) -> str:
 
 
 def _has_forbidden_url_chars(value: str) -> bool:
-    """True for a quote, whitespace, any C0 control or DEL — never part of a
-    canonical URL, and ``urlsplit`` silently strips some of them."""
+    """True for a quote, an ASCII space, any C0 control or DEL — never part
+    of a canonical URL, and ``urlsplit`` silently strips some of them.
+    Non-ASCII is left to the caller (``_parse_origin`` refuses it)."""
     return any(c == '"' or ord(c) <= 0x20 or ord(c) == 0x7F for c in value)
 
 
@@ -3937,14 +3938,16 @@ def _parse_origin(value: str) -> tuple[str, str | None]:
     ``_canonical_netloc``) and ``host`` is returned for the loopback test.
     Any other scheme with a non-empty authority — a browser extension's
     ``chrome-extension://<id>``, a ``vscode-webview://<id>`` — becomes
-    lowercased ``scheme://authority`` with ``host`` None: it can only ever
-    match an exact ``--allow-origin`` entry, never the loopback rule. A
-    lone trailing ``/`` is tolerated (an operator may type one; browsers
-    never send it). Raises ValueError for ``null``, an empty authority,
-    userinfo, any other path, a query or fragment, a bad port, or a quote,
-    whitespace or control character.
+    lowercased ``scheme://authority`` with ``host`` None: its authority is
+    an opaque string (no port parsing), and it can only ever match an exact
+    ``--allow-origin`` entry, never the loopback rule. A lone trailing
+    ``/`` is tolerated (an operator may type one; browsers never send it).
+    Raises ValueError for ``null``, an empty authority, userinfo, any other
+    path, a query or fragment, an http(s) port that does not parse, or a
+    quote, space, control or non-ASCII character (browsers serialize an
+    Origin in ASCII, an internationalized host as punycode).
     """
-    if not value or _has_forbidden_url_chars(value):
+    if not value or _has_forbidden_url_chars(value) or not value.isascii():
         raise ValueError("origin is empty or contains forbidden characters")
     p = urlsplit(value)
     scheme = p.scheme.lower()

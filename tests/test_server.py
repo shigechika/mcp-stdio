@@ -3965,6 +3965,8 @@ def test_normalize_origin_canonical(value, expected):
         "\x00http://localhost",  # urlsplit would strip the control byte
         "https://a\x00b.example",
         "https://app.example.com\x7f",
+        "https://app.example.com\u00a0",  # non-ASCII whitespace
+        "https://bücher.example",  # browsers send punycode
         "chrome-extension://",
         "chrome-extension://x@y",
     ],
