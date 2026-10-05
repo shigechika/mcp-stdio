@@ -542,6 +542,22 @@ class TestPostAndStream:
         assert reply["id"] == 7
         assert "may have executed" in reply["error"]["message"]
 
+    def test_not_replayed_error_skips_cancelled_id(self, httpx_mock):
+        """#444: the synthesized error honors the cancel gate (REVIEW.md §3)."""
+        httpx_mock.add_exception(httpx.ReadTimeout("read timed out"))
+        tracker = _CancelTracker()
+        tracker.add(7)
+        client = httpx.Client()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout), patch("mcp_stdio.relay.time.sleep"):
+            result = _post_and_stream(
+                client, "https://example.com/mcp", self.TOOLS_CALL, {}, 7, tracker
+            )
+        assert result is None
+        assert len(httpx_mock.get_requests()) == 1
+        assert stdout.getvalue() == ""
+        assert tracker.contains(7)  # non-consuming: the late-reply drop still works
+
     @pytest.mark.parametrize(
         "exc",
         [

@@ -66,7 +66,7 @@ Bearer token、カスタムヘッダー、OAuth 2.1 認証情報をリモート�
   - [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750) Bearer Token の利用
     - §2.1 `Authorization: Bearer <token>` リクエストヘッダー
 - **新しい MCP（2026-07-28）のサーバーに対応** — `--protocol-era auto` を付けると、mcp-stdio がサーバーにどちらのプロトコルかを尋ねて自動で合わせます。MCP クライアント側の設定変更は不要です。フラグを付けなければ挙動は変わらないので、バージョンを上げるだけなら安全です。`mcp-stdio serve` は同じアドレスで新旧どちらのクライアントにも自動応答します。`--modern-only` を付ければ新しいクライアント専用にでき、`--modern-idle-ttl` は遊んでいるバックエンドを回収します。新しいクライアントは接続をひとつ開いたままにして、ツール・プロンプト・リソースの一覧が変わったことや、名指しした個別リソースの更新を受け取れます（あなたのサーバーが `resources.subscribe` を表明していれば、mcp-stdio が代わりに購読します）。python-sdk v2.0.0 に対して双方向でエンドツーエンド検証済み。→ [新しい MCP のサーバーを使う](https://shigechika.github.io/mcp-stdio/ja/modes/#protocol-eras)
-- **バックオフ付きリトライ** — 接続エラー時に最大3回リトライ。リクエストがサーバーに届いた可能性がある失敗（遅い `tools/call` の読み取りタイムアウトなど）では読み取り専用のメソッドだけをリトライし、冪等でないツールを二重に実行しない
+- **バックオフ付きリトライ** — 接続エラー時に最大3回リトライ。リクエストがサーバーに届いた後に起きた可能性がある通信エラー（遅い `tools/call` の読み取りタイムアウトなど）では、再送しても安全と分かっているメソッド（`tools/list` や `resources/read` などの読み取り専用か冪等なもの）だけをリトライし、そのエラーで `tools/call` を再実行することはない
 - **HTTP 429 / 503 対応** — `Retry-After`（delta-seconds または HTTP-date）を 60 秒上限で尊重する。対象は仕様上 `Retry-After` を伴う 429（Too Many Requests）と 503（Service Unavailable）の 2 つ（RFC 9110 §10.2.3）。上限超過時はステータスをクライアントに返して判断を委ねる（cf. modelcontextprotocol/typescript-sdk#1892）
 - **自動ページネーション**（Streamable HTTP トランスポート） — `tools/list` / `resources/list` / `resources/templates/list` / `prompts/list` の `nextCursor` を透過的に追従して 1 つのレスポンスにマージ。先頭以降のページを取りこぼすクライアントでも全件を受け取れる（cf. anthropics/claude-code#39586）
 - **ストリーミング耐性** — SSE レスポンスをリアルタイムで転送、ストリーム切断時に自動再接続

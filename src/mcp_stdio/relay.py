@@ -93,10 +93,12 @@ _REPLAY_SAFE_METHODS = frozenset(
 def _replay_safe(content: str) -> bool:
     """Whether ``content`` may be re-POSTed after a post-send transport error.
 
-    A request is safe when its method is in ``_REPLAY_SAFE_METHODS``. A
-    notification or a JSON-RPC response (no ``id``-bearing ``method``) runs no
-    handler twice, and unparseable content cannot have executed, so both stay
-    replayable. A batch array is unsafe: it may carry a ``tools/call``.
+    A request is safe when its method is in ``_REPLAY_SAFE_METHODS``.
+    Notifications and JSON-RPC responses (no ``id``-bearing ``method``) keep
+    the pre-#444 retry policy: a replay can deliver one twice, and the
+    server's handler may then run twice, which is accepted because no
+    request result depends on it. Unparseable content cannot have executed.
+    A batch array is unsafe: it may carry a ``tools/call``.
     """
     try:
         msg = json.loads(content)
@@ -3903,9 +3905,16 @@ def _post_and_stream(
                 # executed this request (a slow tools/call past
                 # --timeout-read, a drop before the first response byte).
                 # Replaying it could run a non-idempotent tool again; tell
-                # the client instead and let it decide.
+                # the client instead and let it decide. Deliberately NOT
+                # era-gated: the legacy era (the default) replays exactly
+                # the same way, and a duplicated tool call is a bug to
+                # fix, not wire behavior to freeze (cf. #416's
+                # --max-message-size, also applied to both eras). The
+                # synthesized error skips an id the client has already
+                # cancelled, through the non-consuming tracker check
+                # ``_drain_pending`` uses.
                 log(f"request {req_id!r} may have reached the server; not retrying")
-                if has_id:
+                if has_id and not (tracker is not None and tracker.contains(req_id)):
                     _write_line(
                         _error_response(
                             "upstream connection failed after the request was "
