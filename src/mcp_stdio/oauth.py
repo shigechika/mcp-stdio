@@ -2615,8 +2615,9 @@ def ensure_token(
             # Best-effort persist: the reconcile is a convenience, and the cached
             # access_token is already valid, so a store-write failure must NOT
             # fail a request this path previously always served. Degrade to the
-            # in-memory reconciled token (refresh below re-reads the store, so it
-            # would still use the old settings until the next successful save).
+            # in-memory reconciled token; the refresh below is handed the same
+            # settings (``resource_settings``), so it uses them even when this
+            # save was skipped.
             # Under refresh_lock, applied to a fresh read (#454): writing back
             # this possibly stale copy could overwrite a refresh token another
             # process just rotated.
