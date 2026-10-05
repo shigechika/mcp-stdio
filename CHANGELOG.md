@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.43.8](https://github.com/shigechika/mcp-stdio/compare/v0.43.7...v0.43.8) (2026-10-05)
+
+
+### Bug Fixes
+
+* never replay a tools/call that may already have reached the server ([#445](https://github.com/shigechika/mcp-stdio/issues/445)) ([c450c72](https://github.com/shigechika/mcp-stdio/commit/c450c729224512312c5cb40f0e90021b85aa2d6b))
+* **oauth:** keep the token on a transient refresh failure; serialize refresh across processes ([#455](https://github.com/shigechika/mcp-stdio/issues/455)) ([8eaf29e](https://github.com/shigechika/mcp-stdio/commit/8eaf29e34a21a6c7a1b4c9f83eafd2eb9051dff5))
+* **oauth:** send scope on refresh, keep the endpoint query, usable URL without a browser ([#452](https://github.com/shigechika/mcp-stdio/issues/452)) ([7a6c2cc](https://github.com/shigechika/mcp-stdio/commit/7a6c2cc916769436f3c72089e914de3dba512b3b))
+* pass a modern stdio client through on the modern era ([#447](https://github.com/shigechika/mcp-stdio/issues/447)) ([ceaab85](https://github.com/shigechika/mcp-stdio/commit/ceaab85a02666dbedf7fb096cd8e90889b8bf07e))
+* **serve:** validate the Origin header against DNS rebinding ([#450](https://github.com/shigechika/mcp-stdio/issues/450)) ([5faed22](https://github.com/shigechika/mcp-stdio/commit/5faed22ef2cd323923bd0fc7398c9d17dbbf0e58))
+
 ## [0.43.7](https://github.com/shigechika/mcp-stdio/compare/v0.43.6...v0.43.7) (2026-09-29)
 
 
