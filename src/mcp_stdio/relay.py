@@ -844,11 +844,12 @@ _MCP_PARAM_TYPES = frozenset({"string", "integer", "boolean"})
 # rejects the tool instead of being silently ignored. ``$ref`` is never
 # followed. Keywords whose value is a map of NAME -> subschema:
 _MCP_PARAM_SCHEMA_MAP_KEYWORDS = frozenset(
-    {"patternProperties", "dependentSchemas", "$defs", "definitions"}
+    {"patternProperties", "dependentSchemas", "dependencies", "$defs", "definitions"}
 )
 _MCP_PARAM_UNREACHABLE_KEYWORDS = (
     "items",
     "prefixItems",
+    "additionalItems",  # draft-07
     "contains",
     "additionalProperties",
     "unevaluatedProperties",
@@ -856,6 +857,8 @@ _MCP_PARAM_UNREACHABLE_KEYWORDS = (
     "propertyNames",
     "patternProperties",
     "dependentSchemas",
+    "dependencies",  # draft-07: name -> schema (or a list of names, skipped)
+    "contentSchema",
     "oneOf",
     "anyOf",
     "allOf",
@@ -897,6 +900,15 @@ def _scan_x_mcp_headers(input_schema: Any) -> tuple[_McpParamDecl, ...] | str:
     """
     if not isinstance(input_schema, dict):
         return ()
+    # A schema that never mentions the key cannot be invalid for this
+    # feature — skip the walk, so the bounds below can only ever reject a
+    # tool that actually carries an annotation. (A body too deep to
+    # serialize falls through to the bounded walk.)
+    try:
+        if f'"{_X_MCP_HEADER_KEY}"' not in json.dumps(input_schema):
+            return ()
+    except (ValueError, TypeError, RecursionError):
+        pass
     decls: list[_McpParamDecl] = []
     seen: set[str] = set()
     stack: list[tuple[Any, tuple[str, ...], bool, int]] = [(input_schema, (), True, 0)]
@@ -1140,12 +1152,16 @@ class _ToolHeaderCache:
         self._generation = 0
         self._warned: set[tuple[str, str]] = set()
 
-    def _scan_locked(
-        self, tools: list[Any]
-    ) -> tuple[list[Any], dict[str, Any], set[str]]:
+    @staticmethod
+    def _scan(tools: list[Any]) -> tuple[list[Any], dict[str, Any], dict[str, str]]:
+        """Validate a list WITHOUT the lock (pure; the walk can be large).
+
+        Returns the tools to show, the valid declarations by name, and the
+        rejection reason by name for the ones dropped.
+        """
         kept: list[Any] = []
         valid: dict[str, tuple[_McpParamDecl, ...]] = {}
-        invalid: set[str] = set()
+        invalid: dict[str, str] = {}
         for tool in tools:
             name = tool.get("name") if isinstance(tool, dict) else None
             if not isinstance(name, str):
@@ -1153,22 +1169,23 @@ class _ToolHeaderCache:
                 continue
             result = _scan_x_mcp_headers(tool.get("inputSchema"))
             if isinstance(result, str):
-                invalid.add(name)
-                key = (name, result)
-                if key not in self._warned and len(self._warned) < self._WARNED_CAP:
-                    self._warned.add(key)
-                    log(
-                        f"warning: excluding tool {name!r} from tools/list: "
-                        f"invalid x-mcp-header declaration — {result}"
-                    )
+                invalid[name] = result
                 continue
             kept.append(tool)
             valid[name] = result
         return kept, valid, invalid
 
     def _commit_locked(
-        self, valid: dict[str, Any], invalid: set[str], *, complete: bool
+        self, valid: dict[str, Any], invalid: dict[str, str], *, complete: bool
     ) -> None:
+        for name, reason in invalid.items():
+            key = (name, reason)
+            if key not in self._warned and len(self._warned) < self._WARNED_CAP:
+                self._warned.add(key)
+                log(
+                    f"warning: excluding tool {name!r} from tools/list: "
+                    f"invalid x-mcp-header declaration — {reason}"
+                )
         if complete:
             self._by_tool = valid
             return
@@ -1182,31 +1199,28 @@ class _ToolHeaderCache:
         *,
         complete: bool,
         generation: int | None = None,
-    ) -> list[Any]:
-        """Learn from a ``tools/list`` answer the client is about to see.
+    ) -> tuple[list[Any], bool]:
+        """Learn from a ``tools/list`` answer; return ``(shown, committed)``.
 
         ``complete`` (a whole catalog) replaces the cache; otherwise (one
         page, a truncated merge) it upserts the valid tools seen, evicts the
         ones seen invalid, and never forgets unseen ones. ``generation`` is
         the value read before the list was fetched: if a
         ``tools/list_changed`` invalidated the cache since, nothing is
-        committed (the list may predate the change) — the tools are still
-        filtered. Returns the list to show the client: the SAME object when
-        nothing was dropped, so callers can emit the original bytes.
+        committed (the list may predate the change) and ``committed`` is
+        False — the tools are still filtered. ``shown`` is the list for the
+        client: the SAME object when nothing was dropped, so callers can
+        emit the original bytes. The schema walk runs outside the lock, so
+        a listen thread's ``invalidate`` never waits for it.
         """
+        kept, valid, invalid = self._scan(tools)
         with self._lock:
-            kept, valid, invalid = self._scan_locked(tools)
-            if generation is None or generation == self._generation:
+            committed = generation is None or generation == self._generation
+            if committed:
                 self._commit_locked(valid, invalid, complete=complete)
-        return tools if len(kept) == len(tools) else kept
-
-    def update(self, tools: list[Any]) -> list[Any]:
-        """``learn`` from a PARTIAL list."""
-        return self.learn(tools, complete=False)
-
-    def replace(self, tools: list[Any]) -> list[Any]:
-        """``learn`` from a COMPLETE catalog: forgets every tool not in it."""
-        return self.learn(tools, complete=True)
+            elif invalid:
+                self._commit_locked({}, invalid, complete=False)  # warn only
+        return (tools if len(kept) == len(tools) else kept), committed
 
     def declarations_for(self, name: Any) -> tuple[_McpParamDecl, ...]:
         if not isinstance(name, str):
@@ -1223,17 +1237,6 @@ class _ToolHeaderCache:
     def generation(self) -> int:
         with self._lock:
             return self._generation
-
-    def commit_if_current(
-        self, generation: int, tools: list[Any], *, complete: bool
-    ) -> bool:
-        """Commit a relay-minted re-list unless an invalidation intervened."""
-        with self._lock:
-            if self._generation != generation:
-                return False
-            _, valid, invalid = self._scan_locked(tools)
-            self._commit_locked(valid, invalid, complete=complete)
-            return True
 
     def observe(self, payload: str) -> None:
         """Invalidate when ``payload`` is a ``tools/list_changed`` notification.
@@ -5024,7 +5027,7 @@ def _paginate_and_stream(
         merged_result["nextCursor"] = pending_cursor
 
     if tool_cache is not None and isinstance(merged_result.get(result_key), list):
-        merged_result[result_key] = tool_cache.learn(
+        merged_result[result_key], _ = tool_cache.learn(
             merged_result[result_key],
             complete=not truncated,
             generation=cache_generation,
@@ -7872,7 +7875,7 @@ def run(
     param_seq = 0
 
     def _refresh_tool_header_cache(
-        abort: "threading.Event | None", call_line: str
+        abort: "threading.Event | None", client_line: str | None
     ) -> bool:
         """Re-list tools for the -32020 rung (#459); True when committed.
 
@@ -7885,14 +7888,15 @@ def run(
         invalidated the cache meanwhile (`generation`); otherwise the cache
         stays empty and the caller does not retry.
 
-        For a #446 modern stdio client, the re-list carries the
-        `io.modelcontextprotocol/*` `_meta` of the rejected call itself
-        (its own version and capabilities — a catalog may depend on them);
-        otherwise the relay's own `_inject_modern_meta`.
+        ``client_line`` is the rejected call of a #446 modern stdio client
+        (None for a legacy client's): its `io.modelcontextprotocol/*` `_meta`
+        (that client's own version and capabilities — a catalog may depend
+        on them) rides the re-list; otherwise the relay's own
+        `_inject_modern_meta`.
         """
         nonlocal param_seq
         assert tool_cache is not None
-        client_meta = _modern_client_meta(call_line)
+        client_meta = _modern_client_meta(client_line) if client_line else None
         generation = tool_cache.generation
         tools: list[Any] = []
         cursor: Any = None
@@ -7938,19 +7942,24 @@ def run(
             if not cursor:
                 complete = True
                 break
-        if not tool_cache.commit_if_current(generation, tools, complete=complete):
+        _, committed = tool_cache.learn(tools, complete=complete, generation=generation)
+        if not committed:
             log("tool list changed during the Mcp-Param re-list; not retrying")
             return False
         return True
 
-    def _make_tools_list_hook(rid: Any) -> Callable[[str], str]:
+    def _make_tools_list_hook(
+        rid: Any, *, from_start: bool = False
+    ) -> Callable[[str], str]:
         """Hook for a streamed ``tools/list`` answer to ``rid`` (#459).
 
-        Teaches ``tool_cache`` from a single page (``update``: a page is
-        partial, so unseen tools are kept) and drops tools whose
-        ``x-mcp-header`` annotations are invalid. Returns the ORIGINAL
-        payload whenever nothing was dropped, so a clean catalog reaches the
-        client byte for byte; never returns None.
+        Teaches ``tool_cache`` and drops tools whose ``x-mcp-header``
+        annotations are invalid. A page is partial (``learn`` keeps unseen
+        tools) unless ``from_start`` — the request carried no cursor — and
+        the answer has no ``nextCursor``: then it is the whole catalog and
+        replaces the cache. Returns the ORIGINAL payload whenever nothing
+        was dropped, so a clean catalog reaches the client byte for byte;
+        never returns None.
         """
 
         generation = tool_cache.generation if tool_cache is not None else None
@@ -7970,7 +7979,8 @@ def run(
             tools = result.get("tools") if isinstance(result, dict) else None
             if not isinstance(tools, list):
                 return payload
-            kept = tool_cache.learn(tools, complete=False, generation=generation)
+            complete = from_start and not result.get("nextCursor")
+            kept, _ = tool_cache.learn(tools, complete=complete, generation=generation)
             if kept is tools:
                 return payload
             result["tools"] = kept
@@ -9835,7 +9845,9 @@ def run(
                             has_id=req_has_id,
                             tool_cache=tool_cache if learns else None,
                             tools_list_hook=(
-                                _make_tools_list_hook(req_id) if learns else None
+                                _make_tools_list_hook(req_id, from_start=True)
+                                if learns
+                                else None
                             ),
                             observe=(
                                 tool_cache.observe if tool_cache is not None else None
@@ -10244,10 +10256,20 @@ def run(
                     log(
                         "upstream rejected Mcp-Param headers (-32020); re-listing tools"
                     )
-                    if _refresh_tool_header_cache(param_abort, line):
+                    # `line` here already carries injected `_meta`, so only a
+                    # #446 modern client's own line lends its metadata.
+                    relisted = _refresh_tool_header_cache(
+                        param_abort, line if client_modern else None
+                    )
+                    fresh_decls = _param_decls_for(line) if relisted else None
+                    if relisted and fresh_decls == line_param_decls:
+                        # The re-list changed nothing for this tool, so the
+                        # same headers would be rejected the same way.
+                        log("re-listed Mcp-Param declarations unchanged; not retrying")
+                    elif relisted:
                         if _abort_requested(param_abort):
                             continue
-                        line_param_decls = _param_decls_for(line)
+                        line_param_decls = fresh_decls
                         req_headers = _prepare_headers(
                             line, param_decls=line_param_decls
                         )

@@ -20468,8 +20468,8 @@ class TestScanXMcpHeaders:
         }
         assert _scan_x_mcp_headers(schema) == ()
 
-    def test_bounds(self):
-        deep: dict = {"type": "string"}
+    def test_bounds_reject_only_an_annotated_schema(self):
+        deep: dict = {"type": "string", "x-mcp-header": "Deep"}
         for _ in range(80):
             deep = {"type": "object", "properties": {"p": deep}}
         assert _scan_x_mcp_headers(deep) == "schema too deeply nested"
@@ -20477,7 +20477,33 @@ class TestScanXMcpHeaders:
             "type": "object",
             "properties": {f"p{i}": {"type": "string"} for i in range(10_001)},
         }
+        wide["properties"]["p0"]["x-mcp-header"] = "P0"
         assert _scan_x_mcp_headers(wide) == "schema too large"
+
+    def test_a_huge_schema_without_annotations_is_never_rejected(self):
+        """#460 review: the bounds must not hide a tool that does not use the
+        feature at all (an OpenAPI-generated schema, say)."""
+        deep: dict = {"type": "string"}
+        for _ in range(80):
+            deep = {"type": "object", "properties": {"p": deep}}
+        assert _scan_x_mcp_headers(deep) == ()
+        wide = {
+            "type": "object",
+            "properties": {f"p{i}": {"type": "string"} for i in range(10_001)},
+        }
+        assert _scan_x_mcp_headers(wide) == ()
+
+    @pytest.mark.parametrize(
+        "wrap",
+        [
+            lambda s: {"type": "object", "additionalItems": s},
+            lambda s: {"type": "object", "dependencies": {"a": s}},
+            lambda s: {"type": "object", "contentSchema": s},
+        ],
+    )
+    def test_draft07_and_content_keywords_are_not_reachable(self, wrap):
+        annotated = {"type": "string", "x-mcp-header": "X"}
+        assert "statically reachable" in _scan_x_mcp_headers(wrap(annotated))
 
 
 class TestBuildMcpParamHeaders:
@@ -20562,26 +20588,27 @@ class TestToolHeaderCache:
     def test_drops_invalid_tools_and_returns_the_same_list_otherwise(self, capsys):
         cache = _ToolHeaderCache()
         clean = [self.GOOD, self.PLAIN]
-        assert cache.update(clean) is clean
-        kept = cache.update([self.GOOD, self.BAD])
+        assert cache.learn(clean, complete=False)[0] is clean
+        kept = cache.learn([self.GOOD, self.BAD], complete=False)[0]
         assert kept == [self.GOOD]
-        cache.update([self.BAD])
+        cache.learn([self.BAD], complete=False)
         err = capsys.readouterr().err
         assert err.count("excluding tool 'bad'") == 1  # warned once
         assert cache.declarations_for("good")[0].header == "Region"
         assert cache.declarations_for("bad") == ()
 
-    def test_update_keeps_unseen_tools_and_replace_forgets_them(self):
+    def test_partial_learn_keeps_unseen_tools_and_complete_forgets_them(self):
         cache = _ToolHeaderCache()
-        cache.update([self.GOOD])
-        cache.update([_annotated("other", {"a": ("string", "A")})])
+        other = _annotated("other", {"a": ("string", "A")})
+        cache.learn([self.GOOD], complete=False)
+        cache.learn([other], complete=False)
         assert cache.declarations_for("good")
-        cache.replace([_annotated("other", {"a": ("string", "A")})])
+        cache.learn([other], complete=True)
         assert cache.declarations_for("good") == ()
 
     def test_observe_invalidates_only_on_the_notification(self):
         cache = _ToolHeaderCache()
-        cache.update([self.GOOD])
+        cache.learn([self.GOOD], complete=False)
         generation = cache.generation
         cache.observe('{"jsonrpc":"2.0","method":"notifications/message","params":{}}')
         # a REQUEST that happens to carry the method name is not the notification
@@ -20597,9 +20624,11 @@ class TestToolHeaderCache:
         cache = _ToolHeaderCache()
         generation = cache.generation
         cache.invalidate()
-        assert cache.commit_if_current(generation, [self.GOOD], complete=True) is False
+        assert (
+            cache.learn([self.GOOD], complete=True, generation=generation)[1] is False
+        )
         assert cache.declarations_for("good") == ()
-        assert cache.commit_if_current(cache.generation, [self.GOOD], complete=True)
+        assert cache.learn([self.GOOD], complete=True, generation=cache.generation)[1]
         assert cache.declarations_for("good")
 
 
@@ -21273,14 +21302,14 @@ class TestMcpParamReviewFixes:
 
     def test_partial_update_evicts_a_tool_that_turned_invalid(self):
         cache = _ToolHeaderCache()
-        cache.update([self.TOOL])
+        cache.learn([self.TOOL], complete=False)
         now_bad = _annotated("region_op", {"region": ("number", "Region")})
-        assert cache.update([now_bad]) == []
+        assert cache.learn([now_bad], complete=False)[0] == []
         assert cache.declarations_for("region_op") == ()
 
     def test_escaped_notification_still_invalidates(self):
         cache = _ToolHeaderCache()
-        cache.update([self.TOOL])
+        cache.learn([self.TOOL], complete=False)
         cache.observe(
             '{"jsonrpc":"2.0","method":"notifications\\/tools\\/list_changed"}'
         )
@@ -21298,3 +21327,21 @@ class TestMcpParamReviewFixes:
             _error_response_for(json.dumps({**json.loads(body), "jsonrpc": "1.0"}), 2)
             is None
         )
+
+    def test_unchanged_declarations_after_relist_skip_the_retry(self, httpx_mock):
+        """#460 review: when the call already carried the current headers, a
+        re-list that changes nothing cannot help — forward, do not re-POST."""
+        self._discover(httpx_mock)
+        self._list_response(httpx_mock, [self.TOOL])
+        self._call_response(httpx_mock, status=400, body=self.MISMATCH)
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/list"},
+            json={"jsonrpc": "2.0", "id": "x", "result": {"tools": [self.TOOL]}},
+        )
+        out = self._run(
+            httpx_mock, [self._list(), self._call(arguments={"region": "us"})]
+        )
+        assert out[-1] == self.MISMATCH
+        (call,) = self._requests(httpx_mock, "tools/call")
+        assert call.headers["mcp-param-region"] == "us"
