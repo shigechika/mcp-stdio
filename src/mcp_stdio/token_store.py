@@ -18,6 +18,7 @@ import os
 import stat
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -724,11 +725,20 @@ def _write_store(data: dict[str, Any]) -> None:
 
 
 @contextlib.contextmanager
-def _store_lock() -> Iterator[None]:
-    """Best-effort advisory exclusive lock around a read-modify-write.
+def _file_lock(name: str, wait: float | None = None) -> Iterator[bool]:
+    """Best-effort advisory exclusive lock on ``_STORE_DIR / name``.
 
-        Serialises ``save_token`` / ``delete_token`` so updates to distinct server
-        keys merge rather than clobbering each other (last-writer-wins). Uses
+    ``wait`` None blocks until the lock is free (``_store_lock``); a number
+    bounds the wait in seconds (``refresh_lock``, #454). Yields False only
+    when that bounded wait ran out while another holder kept the lock, so
+    the caller can decide not to proceed; it yields True when the lock is
+    held AND on the degrade-to-unlocked paths below (no primitive, a planted
+    special file), which keep their old "never block on lock trouble"
+    behavior. Everything below applies to both.
+
+        For ``_store_lock`` it serialises ``save_token`` / ``delete_token`` so
+        updates to distinct server keys merge rather than clobbering each other
+        (last-writer-wins). Uses
         ``fcntl.flock`` on POSIX and ``msvcrt`` on Windows; if no primitive is
         available or acquisition fails, it proceeds without the lock (the operation
         must never be blocked by lock trouble).
@@ -745,7 +755,7 @@ def _store_lock() -> Iterator[None]:
     _ensure_store_dir()
     # Derive the lock path from the current _STORE_DIR (not a module constant)
     # so test monkeypatching of _STORE_DIR redirects the lock file too.
-    lock_path = _STORE_DIR / "tokens.json.lock"
+    lock_path = _STORE_DIR / name
     try:
         # _O_NONBLOCK: without it, an O_WRONLY open of a writer-less
         # FIFO planted at the lock path BLOCKS forever, hanging every
@@ -777,7 +787,7 @@ def _store_lock() -> Iterator[None]:
                     f"saves may last-writer-wins",
                     file=sys.stderr,
                 )
-        yield
+        yield True
         return
     # the 0o600 mode above applies only on CREATION. Re-tighten a
     # pre-existing lock file via the fd (fchmod, anchored to this inode like
@@ -792,20 +802,14 @@ def _store_lock() -> Iterator[None]:
         except OSError:
             pass
     locked = False
+    timed_out = False
     try:
         try:
-            if sys.platform == "win32":
-                import msvcrt
-
-                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(fd, fcntl.LOCK_EX)
-            locked = True
+            locked = _acquire(fd, wait)
+            timed_out = not locked
         except (OSError, ImportError, ValueError):
             pass  # best-effort: fall back to an unsynchronised write
-        yield
+        yield not timed_out
     finally:
         if locked and sys.platform == "win32":
             try:
@@ -816,6 +820,82 @@ def _store_lock() -> Iterator[None]:
             except OSError:
                 pass
         os.close(fd)
+
+
+def _acquire(fd: int, wait: float | None) -> bool:
+    """Take the exclusive lock on ``fd``; False when ``wait`` ran out.
+
+    Raises OSError/ImportError/ValueError when no lock primitive works,
+    which the caller treats as "proceed unlocked".
+    """
+    if sys.platform == "win32":
+        import msvcrt
+
+        if wait is None:
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            return True
+        lock_once = lambda: msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # noqa: E731
+    else:
+        import fcntl
+
+        if wait is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            return True
+        lock_once = lambda: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # noqa: E731
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            lock_once()
+            return True
+        except OSError as e:
+            if e.errno not in (
+                errno.EAGAIN,
+                errno.EACCES,
+                errno.EWOULDBLOCK,
+                errno.EDEADLK,
+            ):
+                raise
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+@contextlib.contextmanager
+def _store_lock() -> Iterator[None]:
+    """Serialise ``save_token`` / ``delete_token``'s read-modify-write.
+
+    A blocking ``_file_lock`` on ``tokens.json.lock`` (see there for the
+    platform primitives and the degrade-to-unlocked rules). NOT re-entrant:
+    each call opens its own fd, so code holding it must not call
+    ``save_token`` / ``delete_token``.
+    """
+    with _file_lock("tokens.json.lock"):  # blocking: never times out
+        yield
+
+
+# Upper bound on waiting for another process's refresh (#454). Running out
+# does NOT mean refreshing unlocked — the holder may just be slow, and two
+# exchanges of one rotating refresh token is the race this lock prevents —
+# the caller re-reads the store and otherwise reports a transient failure.
+_REFRESH_LOCK_WAIT_SECS = 30.0
+
+
+@contextlib.contextmanager
+def refresh_lock(wait: float | None = None) -> Iterator[bool]:
+    """Cross-process lock around one refresh's load -> exchange -> save (#454).
+
+    A separate file from ``_store_lock`` (which ``save_token`` takes inside
+    it), so the holder can still save. With a rotating refresh token, two
+    relay processes exchanging the same token make the AS answer the second
+    with ``invalid_grant`` — or revoke the whole family; holding this and
+    re-reading the store after acquiring it means each process exchanges
+    the latest token. Yields False when the bounded wait (default
+    ``_REFRESH_LOCK_WAIT_SECS``) ran out: the caller must then not exchange.
+    """
+    if wait is None:
+        wait = _REFRESH_LOCK_WAIT_SECS
+    with _file_lock("tokens.json.refresh.lock", wait=wait) as acquired:
+        yield acquired
 
 
 def load_token(server_url: str) -> TokenData | None:
@@ -955,8 +1035,20 @@ def save_token(server_url: str, data: TokenData) -> None:
             )
 
 
-def delete_token(server_url: str) -> None:
-    """Delete token data for a server URL."""
+def delete_token(
+    server_url: str,
+    *,
+    expected_refresh_token: str | None = None,
+    expected_access_token: str | None = None,
+) -> bool:
+    """Delete token data for a server URL; True when an entry was removed.
+
+    With ``expected_refresh_token`` / ``expected_access_token``, delete only
+    while the stored entry still carries those values (#454): a refresh that
+    just failed must not remove a newer token another process saved in the
+    meantime — the access token catches an AS that does not rotate the
+    refresh token.
+    """
     with _store_lock():
         try:
             store = _read_store(for_write=True)
@@ -969,10 +1061,21 @@ def delete_token(server_url: str) -> None:
                 f"not deleting to avoid overwriting other servers' tokens",
                 file=sys.stderr,
             )
-            return
+            return False
         removed = False
         for key in {_normalize_key(server_url), server_url}:
             if key in store:
+                entry = store[key]
+                expected = {
+                    "refresh_token": expected_refresh_token,
+                    "access_token": expected_access_token,
+                }
+                if any(
+                    want is not None
+                    and (not isinstance(entry, dict) or entry.get(field) != want)
+                    for field, want in expected.items()
+                ):
+                    continue
                 del store[key]
                 removed = True
         if removed:
@@ -988,3 +1091,5 @@ def delete_token(server_url: str) -> None:
                     f"warning: could not write token store ({e}); token not deleted",
                     file=sys.stderr,
                 )
+                return False
+        return removed

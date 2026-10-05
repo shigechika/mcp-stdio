@@ -31,7 +31,13 @@ from urllib.parse import (
 import httpx
 
 from .relay import _read_bounded, _parse_auth_params, log
-from .token_store import TokenData, delete_token, load_token, save_token
+from .token_store import (
+    TokenData,
+    delete_token,
+    load_token,
+    refresh_lock,
+    save_token,
+)
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -1208,8 +1214,32 @@ def _make_callback_handler(
     return Handler
 
 
+class OAuthTokenError(RuntimeError):
+    """A token-endpoint error response (RFC 6749 §5.2), with its ``error`` code.
+
+    A ``RuntimeError`` subclass with the same message as before, so existing
+    handlers keep working; ``error`` lets the refresh path tell a dead grant
+    (``invalid_grant``) from a transient one (``temporarily_unavailable``,
+    #454). The code is AS-controlled: kept only when it is a short string.
+    """
+
+    def __init__(self, message: str, error: Any, status: int | None = None) -> None:
+        super().__init__(message)
+        self.error = error if isinstance(error, str) and len(error) <= 64 else ""
+        # The HTTP status it arrived with (None for an in-body error on a 200),
+        # so a 5xx/429 stays transient whatever its body says.
+        self.status = status
+
+
+def _token_error(body: dict[str, Any], status: int | None = None) -> OAuthTokenError:
+    desc = body.get("error_description", body["error"])
+    return OAuthTokenError(
+        f"OAuth token error: {_sanitize_oauth_error(desc)}", body["error"], status
+    )
+
+
 def _raise_for_body_error(result: dict[str, Any]) -> None:
-    """Raise RuntimeError if a 200 token response carries an in-body OAuth error.
+    """Raise OAuthTokenError if a 200 token response carries an in-body OAuth error.
 
     Some providers (GitHub legacy) return HTTP 200 with ``error`` /
     ``error_description`` instead of a token. Applies to both JSON and
@@ -1218,8 +1248,7 @@ def _raise_for_body_error(result: dict[str, Any]) -> None:
     surface as an opaque ``KeyError: 'access_token'`` downstream.
     """
     if "error" in result and "access_token" not in result:
-        desc = result.get("error_description", result["error"])
-        raise RuntimeError(f"OAuth token error: {_sanitize_oauth_error(desc)}")
+        raise _token_error(result)
 
 
 def _parse_token_response(resp: httpx.Response) -> dict[str, Any]:
@@ -1250,8 +1279,7 @@ def _parse_token_response(resp: httpx.Response) -> dict[str, Any]:
         except Exception:
             body = None
         if isinstance(body, dict) and "error" in body:
-            desc = body.get("error_description", body["error"])
-            raise RuntimeError(f"OAuth token error: {_sanitize_oauth_error(desc)}")
+            raise _token_error(body, resp.status_code)
 
     resp.raise_for_status()
 
@@ -1548,6 +1576,49 @@ def _token_response_to_data(
     )
 
 
+@dataclass
+class _RefreshOutcome:
+    """What ``_refresh_cached_token_ex`` produced (#454).
+
+    ``data`` is the usable token, or None on failure. ``dead`` says the
+    failure proves the stored grant unusable (delete it), as opposed to a
+    transient one (keep it for the next attempt). ``refresh_token`` is the
+    one that failed, for ``delete_token``'s compare-and-delete.
+    """
+
+    data: TokenData | None
+    dead: bool = False
+    refresh_token: str | None = None
+
+
+# Token-endpoint ``error`` codes that say "try again later", not "this grant
+# is dead" (RFC 6749 §5.2 defines no such codes for the token endpoint, but
+# ASes use the §4.1.2.1 ones there).
+_TRANSIENT_TOKEN_ERRORS = frozenset({"temporarily_unavailable", "server_error"})
+
+
+def _refresh_error_is_dead(e: Exception) -> bool:
+    """Whether a refresh failure proves the stored grant unusable (#454).
+
+    Only the plainly transient cases keep the token: an HTTP 5xx or 429
+    (whatever its body says), a transient ``error`` code, or any other httpx
+    failure before a status was judged (no answer, a body over
+    --max-message-size, an undecodable body). Everything else —
+    ``invalid_grant``, ``invalid_client``, any other 4xx, a 200 without an
+    access token — is treated as dead, as every failure was before.
+    """
+    if isinstance(e, OAuthTokenError):
+        if e.status is not None and (e.status >= 500 or e.status == 429):
+            return False
+        return e.error not in _TRANSIENT_TOKEN_ERRORS
+    if isinstance(e, httpx.HTTPStatusError):
+        status = e.response.status_code
+        return not (status >= 500 or status == 429)
+    if isinstance(e, httpx.HTTPError):
+        return False
+    return True
+
+
 def refresh_cached_token(server_url: str, client: httpx.Client) -> TokenData | None:
     """Refresh the cached token for a server using its stored refresh_token.
 
@@ -1556,16 +1627,83 @@ def refresh_cached_token(server_url: str, client: httpx.Client) -> TokenData | N
     client_secret per RFC 7591 §3.2.1) or the refresh request fails.
 
     Does not delete stale tokens on failure — callers decide the retry
-    policy.
+    policy (``ensure_token`` uses ``_refresh_cached_token_ex`` for that).
     """
-    cached = load_token(server_url)
+    return _refresh_cached_token_ex(server_url, client).data
+
+
+def _refresh_cached_token_ex(
+    server_url: str,
+    client: httpx.Client,
+    *,
+    seen_access_token: str | None = None,
+    delete_if_dead: bool = False,
+    resource_settings: tuple[bool, str | None] | None = None,
+) -> _RefreshOutcome:
+    """``refresh_cached_token`` plus why it failed, under ``refresh_lock`` (#454).
+
+    ``seen_access_token`` is the (expired) token the caller holds; without
+    one, the store is read before taking the lock. After taking it the
+    store is read again: if the token there differs, another relay process
+    already refreshed and its token is returned without an exchange;
+    otherwise the exchange spends the LATEST stored refresh token. Two
+    processes therefore never spend the same rotating refresh token.
+
+    If the bounded wait for the lock runs out, nothing is exchanged (the
+    holder may just be slow): a token stored meanwhile is returned, else a
+    transient failure. ``delete_if_dead`` deletes a dead grant while the
+    lock is still held, compared against the failed refresh AND access
+    tokens, so no newer token can be removed. ``resource_settings``
+    (``no_resource_indicator``, ``oauth_resource``) is the caller's current
+    intent, applied to the freshly read token before the exchange, so a
+    reconcile that could not be persisted still governs this request.
+    """
+    if seen_access_token is None:
+        snapshot = load_token(server_url)
+        if snapshot is None:
+            # Nothing to refresh: skip the lock (and the store-directory
+            # bootstrap it implies) entirely, as before #454.
+            return _RefreshOutcome(None, dead=True)
+        seen_access_token = snapshot.access_token
+    with refresh_lock() as acquired:
+        cached = load_token(server_url)
+        if (
+            seen_access_token is not None
+            and cached is not None
+            and cached.access_token != seen_access_token
+        ):
+            log("another mcp-stdio process already refreshed the token; using it")
+            return _RefreshOutcome(cached)
+        if not acquired:
+            log(
+                "another mcp-stdio process is still refreshing this token; "
+                "not refreshing concurrently"
+            )
+            return _RefreshOutcome(None)
+        if cached is not None and resource_settings is not None:
+            cached.no_resource_indicator, cached.oauth_resource = resource_settings
+        outcome = _refresh_locked(server_url, client, cached)
+        if outcome.dead and delete_if_dead and cached is not None:
+            delete_token(
+                server_url,
+                expected_refresh_token=cached.refresh_token,
+                expected_access_token=cached.access_token,
+            )
+        return outcome
+
+
+def _refresh_locked(
+    server_url: str, client: httpx.Client, cached: TokenData | None
+) -> _RefreshOutcome:
+    """The exchange itself; the caller holds ``refresh_lock``."""
     if not (
         cached and cached.refresh_token and cached.token_endpoint and cached.client_id
     ):
-        return None
+        return _RefreshOutcome(None, dead=True)
+    failed = _RefreshOutcome(None, dead=True, refresh_token=cached.refresh_token)
     if _is_client_secret_expired(cached):
         log("OAuth client_secret expired (RFC 7591 §3.2.1) — cannot refresh")
-        return None
+        return failed
     log("access token expired, attempting refresh")
     # Defence-in-depth: the cached token_endpoint was validated at
     # persist time, but re-validate before re-POSTing credentials to it. The
@@ -1573,7 +1711,7 @@ def refresh_cached_token(server_url: str, client: httpx.Client) -> TokenData | N
     # the discovery-path validation so a tampered/legacy store cannot redirect
     # the refresh to a cleartext or userinfo-bearing URL. See #13.
     if not _validate_endpoint_url(cached.token_endpoint, label="cached token_endpoint"):
-        return None
+        return failed
     auth_method = cached.token_endpoint_auth_method
     no_resource_indicator = cached.no_resource_indicator
     oauth_resource = cached.oauth_resource
@@ -1603,8 +1741,12 @@ def refresh_cached_token(server_url: str, client: httpx.Client) -> TokenData | N
             # cause (``invalid_scope``, or a scope it cannot accept back
             # verbatim), retry once exactly as before #451 — without it — so
             # sending the scope can never turn a working refresh into a
-            # failing one. A transport error is not retried here.
-            if not cached.scope:
+            # failing one. A transport error, or a transient answer
+            # (5xx/429, ``temporarily_unavailable``), is not retried: the
+            # scope did not cause it, and a scope-less retry could turn it
+            # into a "dead" answer (Entra's AADSTS90009) that deletes the
+            # token (#454).
+            if not cached.scope or not _refresh_error_is_dead(e):
                 raise
             log(
                 f"token refresh with scope failed ({_sanitize_oauth_error(e)}); retrying without scope"
@@ -1617,7 +1759,9 @@ def refresh_cached_token(server_url: str, client: httpx.Client) -> TokenData | N
         # would otherwise leak AS-controlled bytes into the log. Bound it
         # defensively so no exception type can write an unbounded/raw log line.
         log(f"token refresh failed: {_sanitize_oauth_error(e)}")
-        return None
+        return _RefreshOutcome(
+            None, dead=_refresh_error_is_dead(e), refresh_token=cached.refresh_token
+        )
     metadata = OAuthMetadata(
         authorization_endpoint=cached.authorization_endpoint,
         token_endpoint=cached.token_endpoint,
@@ -1655,10 +1799,10 @@ def refresh_cached_token(server_url: str, client: httpx.Client) -> TokenData | N
         # the stale token and re-auth, but the RuntimeError reached cli.py and
         # exited 1). Degrade to None like every other refresh failure.
         log(f"token refresh failed: {_sanitize_oauth_error(e)}")
-        return None
+        return failed
     save_token(server_url, data)
     log("token refreshed successfully")
-    return data
+    return _RefreshOutcome(data)
 
 
 def _resolve_cimd_client_id(
@@ -2471,10 +2615,20 @@ def ensure_token(
             # Best-effort persist: the reconcile is a convenience, and the cached
             # access_token is already valid, so a store-write failure must NOT
             # fail a request this path previously always served. Degrade to the
-            # in-memory reconciled token (refresh below re-reads the store, so it
-            # would still use the old settings until the next successful save).
+            # in-memory reconciled token; the refresh below is handed the same
+            # settings (``resource_settings``), so it uses them even when this
+            # save was skipped.
+            # Under refresh_lock, applied to a fresh read (#454): writing back
+            # this possibly stale copy could overwrite a refresh token another
+            # process just rotated.
             try:
-                save_token(server_url, cached)
+                with refresh_lock() as acquired:
+                    latest = load_token(server_url) if acquired else None
+                    if latest is not None and latest.access_token:
+                        latest.no_resource_indicator = desired_no_ri
+                        latest.oauth_resource = oauth_resource
+                        save_token(server_url, latest)
+                        cached = latest
             except OSError as e:
                 log(f"warning: could not persist reconciled resource settings: {e}")
         if (
@@ -2486,13 +2640,24 @@ def ensure_token(
 
         # Try refresh (skip if client_secret has expired per RFC 7591 §3.2.1)
         if cached.refresh_token and cached.token_endpoint and cached.client_id:
-            refreshed = refresh_cached_token(server_url, client)
-            if refreshed:
-                return refreshed
-            # Refresh failed or was skipped — clear stale token so the full
-            # flow below isn't blocked by cached failure state
-            # (cf. anthropics/claude-code#37747).
-            delete_token(server_url)
+            # A dead grant is deleted inside the refresh lock — clearing the
+            # stale token so the full flow below isn't blocked by cached
+            # failure state (cf. anthropics/claude-code#37747) — and only
+            # while the store still holds the token that failed (#454).
+            outcome = _refresh_cached_token_ex(
+                server_url,
+                client,
+                seen_access_token=cached.access_token,
+                delete_if_dead=True,
+                resource_settings=(not resource_indicator, oauth_resource),
+            )
+            if outcome.data:
+                return outcome.data
+            if not outcome.dead:
+                # A transient failure (no answer, 5xx/429, temporarily_unavailable)
+                # says nothing about the grant: keep the token for the next
+                # attempt instead of throwing away weeks of refresh token (#454).
+                log("keeping the stored OAuth token; its refresh failed transiently")
 
     if not interactive:
         # Non-interactive probe (--oauth-eager warm check): no cached/refreshable

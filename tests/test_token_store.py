@@ -1678,3 +1678,80 @@ class TestLegacyMigration:
         monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
 
         assert load_token("https://example.com/mcp") is None
+
+
+# --- #454: compare-and-delete and the bounded refresh lock ---
+
+
+class TestRefreshDurabilityStore:
+    @pytest.fixture(autouse=True)
+    def _store(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", tmp_path / "t.json")
+
+    def test_delete_with_expected_refresh_token(self):
+        from mcp_stdio.token_store import (
+            TokenData,
+            delete_token,
+            load_token,
+            save_token,
+        )
+
+        url = "https://x.example/mcp"
+        save_token(url, TokenData(access_token="a", refresh_token="rt-new"))
+        assert delete_token(url, expected_refresh_token="rt-old") is False
+        assert load_token(url) is not None
+        assert delete_token(url, expected_refresh_token="rt-new") is True
+        assert load_token(url) is None
+
+    def test_refresh_lock_reports_a_timed_out_wait(self):
+        from mcp_stdio.token_store import refresh_lock
+
+        held = threading.Event()
+        release = threading.Event()
+
+        def holder():
+            with refresh_lock() as acquired:
+                assert acquired is True
+                held.set()
+                release.wait(5)
+
+        t = threading.Thread(target=holder)
+        t.start()
+        assert held.wait(5)
+        try:
+            with refresh_lock(wait=0.1) as acquired:
+                assert acquired is False  # the caller must not exchange
+        finally:
+            release.set()
+            t.join(5)
+
+    def test_delete_compares_the_access_token_too(self):
+        """A non-rotating AS keeps the refresh token, so only the access token
+        tells a token another process refreshed from the one that failed."""
+        from mcp_stdio.token_store import (
+            TokenData,
+            delete_token,
+            load_token,
+            save_token,
+        )
+
+        url = "https://x.example/mcp"
+        save_token(url, TokenData(access_token="at-new", refresh_token="rt"))
+        assert (
+            delete_token(
+                url, expected_refresh_token="rt", expected_access_token="at-old"
+            )
+            is False
+        )
+        assert load_token(url) is not None
+
+    def test_refresh_lock_degrades_when_locking_is_unavailable(self, monkeypatch):
+        from mcp_stdio import token_store
+
+        def broken(fd, wait):
+            raise OSError("no locking here")
+
+        monkeypatch.setattr(token_store, "_acquire", broken)
+        with token_store.refresh_lock() as acquired:
+            assert acquired is True  # degraded: proceed unlocked, as before
