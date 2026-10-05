@@ -7,6 +7,7 @@ import hashlib
 import html
 import ipaddress
 import math
+import os
 import re
 import secrets
 import sys
@@ -19,6 +20,7 @@ from typing import Any
 from urllib.parse import (
     ParseResult,
     parse_qs,
+    parse_qsl,
     quote,
     urlencode,
     urlparse,
@@ -1368,9 +1370,11 @@ def refresh_access_token(
     Args:
         resource: RFC 8707 resource indicator (the MCP server URL).
         auth_method: Token endpoint authentication method (RFC 6749 §2.3).
-        scope: The scope the cached token was granted (RFC 6749 §6 allows
-            re-sending it). Microsoft Entra ID rejects a refresh without it
-            (AADSTS90009) when the client is also the resource app.
+        scope: The cached token's scope — what the AS granted, or what was
+            requested when the AS omitted ``scope`` from its response
+            (RFC 6749 §6 allows re-sending it). Microsoft Entra ID rejects a
+            refresh without it (AADSTS90009) when the client is also the
+            resource app.
 
     Returns the raw token response dict.
     """
@@ -1573,21 +1577,39 @@ def refresh_cached_token(server_url: str, client: httpx.Client) -> TokenData | N
     auth_method = cached.token_endpoint_auth_method
     no_resource_indicator = cached.no_resource_indicator
     oauth_resource = cached.oauth_resource
-    try:
-        raw = refresh_access_token(
+    resource = _effective_resource(
+        server_url,
+        resource_indicator=not no_resource_indicator,
+        oauth_resource=oauth_resource,
+    )
+
+    def _refresh(scope: str | None) -> dict[str, Any]:
+        return refresh_access_token(
             cached.token_endpoint,
             cached.client_id,
             cached.client_secret,
             cached.refresh_token,
             client,
-            resource=_effective_resource(
-                server_url,
-                resource_indicator=not no_resource_indicator,
-                oauth_resource=oauth_resource,
-            ),
+            resource=resource,
             auth_method=auth_method,
-            scope=cached.scope,
+            scope=scope,
         )
+
+    try:
+        try:
+            raw = _refresh(cached.scope)
+        except (RuntimeError, httpx.HTTPStatusError) as e:
+            # The AS answered with an error. If the re-sent scope may be the
+            # cause (``invalid_scope``, or a scope it cannot accept back
+            # verbatim), retry once exactly as before #451 — without it — so
+            # sending the scope can never turn a working refresh into a
+            # failing one. A transport error is not retried here.
+            if not cached.scope:
+                raise
+            log(
+                f"token refresh with scope failed ({_sanitize_oauth_error(e)}); retrying without scope"
+            )
+            raw = _refresh(None)
     except Exception as e:
         # Sanitise the interpolated exception text: today's reachable exceptions
         # (httpx.HTTPStatusError, _raise_for_body_error's RuntimeError) carry no
@@ -1744,6 +1766,66 @@ def _cached_credentials_for_issuer(
     return cached
 
 
+def _build_authorize_url(endpoint: str, params: dict[str, str]) -> str:
+    """Add the flow's ``params`` to ``authorization_endpoint`` (RFC 6749 §3.1).
+
+    The endpoint "MAY include a query component, which MUST be retained
+    when adding additional query parameters" (Azure AD B2C's
+    ``?p=B2C_1_signin``), parameters "MUST NOT be included more than once"
+    (an endpoint-supplied copy of one of ours is dropped in favour of ours),
+    and it "MUST NOT include a fragment component" (dropped). A bare
+    trailing ``?`` simply yields an empty existing query.
+    """
+    p = urlsplit(endpoint)
+    kept = [
+        (k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if k not in params
+    ]
+    query = urlencode(kept + list(params.items()))
+    return urlunsplit((p.scheme, p.netloc, p.path, query, ""))
+
+
+def _gui_browser_available() -> bool:
+    """Whether ``webbrowser.open`` can be trusted not to touch our stdio.
+
+    On a POSIX desktop other than macOS, Python registers graphical
+    browsers only when ``DISPLAY`` or ``WAYLAND_DISPLAY`` is set, and
+    otherwise falls back to console browsers (w3m, lynx, ``www-browser``)
+    that it runs in the FOREGROUND, inheriting stdin/stdout — the JSON-RPC
+    channel to the MCP host. Skip ``webbrowser`` there unless ``BROWSER``
+    names one explicitly (the operator's choice).
+    """
+    if sys.platform == "darwin" or sys.platform.startswith(("win", "cygwin")):
+        return True
+    return bool(
+        os.environ.get("DISPLAY")
+        or os.environ.get("WAYLAND_DISPLAY")
+        or os.environ.get("BROWSER")
+    )
+
+
+def _write_to_tty(text: str) -> bool:
+    """Write ``text`` to the controlling terminal, if there is one.
+
+    For a secret-bearing message (the full authorize URL) that a person at
+    the terminal needs but that must not be persisted in the MCP host's
+    stderr log. Returns False when there is no terminal (a host that
+    detaches its MCP servers, Windows) or the write fails.
+    """
+    if not hasattr(os, "O_NOCTTY"):
+        return False
+    try:
+        fd = os.open("/dev/tty", os.O_WRONLY | os.O_NOCTTY)
+    except OSError:
+        return False
+    try:
+        os.write(fd, text.encode("utf-8", "replace"))
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
 def _run_authorization_flow(
     server_url: str,
     client: httpx.Client,
@@ -1851,36 +1933,45 @@ def _run_authorization_flow(
         if scope:
             params["scope"] = scope
 
-        # RFC 6749 §3.1: the endpoint URI "MAY include a query component,
-        # which MUST be retained when adding additional query parameters"
-        # (e.g. Azure AD B2C's `?p=B2C_1_signin`), so append with `&` then.
-        sep = "&" if urlsplit(metadata.authorization_endpoint).query else "?"
-        auth_url = f"{metadata.authorization_endpoint}{sep}{urlencode(params)}"
-        try:
-            opened = webbrowser.open(auth_url)
-        except Exception:  # noqa: BLE001 — a broken browser hook must not abort the flow
-            opened = False
+        auth_url = _build_authorize_url(metadata.authorization_endpoint, params)
+        # Log a STATE-REDACTED URL: the single-use CSRF ``state`` nonce does
+        # not need to land in stderr — MCP host logs (Claude Desktop/Code)
+        # persist to files that may be shared in bug reports. The PKCE secret
+        # (``code_verifier``) is never in the URL and the S256
+        # ``code_challenge`` is public, so only ``state`` is redacted. Because
+        # the logged URL can therefore never complete the flow, it is shown
+        # for reference only and the hint points at the paths that work.
+        log_url = _build_authorize_url(
+            metadata.authorization_endpoint, {**params, "state": "<redacted>"}
+        )
+        opened = False
+        if _gui_browser_available():
+            try:
+                opened = webbrowser.open(auth_url)
+            except Exception:  # noqa: BLE001 — a broken hook must not abort the flow
+                opened = False
         if opened:
-            # Log a STATE-REDACTED URL. The browser already has the full URL,
-            # and the single-use CSRF ``state`` nonce does not need to land in
-            # stderr — MCP host logs (Claude Desktop/Code) persist to files
-            # that may be shared in bug reports. The PKCE secret
-            # (``code_verifier``) is never in the URL and the S256
-            # ``code_challenge`` is public, so only ``state`` is redacted.
-            log_url = (
-                f"{metadata.authorization_endpoint}{sep}"
-                f"{urlencode({**params, 'state': '<redacted>'})}"
-            )
-            log(f"authorize URL (opened in your browser):\n{log_url}")
-        else:
-            # No browser (SSH, headless): the logged URL is the only way in,
-            # and a redacted ``state`` would fail the callback's CSRF check,
-            # so this one time the full URL is logged. ``state`` is single-use
-            # and dies with this flow.
             log(
-                "could not open a browser; open this URL to authorize "
-                "(or use --oauth-device on a headless host):\n"
-                f"{auth_url}"
+                f"authorize URL (state redacted; sent to your browser):\n{log_url}\n"
+                "If no browser window appeared, re-run with --oauth-device."
+            )
+        else:
+            # The full URL goes to the controlling terminal, never to the
+            # persisted log. Over SSH the callback listens on THIS host, so
+            # the browser elsewhere needs the port forwarded.
+            shown = _write_to_tty(
+                "mcp-stdio: open this URL to authorize "
+                f"(callback on 127.0.0.1:{port}; from another machine, first run "
+                f"`ssh -L {port}:127.0.0.1:{port} <this host>`):\n{auth_url}\n"
+            )
+            log(
+                "could not open a browser"
+                + (
+                    "; the full authorize URL was written to your terminal"
+                    if shown
+                    else ""
+                )
+                + f". On a headless host use --oauth-device.\n{log_url}"
             )
 
         def serve() -> None:

@@ -56,6 +56,13 @@ from mcp_stdio.token_store import TokenData
 pytestmark = pytest.mark.httpx_mock(assert_all_requests_were_expected=False)
 
 
+@pytest.fixture(autouse=True)
+def _gui_browser(monkeypatch):
+    """Let the flow call the (always monkeypatched) webbrowser.open even on a
+    headless CI runner, where _gui_browser_available() is False (#451)."""
+    monkeypatch.setenv("DISPLAY", ":0")
+
+
 # --- _safe_int ---
 
 
@@ -2118,6 +2125,57 @@ class TestRefreshCachedToken:
         # The refresh grant re-sent the cached scope (Entra AADSTS90009).
         req = httpx_mock.get_requests()[0]
         assert parse_qs(req.content.decode())["scope"] == ["read write admin"]
+
+    def _save_scoped(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", tmp_path / "t.json")
+        from mcp_stdio.token_store import save_token
+
+        save_token(
+            "https://api.example.com/mcp",
+            TokenData(
+                access_token="old_at",
+                refresh_token="rt123",
+                expires_at=time.time() - 10,
+                scope="read write",
+                client_id="cid",
+                token_endpoint="https://auth.example.com/token",
+                authorization_endpoint="https://auth.example.com/authorize",
+            ),
+        )
+
+    def test_scope_rejected_retries_without_scope(
+        self, tmp_path, monkeypatch, httpx_mock
+    ):
+        """#451 review: an AS that refuses the re-sent scope gets the pre-#451
+        scope-less refresh, so sending it can never break a working refresh."""
+        self._save_scoped(tmp_path, monkeypatch)
+        httpx_mock.add_response(
+            url="https://auth.example.com/token",
+            status_code=400,
+            json={"error": "invalid_scope"},
+        )
+        httpx_mock.add_response(
+            url="https://auth.example.com/token",
+            json={"access_token": "new_at", "expires_in": 3600},
+        )
+        data = refresh_cached_token("https://api.example.com/mcp", httpx.Client())
+        assert data is not None and data.access_token == "new_at"
+        first, second = (
+            parse_qs(r.content.decode()) for r in httpx_mock.get_requests()
+        )
+        assert first["scope"] == ["read write"]
+        assert "scope" not in second
+
+    def test_transport_error_is_not_retried(self, tmp_path, monkeypatch, httpx_mock):
+        self._save_scoped(tmp_path, monkeypatch)
+        httpx_mock.add_exception(
+            httpx.ConnectError("down"), url="https://auth.example.com/token"
+        )
+        assert (
+            refresh_cached_token("https://api.example.com/mcp", httpx.Client()) is None
+        )
+        assert len(httpx_mock.get_requests()) == 1
 
     def test_returns_none_when_no_cached_token(self, tmp_path, monkeypatch):
         store_file = tmp_path / "tokens.json"
@@ -5132,19 +5190,25 @@ class TestAuthorizationFlowFailurePaths:
         assert q["p"] == ["B2C_1_signin"]
         assert q["client_id"] == ["cid"]
 
-    @pytest.mark.parametrize("opener", ["false", "raises"])
-    def test_full_url_logged_when_no_browser_opens(self, monkeypatch, capsys, opener):
-        """With no browser (SSH, headless) the logged URL is the only way in,
-        so it must carry the real state; a redacted one fails the callback."""
-        seen: dict[str, str] = {}
+    @pytest.mark.parametrize("opener", ["false", "raises", "headless"])
+    def test_no_browser_keeps_state_out_of_the_log(self, monkeypatch, capsys, opener):
+        """No browser: the full URL goes to the terminal only; the persisted
+        log keeps the redacted URL and points at --oauth-device / ssh -L."""
+        seen: dict[str, object] = {"opened": False}
 
         def fake_open(url: str) -> bool:
-            seen["url"] = url
+            seen["opened"] = True
             if opener == "raises":
                 raise RuntimeError("no browser hook")
             return False
 
+        tty: list[str] = []
         monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", fake_open)
+        monkeypatch.setattr(
+            "mcp_stdio.oauth._write_to_tty", lambda text: tty.append(text) or True
+        )
+        if opener == "headless":
+            monkeypatch.setattr("mcp_stdio.oauth._gui_browser_available", lambda: False)
         with pytest.raises(TimeoutError):
             _run_authorization_flow(
                 "https://ex.com/mcp",
@@ -5155,9 +5219,14 @@ class TestAuthorizationFlowFailurePaths:
                 timeout=0.3,
             )
         err = capsys.readouterr().err
-        assert seen["url"] in err
-        assert "redacted" not in err
+        # headless: webbrowser (and its console browsers) is never touched
+        assert seen["opened"] is (opener != "headless")
+        assert len(tty) == 1 and "state=" in tty[0] and "ssh -L" in tty[0]
+        real_state = parse_qs(urlparse(tty[0].split("\n")[1]).query)["state"][0]
+        assert real_state not in err
+        assert "state=%3Credacted%3E" in err
         assert "--oauth-device" in err
+        assert "written to your terminal" in err
 
     def test_callback_error_with_matching_state_raises_oauth_error(self, monkeypatch):
         """A LEGITIMATE error callback echoes `state` (RFC 6749 §4.1.2.1) →
@@ -7830,3 +7899,67 @@ class TestCredentialsBindToIssuer:
         resolve = src.index("_resolve_cimd_client_id")
         guard = src.index("_cached_credentials_for_issuer")
         assert resolve < guard
+
+
+# --- #451: authorize URL building and browser/terminal helpers ---
+
+
+@pytest.mark.parametrize(
+    "endpoint, expected_query",
+    [
+        ("https://ex.com/authorize", [("client_id", "c"), ("state", "s")]),
+        (
+            "https://ex.com/authorize?p=B2C_1",
+            [("p", "B2C_1"), ("client_id", "c"), ("state", "s")],
+        ),
+        ("https://ex.com/authorize?", [("client_id", "c"), ("state", "s")]),
+        ("https://ex.com/authorize#frag", [("client_id", "c"), ("state", "s")]),
+        (  # an endpoint-supplied copy of a flow parameter is replaced
+            "https://ex.com/authorize?client_id=old&p=1",
+            [("p", "1"), ("client_id", "c"), ("state", "s")],
+        ),
+    ],
+)
+def test_build_authorize_url(endpoint, expected_query):
+    from mcp_stdio.oauth import _build_authorize_url
+
+    url = _build_authorize_url(endpoint, {"client_id": "c", "state": "s"})
+    parts = urlparse(url)
+    assert url.count("?") == 1 and not parts.fragment
+    assert (parts.scheme, parts.netloc, parts.path) == ("https", "ex.com", "/authorize")
+    from urllib.parse import parse_qsl
+
+    assert parse_qsl(parts.query) == expected_query
+
+
+@pytest.mark.parametrize(
+    "platform, env, expected",
+    [
+        ("darwin", {}, True),
+        ("win32", {}, True),
+        ("linux", {}, False),  # console browsers only: would draw on stdout
+        ("linux", {"DISPLAY": ":0"}, True),
+        ("linux", {"WAYLAND_DISPLAY": "wayland-0"}, True),
+        ("linux", {"BROWSER": "firefox"}, True),
+        ("freebsd14", {}, False),
+    ],
+)
+def test_gui_browser_available(monkeypatch, platform, env, expected):
+    from mcp_stdio import oauth as oauth_mod
+
+    for var in ("DISPLAY", "WAYLAND_DISPLAY", "BROWSER"):
+        monkeypatch.delenv(var, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(oauth_mod.sys, "platform", platform)
+    assert oauth_mod._gui_browser_available() is expected
+
+
+def test_write_to_tty_without_a_terminal(monkeypatch):
+    from mcp_stdio import oauth as oauth_mod
+
+    def no_tty(*_a, **_k):
+        raise OSError("no controlling terminal")
+
+    monkeypatch.setattr(oauth_mod.os, "open", no_tty)
+    assert oauth_mod._write_to_tty("x") is False
