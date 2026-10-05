@@ -158,6 +158,10 @@ wondering what changed under the hood:
   instant as the request, a server that does all its work before it starts
   replying, and long paginated lists — and in those the reply is still
   discarded, so you never see a result you cancelled.
+- Clients that already speak the newer protocol themselves (Claude Code
+  2.1.281 and later, for example) are passed through as they are: their
+  own capabilities reach the server unchanged, and a long-lived
+  notification connection they open does not hold up their other requests.
 
 ### Publishing your own server with `serve`
 
