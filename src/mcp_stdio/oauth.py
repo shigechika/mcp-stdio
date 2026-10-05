@@ -1785,14 +1785,17 @@ def _build_authorize_url(endpoint: str, params: dict[str, str]) -> str:
 
 
 def _gui_browser_available() -> bool:
-    """Whether ``webbrowser.open`` can be trusted not to touch our stdio.
+    """Heuristic: False on a headless POSIX host, where ``webbrowser``
+    could only pick a console browser.
 
-    On a POSIX desktop other than macOS, Python registers graphical
-    browsers only when ``DISPLAY`` or ``WAYLAND_DISPLAY`` is set, and
-    otherwise falls back to console browsers (w3m, lynx, ``www-browser``)
-    that it runs in the FOREGROUND, inheriting stdin/stdout — the JSON-RPC
-    channel to the MCP host. Skip ``webbrowser`` there unless ``BROWSER``
-    names one explicitly (the operator's choice).
+    On POSIX other than macOS, Python registers graphical browsers only
+    when ``DISPLAY`` or ``WAYLAND_DISPLAY`` is set; without them it falls
+    back to console browsers (w3m, lynx, ``www-browser``) that it runs in
+    the FOREGROUND, inheriting stdin/stdout — the JSON-RPC channel to the
+    MCP host. This skips ``webbrowser`` in that headless case unless
+    ``BROWSER`` names one explicitly (the operator's choice). It does not
+    guarantee the stdio is safe: with a display set but no graphical
+    browser installed, Python can still fall back to a console one.
     """
     if sys.platform == "darwin" or sys.platform.startswith(("win", "cygwin")):
         return True
@@ -1801,29 +1804,6 @@ def _gui_browser_available() -> bool:
         or os.environ.get("WAYLAND_DISPLAY")
         or os.environ.get("BROWSER")
     )
-
-
-def _write_to_tty(text: str) -> bool:
-    """Write ``text`` to the controlling terminal, if there is one.
-
-    For a secret-bearing message (the full authorize URL) that a person at
-    the terminal needs but that must not be persisted in the MCP host's
-    stderr log. Returns False when there is no terminal (a host that
-    detaches its MCP servers, Windows) or the write fails.
-    """
-    if not hasattr(os, "O_NOCTTY"):
-        return False
-    try:
-        fd = os.open("/dev/tty", os.O_WRONLY | os.O_NOCTTY)
-    except OSError:
-        return False
-    try:
-        os.write(fd, text.encode("utf-8", "replace"))
-        return True
-    except OSError:
-        return False
-    finally:
-        os.close(fd)
 
 
 def _run_authorization_flow(
@@ -1956,22 +1936,14 @@ def _run_authorization_flow(
                 "If no browser window appeared, re-run with --oauth-device."
             )
         else:
-            # The full URL goes to the controlling terminal, never to the
-            # persisted log. Over SSH the callback listens on THIS host, so
-            # the browser elsewhere needs the port forwarded.
-            shown = _write_to_tty(
-                "mcp-stdio: open this URL to authorize "
-                f"(callback on 127.0.0.1:{port}; from another machine, first run "
-                f"`ssh -L {port}:127.0.0.1:{port} <this host>`):\n{auth_url}\n"
-            )
+            # Without a browser the browser flow cannot complete: the logged
+            # URL is redacted, and the callback listens on THIS host. Say so
+            # and point at the device flow, which needs no callback at all.
             log(
-                "could not open a browser"
-                + (
-                    "; the full authorize URL was written to your terminal"
-                    if shown
-                    else ""
-                )
-                + f". On a headless host use --oauth-device.\n{log_url}"
+                "could not open a browser, so this sign-in cannot complete "
+                f"(the callback listens on 127.0.0.1:{port} on this host). "
+                "Re-run with --oauth-device to sign in from any browser. "
+                f"Authorize URL, for reference (state redacted):\n{log_url}"
             )
 
         def serve() -> None:

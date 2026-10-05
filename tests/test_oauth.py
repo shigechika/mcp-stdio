@@ -5192,21 +5192,18 @@ class TestAuthorizationFlowFailurePaths:
 
     @pytest.mark.parametrize("opener", ["false", "raises", "headless"])
     def test_no_browser_keeps_state_out_of_the_log(self, monkeypatch, capsys, opener):
-        """No browser: the full URL goes to the terminal only; the persisted
-        log keeps the redacted URL and points at --oauth-device / ssh -L."""
+        """No browser: the log keeps the redacted URL (never the real state),
+        names the callback port, and points at --oauth-device."""
         seen: dict[str, object] = {"opened": False}
 
         def fake_open(url: str) -> bool:
             seen["opened"] = True
+            seen["url"] = url
             if opener == "raises":
                 raise RuntimeError("no browser hook")
             return False
 
-        tty: list[str] = []
         monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", fake_open)
-        monkeypatch.setattr(
-            "mcp_stdio.oauth._write_to_tty", lambda text: tty.append(text) or True
-        )
         if opener == "headless":
             monkeypatch.setattr("mcp_stdio.oauth._gui_browser_available", lambda: False)
         with pytest.raises(TimeoutError):
@@ -5221,12 +5218,12 @@ class TestAuthorizationFlowFailurePaths:
         err = capsys.readouterr().err
         # headless: webbrowser (and its console browsers) is never touched
         assert seen["opened"] is (opener != "headless")
-        assert len(tty) == 1 and "state=" in tty[0] and "ssh -L" in tty[0]
-        real_state = parse_qs(urlparse(tty[0].split("\n")[1]).query)["state"][0]
-        assert real_state not in err
+        if "url" in seen:
+            real_state = parse_qs(urlparse(seen["url"]).query)["state"][0]
+            assert real_state not in err
         assert "state=%3Credacted%3E" in err
         assert "--oauth-device" in err
-        assert "written to your terminal" in err
+        assert "127.0.0.1:" in err
 
     def test_callback_error_with_matching_state_raises_oauth_error(self, monkeypatch):
         """A LEGITIMATE error callback echoes `state` (RFC 6749 §4.1.2.1) →
@@ -7953,13 +7950,3 @@ def test_gui_browser_available(monkeypatch, platform, env, expected):
         monkeypatch.setenv(k, v)
     monkeypatch.setattr(oauth_mod.sys, "platform", platform)
     assert oauth_mod._gui_browser_available() is expected
-
-
-def test_write_to_tty_without_a_terminal(monkeypatch):
-    from mcp_stdio import oauth as oauth_mod
-
-    def no_tty(*_a, **_k):
-        raise OSError("no controlling terminal")
-
-    monkeypatch.setattr(oauth_mod.os, "open", no_tty)
-    assert oauth_mod._write_to_tty("x") is False
