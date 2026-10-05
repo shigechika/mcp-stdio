@@ -7530,8 +7530,10 @@ def run(
             ``tools/list`` responses teach a ``_ToolHeaderCache`` (tools with
             an invalid annotation are dropped from what the client sees),
             every ``tools/call`` carries the headers, and a ``-32020`` for
-            the call triggers one re-list and one retry. ``"off"`` disables
-            all of it. No effect on the legacy era.
+            the call triggers one re-list and one retry. ``"always"`` does
+            the same on a legacy session too (opt-in; a server such as
+            GitHub's hosted one requires the headers there). ``"off"``
+            disables all of it.
 
     Limitation — JSON-RPC batches: a top-level array (a batch) is
     treated like a notification for error synthesis. ``_extract_id_and_presence``
@@ -7781,10 +7783,14 @@ def run(
         era = "legacy"
 
     # #459: x-mcp-header -> Mcp-Param-{Name} mirroring. Resolved once, here,
-    # after the era: None on the legacy era and under --mcp-param-headers
-    # off, which keeps every hook below uninstalled and the legacy wire
-    # byte-identical.
-    mirroring = mcp_param_headers == "modern" and era == "modern"
+    # after the era. `modern` (default) mirrors only on the modern era;
+    # `always` also on a legacy session (servers such as GitHub's hosted one
+    # require the headers there) — the one deliberate exception to the
+    # legacy freeze, and opt-in. Otherwise None: every hook below stays
+    # uninstalled and the legacy wire byte-identical.
+    mirroring = mcp_param_headers == "always" or (
+        mcp_param_headers == "modern" and era == "modern"
+    )
     tool_cache = _ToolHeaderCache() if mirroring else None
 
     # --- modern era: true cancellation (#270 Phase 2 PR D) ---
@@ -7917,8 +7923,10 @@ def run(
             if client_meta is not None:
                 params["_meta"] = dict(client_meta)
                 minted = json.dumps(request)
-            else:
+            elif era == "modern":
                 minted = _inject_modern_meta(json.dumps(request), modern_state)
+            else:  # a legacy session (`always`): a plain 2025-era request
+                minted = json.dumps(request)
             parsed, stream = _post_parsed(
                 client,
                 url,
@@ -8039,7 +8047,10 @@ def run(
         completely UNCHANGED from pre-#270 — this is the code that makes
         acceptance criterion #3 ("byte-identical" wire bytes against a
         legacy remote) hold structurally rather than by assertion. ``line``
-        is accepted but ignored on this branch.
+        is ignored on this branch, except under ``--mcp-param-headers
+        always`` (#459), which adds the same ``Mcp-Param-*`` block as the
+        modern branch — opt-in, and only for a ``tools/call`` whose tool
+        declared ``x-mcp-header``.
 
         MODERN era: per spec rev 2026-07-28 there is no ``Mcp-Session-Id`` at
         all (the relay's own ``session_id`` never gets set on this path — see
@@ -8115,6 +8126,9 @@ def run(
         if protocol_version:
             h = {k: v for k, v in h.items() if k.lower() != "mcp-protocol-version"}
             h["MCP-Protocol-Version"] = protocol_version
+        if tool_cache is not None:  # --mcp-param-headers always (#459)
+            h = {k: v for k, v in h.items() if not k.lower().startswith("mcp-param-")}
+            h.update(_mcp_param_headers_for(line, param_decls))
         return h
 
     def _discover_reseed() -> None:
@@ -9555,6 +9569,18 @@ def run(
                 level = _extract_log_level(line)
                 if level is not None:
                     modern_state.log_level = level
+
+                # #459: set on the modern branch below; a legacy line never
+                # comes from a #446 modern client.
+                client_modern = False
+                # A legacy client's (re)initialize starts a new session that
+                # will re-list (`always`); drop what the old one taught.
+                if (
+                    tool_cache is not None
+                    and era == "legacy"
+                    and _is_initialize_request(line)
+                ):
+                    tool_cache.invalidate()
 
                 if era == "modern":
                     # initialize / notifications/initialized /

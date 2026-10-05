@@ -683,7 +683,7 @@ def _main() -> None:
     )
     parser.add_argument(
         "--mcp-param-headers",
-        choices=["modern", "off"],
+        choices=["modern", "always", "off"],
         default="modern",
         help=(
             "Mirror tool arguments a server marks with x-mcp-header into "
@@ -693,8 +693,9 @@ def _main() -> None:
             "era: tools/list answers teach the relay each tool's "
             "annotations, tools with invalid annotations are hidden, and a "
             "-32020 HeaderMismatch triggers one re-list and one retry. "
-            "'off' disables all of it. No effect on a legacy session or on "
-            "--transport sse. See #459."
+            "'always' does the same on a legacy session too, for servers "
+            "that require the headers there (GitHub's hosted MCP server). "
+            "'off' disables all of it. No effect on --transport sse. See #459."
         ),
     )
     parser.add_argument(
@@ -1094,6 +1095,11 @@ def _main() -> None:
     cancel_filter = not args.no_cancel_filter
     normalize_arguments = not args.no_normalize_arguments
     proactive_refresh = not args.no_proactive_refresh
+    if args.transport == "sse" and args.mcp_param_headers == "always":
+        print(
+            "warning: --mcp-param-headers always is ignored on --transport sse",
+            file=sys.stderr,
+        )
     if args.transport == "sse" and args.protocol_era != "legacy":
         print(
             f"warning: --protocol-era {args.protocol_era} is ignored on "

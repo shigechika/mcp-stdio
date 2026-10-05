@@ -21374,3 +21374,174 @@ def test_a_stale_listing_never_mutates_the_cache():
     )
     assert shown == [] and committed is False
     assert cache.declarations_for("t")  # untouched
+
+
+class TestRunMcpParamHeadersAlways:
+    """#459 PR-B: --mcp-param-headers always on a LEGACY session (GitHub's
+    hosted server lands there and still requires the headers)."""
+
+    URL = "https://example.com/mcp"
+    TOOL = _annotated("get_file", {"owner": ("string", "owner")})
+    PLAIN = {"name": "plain", "inputSchema": {"type": "object"}}
+
+    def _run(self, lines, headers=None, **kwargs):
+        stdout = StringIO()
+        with (
+            patch("sys.stdin", StringIO("\n".join(lines) + "\n")),
+            patch("sys.stdout", stdout),
+        ):
+            run(self.URL, headers or {}, **kwargs)
+        return stdout.getvalue()
+
+    @staticmethod
+    def _line(req_id, method, params=None):
+        msg = {"jsonrpc": "2.0", "id": req_id, "method": method}
+        if params is not None:
+            msg["params"] = params
+        return json.dumps(msg)
+
+    def _initialize(self, httpx_mock):
+        httpx_mock.add_response(
+            url=self.URL,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"protocolVersion": "2025-11-25", "capabilities": {}},
+            },
+            headers={"mcp-session-id": "S1"},
+        )
+
+    def test_legacy_session_learns_and_mirrors(self, httpx_mock):
+        self._initialize(httpx_mock)
+        httpx_mock.add_response(
+            url=self.URL,
+            json={"jsonrpc": "2.0", "id": 2, "result": {"tools": [self.TOOL]}},
+        )
+        httpx_mock.add_response(
+            url=self.URL, json={"jsonrpc": "2.0", "id": 3, "result": {"content": []}}
+        )
+        self._run(
+            [
+                self._line(1, "initialize", {"protocolVersion": "2025-11-25"}),
+                self._line(2, "tools/list"),
+                self._line(
+                    3,
+                    "tools/call",
+                    {"name": "get_file", "arguments": {"owner": "octo"}},
+                ),
+            ],
+            mcp_param_headers="always",
+        )
+        call = httpx_mock.get_requests()[2]
+        assert call.headers["mcp-param-owner"] == "octo"
+        assert call.headers["mcp-session-id"] == "S1"
+        assert "_meta" not in json.loads(call.content)["params"]  # still legacy
+
+    def test_legacy_mismatch_relists_without_modern_meta(self, httpx_mock):
+        self._initialize(httpx_mock)
+        httpx_mock.add_response(
+            url=self.URL,
+            status_code=400,
+            json={
+                "jsonrpc": "2.0",
+                "id": 3,
+                "error": {"code": -32020, "message": "missing Mcp-Param-owner header"},
+            },
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            json={"jsonrpc": "2.0", "id": "x", "result": {"tools": [self.TOOL]}},
+        )
+        httpx_mock.add_response(
+            url=self.URL, json={"jsonrpc": "2.0", "id": 3, "result": {"content": []}}
+        )
+        out = self._run(
+            [
+                self._line(1, "initialize", {"protocolVersion": "2025-11-25"}),
+                self._line(
+                    3,
+                    "tools/call",
+                    {"name": "get_file", "arguments": {"owner": "octo"}},
+                ),
+            ],
+            mcp_param_headers="always",
+        )
+        assert json.loads(out.splitlines()[-1]) == {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {"content": []},
+        }
+        _, first, relist, retry = httpx_mock.get_requests()
+        body = json.loads(relist.content)
+        assert body["method"] == "tools/list" and body["id"].startswith(
+            "mcp-stdio/param/"
+        )
+        assert "_meta" not in body["params"]  # a plain 2025-era request
+        assert relist.headers["mcp-session-id"] == "S1"
+        assert "mcp-param-owner" not in first.headers
+        assert retry.headers["mcp-param-owner"] == "octo"
+
+    def test_unannotated_legacy_server_sees_identical_traffic(self, httpx_mock):
+        """The freeze exception is opt-in AND inert without annotations:
+        request bodies, headers, the request count and stdout match the
+        default exactly."""
+
+        def session(mode):
+            httpx_mock.reset()
+            self._initialize(httpx_mock)
+            httpx_mock.add_response(
+                url=self.URL,
+                json={"jsonrpc": "2.0", "id": 2, "result": {"tools": [self.PLAIN]}},
+            )
+            httpx_mock.add_response(
+                url=self.URL,
+                status_code=400,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "error": {"code": -32602, "message": "x"},
+                },
+            )
+            out = self._run(
+                [
+                    self._line(1, "initialize", {"protocolVersion": "2025-11-25"}),
+                    self._line(2, "tools/list"),
+                    self._line(
+                        3, "tools/call", {"name": "plain", "arguments": {"a": 1}}
+                    ),
+                ],
+                mcp_param_headers=mode,
+            )
+            reqs = [
+                (r.content, sorted(r.headers.items()))
+                for r in httpx_mock.get_requests()
+            ]
+            return out, reqs
+
+        assert session("always") == session("modern")
+
+    def test_legacy_initialize_drops_the_cache(self, httpx_mock):
+        self._initialize(httpx_mock)
+        httpx_mock.add_response(
+            url=self.URL,
+            json={"jsonrpc": "2.0", "id": 2, "result": {"tools": [self.TOOL]}},
+        )
+        self._initialize(httpx_mock)
+        httpx_mock.add_response(
+            url=self.URL, json={"jsonrpc": "2.0", "id": 3, "result": {"content": []}}
+        )
+        self._run(
+            [
+                self._line(1, "initialize", {"protocolVersion": "2025-11-25"}),
+                self._line(2, "tools/list"),
+                self._line(1, "initialize", {"protocolVersion": "2025-11-25"}),
+                self._line(
+                    3,
+                    "tools/call",
+                    {"name": "get_file", "arguments": {"owner": "octo"}},
+                ),
+            ],
+            mcp_param_headers="always",
+        )
+        call = httpx_mock.get_requests()[-1]
+        assert "mcp-param-owner" not in call.headers

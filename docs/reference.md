@@ -51,7 +51,7 @@ spec. See [Working with MCP 2026-07-28 servers](modes.md#protocol-eras).
 |------|---------|-------------|
 | `--protocol-era {legacy,modern,auto}` | `legacy` | How to talk to the remote server. `legacy` behaves exactly as before; `auto` asks the server once at startup and picks for you; `modern` skips the question when you already know it is a newer server. Ignored (with a warning) on `--transport sse` |
 | `--listen-read-timeout SEC` | `300` | How long to wait on a quiet notification connection before reconnecting. Only used against newer servers. Unlike `--sse-read-timeout`, `0` is not allowed — the connection always needs a timeout. Silently ignored on `--transport sse` |
-| `--mcp-param-headers {modern,off}` | `modern` | Mirror tool arguments a newer server marks with `x-mcp-header` into `Mcp-Param-*` headers, hide tools with invalid annotations, and recover from a `-32020` by re-listing once and retrying the call once. `off` disables all of it. Only used against newer servers (#459) |
+| `--mcp-param-headers {modern,always,off}` | `modern` | Mirror tool arguments a server marks with `x-mcp-header` into `Mcp-Param-*` headers, hide tools with invalid annotations, and recover from a `-32020` by re-listing once and retrying the call once. `modern` does this against newer servers only; `always` also on an older-protocol session, for servers that require the headers there (GitHub's hosted MCP server); `off` disables all of it (#459) |
 
 !!! note "What `--check` does and does not cover"
     `--check` confirms the server is reachable either way — if the older

@@ -1800,3 +1800,41 @@ class TestOAuthClientHardening:
             main()
         assert _SpyClient.instances
         assert _SpyClient.instances[0].kwargs.get("follow_redirects") is False
+
+
+class TestMcpParamHeadersFlag:
+    """#459 PR-B: --mcp-param-headers reaches run(); `always` warns on sse."""
+
+    def test_always_reaches_run(self):
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "https://example.com/mcp",
+                    "--mcp-param-headers",
+                    "always",
+                ],
+            ),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+        assert mock_run.call_args.kwargs["mcp_param_headers"] == "always"
+
+    def test_always_warns_on_sse(self, capsys):
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "mcp-stdio",
+                    "https://example.com/sse",
+                    "--transport",
+                    "sse",
+                    "--mcp-param-headers",
+                    "always",
+                ],
+            ),
+            patch("mcp_stdio.cli.run_sse"),
+        ):
+            main()
+        assert "--mcp-param-headers always is ignored" in capsys.readouterr().err
