@@ -667,9 +667,11 @@ def _extract_method_and_name(line: str) -> tuple[str | None, str | None]:
 
 
 def _is_method(line: str, method: str) -> bool:
-    """Whether ``line`` is a JSON-RPC message for ``method`` (substring-gated)."""
-    if f'"{method}"' not in line:
-        return False
+    """Whether ``line`` is a JSON-RPC message for ``method``.
+
+    Parsed, not substring-matched: JSON lets a serializer escape ``/`` as
+    ``\\/``, so ``"tools\\/call"`` is the same method.
+    """
     return _extract_method_and_name(line)[0] == method
 
 
@@ -967,6 +969,10 @@ def _mcp_param_text(value: Any) -> str | None:
                 return str(as_int)
         return None
     if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:  # a lone surrogate: no UTF-8 to Base64
+            return None
         return value
     return None
 
@@ -1020,9 +1026,10 @@ def _build_mcp_param_headers(
     return headers
 
 
-_TOOLS_LIST_CHANGED_RE = re.compile(
-    r'"method"\s*:\s*"notifications/tools/list_changed"'
-)
+# Pre-gate for ``_ToolHeaderCache.observe``: a bare substring, not the full
+# method, so a serializer that escapes ``/`` as ``\/`` still matches; the
+# frame is then parsed authoritatively.
+_TOOLS_LIST_CHANGED_HINT = "list_changed"
 
 
 _SET_LEVEL_METHOD_RE = re.compile(r'"method"\s*:\s*"logging/setLevel"')
@@ -1133,9 +1140,12 @@ class _ToolHeaderCache:
         self._generation = 0
         self._warned: set[tuple[str, str]] = set()
 
-    def _scan_locked(self, tools: list[Any]) -> tuple[list[Any], dict[str, Any]]:
+    def _scan_locked(
+        self, tools: list[Any]
+    ) -> tuple[list[Any], dict[str, Any], set[str]]:
         kept: list[Any] = []
         valid: dict[str, tuple[_McpParamDecl, ...]] = {}
+        invalid: set[str] = set()
         for tool in tools:
             name = tool.get("name") if isinstance(tool, dict) else None
             if not isinstance(name, str):
@@ -1143,6 +1153,7 @@ class _ToolHeaderCache:
                 continue
             result = _scan_x_mcp_headers(tool.get("inputSchema"))
             if isinstance(result, str):
+                invalid.add(name)
                 key = (name, result)
                 if key not in self._warned and len(self._warned) < self._WARNED_CAP:
                     self._warned.add(key)
@@ -1153,26 +1164,49 @@ class _ToolHeaderCache:
                 continue
             kept.append(tool)
             valid[name] = result
-        return kept, valid
+        return kept, valid, invalid
 
-    def update(self, tools: list[Any]) -> list[Any]:
-        """Learn from a PARTIAL list (one page, or a truncated merge).
+    def _commit_locked(
+        self, valid: dict[str, Any], invalid: set[str], *, complete: bool
+    ) -> None:
+        if complete:
+            self._by_tool = valid
+            return
+        self._by_tool.update(valid)
+        for name in invalid:  # seen and now invalid: no stale headers
+            self._by_tool.pop(name, None)
 
-        Upserts the valid tools it sees and never forgets unseen ones.
-        Returns the list to show the client: the SAME object when nothing
-        was dropped, so callers can emit the original bytes untouched.
+    def learn(
+        self,
+        tools: list[Any],
+        *,
+        complete: bool,
+        generation: int | None = None,
+    ) -> list[Any]:
+        """Learn from a ``tools/list`` answer the client is about to see.
+
+        ``complete`` (a whole catalog) replaces the cache; otherwise (one
+        page, a truncated merge) it upserts the valid tools seen, evicts the
+        ones seen invalid, and never forgets unseen ones. ``generation`` is
+        the value read before the list was fetched: if a
+        ``tools/list_changed`` invalidated the cache since, nothing is
+        committed (the list may predate the change) — the tools are still
+        filtered. Returns the list to show the client: the SAME object when
+        nothing was dropped, so callers can emit the original bytes.
         """
         with self._lock:
-            kept, valid = self._scan_locked(tools)
-            self._by_tool.update(valid)
+            kept, valid, invalid = self._scan_locked(tools)
+            if generation is None or generation == self._generation:
+                self._commit_locked(valid, invalid, complete=complete)
         return tools if len(kept) == len(tools) else kept
 
+    def update(self, tools: list[Any]) -> list[Any]:
+        """``learn`` from a PARTIAL list."""
+        return self.learn(tools, complete=False)
+
     def replace(self, tools: list[Any]) -> list[Any]:
-        """Like ``update``, for a COMPLETE catalog: forgets every tool not in it."""
-        with self._lock:
-            kept, valid = self._scan_locked(tools)
-            self._by_tool = valid
-        return tools if len(kept) == len(tools) else kept
+        """``learn`` from a COMPLETE catalog: forgets every tool not in it."""
+        return self.learn(tools, complete=True)
 
     def declarations_for(self, name: Any) -> tuple[_McpParamDecl, ...]:
         if not isinstance(name, str):
@@ -1197,20 +1231,18 @@ class _ToolHeaderCache:
         with self._lock:
             if self._generation != generation:
                 return False
-            _, valid = self._scan_locked(tools)
-            if complete:
-                self._by_tool = valid
-            else:
-                self._by_tool.update(valid)
+            _, valid, invalid = self._scan_locked(tools)
+            self._commit_locked(valid, invalid, complete=complete)
             return True
 
     def observe(self, payload: str) -> None:
         """Invalidate when ``payload`` is a ``tools/list_changed`` notification.
 
-        Called for every frame that passes on a stream, so a regex pre-gate
-        keeps the common case to one search; JSON is parsed only on a hit.
+        Called for every frame that passes on a stream, so a substring
+        pre-gate keeps the common case to one search; JSON is parsed only on
+        a hit.
         """
-        if not _TOOLS_LIST_CHANGED_RE.search(payload):
+        if _TOOLS_LIST_CHANGED_HINT not in payload:
             return
         try:
             msg = json.loads(payload)
@@ -2295,6 +2327,19 @@ def _inject_modern_meta(line: str, modern_state: "_ModernState") -> str:
     params["_meta"] = meta
     msg["params"] = params
     return json.dumps(msg)
+
+
+def _modern_client_meta(line: str) -> dict[str, Any] | None:
+    """The ``io.modelcontextprotocol/*`` ``_meta`` of a modern client's line.
+
+    #459: what a relay-minted request made on behalf of a #446 modern stdio
+    client carries, so the server sees that client's own version and
+    capabilities. None for a legacy client's line (the relay injects its own).
+    """
+    if not _client_meta_protocol_version(line)[0]:
+        return None
+    meta = json.loads(line)["params"]["_meta"]
+    return {k: v for k, v in meta.items() if k.startswith("io.modelcontextprotocol/")}
 
 
 def _client_meta_protocol_version(line: str) -> tuple[bool, str | None]:
@@ -3442,8 +3487,9 @@ def _error_response_for(body: str, req_id: Any) -> dict[str, Any] | None:
 
     #459. ``body`` is a non-200 response body already read (and bounded) by
     ``_read_bounded``. Only ONE plain JSON object that is a pure error
-    response for exactly this id counts: a proxy's stale error for another
-    id must never drive a re-POST of a non-idempotent ``tools/call``. An
+    response for exactly this id — with the ``"jsonrpc": "2.0"`` marker —
+    counts: a proxy's stale or malformed error must never drive a re-POST
+    of a non-idempotent ``tools/call``. An
     SSE-formatted or otherwise unparseable body is None (the caller's
     generic path). ``RecursionError`` is caught: a deeply nested body is
     server-controlled input and must not escape into the never-crash net.
@@ -3453,6 +3499,8 @@ def _error_response_for(body: str, req_id: Any) -> dict[str, Any] | None:
     except (json.JSONDecodeError, ValueError, RecursionError):
         return None
     if not isinstance(parsed, dict) or "error" not in parsed or "result" in parsed:
+        return None
+    if parsed.get("jsonrpc") != "2.0":
         return None
     if "method" in parsed or "id" not in parsed or parsed["id"] != req_id:
         return None
@@ -4799,6 +4847,9 @@ def _paginate_and_stream(
     # everywhere leaves the field absent, matching a fully cache-unaware
     # (e.g. legacy) server's existing behavior unchanged.
     cacheable_missing: dict[str, bool] = dict.fromkeys(_CACHEABLE_MERGE_FIELDS, False)
+    # #459: a tools/list_changed seen while paging (``observe``) means the
+    # pages may predate the change; ``learn`` then filters without committing.
+    cache_generation = tool_cache.generation if tool_cache is not None else None
 
     for page in range(1, MAX_LIST_PAGES + 1):
         page_request = dict(request)
@@ -4973,9 +5024,10 @@ def _paginate_and_stream(
         merged_result["nextCursor"] = pending_cursor
 
     if tool_cache is not None and isinstance(merged_result.get(result_key), list):
-        tools = merged_result[result_key]
-        merged_result[result_key] = (
-            tool_cache.update(tools) if truncated else tool_cache.replace(tools)
+        merged_result[result_key] = tool_cache.learn(
+            merged_result[result_key],
+            complete=not truncated,
+            generation=cache_generation,
         )
 
     merged_response: dict[str, Any] = {
@@ -7819,7 +7871,9 @@ def run(
 
     param_seq = 0
 
-    def _refresh_tool_header_cache(abort: "threading.Event | None") -> bool:
+    def _refresh_tool_header_cache(
+        abort: "threading.Event | None", call_line: str
+    ) -> bool:
         """Re-list tools for the -32020 rung (#459); True when committed.
 
         A relay-minted, `_meta`-carrying `tools/list` (a strict modern server
@@ -7830,9 +7884,15 @@ def run(
         usual. The catalog is committed only if no `tools/list_changed`
         invalidated the cache meanwhile (`generation`); otherwise the cache
         stays empty and the caller does not retry.
+
+        For a #446 modern stdio client, the re-list carries the
+        `io.modelcontextprotocol/*` `_meta` of the rejected call itself
+        (its own version and capabilities — a catalog may depend on them);
+        otherwise the relay's own `_inject_modern_meta`.
         """
         nonlocal param_seq
         assert tool_cache is not None
+        client_meta = _modern_client_meta(call_line)
         generation = tool_cache.generation
         tools: list[Any] = []
         cursor: Any = None
@@ -7843,17 +7903,17 @@ def run(
             param_seq += 1
             minted_id = f"{_PARAM_ID_PREFIX}{param_seq}"
             params: dict[str, Any] = {} if cursor is None else {"cursor": cursor}
-            minted = _inject_modern_meta(
-                json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": minted_id,
-                        "method": "tools/list",
-                        "params": params,
-                    }
-                ),
-                modern_state,
-            )
+            request = {
+                "jsonrpc": "2.0",
+                "id": minted_id,
+                "method": "tools/list",
+                "params": params,
+            }
+            if client_meta is not None:
+                params["_meta"] = dict(client_meta)
+                minted = json.dumps(request)
+            else:
+                minted = _inject_modern_meta(json.dumps(request), modern_state)
             parsed, stream = _post_parsed(
                 client,
                 url,
@@ -7893,6 +7953,8 @@ def run(
         client byte for byte; never returns None.
         """
 
+        generation = tool_cache.generation if tool_cache is not None else None
+
         def hook(payload: str) -> str:
             if tool_cache is None or '"tools"' not in payload:
                 return payload
@@ -7908,7 +7970,7 @@ def run(
             tools = result.get("tools") if isinstance(result, dict) else None
             if not isinstance(tools, list):
                 return payload
-            kept = tool_cache.update(tools)
+            kept = tool_cache.learn(tools, complete=False, generation=generation)
             if kept is tools:
                 return payload
             result["tools"] = kept
@@ -7936,10 +7998,10 @@ def run(
     ) -> dict[str, str]:
         """``Mcp-Param-*`` for a ``tools/call`` line (#459); ``{}`` otherwise.
 
-        A substring pre-gate keeps every other method to one ``in`` test;
-        only a ``tools/call`` line pays the parse.
+        Parsed whenever mirroring is on: a substring pre-gate would miss a
+        serializer that escapes ``/`` (``"tools\\/call"``).
         """
-        if tool_cache is None or '"tools/call"' not in line:
+        if tool_cache is None:
             return {}
         try:
             msg = json.loads(line)
@@ -8487,6 +8549,10 @@ def run(
                     client_id, retry_id, txn["stored_line"]
                 ),
                 input_required_abort=_make_input_required_abort(client_id),
+                # #459: a tools/list_changed on a continuation stream still
+                # invalidates the cache (the continuation's own Mcp-Param
+                # set is pinned in `txn["param_decls"]` and unaffected).
+                observe=tool_cache.observe if tool_cache is not None else None,
                 # #270 Phase 2 PR D, §3.5: a cancel arriving while THIS
                 # POST is in flight must disconnect it, never be
                 # translated into an upstream `notifications/cancelled` —
@@ -9725,7 +9791,12 @@ def run(
                     if in_flight is not None and req_has_id and _is_scalar_id(req_id):
                         in_flight.publish(req_id)
 
-                req_headers = _prepare_headers(line)
+                # #459: the Mcp-Param declarations for THIS line, looked up
+                # once and used for both the headers and the MRTR snapshot,
+                # so a listen-thread invalidation in between cannot make the
+                # transaction remember a set the POST did not carry.
+                line_param_decls = _param_decls_for(line)
+                req_headers = _prepare_headers(line, param_decls=line_param_decls)
 
                 def _dispatch(content: str, h: dict[str, str]) -> _StreamResult | None:
                     nonlocal protocol_version
@@ -9841,7 +9912,7 @@ def run(
                                 content,
                                 # #459: the Mcp-Param set THIS POST carries,
                                 # for the transaction it may open.
-                                param_decls=_param_decls_for(content),
+                                param_decls=line_param_decls,
                             )
                             if mrtr_eligible
                             else (
@@ -9995,7 +10066,9 @@ def run(
                     if new_headers:
                         with headers_lock:
                             headers.update(new_headers)
-                        req_headers = _prepare_headers(line)
+                        req_headers = _prepare_headers(
+                            line, param_decls=line_param_decls
+                        )
                         result = _dispatch(line, req_headers)
                         if result is None:
                             # Transport exhaustion on the refreshed retry (None is
@@ -10062,7 +10135,9 @@ def run(
                         if new_headers:
                             with headers_lock:
                                 headers.update(new_headers)
-                            req_headers = _prepare_headers(line)
+                            req_headers = _prepare_headers(
+                                line, param_decls=line_param_decls
+                            )
                             result = _dispatch(line, req_headers)
                             if result is None:
                                 # Transport exhaustion on the stepped-up retry (None
@@ -10117,7 +10192,7 @@ def run(
                     if renegotiated and renegotiated != protocol_version:
                         log(f"re-negotiated MCP protocol version: {renegotiated}")
                         protocol_version = renegotiated
-                    req_headers = _prepare_headers(line)
+                    req_headers = _prepare_headers(line, param_decls=line_param_decls)
                     result = _dispatch(line, req_headers)
                     if result is None:
                         continue
@@ -10169,15 +10244,24 @@ def run(
                     log(
                         "upstream rejected Mcp-Param headers (-32020); re-listing tools"
                     )
-                    if _refresh_tool_header_cache(param_abort):
+                    if _refresh_tool_header_cache(param_abort, line):
                         if _abort_requested(param_abort):
                             continue
-                        req_headers = _prepare_headers(line)
+                        line_param_decls = _param_decls_for(line)
+                        req_headers = _prepare_headers(
+                            line, param_decls=line_param_decls
+                        )
                         result = _dispatch(line, req_headers)
                         if result is None:
                             continue
                         if result.aborted:  # PR D — see the top-level arm.
                             continue
+                    # A cancel can land during the re-list (the reader sets
+                    # the event at once; the tracker learns of it only when
+                    # this consumer dequeues the cancel), or right after the
+                    # retry: honour it before answering at all.
+                    if _abort_requested(param_abort):
+                        continue
                     if (
                         result.status_code == 400
                         and result.error_code == _HEADER_MISMATCH

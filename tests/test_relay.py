@@ -21019,3 +21019,282 @@ class TestRunMcpParamHeadersLegacy:
         requests = httpx_mock.get_requests()
         assert len(requests) == 2  # no re-list, no retry
         assert not [k for k in requests[1].headers if k.startswith("mcp-param-")]
+
+
+class TestMcpParamReviewFixes:
+    """#460 review: Copilot, ai-review and codex (gpt-6-astra) findings."""
+
+    URL = "https://example.com/mcp"
+    TOOL = _annotated("region_op", {"region": ("string", "Region")})
+    MISMATCH = {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "error": {"code": -32020, "message": "Mcp-Param-Region header is missing"},
+    }
+    CHANGED = '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}'
+
+    _run = TestRunMcpParamHeaders._run
+    _discover = TestRunMcpParamHeaders._discover
+    _list_response = TestRunMcpParamHeaders._list_response
+    _call_response = TestRunMcpParamHeaders._call_response
+    _list = staticmethod(TestRunMcpParamHeaders._list)
+    _call = staticmethod(TestRunMcpParamHeaders._call)
+    _requests = staticmethod(TestRunMcpParamHeaders._requests)
+
+    def test_cancel_during_a_failed_relist_writes_nothing(self, httpx_mock):
+        relist_entered = threading.Event()
+        cancel_read = threading.Event()
+
+        class Stdin:
+            def __iter__(self):
+                yield TestRunMcpParamHeaders._call(arguments={"region": "us"}) + "\n"
+                relist_entered.wait(5)
+                yield (
+                    '{"jsonrpc":"2.0","method":"notifications/cancelled",'
+                    '"params":{"requestId":2}}\n'
+                )
+                cancel_read.set()  # the reader has handled the cancel line
+
+        def relist(request):
+            relist_entered.set()
+            cancel_read.wait(5)
+            return httpx.Response(500)
+
+        self._discover(httpx_mock)
+        self._call_response(httpx_mock, status=400, body=self.MISMATCH)
+        httpx_mock.add_callback(
+            relist, url=self.URL, match_headers={"Mcp-Method": "tools/list"}
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", Stdin()), patch("sys.stdout", stdout):
+            run(self.URL, {}, protocol_era="modern")
+        assert stdout.getvalue() == ""  # the cancelled id gets no answer at all
+
+    def test_headers_and_mrtr_snapshot_come_from_one_lookup(
+        self, httpx_mock, monkeypatch
+    ):
+        """The first lookup answers; any later one would see an emptied cache.
+        Both the opening POST and its continuation must carry the header."""
+        real = _ToolHeaderCache.declarations_for
+        calls = {"n": 0}
+
+        def once(self, name):
+            calls["n"] += 1
+            return real(self, name) if calls["n"] == 1 else ()
+
+        self._discover(httpx_mock)
+        self._list_response(httpx_mock, [self.TOOL], req_id=5)
+        input_required = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "resultType": "input_required",
+                "inputRequests": {
+                    "who": {
+                        "method": "elicitation/create",
+                        "params": {"message": "?", "requestedSchema": {}},
+                    }
+                },
+                "requestState": "S",
+            },
+        }
+        self._call_response(httpx_mock, body=input_required)
+        self._call_response(
+            httpx_mock,
+            body={
+                "jsonrpc": "2.0",
+                "id": "mcp-stdio/mrtr-retry/1/1",
+                "result": {"content": []},
+            },
+        )
+        initialize = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": {"elicitation": {}},
+                },
+            }
+        )
+        answer = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": "mcp-stdio/mrtr/1/who",
+                "result": {"action": "accept", "content": {}},
+            }
+        )
+        stdin = [initialize, self._list(5), self._call(arguments={"region": "us"})]
+        # learn first, then count lookups only from the call on
+        out_lines = stdin + [answer]
+        monkeypatch.setattr(_ToolHeaderCache, "declarations_for", once)
+        self._run(httpx_mock, out_lines)
+        opening, retry = self._requests(httpx_mock, "tools/call")
+        assert opening.headers["mcp-param-region"] == "us"
+        assert retry.headers["mcp-param-region"] == "us"
+
+    def test_relist_for_a_modern_client_carries_its_own_meta(self, httpx_mock):
+        self._discover(httpx_mock)
+        self._call_response(httpx_mock, status=400, body=self.MISMATCH)
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/list"},
+            json={"jsonrpc": "2.0", "id": "x", "result": {"tools": [self.TOOL]}},
+        )
+        self._call_response(httpx_mock)
+        meta = {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {"elicitation": {}},
+            "progressToken": "p",  # not metadata to copy
+        }
+        line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "region_op",
+                    "arguments": {"region": "us"},
+                    "_meta": meta,
+                },
+            }
+        )
+        self._run(httpx_mock, [line])
+        (relist,) = self._requests(httpx_mock, "tools/list")
+        assert json.loads(relist.content)["params"]["_meta"] == {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {"elicitation": {}},
+        }
+
+    def test_list_changed_between_pages_is_not_overwritten(self, httpx_mock):
+        self._discover(httpx_mock)
+        bad = _annotated("bad", {"x": ("number", "X")})
+        page1 = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"tools": [self.TOOL], "nextCursor": "p2"},
+            }
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/list"},
+            stream=IteratorStream(
+                [f"data: {self.CHANGED}\n\ndata: {page1}\n\n".encode()]
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+        self._list_response(httpx_mock, [bad])  # page 2
+        self._call_response(httpx_mock)
+        out = self._run(
+            httpx_mock, [self._list(), self._call(arguments={"region": "us"})]
+        )
+        listed = next(m for m in out if m.get("id") == 1)
+        assert listed["result"]["tools"] == [self.TOOL]  # still filtered
+        (call,) = self._requests(httpx_mock, "tools/call")
+        assert "mcp-param-region" not in call.headers  # not committed
+
+    def test_list_changed_on_a_continuation_stream_invalidates(self, httpx_mock):
+        self._discover(httpx_mock)
+        self._list_response(httpx_mock, [self.TOOL], req_id=5)
+        self._call_response(
+            httpx_mock,
+            body={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "resultType": "input_required",
+                    "inputRequests": {
+                        "who": {
+                            "method": "elicitation/create",
+                            "params": {"message": "?", "requestedSchema": {}},
+                        }
+                    },
+                    "requestState": "S",
+                },
+            },
+        )
+        final = (
+            '{"jsonrpc":"2.0","id":"mcp-stdio/mrtr-retry/1/1","result":{"content":[]}}'
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            stream=IteratorStream(
+                [f"data: {self.CHANGED}\n\ndata: {final}\n\n".encode()]
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+        self._call_response(httpx_mock, req_id=3)
+        initialize = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": {"elicitation": {}},
+                },
+            }
+        )
+        answer = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": "mcp-stdio/mrtr/1/who",
+                "result": {"action": "accept", "content": {}},
+            }
+        )
+        self._run(
+            httpx_mock,
+            [
+                initialize,
+                self._list(5),
+                self._call(2, arguments={"region": "us"}),
+                answer,
+                self._call(3, arguments={"region": "us"}),
+            ],
+        )
+        *_, later = self._requests(httpx_mock, "tools/call")
+        assert json.loads(later.content)["id"] == 3
+        assert "mcp-param-region" not in later.headers
+
+    def test_escaped_slashes_are_still_tools_call(self, httpx_mock):
+        self._discover(httpx_mock)
+        self._list_response(httpx_mock, [self.TOOL])
+        self._call_response(httpx_mock)
+        escaped = (
+            '{"jsonrpc":"2.0","id":2,"method":"tools\\/call",'
+            '"params":{"name":"region_op","arguments":{"region":"us"}}}'
+        )
+        self._run(httpx_mock, [self._list(), escaped])
+        (call,) = self._requests(httpx_mock, "tools/call")
+        assert call.headers["mcp-param-region"] == "us"
+
+    def test_partial_update_evicts_a_tool_that_turned_invalid(self):
+        cache = _ToolHeaderCache()
+        cache.update([self.TOOL])
+        now_bad = _annotated("region_op", {"region": ("number", "Region")})
+        assert cache.update([now_bad]) == []
+        assert cache.declarations_for("region_op") == ()
+
+    def test_escaped_notification_still_invalidates(self):
+        cache = _ToolHeaderCache()
+        cache.update([self.TOOL])
+        cache.observe(
+            '{"jsonrpc":"2.0","method":"notifications\\/tools\\/list_changed"}'
+        )
+        assert cache.declarations_for("region_op") == ()
+
+    def test_lone_surrogate_omits_the_header(self):
+        decls = (_McpParamDecl(("region",), "Region", "string"),)
+        args = json.loads('{"region": "\\ud800"}')
+        assert _build_mcp_param_headers(decls, args) == {}
+
+    def test_error_without_the_jsonrpc_marker_does_not_count(self):
+        body = json.dumps({"id": 2, "error": {"code": -32020, "message": "m"}})
+        assert _error_response_for(body, 2) is None
+        assert (
+            _error_response_for(json.dumps({**json.loads(body), "jsonrpc": "1.0"}), 2)
+            is None
+        )
