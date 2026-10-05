@@ -221,7 +221,7 @@ mcp-stdio implements the following specifications:
 
 - HTTP 429 (Too Many Requests) and 503 (Service Unavailable) — honors Retry-After up to 60 seconds
 
-- Automatic retry with exponential backoff on connection errors (up to 3 retries)
+- Automatic retry with exponential backoff on connection errors (up to 3 retries); after a failure that may follow delivery (read timeout, dropped response), only read-only methods are retried — `tools/call` gets an error saying it may have executed
 
 ### WHATWG Server-Sent Events
 

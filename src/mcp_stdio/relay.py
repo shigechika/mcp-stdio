@@ -52,6 +52,64 @@ _RATE_LIMIT_SLEEP_CAP_SECS = 60.0
 # a duplicated effect after replay. Accepted as the conventional tradeoff.
 _RETRYABLE_RATE_LIMIT_STATUSES = (429, 503)
 
+# Transport errors httpx raises only before the request was fully sent, so
+# the server cannot have acted on it and a replay is safe for every method
+# (#444). Any other transport error (``ReadTimeout``, ``ReadError``,
+# ``RemoteProtocolError``, ``DecodingError``, ...) fires after the body went
+# out, when the server may already have executed the request.
+_NOT_SENT_ERRORS: tuple[type[httpx.HTTPError], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.WriteError,
+    httpx.WriteTimeout,
+    httpx.ProxyError,
+    httpx.UnsupportedProtocol,
+)
+
+# Client-to-server methods that are read-only or idempotent, so replaying one
+# after a post-send transport error at worst repeats a harmless read (#444).
+# Everything else — ``tools/call`` above all, plus unknown/custom methods —
+# is surfaced as an error instead, because the tool may already have run.
+_REPLAY_SAFE_METHODS = frozenset(
+    {
+        "initialize",
+        "ping",
+        "server/discover",
+        "tools/list",
+        "resources/list",
+        "resources/templates/list",
+        "resources/read",
+        "resources/subscribe",
+        "resources/unsubscribe",
+        "prompts/list",
+        "prompts/get",
+        "completion/complete",
+        "logging/setLevel",
+    }
+)
+
+
+def _replay_safe(content: str) -> bool:
+    """Whether ``content`` may be re-POSTed after a post-send transport error.
+
+    A request is safe when its method is in ``_REPLAY_SAFE_METHODS``. A
+    notification or a JSON-RPC response (no ``id``-bearing ``method``) runs no
+    handler twice, and unparseable content cannot have executed, so both stay
+    replayable. A batch array is unsafe: it may carry a ``tools/call``.
+    """
+    try:
+        msg = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return True
+    if not isinstance(msg, dict):
+        return False
+    method = msg.get("method")
+    if not isinstance(method, str) or "id" not in msg:
+        return True
+    return method in _REPLAY_SAFE_METHODS
+
+
 # TCP keepalive tuning. Together (60 s idle + 4 × 15 s probes) a silent
 # half-open TCP is surfaced as a socket error within ~120 s — fast enough
 # to matter during a long tool call, slow enough to tolerate transient
@@ -3487,6 +3545,11 @@ def _post_and_stream(
     on success (including non-200 status for caller to handle), or
     ``None`` when all retries are exhausted (error already printed).
 
+    A transport error after the body was sent is retried only when
+    ``_replay_safe(content)`` holds (#444); otherwise the request may
+    already have executed server-side, so the error is printed at once and
+    ``None`` returned without a replay.
+
     When ``capture_init`` is set the streamed payload is additionally
     parsed for ``result.protocolVersion`` (the negotiated MCP protocol
     version from an InitializeResult), surfaced via
@@ -3835,6 +3898,22 @@ def _post_and_stream(
                 # error under req_id + return None) instead of burning
                 # MAX_RETRIES attempts re-fetching the same too-large body.
                 break
+            if not isinstance(e, _NOT_SENT_ERRORS) and not _replay_safe(content):
+                # #444: the body already went out, so the server may have
+                # executed this request (a slow tools/call past
+                # --timeout-read, a drop before the first response byte).
+                # Replaying it could run a non-idempotent tool again; tell
+                # the client instead and let it decide.
+                log(f"request {req_id!r} may have reached the server; not retrying")
+                if has_id:
+                    _write_line(
+                        _error_response(
+                            "upstream connection failed after the request was "
+                            f"sent; not retried because it may have executed: {e}",
+                            req_id,
+                        )
+                    )
+                return None
             if attempt < MAX_RETRIES:
                 if _abort_requested(abort):
                     # Required change 8, the pre-SLEEP half. The loop-top

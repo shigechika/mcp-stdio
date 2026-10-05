@@ -82,6 +82,7 @@ from mcp_stdio.relay import (
     _post_and_stream,
     _probe_protocol_era,
     _read_bounded,
+    _replay_safe,
     _reject_content_encoding,
     _cold_start_loop,
     _cold_start_response,
@@ -442,6 +443,27 @@ class TestIsPureResponseFor:
         assert _is_pure_response_for(json.dumps([1, 2]), 5) is False
 
 
+# --- _replay_safe (#444) ---
+
+
+class TestReplaySafe:
+    @pytest.mark.parametrize(
+        "line, expected",
+        [
+            ('{"jsonrpc":"2.0","id":1,"method":"tools/list"}', True),
+            ('{"jsonrpc":"2.0","id":1,"method":"resources/read"}', True),
+            ('{"jsonrpc":"2.0","id":1,"method":"tools/call"}', False),
+            ('{"jsonrpc":"2.0","id":1,"method":"x-vendor/do"}', False),
+            ('{"jsonrpc":"2.0","method":"notifications/cancelled"}', True),
+            ('{"jsonrpc":"2.0","id":1,"result":{}}', True),
+            ('[{"jsonrpc":"2.0","id":1,"method":"tools/list"}]', False),
+            ("not json", True),
+        ],
+    )
+    def test_classification(self, line, expected):
+        assert _replay_safe(line) is expected
+
+
 # --- _post_and_stream ---
 
 
@@ -491,6 +513,72 @@ class TestPostAndStream:
             )
         assert result is not None and result.status_code == 200
         assert len(httpx_mock.get_requests()) == 2  # retried after the transient
+
+    TOOLS_CALL = json.dumps(
+        {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "x"}}
+    )
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            httpx.ReadTimeout("read timed out"),
+            httpx.ReadError("connection reset"),
+            httpx.RemoteProtocolError("server disconnected without a response"),
+        ],
+    )
+    def test_tools_call_not_replayed_after_send(self, httpx_mock, exc):
+        """#444: a post-send transport error must not re-POST a tools/call —
+        the server may already have run the tool."""
+        httpx_mock.add_exception(exc)
+        client = httpx.Client()
+        stdout = StringIO()
+        with patch("sys.stdout", stdout), patch("mcp_stdio.relay.time.sleep"):
+            result = _post_and_stream(
+                client, "https://example.com/mcp", self.TOOLS_CALL, {}, 7
+            )
+        assert result is None
+        assert len(httpx_mock.get_requests()) == 1
+        reply = json.loads(stdout.getvalue())
+        assert reply["id"] == 7
+        assert "may have executed" in reply["error"]["message"]
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            httpx.ConnectError("refused"),
+            httpx.ConnectTimeout("connect timed out"),
+            httpx.PoolTimeout("pool timed out"),
+            httpx.WriteError("write failed"),
+        ],
+    )
+    def test_tools_call_retried_when_never_sent(self, httpx_mock, exc):
+        """#444: errors raised before the body went out still retry tools/call."""
+        httpx_mock.add_exception(exc)
+        httpx_mock.add_response(
+            json={"jsonrpc": "2.0", "result": {"ok": True}, "id": 7},
+            headers={"content-type": "application/json"},
+        )
+        client = httpx.Client()
+        with patch("sys.stdout", StringIO()), patch("mcp_stdio.relay.time.sleep"):
+            result = _post_and_stream(
+                client, "https://example.com/mcp", self.TOOLS_CALL, {}, 7
+            )
+        assert result is not None and result.status_code == 200
+        assert len(httpx_mock.get_requests()) == 2
+
+    def test_read_only_method_retried_after_send(self, httpx_mock):
+        """#444: a replay-safe method keeps retrying a post-send error."""
+        httpx_mock.add_exception(httpx.ReadTimeout("read timed out"))
+        httpx_mock.add_response(
+            json={"jsonrpc": "2.0", "result": {"tools": []}, "id": 3},
+            headers={"content-type": "application/json"},
+        )
+        line = json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
+        client = httpx.Client()
+        with patch("sys.stdout", StringIO()), patch("mcp_stdio.relay.time.sleep"):
+            result = _post_and_stream(client, "https://example.com/mcp", line, {}, 3)
+        assert result is not None and result.status_code == 200
+        assert len(httpx_mock.get_requests()) == 2
 
     def test_non_200_returns_status(self, httpx_mock):
         httpx_mock.add_response(
@@ -2510,15 +2598,16 @@ class TestRun:
         """HIGH end-to-end: a request whose body fails to decode
         (bad Content-Encoding) must NOT crash run() — the client gets an error
         and the loop survives to process the next stdin line."""
-        for _ in range(MAX_RETRIES):  # bad-gzip request 1 → DecodingError ×3
-            httpx_mock.add_response(
-                status_code=200,
-                headers={
-                    "content-type": "application/json",
-                    "content-encoding": "gzip",
-                },
-                content=b"not gzip",
-            )
+        # bad-gzip request 1 → DecodingError once: the 200 proves the server
+        # already ran the tools/call, so it is not replayed (#444).
+        httpx_mock.add_response(
+            status_code=200,
+            headers={
+                "content-type": "application/json",
+                "content-encoding": "gzip",
+            },
+            content=b"not gzip",
+        )
         # request 2 succeeds — proves the loop kept going after the crash-y line.
         httpx_mock.add_response(
             text='{"jsonrpc":"2.0","result":{"ok":true},"id":2}',
