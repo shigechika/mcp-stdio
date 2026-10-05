@@ -441,7 +441,12 @@ command follows the options (an optional `--` separator is supported).
     locations (`/.well-known/oauth-authorization-server/team-a`,
     `/.well-known/oauth-protected-resource/team-a/mcp`) — byte-symmetric with
     the client's path-aware discovery. A bare-origin `--public-url` behaves
-    exactly as before (#245).
+    exactly as before (#245). claude.ai custom connectors are the exception:
+    claude.ai currently cannot complete a connection to an endpoint whose path
+    is not exactly `/mcp` — it stops sending MCP requests once the token is
+    issued (anthropics/claude-ai-mcp#878), and a multi-segment path gets none
+    at all (#738) — so for them give each backend its own hostname instead of
+    a path prefix.
 
 ### Multi-user deployment
 

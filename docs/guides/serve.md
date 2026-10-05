@@ -60,7 +60,7 @@ a crossover.
 | You need… | Do this |
 |---|---|
 | Claude.ai custom connectors (browser-based clients) | `--allow-redirect-uri https://claude.ai/api/mcp/auth_callback` |
-| Several backends on one host | run one serve process per backend with path-scoped issuers: `--public-url https://mcp.example.com/team-a`, `…/team-b` — AS endpoints and well-known documents nest under each prefix |
+| Several backends on one host | run one serve process per backend with path-scoped issuers: `--public-url https://mcp.example.com/team-a`, `…/team-b` — AS endpoints and well-known documents nest under each prefix. Not for claude.ai custom connectors: claude.ai currently cannot complete a connection to an endpoint whose path is anything other than exactly `/mcp` — MCP requests stop once the token is issued ([anthropics/claude-ai-mcp#878](https://github.com/anthropics/claude-ai-mcp/issues/878)), and a multi-segment path gets none at all ([#738](https://github.com/anthropics/claude-ai-mcp/issues/738)) — so give each backend its own hostname there |
 | Cap concurrent users | `--max-sessions N` (default 100; excess `initialize` gets `503`) |
 | Static token instead of OAuth | drop `--enable-oauth`, set `MCP_STDIO_SERVE_TOKEN` |
 | Longer / shorter access tokens | `--access-token-ttl SECONDS` (default 3600) |

@@ -434,7 +434,11 @@ open-gateway と共有 static-token principal は、いずれも本物の呼び�
     位置（`/.well-known/oauth-authorization-server/team-a`、
     `/.well-known/oauth-protected-resource/team-a/mcp`）に置かれ、クライアントの
     パス対応ディスカバリとバイト単位で対称。パスなしの `--public-url` は従来通り
-    動作します（#245）。
+    動作します（#245）。ただし claude.ai のカスタムコネクタは例外で、claude.ai は
+    現在、パスがちょうど `/mcp` でないエンドポイントへの接続を完了できません
+    （トークン発行後に MCP のリクエストが途絶える：anthropics/claude-ai-mcp#878、
+    複数階層のパスでは 1 件も届かない：#738）。その場合はパスプレフィックスでは
+    なくバックエンドごとにホスト名を分けてください。
 
 ### マルチユーザ運用
 
