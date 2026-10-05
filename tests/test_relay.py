@@ -20119,6 +20119,12 @@ class TestClientListenLoop:
         out = self._run(httpx_mock)
         assert out == [json.loads(self.ACK), json.loads(self.FINAL)]
 
+    def test_frames_after_the_final_response_are_not_forwarded(self, httpx_mock):
+        late = json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"late": True}})
+        self._sse(httpx_mock, self.ACK, self.FINAL, late)
+        out = self._run(httpx_mock)
+        assert out == [json.loads(self.ACK), json.loads(self.FINAL)]
+
     def test_abrupt_end_synthesizes_one_error(self, httpx_mock):
         self._sse(httpx_mock, self.ACK)
         out = self._run(httpx_mock)
@@ -20220,7 +20226,8 @@ class TestRunModernStdioClient:
         # wait that out before answering tools/list.
         assert elapsed < 5
         out = [json.loads(x) for x in stdout.getvalue().splitlines() if x]
-        assert out[0] == json.loads(ack)
+        # Present, not first: the listen thread and tools/list race.
+        assert json.loads(ack) in out
         assert {"jsonrpc": "2.0", "id": 3, "result": {"tools": []}} in out
         # The teardown aborted the open listen: no error under its id.
         assert not any(m.get("id") == 2 for m in out)

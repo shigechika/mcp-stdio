@@ -926,9 +926,11 @@ class _ModernState:
     One dispatch is NOT synchronous (#446): a ``subscriptions/listen`` a
     modern stdio client sends runs on its own thread, because its stream
     never ends. That thread touches none of this state — its headers are
-    built on the consumer before it starts, and it only writes to stdout
-    through ``_emit`` and reads the thread-safe cancel tracker — so the
-    single-mutator invariant above still holds.
+    built on the consumer before it starts, it writes to stdout only
+    through ``_emit`` (frames) and ``_write_line`` (its own synthesized
+    error, after the non-consuming cancel-tracker check), and it only reads
+    the thread-safe cancel tracker — so the single-mutator invariant above
+    still holds.
     """
 
     __slots__ = (
@@ -6858,7 +6860,10 @@ def _client_listen_loop(
                         return
                     _emit(payload, tracker)
                     if _is_pure_response_for(payload, req_id):
+                        # The final response ends the listen: stop reading,
+                        # so a non-compliant second one is never forwarded.
                         answered = True
+                        break
             else:
                 _read_bounded(resp, client)
                 body = resp.text.strip()
