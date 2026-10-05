@@ -3930,3 +3930,159 @@ class TestMaxMessageSize:
         sid, resp = _init(url)
         assert resp.status_code == 200
         assert sid
+
+
+# --- #449: Origin validation (DNS rebinding) ---
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("http://localhost:6274", "http://localhost:6274"),
+        ("HTTPS://App.Example.COM:443", "https://app.example.com"),
+        ("http://[::1]:80", "http://[::1]"),
+        ("https://app.example.com/", "https://app.example.com"),
+    ],
+)
+def test_normalize_origin_canonical(value, expected):
+    assert server._normalize_origin(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "null",
+        "",
+        "file://",
+        "ftp://app.example.com",
+        "http://localhost@evil.example",  # userinfo (typescript-sdk#2489)
+        "http://app.example.com/path",
+        "http://app.example.com?q=1",
+        "http://app.example.com#f",
+        "http://app.example.com:99999",
+        "http://app.example.com extra",
+    ],
+)
+def test_normalize_origin_rejects(value):
+    with pytest.raises(ValueError):
+        server._normalize_origin(value)
+
+
+@pytest.mark.parametrize(
+    "values, expected",
+    [
+        ([], True),  # non-browser client
+        (["http://localhost:6274"], True),
+        (["http://127.0.0.1"], True),
+        (["https://[::1]:8443"], True),
+        (["HTTP://LOCALHOST:1"], True),  # case-insensitive (python-sdk#3437)
+        (["https://app.example.com"], True),
+        (["https://APP.example.com:443"], True),
+        (["https://app.example.com.evil.example"], False),  # suffix (#3463)
+        (["https://app.example.co"], False),  # prefix (python-sdk#3364)
+        (["http://localhost.evil.example"], False),
+        (["http://127.0.0.1.nip.io"], False),
+        (["http://localhost@evil.example"], False),
+        (["null"], False),
+        (["http://attacker.example:8080"], False),
+        (["http://localhost", "http://localhost"], False),  # duplicated header
+    ],
+)
+def test_origin_allowed(values, expected):
+    allowed = frozenset({"https://app.example.com"})
+    assert server._origin_allowed(values, allowed) is expected
+
+
+def _origin_post(url, origin, sid=None):
+    headers = {"Origin": origin, "Content-Type": "text/plain"}
+    if sid:
+        headers["Mcp-Session-Id"] = sid
+    return httpx.post(
+        url,
+        content=json.dumps({"jsonrpc": "2.0", "id": "init", "method": "initialize"}),
+        headers=headers,
+        timeout=10,
+    )
+
+
+def test_dns_rebinding_origin_is_rejected(gateway):
+    url, registry = gateway
+    resp = _origin_post(url, "http://attacker.example:8080")
+    assert resp.status_code == 403
+    assert "mcp-session-id" not in resp.headers
+    assert not registry._sessions  # no backend child was spawned
+
+
+def test_loopback_origin_and_no_origin_are_served(gateway):
+    url, _ = gateway
+    assert _origin_post(url, "http://localhost:6274").status_code == 200
+    sid, resp = _init(url)
+    assert resp.status_code == 200 and sid
+
+
+def test_get_and_delete_check_origin_too(gateway):
+    url, _ = gateway
+    sid, _ = _init(url)
+    bad = {"Origin": "http://attacker.example", "Mcp-Session-Id": sid}
+    assert httpx.get(url, headers=bad, timeout=10).status_code == 403
+    assert httpx.delete(url, headers=bad, timeout=10).status_code == 403
+    # The session survived the rejected DELETE.
+    ok = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "echo"}, sid)
+    assert ok.status_code == 200
+
+
+def test_allow_origin_extends_the_allowlist():
+    httpd, registry = server.build_server(
+        _BACKEND,
+        host="127.0.0.1",
+        port=0,
+        allowed_origins=["HTTPS://App.Example.com:443"],
+    )
+    host, port = httpd.server_address[0], httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    url = f"http://{host}:{port}/mcp"
+    try:
+        assert _origin_post(url, "https://app.example.com").status_code == 200
+        assert _origin_post(url, "https://other.example.com").status_code == 403
+    finally:
+        httpd.shutdown()
+        registry.shutdown_all()
+        httpd.server_close()
+
+
+def test_public_url_origin_is_allowed_but_not_a_reflected_host():
+    with _run(oauth=_provider(public_url="https://gw.example.org/team-a")) as (
+        base,
+        _,
+    ):
+        # The explicit --public-url origin is trusted for the AS endpoints...
+        ok = httpx.post(
+            base + "/team-a/register",
+            json={"client_name": "t", "redirect_uris": [_REDIRECT]},
+            headers={"Origin": "https://gw.example.org"},
+            timeout=10,
+        )
+        assert ok.status_code != 403
+    with _run(oauth=_provider()) as (base, _):
+        # ...but without one, an Origin matching the (attacker-controlled)
+        # Host is not.
+        resp = httpx.post(
+            base + "/register",
+            json={"client_name": "t", "redirect_uris": [_REDIRECT]},
+            headers={"Origin": "http://attacker.example", "Host": "attacker.example"},
+            timeout=10,
+        )
+        assert resp.status_code == 403
+
+
+@pytest.mark.parametrize("value", ["null", "http://localhost@evil.example", "x"])
+def test_serve_main_bad_allow_origin(value):
+    with pytest.raises(SystemExit):
+        server.serve_main(["--allow-origin", value, "--", "true"])
+
+
+def test_serve_main_passes_normalized_allow_origin(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(server, "serve", lambda command, **kw: seen.update(kw))
+    server.serve_main(["--allow-origin", "HTTPS://App.Example.com:443", "--", "true"])
+    assert seen["allowed_origins"] == ["https://app.example.com"]

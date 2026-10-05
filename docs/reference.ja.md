@@ -107,6 +107,7 @@ Arguments:
 | `--port PORT` | `8080` | バインドポート |
 | `--path PATH` | `/mcp` | HTTP エンドポイントパス |
 | `--max-message-size BYTES` | 10 MiB | 宣言された `Content-Length` がこれを超えるリクエストを、本文を読む前に `413` で拒否する。0 で無効化（#416） |
+| `--allow-origin ORIGIN` | — | この `scheme://host[:port]` からのブラウザのリクエストも受け付ける（繰り返し可能、完全一致）。ループバックのオリジンと `--public-url` のオリジンは常に受け付け、それ以外の `Origin` には `403` を返す。`Origin` ヘッダーを送らないリクエスト（ブラウザ以外のクライアント）には影響しない。DNS rebinding 対策（#449） |
 
 ### 認証
 

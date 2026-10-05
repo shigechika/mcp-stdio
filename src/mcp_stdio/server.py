@@ -3901,6 +3901,60 @@ def _log_safe_uri(value: Any, *, max_len: int = 200) -> str:
     return repr(value)[: max_len + 8]
 
 
+def _normalize_origin(value: str) -> str:
+    """Canonicalize an Origin value to ``scheme://host[:port]`` (#449).
+
+    Lowercases the scheme and host, drops a default port and re-brackets an
+    IPv6 literal, so ``--allow-origin`` entries and request ``Origin``
+    headers compare as exact strings. Raises ValueError for anything that is
+    not a plain http(s) origin: ``null``, a missing host, userinfo (the
+    ``http://localhost@evil`` trick), a path, query or fragment, a bad port,
+    or whitespace/quotes.
+    """
+    if not value or any(c in value for c in ('"', "\r", "\n", " ", "\t")):
+        raise ValueError("origin is empty or contains forbidden characters")
+    p = urlsplit(value)
+    scheme = p.scheme.lower()
+    if scheme not in ("http", "https") or not p.hostname:
+        raise ValueError("origin must be an http(s) scheme://host[:port]")
+    if p.username is not None or p.password is not None or "@" in p.netloc:
+        raise ValueError("origin must not contain userinfo")
+    if p.path not in ("", "/") or p.query or p.fragment or "?" in value or "#" in value:
+        raise ValueError("origin must not contain a path, query or fragment")
+    try:
+        port = p.port
+    except ValueError as e:
+        raise ValueError("origin has an invalid port") from e
+    host = p.hostname.lower()
+    hostpart = f"[{host}]" if ":" in host else host
+    default_port = 80 if scheme == "http" else 443
+    if port is None or port == default_port:
+        return f"{scheme}://{hostpart}"
+    return f"{scheme}://{hostpart}:{port}"
+
+
+def _origin_allowed(values: list[str], allowed: frozenset[str]) -> bool:
+    """Whether a request's ``Origin`` header(s) pass the #449 check.
+
+    No header passes: non-browser clients never send one, and a browser
+    always does on the POST/DELETE a DNS-rebinding page needs. More than one
+    header fails. A single value passes when its host is loopback (any port,
+    http or https) or its canonical form is in ``allowed`` — exact string
+    equality after ``_normalize_origin``, never a prefix or suffix match.
+    """
+    if not values:
+        return True
+    if len(values) != 1:
+        return False
+    try:
+        canonical = _normalize_origin(values[0])
+    except ValueError:
+        return False
+    if urlsplit(canonical).hostname in _LOOPBACK_HOSTS:
+        return True
+    return canonical in allowed
+
+
 def _normalize_public_url(url: str) -> str:
     """Normalize --public-url to a canonical issuer ``scheme://host[:port][/path]``.
 
@@ -5365,6 +5419,8 @@ class _Handler(BaseHTTPRequestHandler):
     # None disables the embedded OAuth AS. A provider enables it:
     # /authorize /token /register + AS metadata + issued-token RS validation.
     oauth: _OAuthProvider | None = None
+    # Non-loopback origins the #449 Origin check accepts (canonical form).
+    allowed_origins: frozenset[str] = frozenset()
 
     # Quieter, consistent logging: route BaseHTTPRequestHandler's access log
     # through the project logger instead of stderr's default apache-style line.
@@ -5451,6 +5507,22 @@ class _Handler(BaseHTTPRequestHandler):
         """
         _, prefix = self._issuer_origin_and_prefix()
         return prefix + self.mcp_path
+
+    def _reject_bad_origin(self) -> bool:
+        """Answer 403 to a disallowed ``Origin`` (#449); True when rejected.
+
+        Streamable HTTP: "Servers MUST validate the Origin header on all
+        incoming connections to prevent DNS rebinding attacks. If the
+        Origin header is present and invalid, servers MUST respond with
+        HTTP 403 Forbidden." Runs before routing and auth on every method.
+        """
+        values = self.headers.get_all("Origin") or []
+        if _origin_allowed(values, self.allowed_origins):
+            return False
+        shown = _sanitize_host(" ".join(values).replace("://", ":"))[:128]
+        log(f"rejected request with a disallowed Origin ({shown or 'unprintable'})")
+        self._send_json(403, _error_body("forbidden: Origin not allowed"))
+        return True
 
     def _wrong_path(self) -> bool:
         # Compare only the path component; ignore any query string.
@@ -6689,6 +6761,10 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
         raw = self.rfile.read(length) if length > 0 else b""
+        # #449: after the body is drained (keep-alive stays sane), before
+        # any routing — the AS endpoints included.
+        if self._reject_bad_origin():
+            return
         if self.oauth is not None:
             # AS POST endpoints (DCR + token) bootstrap the token, exempt from
             # the RS gate. Match by EXACT path under the issuer prefix (empty for
@@ -6859,6 +6935,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         self._session_id = None
+        if self._reject_bad_origin():
+            return
         path = self.path.split("?", 1)[0]
         # RFC 9728 metadata is unauthenticated — it is how the client discovers
         # how to authenticate — so it is checked before the auth gate. Match the
@@ -6962,6 +7040,8 @@ class _Handler(BaseHTTPRequestHandler):
         # MCP clients DELETE the endpoint to terminate a session (spec item 5).
         # Tear down that session's backend child.
         self._session_id = None
+        if self._reject_bad_origin():
+            return
         if self._wrong_path():
             return
         if not self._require_auth():
@@ -7007,6 +7087,7 @@ def build_server(
     modern_only: bool = False,
     user_env_var: str | None = None,
     max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
+    allowed_origins: Iterable[str] = (),
 ) -> tuple[ThreadingHTTPServer, SessionRegistry]:
     """Construct the HTTP server and session registry without running the loop.
 
@@ -7028,7 +7109,16 @@ def build_server(
     pooling-strategy change. ``max_message_size`` (bytes, ``0`` = unlimited,
     default 10 MiB) rejects a request whose declared ``Content-Length``
     exceeds it with ``413`` before reading any of the body (#416, CWE-770).
+    ``allowed_origins`` (canonical ``scheme://host[:port]`` strings) extends
+    the #449 ``Origin`` allowlist beyond loopback; an ``oauth`` provider's
+    explicit ``public_url`` origin is added automatically. The
+    request-derived issuer never is: a DNS-rebinding request controls
+    ``Host``.
     """
+    origins = {_normalize_origin(o) for o in allowed_origins}
+    if oauth is not None and oauth.public_url:
+        issuer = urlsplit(oauth.public_url)
+        origins.add(_normalize_origin(f"{issuer.scheme}://{issuer.netloc}"))
     registry = SessionRegistry(
         command,
         max_sessions=max_sessions,
@@ -7059,6 +7149,7 @@ def build_server(
             "cache_ttl_ms": cache_ttl_ms,
             "modern_only": modern_only,
             "max_message_size": max_message_size,
+            "allowed_origins": frozenset(origins),
         },
     )
     httpd = ThreadingHTTPServer((host, port), handler)
@@ -7088,6 +7179,7 @@ def serve(
     modern_only: bool = False,
     user_env_var: str | None = None,
     max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
+    allowed_origins: Iterable[str] = (),
 ) -> None:
     """Run the reverse gateway until interrupted.
 
@@ -7098,7 +7190,8 @@ def serve(
     concurrent sessions; ``idle_ttl`` (when ``> 0``) evicts idle sessions.
     ``user_env_var`` injects the authenticated principal into each spawned
     child's environment (see :func:`build_server`). ``max_message_size``
-    bounds a single request body (see :func:`build_server`).
+    bounds a single request body and ``allowed_origins`` extends the
+    ``Origin`` allowlist (see :func:`build_server`).
     """
     httpd, registry = build_server(
         command,
@@ -7115,6 +7208,7 @@ def serve(
         modern_only=modern_only,
         user_env_var=user_env_var,
         max_message_size=max_message_size,
+        allowed_origins=allowed_origins,
     )
     # #385: the legacy reaper now always starts (it sweeps dead children
     # unconditionally, not just idle-past-TTL ones), independent of
@@ -7262,6 +7356,19 @@ def serve_main(argv: list[str]) -> None:
             "Matched byte-for-byte -- never widened to a host or prefix -- so "
             "only add a URL you have verified belongs to a client you trust; "
             "each is exactly as trusted as a hardcoded redirect target."
+        ),
+    )
+    parser.add_argument(
+        "--allow-origin",
+        action="append",
+        default=[],
+        metavar="ORIGIN",
+        help=(
+            "Accept browser requests carrying this Origin (scheme://host[:port]) "
+            "in addition to loopback origins and the --public-url origin. "
+            "Repeatable; matched exactly. Requests from any other Origin get "
+            "403 (DNS-rebinding protection); requests with no Origin header, "
+            "as non-browser MCP clients send them, are unaffected."
         ),
     )
     parser.add_argument(
@@ -7493,6 +7600,12 @@ def serve_main(argv: list[str]) -> None:
         parser.error("--cache-ttl-ms must be >= 0")
     if args.max_message_size < 0:
         parser.error("--max-message-size must be >= 0")
+    allowed_origins: list[str] = []
+    for origin in args.allow_origin:
+        try:
+            allowed_origins.append(_normalize_origin(origin))
+        except ValueError as e:
+            parser.error(f"--allow-origin {origin!r} invalid: {e}")
     if args.max_sessions < 1:
         parser.error("--max-sessions must be >= 1")
     if args.session_idle_ttl < 0 or not math.isfinite(args.session_idle_ttl):
@@ -7632,4 +7745,5 @@ def serve_main(argv: list[str]) -> None:
         modern_only=args.modern_only,
         user_env_var=args.user_env,
         max_message_size=args.max_message_size,
+        allowed_origins=allowed_origins,
     )

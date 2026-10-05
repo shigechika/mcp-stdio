@@ -74,6 +74,13 @@ a crossover.
 - Treat `--token-store`'s file like a private key. It is created `0600` in
   a `0700` directory.
 - Every request is logged to stderr with query strings redacted.
+- Browser requests are checked against their `Origin` header (DNS-rebinding
+  protection, #449): a web page that rebinds its own hostname to `127.0.0.1`
+  cannot drive a loopback gateway, even one with no auth. Loopback origins
+  and the `--public-url` origin are accepted; add any other browser client's
+  origin with `--allow-origin https://app.example.com` (repeatable, exact
+  match). Anything else gets `403`. Clients that send no `Origin` — Claude
+  Code, Claude Desktop, the mcp-stdio relay, SDK clients — are unaffected.
 - Session handling is strict and lifecycle-correct: requests route by
   `Mcp-Session-Id` only (never by JSON-RPC request id), and each session has its
   own child. A fresh `initialize` mints a new session; an unknown or terminated

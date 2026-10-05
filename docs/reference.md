@@ -107,6 +107,7 @@ Arguments:
 | `--port PORT` | `8080` | Bind port |
 | `--path PATH` | `/mcp` | HTTP endpoint path |
 | `--max-message-size BYTES` | 10 MiB | Reject a request whose declared `Content-Length` exceeds this with `413`, before reading any of the body; 0 disables the cap (#416) |
+| `--allow-origin ORIGIN` | — | Also accept browser requests from this `scheme://host[:port]` (repeatable, exact match). Loopback origins and the `--public-url` origin are always accepted; any other `Origin` gets `403`, and requests without an `Origin` header (non-browser clients) are unaffected — DNS-rebinding protection (#449) |
 
 ### Authentication
 
