@@ -185,7 +185,7 @@ authenticated user (or a single shared one if you run without
 authentication), because those clients have no session to tie a process to.
 This also means a backend that cannot run two concurrent instances of
 itself can be shared safely across any number of callers — see the
-[Claude Desktop entry in WORKAROUNDS.md](https://github.com/shigechika/mcp-stdio/blob/main/WORKAROUNDS.md#claude-desktop)
+[Claude Desktop entry in WORKAROUNDS.md](https://github.com/shigechika/mcp-stdio/blob/main/WORKAROUNDS.md#claude-desktop-and-claudeai)
 for a concrete case where this matters.
 
 <a id="listchanged-serve"></a>

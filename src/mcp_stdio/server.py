@@ -5246,7 +5246,8 @@ class _OAuthProvider:
         Encapsulates the lookup + expiry purge + RFC 8707 / MCP audience check
         shared by :meth:`validate_access_token` and :meth:`user_for_token`:
         when the token was minted for a specific ``resource`` and the caller
-        passes the resource it is guarding, the two MUST match — a token issued
+        passes the resource it is guarding, the two MUST match (ignoring case
+        and a trailing slash, #456) — a token issued
         for a different audience is rejected even though it is otherwise live. A
         token with no resource binding (``None``) stays accepted (lenient), as
         does a call that does not supply an expected resource.
@@ -5262,10 +5263,15 @@ class _OAuthProvider:
                 del self._access[token]
                 return None
             tok_resource = entry.get("resource")
+            # Case-insensitive (#456): a client that upper-cases the connector
+            # URL (claude.ai's `https://MCP.EXAMPLE.COM/MCP`) requests the
+            # token for that spelling; a token for another resource differs in
+            # more than case, and is only ever valid on the serve that issued it.
             if (
                 tok_resource is not None
                 and expected_resource is not None
-                and tok_resource.rstrip("/") != expected_resource.rstrip("/")
+                and tok_resource.rstrip("/").lower()
+                != expected_resource.rstrip("/").lower()
             ):
                 return None
             return entry
@@ -5588,9 +5594,12 @@ class _Handler(BaseHTTPRequestHandler):
         return True
 
     def _wrong_path(self) -> bool:
-        # Compare only the path component; ignore any query string.
+        # Compare only the path component; ignore any query string. Case-
+        # insensitive (#456): claude.ai can store a connector URL upper-cased
+        # (`/MCP`), and since serve exposes exactly one MCP path a different
+        # case cannot reach a different resource; auth still applies.
         path = self.path.split("?", 1)[0]
-        if path != self._mcp_wire_path():
+        if path.lower() != self._mcp_wire_path().lower():
             self._send_json(404, _error_body("not found"))
             return True
         return False

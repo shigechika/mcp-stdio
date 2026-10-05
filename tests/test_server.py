@@ -4176,3 +4176,61 @@ def test_idn_public_url_starts_without_guessing_its_origin(capsys):
     finally:
         registry.shutdown_all()
         httpd.server_close()
+
+
+# --- #456: claude.ai's upper-cased connector URL (/MCP) ---
+
+
+def test_mcp_path_is_case_insensitive(gateway):
+    url, _ = gateway
+    base = url.rsplit("/mcp", 1)[0]
+    sid, resp = _init(base + "/MCP")
+    assert resp.status_code == 200 and sid
+    assert httpx.post(base + "/mcpx", content="{}", timeout=10).status_code == 404
+
+
+def test_validate_access_token_audience_ignores_case():
+    prov = _provider()
+    _, body = prov._issue("u", "c", "", "https://API.EXAMPLE.COM/MCP", family="f")
+    token = body["access_token"]
+    assert prov.validate_access_token(token, "https://api.example.com/mcp") is True
+    assert prov.validate_access_token(token, "https://api.example.com/other") is False
+
+
+def test_upper_cased_connector_url_end_to_end():
+    """Authorize for `<base>/MCP`, then call `/MCP` with the token: 200."""
+    with _run(oauth=_provider()) as (base, _):
+        cid = _register(base).json()["client_id"]
+        verifier, challenge = client_oauth.generate_pkce()
+        az = httpx.get(
+            base + "/authorize",
+            params={
+                "client_id": cid,
+                "response_type": "code",
+                "redirect_uri": _REDIRECT,
+                "state": "s",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "resource": base.upper() + "/MCP",
+            },
+            follow_redirects=False,
+            timeout=10,
+        )
+        code = _redirect_params(az)["code"]
+        access = _token(
+            base,
+            {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": _REDIRECT,
+                "client_id": cid,
+                "code_verifier": verifier,
+            },
+        ).json()["access_token"]
+        resp = httpx.post(
+            base + "/MCP",
+            content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
+            headers={"Authorization": f"Bearer {access}"},
+            timeout=10,
+        )
+        assert resp.status_code == 200
