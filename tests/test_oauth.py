@@ -7950,3 +7950,147 @@ def test_gui_browser_available(monkeypatch, platform, env, expected):
         monkeypatch.setenv(k, v)
     monkeypatch.setattr(oauth_mod.sys, "platform", platform)
     assert oauth_mod._gui_browser_available() is expected
+
+
+# --- #454: refresh failure classification and cross-process serialization ---
+
+_DUR_URL = "https://api.example.com/mcp"
+_DUR_TOKEN = "https://auth.example.com/token"
+
+
+class TestRefreshDurability:
+    @pytest.fixture(autouse=True)
+    def _store(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", tmp_path / "t.json")
+
+    def _save_expired(self, refresh_token="rt-old", access_token="at-old"):
+        from mcp_stdio.token_store import save_token
+
+        save_token(
+            _DUR_URL,
+            TokenData(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                expires_at=time.time() - 10,
+                client_id="cid",
+                token_endpoint=_DUR_TOKEN,
+                authorization_endpoint="https://auth.example.com/authorize",
+            ),
+        )
+
+    def _ensure(self):
+        return ensure_token(_DUR_URL, httpx.Client(), interactive=False)
+
+    @pytest.mark.parametrize(
+        "kind, kwargs",
+        [
+            ("json-400", {"status_code": 400, "json": {"error": "invalid_grant"}}),
+            ("body-200", {"status_code": 200, "json": {"error": "invalid_grant"}}),
+            (
+                "form-400",
+                {
+                    "status_code": 400,
+                    "text": "error=invalid_grant&error_description=gone",
+                    "headers": {"content-type": "application/x-www-form-urlencoded"},
+                },
+            ),
+        ],
+    )
+    def test_token_error_carries_its_code(self, httpx_mock, kind, kwargs):
+        from mcp_stdio.oauth import OAuthTokenError
+
+        httpx_mock.add_response(url=_DUR_TOKEN, **kwargs)
+        with pytest.raises(OAuthTokenError, match="OAuth token error") as exc:
+            refresh_access_token(_DUR_TOKEN, "cid", None, "rt", httpx.Client())
+        assert exc.value.error == "invalid_grant"
+        assert isinstance(exc.value, RuntimeError)
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            {"exception": httpx.ConnectError("down")},
+            {"status_code": 503, "text": ""},
+            {"status_code": 429, "text": ""},
+            {"status_code": 400, "json": {"error": "temporarily_unavailable"}},
+        ],
+    )
+    def test_transient_failure_keeps_the_token(self, httpx_mock, failure):
+        from mcp_stdio.token_store import load_token
+
+        self._save_expired()
+        if "exception" in failure:
+            httpx_mock.add_exception(failure["exception"], url=_DUR_TOKEN)
+        else:
+            httpx_mock.add_response(url=_DUR_TOKEN, **failure)
+        assert self._ensure() is None
+        kept = load_token(_DUR_URL)
+        assert kept is not None and kept.refresh_token == "rt-old"
+
+    @pytest.mark.parametrize("code", ["invalid_grant", "invalid_client"])
+    def test_dead_grant_deletes_the_token(self, httpx_mock, code):
+        from mcp_stdio.token_store import load_token
+
+        self._save_expired()
+        httpx_mock.add_response(url=_DUR_TOKEN, status_code=400, json={"error": code})
+        assert self._ensure() is None
+        assert load_token(_DUR_URL) is None
+
+    def test_dead_grant_spares_a_token_saved_meanwhile(self, httpx_mock, monkeypatch):
+        """Compare-and-delete: another process stored a newer token between our
+        failed exchange and our delete (the degraded, unlocked case)."""
+        from mcp_stdio import oauth as oauth_mod
+        from mcp_stdio.token_store import load_token
+
+        self._save_expired()
+        httpx_mock.add_response(
+            url=_DUR_TOKEN, status_code=400, json={"error": "invalid_grant"}
+        )
+        real_locked = oauth_mod._refresh_locked
+
+        def racing(server_url, client, cached):
+            outcome = real_locked(server_url, client, cached)
+            self._save_expired(refresh_token="rt-new", access_token="at-new")
+            return outcome
+
+        monkeypatch.setattr(oauth_mod, "_refresh_locked", racing)
+        assert self._ensure() is None
+        survivor = load_token(_DUR_URL)
+        assert survivor is not None and survivor.refresh_token == "rt-new"
+
+    def test_concurrent_refreshes_spend_the_refresh_token_once(self, httpx_mock):
+        """Two refreshers (two processes; threads with their own lock fds
+        behave the same): the second waits, re-reads, and uses the first's
+        new token instead of replaying the rotated refresh token."""
+        from mcp_stdio.oauth import refresh_cached_token
+
+        self._save_expired()
+
+        def slow_token(request):
+            time.sleep(0.3)
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "at-new",
+                    "refresh_token": "rt-new",
+                    "expires_in": 3600,
+                },
+            )
+
+        httpx_mock.add_callback(slow_token, url=_DUR_TOKEN)
+        results: list[object] = []
+        threads = [
+            threading.Thread(
+                target=lambda: results.append(
+                    refresh_cached_token(_DUR_URL, httpx.Client())
+                )
+            )
+            for _ in range(2)
+        ]
+        for th in threads:
+            th.start()
+            time.sleep(0.05)  # both snapshot the old token before the first saves
+        for th in threads:
+            th.join(5)
+        assert len(httpx_mock.get_requests()) == 1
+        assert [r.access_token for r in results] == ["at-new", "at-new"]

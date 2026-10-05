@@ -6,6 +6,7 @@ import os
 import stat
 import sys
 import threading
+import time
 
 import pytest
 
@@ -1678,3 +1679,62 @@ class TestLegacyMigration:
         monkeypatch.setattr("mcp_stdio.token_store._LEGACY_STORE_FILE", legacy_file)
 
         assert load_token("https://example.com/mcp") is None
+
+
+# --- #454: compare-and-delete and the bounded refresh lock ---
+
+
+class TestRefreshDurabilityStore:
+    @pytest.fixture(autouse=True)
+    def _store(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_FILE", tmp_path / "t.json")
+
+    def test_delete_with_expected_refresh_token(self):
+        from mcp_stdio.token_store import (
+            TokenData,
+            delete_token,
+            load_token,
+            save_token,
+        )
+
+        url = "https://x.example/mcp"
+        save_token(url, TokenData(access_token="a", refresh_token="rt-new"))
+        assert delete_token(url, expected_refresh_token="rt-old") is False
+        assert load_token(url) is not None
+        assert delete_token(url, expected_refresh_token="rt-new") is True
+        assert load_token(url) is None
+
+    def test_refresh_lock_gives_up_after_its_wait(self, capsys):
+        from mcp_stdio.token_store import refresh_lock
+
+        held = threading.Event()
+        release = threading.Event()
+
+        def holder():
+            with refresh_lock():
+                held.set()
+                release.wait(5)
+
+        t = threading.Thread(target=holder)
+        t.start()
+        assert held.wait(5)
+        started = time.monotonic()
+        with refresh_lock(wait=0.2):
+            waited = time.monotonic() - started
+        release.set()
+        t.join(5)
+        assert 0.15 <= waited < 2
+        assert "still held" in capsys.readouterr().err
+
+    def test_refresh_lock_degrades_when_locking_is_unavailable(self, monkeypatch):
+        from mcp_stdio import token_store
+
+        def broken(fd, wait):
+            raise OSError("no locking here")
+
+        monkeypatch.setattr(token_store, "_acquire", broken)
+        ran = []
+        with token_store.refresh_lock():
+            ran.append(True)
+        assert ran == [True]
