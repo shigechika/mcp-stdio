@@ -23,6 +23,13 @@ from mcp_stdio import server
 _BACKEND = [sys.executable, os.path.join(os.path.dirname(__file__), "_fake_backend.py")]
 
 
+@pytest.fixture(autouse=True)
+def _gui_browser(monkeypatch):
+    """Let the flow call the (always monkeypatched) webbrowser.open even on a
+    headless CI runner, where _gui_browser_available() is False (#451)."""
+    monkeypatch.setenv("DISPLAY", ":0")
+
+
 @pytest.fixture()
 def gateway():
     """Start the gateway on an ephemeral port; yield its base MCP URL."""
