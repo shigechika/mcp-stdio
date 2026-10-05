@@ -36,6 +36,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import ipaddress
 import json
 import math
 import os
@@ -52,7 +53,7 @@ from collections.abc import Iterable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import SplitResult, parse_qs, urlencode, urlsplit
 
 from .relay import (
     _META_CLIENT_CAPABILITIES,
@@ -3901,11 +3902,131 @@ def _log_safe_uri(value: Any, *, max_len: int = 200) -> str:
     return repr(value)[: max_len + 8]
 
 
+def _has_forbidden_url_chars(value: str) -> bool:
+    """True for a quote, an ASCII space, any C0 control or DEL — never part
+    of a canonical URL, and ``urlsplit`` silently strips some of them.
+    Non-ASCII is left to the caller (``_parse_origin`` refuses it)."""
+    return any(c == '"' or ord(c) <= 0x20 or ord(c) == 0x7F for c in value)
+
+
+def _canonical_netloc(p: SplitResult, label: str) -> tuple[str, str]:
+    """Return ``(host, netloc)`` for an http(s) ``urlsplit`` result with a host.
+
+    Shared by ``_parse_origin`` and ``_normalize_public_url`` so the two
+    cannot drift: userinfo is refused, the host is lowercased, an IPv6
+    literal is re-bracketed and a default port is dropped. ``label`` names
+    the value in the ValueError messages.
+    """
+    if p.username is not None or p.password is not None or "@" in p.netloc:
+        raise ValueError(f"{label} must not contain userinfo")
+    try:
+        port = p.port
+    except ValueError as e:
+        raise ValueError(f"{label} has an invalid port") from e
+    host = (p.hostname or "").lower()
+    hostpart = f"[{host}]" if ":" in host else host
+    default_port = 80 if p.scheme.lower() == "http" else 443
+    if port is None or port == default_port:
+        return host, hostpart
+    return host, f"{hostpart}:{port}"
+
+
+def _parse_origin(value: str) -> tuple[str, str | None]:
+    """Parse an Origin value into ``(canonical, host)`` (#449).
+
+    http(s) origins become ``scheme://host[:port]`` (see
+    ``_canonical_netloc``) and ``host`` is returned for the loopback test.
+    Any other scheme with a non-empty authority — a browser extension's
+    ``chrome-extension://<id>``, a ``vscode-webview://<id>`` — becomes
+    lowercased ``scheme://authority`` with ``host`` None: its authority is
+    an opaque string (no port parsing), and it can only ever match an exact
+    ``--allow-origin`` entry, never the loopback rule. A lone trailing
+    ``/`` is tolerated (an operator may type one; browsers never send it).
+    Raises ValueError for ``null``, an empty authority, userinfo, any other
+    path, a query or fragment, an http(s) port that does not parse, or a
+    quote, space, control or non-ASCII character (browsers serialize an
+    Origin in ASCII, an internationalized host as punycode).
+    """
+    if not value or _has_forbidden_url_chars(value) or not value.isascii():
+        raise ValueError("origin is empty or contains forbidden characters")
+    p = urlsplit(value)
+    scheme = p.scheme.lower()
+    if not scheme or not p.netloc:
+        raise ValueError("origin must be scheme://host[:port]")
+    if p.path not in ("", "/") or p.query or p.fragment or "?" in value or "#" in value:
+        raise ValueError("origin must not contain a path, query or fragment")
+    if scheme not in ("http", "https"):
+        if "@" in p.netloc:
+            raise ValueError("origin must not contain userinfo")
+        return f"{scheme}://{p.netloc.lower()}", None
+    if not p.hostname:
+        raise ValueError("origin must be scheme://host[:port]")
+    host, netloc = _canonical_netloc(p, "origin")
+    return f"{scheme}://{netloc}", host
+
+
+def _normalize_origin(value: str) -> str:
+    """The canonical form of an Origin value (see ``_parse_origin``)."""
+    return _parse_origin(value)[0]
+
+
+def _is_loopback_host(host: str) -> bool:
+    """``localhost``, any ``*.localhost`` (browsers resolve those to loopback
+    themselves), 127.0.0.0/8 and ``::1``; a trailing dot is ignored."""
+    host = host.rstrip(".")
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _origin_allowed(values: list[str], allowed: frozenset[str]) -> bool:
+    """Whether a request's ``Origin`` header(s) pass the #449 check.
+
+    No header passes: non-browser clients never send one, and a browser
+    always does on the POST/DELETE a DNS-rebinding page needs. More than one
+    header fails. A single value passes when it is an http(s) origin whose
+    host is loopback (any port), or when its canonical form is in
+    ``allowed`` — exact string equality, never a prefix or suffix match.
+    """
+    if not values:
+        return True
+    if len(values) != 1:
+        return False
+    try:
+        canonical, host = _parse_origin(values[0])
+    except ValueError:
+        return False
+    if host is not None and _is_loopback_host(host):
+        return True
+    return canonical in allowed
+
+
+def _origin_of_url(url: str) -> str:
+    """The canonical origin of an absolute http(s) URL such as --public-url.
+
+    Raises ValueError for an internationalized host rather than guessing its
+    punycode form: Python's ``idna`` codec (IDNA 2003) maps some names
+    differently from the IDNA browsers use (``faß`` -> ``fass``), which would
+    trust a different origin than the one browsers send. Callers warn and
+    the operator lists the browser's punycode origin with ``--allow-origin``.
+    """
+    p = urlsplit(url)
+    if not p.netloc.isascii():
+        raise ValueError(
+            "an internationalized host is not converted; add the punycode "
+            "origin your browser sends with --allow-origin"
+        )
+    return _normalize_origin(f"{p.scheme}://{p.netloc}")
+
+
 def _normalize_public_url(url: str) -> str:
     """Normalize --public-url to a canonical issuer ``scheme://host[:port][/path]``.
 
-    Raises ValueError on a non-http(s) URL, a missing host, userinfo,
-    CR/LF/quote/space, a non-loopback ``http://`` (a compliant client refuses
+    Raises ValueError on a non-http(s) URL, a missing host, userinfo, a
+    quote/whitespace/control character, a non-loopback ``http://`` (a compliant client refuses
     cleartext non-loopback endpoints), a bad port, or a query/fragment (the
     RFC 8414 Sec. 2 issuer grammar forbids them). The host is lowercased, an
     explicit default port is dropped, an IPv6 literal is re-bracketed, and a
@@ -3918,27 +4039,16 @@ def _normalize_public_url(url: str) -> str:
     bundled client's RFC 8414 Sec. 3.1 / RFC 9728 Sec. 3.1 path-aware discovery
     (#245). A bare-origin URL (no path) behaves exactly as before.
     """
-    if any(c in url for c in ('"', "\r", "\n", " ")):
+    if _has_forbidden_url_chars(url):
         raise ValueError("public-url contains forbidden characters")
     p = urlsplit(url)
     if p.scheme not in ("http", "https") or not p.hostname:
         raise ValueError("public-url must be an absolute http(s) URL with a host")
-    if p.username or p.password or "@" in p.netloc:
-        raise ValueError("public-url must not contain userinfo")
     if p.query or p.fragment:
         raise ValueError("public-url must not contain a query or fragment")
-    host = p.hostname.lower()
+    host, netloc = _canonical_netloc(p, "public-url")
     if p.scheme == "http" and host not in _LOOPBACK_HOSTS:
         raise ValueError("a non-loopback public-url must use https")
-    try:
-        port = p.port
-    except ValueError as e:
-        raise ValueError("public-url has an invalid port") from e
-    hostpart = f"[{host}]" if ":" in host else host
-    default_port = 80 if p.scheme == "http" else 443
-    netloc = (
-        hostpart if (port is None or port == default_port) else f"{hostpart}:{port}"
-    )
     # Retain the path as the issuer prefix; strip only a trailing slash so
     # "https://host/a/" and "https://host/a" canonicalize identically and a bare
     # "https://host/" collapses to the bare origin (unchanged legacy behavior).
@@ -5365,6 +5475,8 @@ class _Handler(BaseHTTPRequestHandler):
     # None disables the embedded OAuth AS. A provider enables it:
     # /authorize /token /register + AS metadata + issued-token RS validation.
     oauth: _OAuthProvider | None = None
+    # Non-loopback origins the #449 Origin check accepts (canonical form).
+    allowed_origins: frozenset[str] = frozenset()
 
     # Quieter, consistent logging: route BaseHTTPRequestHandler's access log
     # through the project logger instead of stderr's default apache-style line.
@@ -5451,6 +5563,29 @@ class _Handler(BaseHTTPRequestHandler):
         """
         _, prefix = self._issuer_origin_and_prefix()
         return prefix + self.mcp_path
+
+    def _reject_bad_origin(self) -> bool:
+        """Answer 403 to a disallowed ``Origin`` (#449); True when rejected.
+
+        Streamable HTTP: "Servers MUST validate the Origin header on all
+        incoming connections to prevent DNS rebinding attacks. If the
+        Origin header is present and invalid, servers MUST respond with
+        HTTP 403 Forbidden." Runs before routing and auth on every method.
+        """
+        values = self.headers.get_all("Origin") or []
+        if _origin_allowed(values, self.allowed_origins):
+            return False
+        # Sanitized per value and joined outside the sanitizer, so several
+        # headers stay distinguishable from one odd value.
+        shown = " | ".join(
+            _sanitize_host(v.replace("://", ":"))[:64] or "unprintable"
+            for v in values[:4]
+        )
+        log(f"rejected request with a disallowed Origin ({len(values)}: {shown})")
+        # The body (if any) is left unread, so the connection cannot be reused.
+        self.close_connection = True
+        self._send_json(403, _error_body("forbidden: Origin not allowed"))
+        return True
 
     def _wrong_path(self) -> bool:
         # Compare only the path component; ignore any query string.
@@ -6656,6 +6791,11 @@ class _Handler(BaseHTTPRequestHandler):
         # Reset the per-request session id (the handler instance is reused
         # across keep-alive requests); responses before resolution omit it.
         self._session_id = None
+        # #449: first, before the Content-Length checks and before reading a
+        # byte of the body — a disallowed Origin always gets the spec's 403,
+        # and a rebinding page cannot make the gateway buffer its body.
+        if self._reject_bad_origin():
+            return
         # Read (drain) the request body BEFORE any early return. On HTTP/1.1
         # keep-alive, leaving an unread body in the socket makes the handler
         # parse those leftover bytes as the next request line ("Bad request
@@ -6859,6 +6999,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         self._session_id = None
+        if self._reject_bad_origin():
+            return
         path = self.path.split("?", 1)[0]
         # RFC 9728 metadata is unauthenticated — it is how the client discovers
         # how to authenticate — so it is checked before the auth gate. Match the
@@ -6962,6 +7104,8 @@ class _Handler(BaseHTTPRequestHandler):
         # MCP clients DELETE the endpoint to terminate a session (spec item 5).
         # Tear down that session's backend child.
         self._session_id = None
+        if self._reject_bad_origin():
+            return
         if self._wrong_path():
             return
         if not self._require_auth():
@@ -7007,6 +7151,7 @@ def build_server(
     modern_only: bool = False,
     user_env_var: str | None = None,
     max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
+    allowed_origins: Iterable[str] = (),
 ) -> tuple[ThreadingHTTPServer, SessionRegistry]:
     """Construct the HTTP server and session registry without running the loop.
 
@@ -7028,7 +7173,18 @@ def build_server(
     pooling-strategy change. ``max_message_size`` (bytes, ``0`` = unlimited,
     default 10 MiB) rejects a request whose declared ``Content-Length``
     exceeds it with ``413`` before reading any of the body (#416, CWE-770).
+    ``allowed_origins`` (canonical ``scheme://host[:port]`` strings) extends
+    the #449 ``Origin`` allowlist beyond loopback; an ``oauth`` provider's
+    explicit ``public_url`` origin is added automatically. The
+    request-derived issuer never is: a DNS-rebinding request controls
+    ``Host``.
     """
+    origins = {_normalize_origin(o) for o in allowed_origins}
+    if oauth is not None and oauth.public_url:
+        try:
+            origins.add(_origin_of_url(oauth.public_url))
+        except ValueError as e:
+            log(f"warning: --public-url origin not added to the Origin allowlist: {e}")
     registry = SessionRegistry(
         command,
         max_sessions=max_sessions,
@@ -7059,6 +7215,7 @@ def build_server(
             "cache_ttl_ms": cache_ttl_ms,
             "modern_only": modern_only,
             "max_message_size": max_message_size,
+            "allowed_origins": frozenset(origins),
         },
     )
     httpd = ThreadingHTTPServer((host, port), handler)
@@ -7088,6 +7245,7 @@ def serve(
     modern_only: bool = False,
     user_env_var: str | None = None,
     max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
+    allowed_origins: Iterable[str] = (),
 ) -> None:
     """Run the reverse gateway until interrupted.
 
@@ -7098,7 +7256,8 @@ def serve(
     concurrent sessions; ``idle_ttl`` (when ``> 0``) evicts idle sessions.
     ``user_env_var`` injects the authenticated principal into each spawned
     child's environment (see :func:`build_server`). ``max_message_size``
-    bounds a single request body (see :func:`build_server`).
+    bounds a single request body and ``allowed_origins`` extends the
+    ``Origin`` allowlist (see :func:`build_server`).
     """
     httpd, registry = build_server(
         command,
@@ -7115,6 +7274,7 @@ def serve(
         modern_only=modern_only,
         user_env_var=user_env_var,
         max_message_size=max_message_size,
+        allowed_origins=allowed_origins,
     )
     # #385: the legacy reaper now always starts (it sweeps dead children
     # unconditionally, not just idle-past-TTL ones), independent of
@@ -7262,6 +7422,22 @@ def serve_main(argv: list[str]) -> None:
             "Matched byte-for-byte -- never widened to a host or prefix -- so "
             "only add a URL you have verified belongs to a client you trust; "
             "each is exactly as trusted as a hardcoded redirect target."
+        ),
+    )
+    parser.add_argument(
+        "--allow-origin",
+        action="append",
+        default=[],
+        metavar="ORIGIN",
+        help=(
+            "Accept browser requests carrying this Origin (scheme://host[:port], "
+            "or an extension/webview origin such as chrome-extension://<id>) in "
+            "addition to loopback origins and the --public-url origin. "
+            "Repeatable; matched exactly. Requests from any other Origin get "
+            "403 (DNS-rebinding protection); requests with no Origin header, "
+            "as non-browser MCP clients send them, are unaffected. This only "
+            "relaxes the Origin check: serve sends no CORS headers, so a "
+            "cross-origin browser client still needs a CORS-adding proxy."
         ),
     )
     parser.add_argument(
@@ -7493,6 +7669,22 @@ def serve_main(argv: list[str]) -> None:
         parser.error("--cache-ttl-ms must be >= 0")
     if args.max_message_size < 0:
         parser.error("--max-message-size must be >= 0")
+    allowed_origins: list[str] = list(args.allow_origin)
+    for origin in allowed_origins:
+        try:
+            _normalize_origin(origin)  # validate only; build_server normalizes
+        except ValueError as e:
+            parser.error(f"--allow-origin {origin!r} invalid: {e}")
+    if args.public_url is not None and not args.enable_oauth:
+        # Without --enable-oauth nothing else reads --public-url, but it still
+        # names the gateway's own browser origin (a same-origin UI behind a
+        # proxy), so trust that origin for the #449 check.
+        try:
+            allowed_origins.append(
+                _origin_of_url(_normalize_public_url(args.public_url))
+            )
+        except ValueError as e:
+            log(f"warning: --public-url ignored for the Origin check: {e}")
     if args.max_sessions < 1:
         parser.error("--max-sessions must be >= 1")
     if args.session_idle_ttl < 0 or not math.isfinite(args.session_idle_ttl):
@@ -7632,4 +7824,5 @@ def serve_main(argv: list[str]) -> None:
         modern_only=args.modern_only,
         user_env_var=args.user_env,
         max_message_size=args.max_message_size,
+        allowed_origins=allowed_origins,
     )
