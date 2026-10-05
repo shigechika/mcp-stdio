@@ -4146,3 +4146,24 @@ def test_bad_origin_gets_403_before_body_checks(gateway, headers):
         sock.sendall("\r\n".join(lines).encode())
         status = sock.recv(1024).split(b"\r\n", 1)[0]
     assert b" 403 " in status
+
+
+def test_idn_public_url_origin_is_punycode():
+    """An internationalized --public-url still starts the gateway, and its
+    origin is allowed in the punycode form a browser sends (#450 review)."""
+    assert server._origin_of_url("https://bücher.example/x") == (
+        "https://xn--bcher-kva.example"
+    )
+    httpd, registry = server.build_server(
+        _BACKEND,
+        host="127.0.0.1",
+        port=0,
+        oauth=_provider(public_url="https://bücher.example"),
+    )
+    try:
+        assert (
+            "https://xn--bcher-kva.example" in httpd.RequestHandlerClass.allowed_origins
+        )
+    finally:
+        registry.shutdown_all()
+        httpd.server_close()

@@ -4005,9 +4005,14 @@ def _origin_allowed(values: list[str], allowed: frozenset[str]) -> bool:
 
 
 def _origin_of_url(url: str) -> str:
-    """The canonical origin of an absolute http(s) URL such as --public-url."""
+    """The canonical origin of an absolute http(s) URL such as --public-url.
+
+    An internationalized host is converted to its IDNA (punycode) form
+    first, which is how a browser serializes it in an ``Origin`` header.
+    """
     p = urlsplit(url)
-    return _normalize_origin(f"{p.scheme}://{p.netloc}")
+    netloc = p.netloc.encode("idna").decode("ascii")
+    return _normalize_origin(f"{p.scheme}://{netloc}")
 
 
 def _normalize_public_url(url: str) -> str:
@@ -7169,7 +7174,10 @@ def build_server(
     """
     origins = {_normalize_origin(o) for o in allowed_origins}
     if oauth is not None and oauth.public_url:
-        origins.add(_origin_of_url(oauth.public_url))
+        try:
+            origins.add(_origin_of_url(oauth.public_url))
+        except ValueError as e:
+            log(f"warning: --public-url origin not added to the Origin allowlist: {e}")
     registry = SessionRegistry(
         command,
         max_sessions=max_sessions,
