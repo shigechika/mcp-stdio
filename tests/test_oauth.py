@@ -1,6 +1,7 @@
 """Tests for mcp_stdio.oauth module."""
 
 import base64
+import contextlib
 import hashlib
 import inspect
 import json
@@ -8220,3 +8221,43 @@ class TestRefreshDurability:
         stored = load_token(_DUR_URL)
         assert stored.refresh_token == "rt-2" and stored.oauth_resource == "api://x"
         assert data.access_token == "at-2"
+
+    def test_refresh_uses_current_resource_flags_even_if_unpersisted(
+        self, httpx_mock, monkeypatch
+    ):
+        """The reconcile's save can be skipped (lock wait ran out); the
+        exchange must still follow --no-resource-indicator (#455 review)."""
+        from mcp_stdio import token_store
+
+        self._save_expired()
+        real_lock = token_store.refresh_lock
+        calls = {"n": 0}
+
+        @contextlib.contextmanager
+        def first_times_out(wait=None):
+            calls["n"] += 1
+            if calls["n"] == 1:  # the reconcile's attempt
+                yield False
+                return
+            with real_lock(wait) as acquired:
+                yield acquired
+
+        monkeypatch.setattr("mcp_stdio.oauth.refresh_lock", first_times_out)
+        httpx_mock.add_response(
+            url=_DUR_TOKEN, json={"access_token": "at-new", "expires_in": 3600}
+        )
+        data = ensure_token(
+            _DUR_URL, httpx.Client(), resource_indicator=False, interactive=False
+        )
+        assert data.access_token == "at-new"
+        sent = parse_qs(httpx_mock.get_requests()[0].content.decode())
+        assert "resource" not in sent
+
+    def test_refresh_without_a_cached_token_skips_the_lock(self, monkeypatch):
+        from mcp_stdio import oauth as oauth_mod
+
+        def no_lock(*a, **k):
+            raise AssertionError("refresh_lock taken with nothing to refresh")
+
+        monkeypatch.setattr(oauth_mod, "refresh_lock", no_lock)
+        assert oauth_mod.refresh_cached_token(_DUR_URL, httpx.Client()) is None

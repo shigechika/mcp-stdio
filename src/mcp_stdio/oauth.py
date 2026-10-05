@@ -1638,6 +1638,7 @@ def _refresh_cached_token_ex(
     *,
     seen_access_token: str | None = None,
     delete_if_dead: bool = False,
+    resource_settings: tuple[bool, str | None] | None = None,
 ) -> _RefreshOutcome:
     """``refresh_cached_token`` plus why it failed, under ``refresh_lock`` (#454).
 
@@ -1652,11 +1653,18 @@ def _refresh_cached_token_ex(
     holder may just be slow): a token stored meanwhile is returned, else a
     transient failure. ``delete_if_dead`` deletes a dead grant while the
     lock is still held, compared against the failed refresh AND access
-    tokens, so no newer token can be removed.
+    tokens, so no newer token can be removed. ``resource_settings``
+    (``no_resource_indicator``, ``oauth_resource``) is the caller's current
+    intent, applied to the freshly read token before the exchange, so a
+    reconcile that could not be persisted still governs this request.
     """
     if seen_access_token is None:
         snapshot = load_token(server_url)
-        seen_access_token = snapshot.access_token if snapshot else None
+        if snapshot is None:
+            # Nothing to refresh: skip the lock (and the store-directory
+            # bootstrap it implies) entirely, as before #454.
+            return _RefreshOutcome(None, dead=True)
+        seen_access_token = snapshot.access_token
     with refresh_lock() as acquired:
         cached = load_token(server_url)
         if (
@@ -1672,6 +1680,8 @@ def _refresh_cached_token_ex(
                 "not refreshing concurrently"
             )
             return _RefreshOutcome(None)
+        if cached is not None and resource_settings is not None:
+            cached.no_resource_indicator, cached.oauth_resource = resource_settings
         outcome = _refresh_locked(server_url, client, cached)
         if outcome.dead and delete_if_dead and cached is not None:
             delete_token(
@@ -2638,6 +2648,7 @@ def ensure_token(
                 client,
                 seen_access_token=cached.access_token,
                 delete_if_dead=True,
+                resource_settings=(not resource_indicator, oauth_resource),
             )
             if outcome.data:
                 return outcome.data
