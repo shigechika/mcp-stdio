@@ -21581,3 +21581,32 @@ class TestRunMcpParamHeadersAlways:
         retry = httpx_mock.get_requests()[-1]
         assert retry.headers["mcp-session-id"] == "S2"
         assert retry.headers["mcp-param-owner"] == "octo"
+
+    def test_failed_legacy_reinitialize_keeps_the_cache(self, httpx_mock):
+        """#461 /code-review: the cache is dropped only once a new session is
+        actually established; a re-initialize answered 500 leaves the live
+        session's declarations in place."""
+        self._initialize(httpx_mock)
+        httpx_mock.add_response(
+            url=self.URL,
+            json={"jsonrpc": "2.0", "id": 2, "result": {"tools": [self.TOOL]}},
+        )
+        httpx_mock.add_response(url=self.URL, status_code=500)
+        httpx_mock.add_response(
+            url=self.URL, json={"jsonrpc": "2.0", "id": 3, "result": {"content": []}}
+        )
+        self._run(
+            [
+                self._line(1, "initialize", {"protocolVersion": "2025-11-25"}),
+                self._line(2, "tools/list"),
+                self._line(4, "initialize", {"protocolVersion": "2025-11-25"}),
+                self._line(
+                    3,
+                    "tools/call",
+                    {"name": "get_file", "arguments": {"owner": "octo"}},
+                ),
+            ],
+            mcp_param_headers="always",
+        )
+        call = httpx_mock.get_requests()[-1]
+        assert call.headers["mcp-param-owner"] == "octo"

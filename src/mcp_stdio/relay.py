@@ -3475,8 +3475,9 @@ class _StreamResult:
         self.aborted = aborted
         # #459: the JSON-RPC error a non-200 body carried for THIS request,
         # parsed only when the caller asked (``capture_error``) — the
-        # ``-32020`` rung keys on it. None otherwise, and always on the
-        # default legacy era, whose non-200 bodies stay unparsed.
+        # ``-32020`` rung keys on it. None otherwise — always so on a legacy
+        # session unless ``--mcp-param-headers always`` opted in, so the
+        # default legacy era's non-200 bodies stay unparsed.
         self.error_response = error_response
 
     @property
@@ -7942,12 +7943,16 @@ def run(
                 emit_error_on_failure=False,
                 observe=tool_cache.observe,
             )
-            if era == "legacy" and stream is not None and stream.session_id:
-                if stream.status_code == 200:
-                    # Same adoption rule as run()'s loop: only from a
-                    # successful response, so the next page and the retried
-                    # call carry the rotated id instead of a stale one.
-                    session_id = stream.session_id
+            # run()'s loop adopts a rotated id only from a non-error answer;
+            # for this request (it has an id) that means a 200. The next page
+            # and the retried call then carry it instead of a stale one.
+            if (
+                era == "legacy"
+                and stream is not None
+                and stream.status_code == 200
+                and stream.session_id
+            ):
+                session_id = stream.session_id
             if stream is None or stream.status_code != 200 or parsed is None:
                 log("re-list for Mcp-Param headers failed; not retrying the call")
                 return False
@@ -8030,7 +8035,8 @@ def run(
         Parsed whenever mirroring is on: a substring pre-gate would miss a
         serializer that escapes ``/`` (``"tools\\/call"``).
         """
-        if tool_cache is None:
+        # "call" survives JSON's "/" escaping, so this cheap gate is safe.
+        if tool_cache is None or "call" not in line:
             return {}
         try:
             msg = json.loads(line)
@@ -8061,9 +8067,10 @@ def run(
         always`` (#459), which applies the same ``Mcp-Param-*`` block as the
         modern branch: opt-in, it ADDS headers only for a ``tools/call``
         whose tool declared ``x-mcp-header``, and — the one change on every
-        request — drops any ``Mcp-Param-*`` pinned with ``-H`` (a pinned
-        value must not ride on a request that derives none; ``off`` keeps
-        it).
+        request it forwards — drops any ``Mcp-Param-*`` pinned with ``-H``
+        (a pinned value must not ride on a request that derives none;
+        ``off`` keeps it). The relay's own re-initialize handshakes (404
+        recovery, cold-start) do not go through here and are unchanged.
 
         MODERN era: per spec rev 2026-07-28 there is no ``Mcp-Session-Id`` at
         all (the relay's own ``session_id`` never gets set on this path — see
@@ -8094,7 +8101,8 @@ def run(
         a synthetic method value for a line with none would be worse than
         omitting the header).
 
-        ``Mcp-Param-{Name}`` (#459, modern era with mirroring on): every
+        ``Mcp-Param-{Name}`` (#459, whenever mirroring is on: the modern era
+        by default, a legacy session too under ``always``): every
         pinned ``mcp-param-*`` is dropped by the same rule, then a
         ``tools/call`` gets the headers its tool's ``x-mcp-header``
         declarations derive from its ``arguments`` — from
@@ -8125,21 +8133,19 @@ def run(
                 h["Mcp-Method"] = mcp_headers["Mcp-Method"]
             if "Mcp-Name" in mcp_headers:
                 h["Mcp-Name"] = mcp_headers["Mcp-Name"]
-            if tool_cache is not None:
-                h = {
-                    k: v for k, v in h.items() if not k.lower().startswith("mcp-param-")
-                }
-                h.update(_mcp_param_headers_for(line, param_decls))
-            return h
-        # session_id / protocol_version are mutated only by this (main) thread,
-        # so they need no lock; only the shared ``headers`` object is contended.
-        if session_id:
-            h = {k: v for k, v in h.items() if k.lower() != "mcp-session-id"}
-            h["Mcp-Session-Id"] = session_id
-        if protocol_version:
-            h = {k: v for k, v in h.items() if k.lower() != "mcp-protocol-version"}
-            h["MCP-Protocol-Version"] = protocol_version
-        if tool_cache is not None:  # --mcp-param-headers always (#459)
+        else:
+            # session_id / protocol_version are mutated only by this (main)
+            # thread, so they need no lock; only the shared ``headers``
+            # object is contended.
+            if session_id:
+                h = {k: v for k, v in h.items() if k.lower() != "mcp-session-id"}
+                h["Mcp-Session-Id"] = session_id
+            if protocol_version:
+                h = {k: v for k, v in h.items() if k.lower() != "mcp-protocol-version"}
+                h["MCP-Protocol-Version"] = protocol_version
+        # #459, both eras: tool_cache exists on the modern era by default and
+        # on a legacy session only under `--mcp-param-headers always`.
+        if tool_cache is not None:
             h = {k: v for k, v in h.items() if not k.lower().startswith("mcp-param-")}
             h.update(_mcp_param_headers_for(line, param_decls))
         return h
@@ -9586,14 +9592,6 @@ def run(
                 # #459: set on the modern branch below; a legacy line never
                 # comes from a #446 modern client.
                 client_modern = False
-                # A legacy client's (re)initialize starts a new session that
-                # will re-list (`always`); drop what the old one taught.
-                if (
-                    tool_cache is not None
-                    and era == "legacy"
-                    and _is_initialize_request(line)
-                ):
-                    tool_cache.invalidate()
 
                 if era == "modern":
                     # initialize / notifications/initialized /
@@ -9950,7 +9948,8 @@ def run(
                         # recovery ladder, and each POST must intercept
                         # under its own id with no state carried over.
                         # None on every non-eligible line and on the whole
-                        # legacy era.
+                        # legacy era (except the #459 tools/list hook below,
+                        # which `--mcp-param-headers always` installs there).
                         # #459: a client `tools/list` that carries its own
                         # cursor reaches here, not the pagination branch; its
                         # page teaches the x-mcp-header cache through the
@@ -10337,6 +10336,19 @@ def run(
 
                 req_202_hang = result.status_code == 202 and req_has_id
                 is_error = result.status_code >= 400 or req_202_hang
+                # #459 (`always`): a legacy client's SUCCESSFUL (re)initialize
+                # starts a session that will re-list; drop what the old one
+                # taught. After the ladder, not before dispatch, so a failed
+                # re-initialize leaves the live session's cache intact. (The
+                # modern era clears before dispatch instead: its initialize
+                # is answered locally and never reaches here.)
+                if (
+                    tool_cache is not None
+                    and era == "legacy"
+                    and not is_error
+                    and _is_initialize_request(line)
+                ):
+                    tool_cache.invalidate()
 
                 # Adopt a server-rotated session id only from a NON-error response.
                 # A 4xx/5xx (or a non-compliant 202-to-request we are about to
