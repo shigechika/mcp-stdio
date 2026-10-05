@@ -74,6 +74,7 @@ a crossover.
 - Treat `--token-store`'s file like a private key. It is created `0600` in
   a `0700` directory.
 - Every request is logged to stderr with query strings redacted.
+- `Mcp-Param-*` headers (a tool's `x-mcp-header` arguments, MCP 2026-07-28) are accepted and ignored: the stdio child never sees HTTP headers, and the spec lets an intermediary that does not validate them pass them over. serve never answers `-32020` for them.
 - The MCP endpoint path and the token audience are matched case-insensitively, so a client that upper-cases the connector URL (claude.ai can store `https://mcp.example.com/mcp` as `https://MCP.EXAMPLE.COM/MCP`) still connects, provided any reverse proxy in front also forwards the upper-cased path (#456).
 - Browser requests are checked against their `Origin` header (DNS-rebinding
   protection, #449): a web page that rebinds its own hostname to `127.0.0.1`
