@@ -1175,9 +1175,7 @@ class _ToolHeaderCache:
             valid[name] = result
         return kept, valid, invalid
 
-    def _commit_locked(
-        self, valid: dict[str, Any], invalid: dict[str, str], *, complete: bool
-    ) -> None:
+    def _warn_locked(self, invalid: dict[str, str]) -> None:
         for name, reason in invalid.items():
             key = (name, reason)
             if key not in self._warned and len(self._warned) < self._WARNED_CAP:
@@ -1186,6 +1184,10 @@ class _ToolHeaderCache:
                     f"warning: excluding tool {name!r} from tools/list: "
                     f"invalid x-mcp-header declaration — {reason}"
                 )
+
+    def _commit_locked(
+        self, valid: dict[str, Any], invalid: dict[str, str], *, complete: bool
+    ) -> None:
         if complete:
             self._by_tool = valid
             return
@@ -1215,11 +1217,10 @@ class _ToolHeaderCache:
         """
         kept, valid, invalid = self._scan(tools)
         with self._lock:
+            self._warn_locked(invalid)
             committed = generation is None or generation == self._generation
             if committed:
                 self._commit_locked(valid, invalid, complete=complete)
-            elif invalid:
-                self._commit_locked({}, invalid, complete=False)  # warn only
         return (tools if len(kept) == len(tools) else kept), committed
 
     def declarations_for(self, name: Any) -> tuple[_McpParamDecl, ...]:

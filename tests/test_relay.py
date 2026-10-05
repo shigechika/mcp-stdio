@@ -20648,11 +20648,20 @@ class TestErrorResponseFor:
             (json.dumps({"jsonrpc": "2.0", "id": 7, "result": {}}), 7),
             ("event: message\ndata: {}\n\n", 7),  # SSE: unsupported
             ("not json", 7),
-            ("[" * 100_000 + "]" * 100_000, 7),  # RecursionError, not a crash
         ],
     )
     def test_anything_else_is_none(self, body, req_id):
         assert _error_response_for(body, req_id) is None
+
+    def test_a_recursion_error_is_none_not_a_crash(self, monkeypatch):
+        """A deeply nested body makes json.loads raise RecursionError (forced
+        here: a real one can overflow the C stack on Windows first)."""
+
+        def deep(*_a, **_k):
+            raise RecursionError("maximum recursion depth exceeded")
+
+        monkeypatch.setattr("mcp_stdio.relay.json.loads", deep)
+        assert _error_response_for("[[[]]]", 7) is None
 
 
 class TestRunMcpParamHeaders:
@@ -21070,7 +21079,7 @@ class TestMcpParamReviewFixes:
     _call = staticmethod(TestRunMcpParamHeaders._call)
     _requests = staticmethod(TestRunMcpParamHeaders._requests)
 
-    def test_cancel_during_a_failed_relist_writes_nothing(self, httpx_mock):
+    def test_cancel_during_a_failed_relist_writes_nothing(self, httpx_mock, capsys):
         relist_entered = threading.Event()
         cancel_read = threading.Event()
 
@@ -21097,7 +21106,11 @@ class TestMcpParamReviewFixes:
         stdout = StringIO()
         with patch("sys.stdin", Stdin()), patch("sys.stdout", stdout):
             run(self.URL, {}, protocol_era="modern")
-        assert stdout.getvalue() == ""  # the cancelled id gets no answer at all
+        # The relay really reached the failed re-list (not a silent exit) ...
+        assert relist_entered.is_set()
+        assert "re-list for Mcp-Param headers failed" in capsys.readouterr().err
+        # ... and the cancelled id gets no answer at all.
+        assert stdout.getvalue() == ""
 
     def test_headers_and_mrtr_snapshot_come_from_one_lookup(
         self, httpx_mock, monkeypatch
@@ -21345,3 +21358,19 @@ class TestMcpParamReviewFixes:
         assert out[-1] == self.MISMATCH
         (call,) = self._requests(httpx_mock, "tools/call")
         assert call.headers["mcp-param-region"] == "us"
+
+
+def test_a_stale_listing_never_mutates_the_cache():
+    """#460 ai-review R3F1: a list fetched before an invalidation must not
+    evict what a newer listing taught, even when it calls the tool invalid."""
+    cache = _ToolHeaderCache()
+    stale_generation = cache.generation
+    cache.invalidate()
+    tool = _annotated("t", {"r": ("string", "R")})
+    cache.learn([tool], complete=False, generation=cache.generation)
+    now_bad = _annotated("t", {"r": ("number", "R")})
+    shown, committed = cache.learn(
+        [now_bad], complete=False, generation=stale_generation
+    )
+    assert shown == [] and committed is False
+    assert cache.declarations_for("t")  # untouched
