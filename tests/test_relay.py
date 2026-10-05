@@ -84,6 +84,9 @@ from mcp_stdio.relay import (
     _read_bounded,
     _replay_safe,
     _reject_content_encoding,
+    _ClientListens,
+    _client_listen_loop,
+    _client_meta_protocol_version,
     _cold_start_loop,
     _cold_start_response,
     _proactive_refresh_loop,
@@ -19988,3 +19991,352 @@ class TestResourceListenStreamLoop:
         assert emitted[0]["method"] == _RESOURCE_UPDATED_METHOD
         assert "_meta" not in emitted[0]["params"]
         assert len(httpx_mock.get_requests()) == 1
+
+
+# --- #446: modern stdio client passthrough ---
+
+_MODERN_META = {
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientInfo": {"name": "modern-client", "version": "1"},
+    "io.modelcontextprotocol/clientCapabilities": {"elicitation": {}},
+}
+
+
+def _modern_line(req_id, method, **params):
+    return json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": method,
+            "params": {**params, "_meta": _MODERN_META},
+        }
+    )
+
+
+class TestClientMetaProtocolVersion:
+    @pytest.mark.parametrize(
+        "line, expected",
+        [
+            (_modern_line(1, "tools/list"), (True, "2026-07-28")),
+            (
+                '{"jsonrpc":"2.0","id":1,"method":"tools/list",'
+                '"params":{"_meta":{"io.modelcontextprotocol/protocolVersion":7}}}',
+                (True, None),
+            ),
+            ('{"jsonrpc":"2.0","id":1,"method":"tools/list"}', (False, None)),
+            (
+                '{"jsonrpc":"2.0","id":1,"method":"x","params":{"_meta":{"a":1}}}',
+                (False, None),
+            ),
+            ("[]", (False, None)),
+            ("not json", (False, None)),
+        ],
+    )
+    def test_classification(self, line, expected):
+        assert _client_meta_protocol_version(line) == expected
+
+
+class TestClientListens:
+    def test_duplicate_id_is_refused(self):
+        reg = _ClientListens()
+        c1, c2 = httpx.Client(), httpx.Client()
+        t = threading.Thread(target=lambda: None)
+        assert reg.open(2, c1, threading.Event(), t) is True
+        assert reg.open(2, c2, threading.Event(), t) is False
+        c1.close()
+        c2.close()
+
+    def test_abort_sets_event_and_closes_client(self):
+        reg = _ClientListens()
+        client, aborted = httpx.Client(), threading.Event()
+        reg.open(2, client, aborted, threading.Thread(target=lambda: None))
+        assert reg.abort(2) is True
+        assert aborted.is_set() and client.is_closed
+        assert reg.abort(2) is False  # already gone
+
+    def test_release_only_drops_its_own_entry(self):
+        reg = _ClientListens()
+        old, new = httpx.Client(), httpx.Client()
+        t = threading.Thread(target=lambda: None)
+        reg.open(2, new, threading.Event(), t)
+        reg.release(2, old)  # a stale thread's exit must not drop the new one
+        assert reg.open(2, httpx.Client(), threading.Event(), t) is False
+        reg.release(2, new)
+        assert reg.open(2, old, threading.Event(), t) is True
+        old.close()
+        new.close()
+
+    def test_abort_all_returns_threads(self):
+        reg = _ClientListens()
+        t = threading.Thread(target=lambda: None)
+        aborted = threading.Event()
+        reg.open(2, httpx.Client(), aborted, t)
+        assert reg.abort_all() == [t]
+        assert aborted.is_set()
+        assert reg.abort_all() == []
+
+
+class TestClientListenLoop:
+    URL = "https://example.com/mcp"
+    ACK = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": {"_meta": {"io.modelcontextprotocol/subscriptionId": 2}},
+        }
+    )
+    FINAL = json.dumps(
+        {"jsonrpc": "2.0", "id": 2, "result": {"resultType": "complete"}}
+    )
+
+    def _run(self, httpx_mock, *, aborted=None, tracker=None):
+        exits = []
+        stdout = StringIO()
+        with patch("sys.stdout", stdout):
+            _client_listen_loop(
+                httpx.Client(),
+                self.URL,
+                _modern_line(2, "subscriptions/listen"),
+                {},
+                2,
+                tracker,
+                httpx.Timeout(5),
+                aborted or threading.Event(),
+                lambda: exits.append(True),
+            )
+        assert exits == [True]
+        return [json.loads(x) for x in stdout.getvalue().splitlines() if x]
+
+    def _sse(self, httpx_mock, *frames):
+        body = "".join(f"data: {f}\n\n" for f in frames).encode()
+        httpx_mock.add_response(
+            stream=IteratorStream([body]),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    def test_final_response_is_passed_through_without_error(self, httpx_mock):
+        self._sse(httpx_mock, self.ACK, self.FINAL)
+        out = self._run(httpx_mock)
+        assert out == [json.loads(self.ACK), json.loads(self.FINAL)]
+
+    def test_frames_after_the_final_response_are_not_forwarded(self, httpx_mock):
+        late = json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"late": True}})
+        self._sse(httpx_mock, self.ACK, self.FINAL, late)
+        out = self._run(httpx_mock)
+        assert out == [json.loads(self.ACK), json.loads(self.FINAL)]
+
+    def test_abrupt_end_synthesizes_one_error(self, httpx_mock):
+        self._sse(httpx_mock, self.ACK)
+        out = self._run(httpx_mock)
+        assert out[0] == json.loads(self.ACK)
+        assert out[1]["id"] == 2 and out[1]["error"]["code"] == -32000
+        assert len(out) == 2
+
+    def test_aborted_stream_ends_silently(self, httpx_mock):
+        self._sse(httpx_mock, self.ACK)
+        aborted = threading.Event()
+        aborted.set()
+        # Nothing is forwarded once aborted, buffered frames included.
+        assert self._run(httpx_mock, aborted=aborted) == []
+
+    def test_cancelled_id_gets_no_synthesized_error(self, httpx_mock):
+        self._sse(httpx_mock, self.ACK)
+        tracker = _CancelTracker()
+        tracker.add(2)
+        assert self._run(httpx_mock, tracker=tracker) == [json.loads(self.ACK)]
+        assert tracker.contains(2)
+
+    def test_non_200_jsonrpc_error_body_is_forwarded(self, httpx_mock):
+        body = {"jsonrpc": "2.0", "id": 2, "error": {"code": -32022, "message": "v"}}
+        httpx_mock.add_response(
+            status_code=400, json=body, headers={"content-type": "application/json"}
+        )
+        assert self._run(httpx_mock) == [body]
+
+    def test_non_200_without_body_synthesizes_error(self, httpx_mock):
+        httpx_mock.add_response(status_code=500, text="")
+        out = self._run(httpx_mock)
+        assert len(out) == 1 and out[0]["id"] == 2
+        assert "HTTP 500" in out[0]["error"]["message"]
+
+    def test_transport_error_synthesizes_error(self, httpx_mock):
+        httpx_mock.add_exception(httpx.ConnectError("refused"))
+        out = self._run(httpx_mock)
+        assert len(out) == 1 and out[0]["id"] == 2 and "error" in out[0]
+
+
+class TestRunModernStdioClient:
+    """run() with a modern stdio client on the modern era (#446)."""
+
+    URL = "https://example.com/mcp"
+
+    def test_listen_does_not_block_and_meta_is_kept(self, httpx_mock):
+        release = threading.Event()
+        ack = TestClientListenLoop.ACK
+
+        def listen_body():
+            yield f"data: {ack}\n\n".encode()
+            release.wait(10)  # an open listen stream: no final frame
+
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "subscriptions/listen"},
+            stream=IteratorStream(listen_body()),
+            headers={"content-type": "text/event-stream"},
+        )
+        discover = {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "result": {
+                "resultType": "complete",
+                "supportedVersions": ["2026-07-28"],
+                "capabilities": {"tools": {}},
+            },
+        }
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "server/discover"},
+            json=discover,
+            is_reusable=True,
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/list"},
+            json={"jsonrpc": "2.0", "id": 3, "result": {"tools": []}},
+        )
+        stdin_lines = [
+            _modern_line(2, "subscriptions/listen", notifications={}),
+            _modern_line(3, "tools/list"),
+        ]
+        stdout = StringIO()
+        # Hold stdin open until the listen is proven alive (its ack reached
+        # stdout), so the teardown below ends a stream that really is open.
+        stdin = _StdinUntil(stdin_lines, lambda: "acknowledged" in stdout.getvalue())
+        started = time.monotonic()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            try:
+                run(self.URL, {}, protocol_era="modern")
+            finally:
+                elapsed = time.monotonic() - started
+                release.set()
+                # Keep stdout captured until the worker has really exited,
+                # so a late write could not escape the assertions below.
+                _join_client_listen_threads()
+        # The listen body only ends after 10 s; a blocking dispatch would
+        # wait that out before answering tools/list.
+        assert elapsed < 5
+        out = [json.loads(x) for x in stdout.getvalue().splitlines() if x]
+        # Present, not first: the listen thread and tools/list race.
+        assert json.loads(ack) in out
+        assert {"jsonrpc": "2.0", "id": 3, "result": {"tools": []}} in out
+        # The teardown aborted the open listen: no error under its id.
+        assert not any(m.get("id") == 2 for m in out)
+        tools_list = next(
+            r
+            for r in httpx_mock.get_requests()
+            if r.headers.get("mcp-method") == "tools/list"
+        )
+        assert json.loads(tools_list.content)["params"]["_meta"] == _MODERN_META
+        assert tools_list.headers["mcp-protocol-version"] == "2026-07-28"
+
+    def test_cancel_queued_before_the_listen_started_closes_it(self, httpx_mock):
+        """A cancel the reader saw while the listen was still queued behind
+        a slow request is applied by the consumer once it starts (#447
+        review)."""
+        release = threading.Event()
+        ack = TestClientListenLoop.ACK
+
+        def listen_body():
+            yield f"data: {ack}\n\n".encode()
+            release.wait(10)
+
+        def slow_call(request):
+            time.sleep(0.5)  # the reader reads every line meanwhile
+            return httpx.Response(
+                200, json={"jsonrpc": "2.0", "id": 1, "result": {"content": []}}
+            )
+
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "server/discover"},
+            json={
+                "jsonrpc": "2.0",
+                "id": 0,
+                "result": {
+                    "resultType": "complete",
+                    "supportedVersions": ["2026-07-28"],
+                    "capabilities": {"tools": {}},
+                },
+            },
+        )
+        httpx_mock.add_callback(
+            slow_call, url=self.URL, match_headers={"Mcp-Method": "tools/call"}
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "subscriptions/listen"},
+            stream=IteratorStream(listen_body()),
+            headers={"content-type": "text/event-stream"},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/list"},
+            json={"jsonrpc": "2.0", "id": 3, "result": {"tools": []}},
+        )
+        hits = []
+        real_abort = _ClientListens.abort
+
+        def recording_abort(self, req_id):
+            matched = real_abort(self, req_id)
+            if matched:
+                hits.append(threading.current_thread() is threading.main_thread())
+            return matched
+
+        stdin_lines = [
+            _modern_line(1, "tools/call", name="x", arguments={}),
+            _modern_line(2, "subscriptions/listen", notifications={}),
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {"requestId": 2},
+                }
+            ),
+            _modern_line(3, "tools/list"),
+        ]
+        stdout = StringIO()
+        with (
+            patch.object(_ClientListens, "abort", recording_abort),
+            patch("sys.stdin", StringIO("\n".join(stdin_lines) + "\n")),
+            patch("sys.stdout", stdout),
+        ):
+            try:
+                run(self.URL, {}, protocol_era="modern")
+            finally:
+                release.set()
+                _join_client_listen_threads()
+        # The reader's abort found nothing to close; the consumer's did.
+        assert hits == [True]
+        out = [json.loads(x) for x in stdout.getvalue().splitlines() if x]
+        assert not any(m.get("id") == 2 for m in out)
+
+
+class _StdinUntil:
+    """A stdin stand-in that yields ``lines``, then EOF once ``ready()``."""
+
+    def __init__(self, lines, ready, timeout=5.0):
+        self._lines = [f"{line}\n" for line in lines]
+        self._ready = ready
+        self._timeout = timeout
+
+    def __iter__(self):
+        yield from self._lines
+        deadline = time.monotonic() + self._timeout
+        while not self._ready() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+
+def _join_client_listen_threads():
+    for thread in threading.enumerate():
+        if thread.name == "mcp-stdio-client-listen":
+            thread.join(timeout=5)

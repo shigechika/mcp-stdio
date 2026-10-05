@@ -915,12 +915,22 @@ class _ModernState:
     handoff. What that PR moved to a second thread is READING stdin, not
     dispatching from it: the reader enqueues every line unchanged and
     acts out-of-band on exactly one thing, closing the published
-    in-flight response when a ``notifications/cancelled`` names it (the
-    cancellation signal on this transport — see ``_InFlightPost``). Every
+    in-flight response (or a client listen stream, below) when a
+    ``notifications/cancelled`` names it (the cancellation signal on this
+    transport — see ``_InFlightPost``). Every
     single-writer invariant this note used to protect —
     ``protocol_version``, the 401/403/404 recovery ladder, the MRTR
     dicts, and this object — still has exactly one mutator, the consumer,
     which is why the handoff needed no re-audit of them.
+
+    One dispatch is NOT synchronous (#446): a ``subscriptions/listen`` a
+    modern stdio client sends runs on its own thread, because its stream
+    never ends. That thread touches none of this state — its headers are
+    built on the consumer before it starts, it writes to stdout only
+    through ``_emit`` (frames) and ``_write_line`` (its own synthesized
+    error, after the non-consuming cancel-tracker check), and it only reads
+    the thread-safe cancel tracker — so the single-mutator invariant above
+    still holds.
     """
 
     __slots__ = (
@@ -1942,6 +1952,30 @@ def _inject_modern_meta(line: str, modern_state: "_ModernState") -> str:
     params["_meta"] = meta
     msg["params"] = params
     return json.dumps(msg)
+
+
+def _client_meta_protocol_version(line: str) -> tuple[bool, str | None]:
+    """Detect a line sent by a 2026-07-28 (modern) stdio client (#446).
+
+    Returns ``(is_modern, version)``. ``is_modern`` is True when
+    ``params._meta`` carries the ``io.modelcontextprotocol/protocolVersion``
+    KEY — the same positive evidence serve's ``_request_era`` uses. A legacy
+    client never puts it there, so its lines keep the relay's own ``_meta``
+    injection and MRTR bridging. ``version`` is the key's value when it is a
+    string, else None.
+    """
+    try:
+        msg = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return False, None
+    if not isinstance(msg, dict):
+        return False, None
+    params = msg.get("params")
+    meta = params.get("_meta") if isinstance(params, dict) else None
+    if not isinstance(meta, dict) or _META_PROTOCOL_VERSION not in meta:
+        return False, None
+    version = meta[_META_PROTOCOL_VERSION]
+    return True, version if isinstance(version, str) else None
 
 
 # Cancel-aware response filter (MCP cancellation spec SHOULDs).
@@ -6699,6 +6733,159 @@ def _stop_proactive_refresh(
             thread.join(timeout=1.0)
 
 
+class _ClientListens:
+    """Open ``subscriptions/listen`` streams the stdio CLIENT started (#446).
+
+    A modern stdio client (Claude Code 2.1.281+) sends its own
+    ``subscriptions/listen``. Its response stream never ends on its own, so
+    it cannot go through run()'s single-dispatch consumer, which would then
+    never reach the next request. Each one runs on its own daemon thread
+    with a dedicated ``httpx.Client``; this registry is how a cancel (the
+    stdin reader's out-of-band one, and the consumer's for a listen that
+    started after the reader saw the cancel) and run()'s teardown reach it.
+
+    Kept apart from ``_InFlightPost``, which is by design the ONE request a
+    cancel may abort. Here closing the CLIENT is correct: it belongs to the
+    stream alone and is discarded with it.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[
+            Any, tuple[httpx.Client, threading.Event, threading.Thread]
+        ] = {}
+
+    def open(
+        self,
+        req_id: Any,
+        client: httpx.Client,
+        aborted: threading.Event,
+        thread: threading.Thread,
+    ) -> bool:
+        """Register a stream; False when ``req_id`` already has one open."""
+        with self._lock:
+            if req_id in self._entries:
+                return False
+            self._entries[req_id] = (client, aborted, thread)
+            return True
+
+    def release(self, req_id: Any, client: httpx.Client) -> None:
+        """Drop ``req_id``'s entry if it is still the one ``client`` owns."""
+        with self._lock:
+            entry = self._entries.get(req_id)
+            if entry is not None and entry[0] is client:
+                del self._entries[req_id]
+
+    def abort(self, req_id: Any) -> bool:
+        """End ``req_id``'s stream (a client cancel); True on a match."""
+        with self._lock:
+            entry = self._entries.pop(req_id, None)
+        if entry is None:
+            return False
+        entry[1].set()
+        entry[0].close()
+        return True
+
+    def abort_all(self) -> list[threading.Thread]:
+        """End every stream (teardown); returns the threads to join."""
+        with self._lock:
+            entries = list(self._entries.values())
+            self._entries.clear()
+        for _client, aborted, _thread in entries:
+            aborted.set()
+        for client, _aborted, _thread in entries:
+            client.close()
+        return [thread for _client, _aborted, thread in entries]
+
+
+def _client_listen_loop(
+    client: httpx.Client,
+    url: str,
+    content: str,
+    headers: dict[str, str],
+    req_id: Any,
+    tracker: "_CancelTracker | None",
+    timeout: httpx.Timeout,
+    aborted: threading.Event,
+    on_exit: Callable[[], None],
+) -> None:
+    """Pass one client-originated ``subscriptions/listen`` through (#446).
+
+    Every frame goes to stdout via ``_emit`` unchanged: the ack, the
+    notifications and the final response all belong to the client, which
+    matches them by its own subscription id. No retry and no reconnect —
+    re-listening is the client's decision ("clients MUST re-issue with a
+    new request ID" after a broken stream).
+
+    Once ``aborted`` is set (a cancel or teardown) nothing more is
+    forwarded. Otherwise exactly one answer under ``req_id`` reaches the
+    client: the server's own
+    final response, or a synthesized ``-32000`` when the stream ends
+    without one (a non-200 status, a transport error, or an abrupt close).
+    Synthesized errors skip an id the client already cancelled through the
+    non-consuming tracker check ``_drain_pending`` uses.
+    """
+
+    def _fail(message: str) -> None:
+        if aborted.is_set() or (tracker is not None and tracker.contains(req_id)):
+            return
+        _write_line(_error_response(message, req_id))
+
+    answered = False
+    try:
+        with client.stream(
+            "POST", url, content=content, headers=headers, timeout=timeout
+        ) as resp:
+            if resp.status_code != 200:
+                _read_bounded(resp, client)
+                body = resp.text.strip()
+                if aborted.is_set():
+                    return
+                if body and _is_pure_response_for(body, req_id):
+                    _emit(body, tracker)
+                else:
+                    _fail(f"subscriptions/listen failed: HTTP {resp.status_code}")
+                return
+            if "text/event-stream" in resp.headers.get("content-type", ""):
+                for event_type, payload in _iter_sse_events(
+                    _iter_sse_lines(_iter_text_bounded(resp, client))
+                ):
+                    if event_type != "message":
+                        continue
+                    # A cancel sets ``aborted`` on the reader thread before
+                    # the consumer records it in the tracker, so the event
+                    # is the only gate that closes that window for frames
+                    # already buffered when the stream was closed.
+                    if aborted.is_set():
+                        return
+                    _emit(payload, tracker)
+                    if _is_pure_response_for(payload, req_id):
+                        # The final response ends the listen: stop reading,
+                        # so a non-compliant second one is never forwarded.
+                        answered = True
+                        break
+            else:
+                _read_bounded(resp, client)
+                body = resp.text.strip()
+                if body and not aborted.is_set():
+                    _emit(body, tracker)
+                    answered = _is_pure_response_for(body, req_id)
+        if not answered:
+            _fail("subscriptions/listen stream ended without a final response")
+    except (httpx.HTTPError, RuntimeError) as e:
+        # RuntimeError covers httpx.StreamClosed: a cancel or teardown closed
+        # this stream's client mid-read, which ``_fail`` then keeps silent.
+        if not answered:
+            _fail(f"subscriptions/listen stream interrupted: {e}")
+    except Exception as e:  # noqa: BLE001 — never crash the gateway
+        log(f"internal relay error on client listen {req_id!r}: {e}")
+        if not answered:
+            _fail("internal relay error")
+    finally:
+        client.close()
+        on_exit()
+
+
 def run(
     url: str,
     headers: dict[str, str],
@@ -7081,6 +7268,8 @@ def run(
     # an ordinary POST while the cancel tracker drops the late response —
     # spec-compliant with the 2025-06-18 SHOULDs and deliberately unchanged.
     in_flight = _InFlightPost() if era == "modern" else None
+    # #446: subscriptions/listen streams a modern stdio client opened itself.
+    client_listens = _ClientListens() if era == "modern" else None
 
     # The stdin handoff itself (§3.1/§3.2), started HERE — at era
     # resolution, before the loop's first iteration — and only on the
@@ -7134,6 +7323,8 @@ def run(
             """
             if in_flight is not None and in_flight.abort_if_matches(cancel_id):
                 log(f"cancelling id {cancel_id!r}: closing the in-flight upstream POST")
+            if client_listens is not None and client_listens.abort(cancel_id):
+                log(f"cancelling id {cancel_id!r}: closing the client's listen stream")
 
         stdin_reader = threading.Thread(
             target=_stdin_reader_loop,
@@ -7197,9 +7388,16 @@ def run(
         if era == "modern":
             h = {k: v for k, v in h.items() if k.lower() != "mcp-session-id"}
             h = {k: v for k, v in h.items() if k.lower() != "mcp-protocol-version"}
-            h["MCP-Protocol-Version"] = (
-                modern_state.negotiated_version or _MODERN_PROTOCOL_VERSION_DEFAULT
-            )
+            # #446: a modern stdio client's own `_meta` version goes out
+            # untouched, so the header must mirror it, not the relay's
+            # negotiated one — a mismatch is a -32020 HeaderMismatch.
+            _, client_version = _client_meta_protocol_version(line)
+            if client_version is not None and _is_header_safe_ascii(client_version):
+                h["MCP-Protocol-Version"] = client_version
+            else:
+                h["MCP-Protocol-Version"] = (
+                    modern_state.negotiated_version or _MODERN_PROTOCOL_VERSION_DEFAULT
+                )
             h = {k: v for k, v in h.items() if k.lower() != "mcp-method"}
             h = {k: v for k, v in h.items() if k.lower() != "mcp-name"}
             mcp_headers = _mcp_request_headers(line)
@@ -8294,6 +8492,41 @@ def run(
         pool=10,
     )
 
+    def _start_client_listen(line: str, req_id: Any) -> None:
+        """Run a stdin ``subscriptions/listen`` on its own thread (#446)."""
+        assert client_listens is not None  # modern era only
+        listen_client = _new_listen_client()
+        aborted = threading.Event()
+        thread = threading.Thread(
+            target=_client_listen_loop,
+            kwargs={
+                "client": listen_client,
+                "url": url,
+                "content": line,
+                "headers": _prepare_headers(line),
+                "req_id": req_id,
+                "tracker": tracker,
+                "timeout": listen_timeout,
+                "aborted": aborted,
+                "on_exit": lambda: client_listens.release(req_id, listen_client),
+            },
+            name="mcp-stdio-client-listen",
+            daemon=True,
+        )
+        if not client_listens.open(req_id, listen_client, aborted, thread):
+            listen_client.close()
+            if tracker is not None and tracker.contains(req_id):
+                return
+            _write_line(
+                _error_response(
+                    "a subscriptions/listen with this id is already open",
+                    req_id,
+                    code=-32600,
+                )
+            )
+            return
+        thread.start()
+
     def _start_listen_stream() -> None:
         """Open the background subscriptions/listen stream, at most once.
 
@@ -8554,6 +8787,15 @@ def run(
                             tracker.add(cid)
                         if era == "modern":
                             _mrtr_handle_cancel(cid)
+                        # #446: the reader's out-of-band abort misses a
+                        # listen the consumer had not started yet (it was
+                        # still queued behind a slow request); by the time
+                        # this cancel line is dequeued it has started, so
+                        # end it here. A no-op when the reader got it.
+                        if client_listens is not None and client_listens.abort(cid):
+                            log(
+                                f"cancelling id {cid!r}: closing the client's listen stream"
+                            )
 
                 # Derive both the id value and its presence from one parse (the
                 # hot path). A notification (no id) must never receive a response —
@@ -8785,10 +9027,18 @@ def run(
                     # transaction. ``unsafe_method`` was just parsed above
                     # and is the same value `_inject_modern_meta` leaves
                     # untouched, so no second parse is needed.
+                    # #446: a modern stdio client handles `input_required`
+                    # itself and already sends the full per-request `_meta`,
+                    # so its lines skip both the MRTR bridge and the
+                    # injection below, which would otherwise replace its
+                    # declared capabilities with the (never captured,
+                    # hence empty) legacy-handshake ones.
+                    client_modern, _ = _client_meta_protocol_version(line)
                     mrtr_eligible = (
                         req_has_id
                         and _is_scalar_id(req_id)
                         and unsafe_method in _MRTR_SUPPORTED_METHODS
+                        and not client_modern
                     )
                     # Every other request/notification carries the modern
                     # per-request _meta block (protocol version, client
@@ -8798,7 +9048,18 @@ def run(
                     # `line` variable) automatically sends the meta-injected
                     # body — no separate threading of the injected content
                     # through the recovery branches.
-                    line = _inject_modern_meta(line, modern_state)
+                    if not client_modern:
+                        line = _inject_modern_meta(line, modern_state)
+                    # #446: a client-originated subscriptions/listen never
+                    # ends on its own, so it runs on its own thread and the
+                    # loop moves straight on to the next stdin line.
+                    if (
+                        unsafe_method == _LISTEN_METHOD
+                        and req_has_id
+                        and _is_scalar_id(req_id)
+                    ):
+                        _start_client_listen(line, req_id)
+                        continue
                     # #270 Phase 2 PR D: this line has survived every
                     # id-intake guard and is about to go upstream, so it
                     # is now the one request a cancel may abort. Published
@@ -9300,6 +9561,11 @@ def run(
         for stream in (listen_stream, res_stream):
             if stream.thread is not None:
                 stream.thread.join(timeout=1.0)
+        # #446: the client's own listen streams, the same stop-then-close-
+        # then-join order (their `aborted` event is the stop).
+        if client_listens is not None:
+            for thread in client_listens.abort_all():
+                thread.join(timeout=1.0)
         # The cold-start daemon self-exits after one OAuth attempt; briefly join
         # it so a clean shutdown does not race its final emit. daemon=True keeps
         # process exit unblocked if it is still parked in the interactive flow.
