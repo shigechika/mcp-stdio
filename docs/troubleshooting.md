@@ -182,8 +182,12 @@ than guessing.
 
 **If you are connecting to a remote server with mcp-stdio**, you did not
 cause this: mcp-stdio builds those headers itself and keeps them
-consistent. Something between you and the server is rewriting them —
-usually a proxy or an API gateway. Try connecting without it to confirm.
+consistent — including the `Mcp-Param-*` headers a tool asks for with
+`x-mcp-header`. On a `-32020` for a tool call it re-lists the tools once
+and retries, so a server whose tool list just changed recovers on its own.
+If the error still reaches you, something between you and the server is
+rewriting the headers — usually a proxy or an API gateway. Try connecting
+without it to confirm.
 
 **If you are running `mcp-stdio serve`** and a client gets this, that
 client is sending inconsistent requests; the error message names which

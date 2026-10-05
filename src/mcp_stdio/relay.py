@@ -18,7 +18,7 @@ import time
 import zlib
 from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urljoin, urlsplit
 from urllib.request import parse_http_list, parse_keqv_list
 
@@ -570,6 +570,11 @@ _RELAY_ID_NAMESPACE = "mcp-stdio/"
 # second.
 _MRTR_ID_PREFIX = f"{_RELAY_ID_NAMESPACE}mrtr/"
 _MRTR_RETRY_ID_PREFIX = f"{_RELAY_ID_NAMESPACE}mrtr-retry/"
+# #459: the relay-minted `tools/list` the -32020 rung re-lists with. Its
+# answer is consumed by the relay and never reaches stdout.
+_PARAM_ID_PREFIX = f"{_RELAY_ID_NAMESPACE}param/"
+# JSON-RPC `HeaderMismatch` (spec rev 2026-07-28).
+_HEADER_MISMATCH = -32020
 # Round cap per transaction (design change 4). An InputRequiredResult that
 # carries ONLY ``requestState`` is legal ("Servers MUST include at least one
 # of inputRequests or requestState") and the client "MAY retry the original
@@ -619,9 +624,8 @@ def _mrtr_strip_enabled() -> bool:
 # `params.uri` for resources/read) into `Mcp-Name`. Sent ONLY on the modern
 # path — see the module docstring above and _prepare_headers in run().
 # `x-mcp-header` / `Mcp-Param-{Name}` (custom per-tool headers mirrored from
-# `inputSchema` annotations) is a separate, materially larger feature — it
-# requires caching each tool's schema from `tools/list` responses to know
-# which call arguments to mirror — and is deliberately out of scope here.
+# `inputSchema` annotations) needs each tool's schema from `tools/list`, so it
+# lives in its own block below (`_scan_x_mcp_headers` and friends, #459).
 #
 # Batches: MCP removed JSON-RPC batching in spec rev 2025-06-18, and a batch
 # has no single top-level `method` to mirror, so `_extract_method_and_name`
@@ -660,6 +664,13 @@ def _extract_method_and_name(line: str) -> tuple[str | None, str | None]:
         return method, None
     value = params.get(name_key)
     return method, value if isinstance(value, str) else None
+
+
+def _is_method(line: str, method: str) -> bool:
+    """Whether ``line`` is a JSON-RPC message for ``method`` (substring-gated)."""
+    if f'"{method}"' not in line:
+        return False
+    return _extract_method_and_name(line)[0] == method
 
 
 _BASE64_SENTINEL_RE = re.compile(r"\A=\?base64\?.*\?=\Z", re.DOTALL)
@@ -701,6 +712,12 @@ def _encode_mcp_name(value: str) -> str:
     """
     if _is_header_safe_ascii(value) and not _BASE64_SENTINEL_RE.match(value):
         return value
+    return _base64_sentinel(value)
+
+
+def _base64_sentinel(value: str) -> str:
+    """``=?base64?{Base64(UTF-8)}?=`` — the one spec-defined escape, shared by
+    ``Mcp-Name`` and ``Mcp-Param-{Name}`` (only their "plain" tests differ)."""
     encoded = base64.b64encode(value.encode("utf-8")).decode("ascii")
     return f"=?base64?{encoded}?="
 
@@ -802,6 +819,212 @@ def _mcp_request_headers(line: str) -> dict[str, str]:
     return headers
 
 
+# --- x-mcp-header -> Mcp-Param-{Name} (spec rev 2026-07-28, SEP-2243, #459) ---
+#
+# A server may annotate a tool's ``inputSchema`` property with
+# ``"x-mcp-header": "<Name>"``; a client MUST then mirror that argument into
+# an ``Mcp-Param-<Name>`` header on every ``tools/call`` (python-sdk v2
+# servers reject a missing one with ``-32020``), and MUST exclude a tool
+# whose annotations are invalid from the ``tools/list`` it exposes. The
+# rules below are the final spec text, cross-checked with the conformance
+# suite (which, unlike the TS SDK, rejects ``number``-typed annotations).
+# These helpers are pure; the cache and the wiring live in run().
+
+_X_MCP_HEADER_KEY = "x-mcp-header"
+_MCP_PARAM_HEADER_PREFIX = "Mcp-Param-"
+# RFC 9110 ``tchar``; used with ``fullmatch`` (``$`` would accept a trailing
+# newline, which is exactly the kind of value this exists to refuse).
+_MCP_PARAM_TCHAR_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+_MCP_PARAM_TYPES = frozenset({"string", "integer", "boolean"})
+# Subschema keywords an annotation must NOT sit under: the property is then
+# not "statically reachable" through ``properties`` keys alone. They are
+# still walked (with reachable=False) so an annotation there is DETECTED and
+# rejects the tool instead of being silently ignored. ``$ref`` is never
+# followed. Keywords whose value is a map of NAME -> subschema:
+_MCP_PARAM_SCHEMA_MAP_KEYWORDS = frozenset(
+    {"patternProperties", "dependentSchemas", "$defs", "definitions"}
+)
+_MCP_PARAM_UNREACHABLE_KEYWORDS = (
+    "items",
+    "prefixItems",
+    "contains",
+    "additionalProperties",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+    "propertyNames",
+    "patternProperties",
+    "dependentSchemas",
+    "oneOf",
+    "anyOf",
+    "allOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    "$defs",
+    "definitions",
+)
+# A tool schema is server-supplied input: bound the walk so a hostile or
+# pathological one cannot exhaust the relay. Generous — real catalogs
+# (GitHub's) carry large schemas — and exceeding either rejects the tool,
+# the spec-safe outcome.
+_MCP_PARAM_MAX_DEPTH = 64
+_MCP_PARAM_MAX_NODES = 10_000
+# Integer values must be within the JavaScript safe range (spec).
+_MCP_PARAM_MAX_SAFE_INT = 2**53 - 1
+
+
+class _McpParamDecl(NamedTuple):
+    """One valid ``x-mcp-header`` annotation of a tool's ``inputSchema``."""
+
+    path: tuple[str, ...]  # chain of ``properties`` keys from the root
+    header: str  # the annotation value, verbatim (declared case)
+    type: str  # "string" | "integer" | "boolean"
+
+
+def _scan_x_mcp_headers(input_schema: Any) -> tuple[_McpParamDecl, ...] | str:
+    """Collect a tool's ``x-mcp-header`` declarations, or say why it is invalid.
+
+    Returns the declarations (empty when the schema carries none — or is not
+    an object at all, which this feature has no opinion on), or a reason
+    string when the tool must be excluded from ``tools/list``. First fault
+    wins, in the conformance order: reachability, non-empty string, RFC 9110
+    ``tchar``, a primitive ``type`` (exactly ``string``/``integer``/
+    ``boolean``: ``number``, a type array and a missing type are invalid),
+    then case-insensitive uniqueness. Iterative, depth- and node-bounded.
+    """
+    if not isinstance(input_schema, dict):
+        return ()
+    decls: list[_McpParamDecl] = []
+    seen: set[str] = set()
+    stack: list[tuple[Any, tuple[str, ...], bool, int]] = [(input_schema, (), True, 0)]
+    nodes = 0
+    while stack:
+        node, path, reachable, depth = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        nodes += 1
+        if nodes > _MCP_PARAM_MAX_NODES:
+            return "schema too large"
+        if depth > _MCP_PARAM_MAX_DEPTH:
+            return "schema too deeply nested"
+        if _X_MCP_HEADER_KEY in node:
+            name = node[_X_MCP_HEADER_KEY]
+            if not reachable or not path:
+                return "x-mcp-header on a property that is not statically reachable"
+            if not isinstance(name, str) or not name:
+                return "x-mcp-header must be a non-empty string"
+            if not _MCP_PARAM_TCHAR_RE.fullmatch(name):
+                return f"x-mcp-header {name!r} is not an HTTP field-name token"
+            ptype = node.get("type")
+            if not (isinstance(ptype, str) and ptype in _MCP_PARAM_TYPES):
+                return (
+                    f"x-mcp-header {name!r} must be on a string, integer or "
+                    f"boolean property"
+                )
+            if name.lower() in seen:
+                return f"x-mcp-header {name!r} is not unique (case-insensitive)"
+            seen.add(name.lower())
+            decls.append(_McpParamDecl(path, name, ptype))
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            for key, sub in properties.items():
+                stack.append((sub, (*path, key), reachable, depth + 1))
+        for keyword in _MCP_PARAM_UNREACHABLE_KEYWORDS:
+            value = node.get(keyword)
+            if isinstance(value, dict) and keyword in _MCP_PARAM_SCHEMA_MAP_KEYWORDS:
+                subs: Iterable[Any] = value.values()
+            elif isinstance(value, dict):
+                subs = (value,)
+            elif isinstance(value, list):
+                subs = value
+            else:
+                continue
+            for sub in subs:
+                stack.append((sub, path, False, depth + 1))
+    return tuple(decls)
+
+
+def _mcp_param_text(value: Any) -> str | None:
+    """Render an argument for ``Mcp-Param-*``, or None to omit the header.
+
+    Rendered from the RUNTIME type, not the declared one: the server compares
+    the header against the body value, so a header omitted for a value of an
+    unexpected type is a guaranteed ``-32020``. JSON ``42.0`` / ``4.2e1``
+    decode as float; an integral finite float renders as its integer. Out of
+    the JavaScript safe range, ``None`` and non-primitives are omitted.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value) if abs(value) <= _MCP_PARAM_MAX_SAFE_INT else None
+    if isinstance(value, float):
+        if math.isfinite(value) and value.is_integer():
+            as_int = int(value)
+            if abs(as_int) <= _MCP_PARAM_MAX_SAFE_INT:
+                return str(as_int)
+        return None
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def _is_mcp_param_plain(value: str) -> bool:
+    """True when a ``Mcp-Param-*`` value can ride verbatim.
+
+    Stricter than ``_is_header_safe_ascii`` (which ``Mcp-Name`` keeps): an
+    empty value is encoded (``=?base64??=``; an empty header may be dropped
+    by an intermediary) and so is a tab anywhere (a control character).
+    Visible ASCII plus interior spaces only, and never a value that already
+    looks like the sentinel.
+    """
+    if not value or value[0] == " " or value[-1] == " ":
+        return False
+    if not all(c == " " or 0x21 <= ord(c) <= 0x7E for c in value):
+        return False
+    return not _BASE64_SENTINEL_RE.match(value)
+
+
+def _encode_mcp_param_value(value: str) -> str:
+    """Spec rev 2026-07-28 Value Encoding for one ``Mcp-Param-*`` value."""
+    return value if _is_mcp_param_plain(value) else _base64_sentinel(value)
+
+
+def _build_mcp_param_headers(
+    decls: Iterable[_McpParamDecl], arguments: Any
+) -> dict[str, str]:
+    """``Mcp-Param-*`` headers for one ``tools/call``'s ``arguments``.
+
+    Reads each declaration's exact property path; an absent value, ``null``,
+    a non-object ``arguments`` or a non-object step on the path omits that
+    header (spec: "If no value is present at that path ... the header is
+    omitted"). Never raises on malformed input.
+    """
+    if not isinstance(arguments, dict):
+        return {}
+    headers: dict[str, str] = {}
+    for decl in decls:
+        value: Any = arguments
+        for key in decl.path:
+            if not isinstance(value, dict) or key not in value:
+                value = None
+                break
+            value = value[key]
+        text = _mcp_param_text(value)
+        if text is not None:
+            headers[_MCP_PARAM_HEADER_PREFIX + decl.header] = _encode_mcp_param_value(
+                text
+            )
+    return headers
+
+
+_TOOLS_LIST_CHANGED_RE = re.compile(
+    r'"method"\s*:\s*"notifications/tools/list_changed"'
+)
+
+
 _SET_LEVEL_METHOD_RE = re.compile(r'"method"\s*:\s*"logging/setLevel"')
 
 
@@ -879,6 +1102,126 @@ def _negotiate_modern_version(requested: str | None, supported: list[str]) -> st
     if requested and requested in _RELAY_IMPLEMENTED_MODERN_VERSIONS:
         return requested
     return _MODERN_PROTOCOL_VERSION_DEFAULT
+
+
+class _ToolHeaderCache:
+    """Per-session ``x-mcp-header`` declarations, learned from ``tools/list``.
+
+    #459. Fed by the ``tools/list`` responses the client already receives
+    (and by the ``-32020`` rung's relay-minted re-list), read by
+    ``_prepare_headers`` for every ``tools/call``. Holds only VALID tools; a
+    tool with an invalid annotation is dropped from the list the client sees
+    (spec MUST) and is absent here.
+
+    Its own lock, not a ``_ModernState`` slot: ``invalidate`` is called from
+    the listen daemon threads when a ``notifications/tools/list_changed``
+    passes, which ``_ModernState``'s no-lock single-mutator invariant forbids.
+    ``generation`` lets a re-list detect an invalidation that landed while it
+    was in flight, so a stale catalog is never committed over it.
+    """
+
+    # Bound on the once-per-(tool, reason) warning set, so a server that keeps
+    # renaming broken tools cannot grow it without limit. Past the cap the
+    # relay stays SILENT about new pairs (still excluding the tools): a
+    # thousand distinct warnings already make the point, and warning on
+    # every re-list from then on would flood stderr.
+    _WARNED_CAP = 1000
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_tool: dict[str, tuple[_McpParamDecl, ...]] = {}
+        self._generation = 0
+        self._warned: set[tuple[str, str]] = set()
+
+    def _scan_locked(self, tools: list[Any]) -> tuple[list[Any], dict[str, Any]]:
+        kept: list[Any] = []
+        valid: dict[str, tuple[_McpParamDecl, ...]] = {}
+        for tool in tools:
+            name = tool.get("name") if isinstance(tool, dict) else None
+            if not isinstance(name, str):
+                kept.append(tool)
+                continue
+            result = _scan_x_mcp_headers(tool.get("inputSchema"))
+            if isinstance(result, str):
+                key = (name, result)
+                if key not in self._warned and len(self._warned) < self._WARNED_CAP:
+                    self._warned.add(key)
+                    log(
+                        f"warning: excluding tool {name!r} from tools/list: "
+                        f"invalid x-mcp-header declaration — {result}"
+                    )
+                continue
+            kept.append(tool)
+            valid[name] = result
+        return kept, valid
+
+    def update(self, tools: list[Any]) -> list[Any]:
+        """Learn from a PARTIAL list (one page, or a truncated merge).
+
+        Upserts the valid tools it sees and never forgets unseen ones.
+        Returns the list to show the client: the SAME object when nothing
+        was dropped, so callers can emit the original bytes untouched.
+        """
+        with self._lock:
+            kept, valid = self._scan_locked(tools)
+            self._by_tool.update(valid)
+        return tools if len(kept) == len(tools) else kept
+
+    def replace(self, tools: list[Any]) -> list[Any]:
+        """Like ``update``, for a COMPLETE catalog: forgets every tool not in it."""
+        with self._lock:
+            kept, valid = self._scan_locked(tools)
+            self._by_tool = valid
+        return tools if len(kept) == len(tools) else kept
+
+    def declarations_for(self, name: Any) -> tuple[_McpParamDecl, ...]:
+        if not isinstance(name, str):
+            return ()
+        with self._lock:
+            return self._by_tool.get(name, ())
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._by_tool = {}
+            self._generation += 1
+
+    @property
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
+
+    def commit_if_current(
+        self, generation: int, tools: list[Any], *, complete: bool
+    ) -> bool:
+        """Commit a relay-minted re-list unless an invalidation intervened."""
+        with self._lock:
+            if self._generation != generation:
+                return False
+            _, valid = self._scan_locked(tools)
+            if complete:
+                self._by_tool = valid
+            else:
+                self._by_tool.update(valid)
+            return True
+
+    def observe(self, payload: str) -> None:
+        """Invalidate when ``payload`` is a ``tools/list_changed`` notification.
+
+        Called for every frame that passes on a stream, so a regex pre-gate
+        keeps the common case to one search; JSON is parsed only on a hit.
+        """
+        if not _TOOLS_LIST_CHANGED_RE.search(payload):
+            return
+        try:
+            msg = json.loads(payload)
+        except (json.JSONDecodeError, ValueError, RecursionError):
+            return
+        if (
+            isinstance(msg, dict)
+            and msg.get("method") == "notifications/tools/list_changed"
+            and "id" not in msg
+        ):
+            self.invalidate()
 
 
 class _ModernState:
@@ -3046,6 +3389,7 @@ class _StreamResult:
         "protocol_version",
         "retry_after",
         "aborted",
+        "error_response",
     )
 
     def __init__(
@@ -3057,6 +3401,7 @@ class _StreamResult:
         retry_after: float | None = None,
         *,
         aborted: bool = False,
+        error_response: dict[str, Any] | None = None,
     ):
         self.session_id = session_id
         self.status_code = status_code
@@ -3079,6 +3424,41 @@ class _StreamResult:
         # re-POSTing a cancelled ``tools/call`` MAX_RETRIES times and the
         # 401/403/404 recovery ladder from re-dispatching it.
         self.aborted = aborted
+        # #459: the JSON-RPC error a non-200 body carried for THIS request,
+        # parsed only when the caller asked (``capture_error``) — the
+        # ``-32020`` rung keys on it. None otherwise, and always on the
+        # default legacy era, whose non-200 bodies stay unparsed.
+        self.error_response = error_response
+
+    @property
+    def error_code(self) -> int | None:
+        error = self.error_response.get("error") if self.error_response else None
+        code = error.get("code") if isinstance(error, dict) else None
+        return code if isinstance(code, int) and not isinstance(code, bool) else None
+
+
+def _error_response_for(body: str, req_id: Any) -> dict[str, Any] | None:
+    """The JSON-RPC error response ``body`` carries for ``req_id``, or None.
+
+    #459. ``body`` is a non-200 response body already read (and bounded) by
+    ``_read_bounded``. Only ONE plain JSON object that is a pure error
+    response for exactly this id counts: a proxy's stale error for another
+    id must never drive a re-POST of a non-idempotent ``tools/call``. An
+    SSE-formatted or otherwise unparseable body is None (the caller's
+    generic path). ``RecursionError`` is caught: a deeply nested body is
+    server-controlled input and must not escape into the never-crash net.
+    """
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(parsed, dict) or "error" not in parsed or "result" in parsed:
+        return None
+    if "method" in parsed or "id" not in parsed or parsed["id"] != req_id:
+        return None
+    if type(parsed["id"]) is not type(req_id):  # 1 vs "1" vs True
+        return None
+    return parsed if isinstance(parsed.get("error"), dict) else None
 
 
 def _parse_auth_params(header: str | None) -> dict[str, str]:
@@ -3574,6 +3954,8 @@ def _post_and_stream(
     input_required_abort: Callable[[str], None] | None = None,
     abort: "threading.Event | None" = None,
     publish_response: Callable[["httpx.Response | None"], None] | None = None,
+    capture_error: bool = False,
+    observe: Callable[[str], None] | None = None,
 ) -> _StreamResult | None:
     """Send a POST and stream the response to stdout with retry.
 
@@ -3599,10 +3981,15 @@ def _post_and_stream(
     is still logged to stderr), matching the ``req_has_id`` gating in run().
 
     ``input_required_hook`` is the MRTR interception point (#270 Phase 2 PR
-    C, design change 1). It is passed ONLY by run()'s modern-era dispatch of
-    an MRTR-eligible request; every other caller (``_paginate_and_stream``'s
-    sibling ``_post_parsed``, ``_reinitialize``, run_sse, cold-start, and
-    the legacy era in its entirety) leaves it ``None``, which restores this
+    C, design change 1). It is passed by run()'s modern-era dispatch of an
+    MRTR-eligible request, and — its second use (#459) — for a modern-era
+    ``tools/list`` with ``x-mcp-header`` mirroring on (run()'s dispatch and
+    both of ``_paginate_and_stream``'s fallbacks), where it teaches the
+    tool-header cache and drops invalid tools: that hook always returns a
+    string, so it never swallows, and it comes without
+    ``input_required_abort``. Every other caller (``_post_parsed``,
+    ``_reinitialize``, run_sse, cold-start, and the legacy era in its
+    entirety) leaves it ``None``, which restores this
     function byte-for-byte — the interception CANNOT be "when dispatch
     returns", because a payload is committed to stdout the moment it is
     parsed off the stream, before any caller regains control. The hook is
@@ -3789,7 +4176,19 @@ def _post_and_stream(
                             f"(HTTP {resp.status_code})"
                         )
                         return _aborted_result()
-                    return _StreamResult(session, resp.status_code, www_auth)
+                    # #459: parse the already-read body only when asked
+                    # (the -32020 rung); a legacy-default non-200 stays
+                    # byte-for-byte the opaque status it always was.
+                    return _StreamResult(
+                        session,
+                        resp.status_code,
+                        www_auth,
+                        error_response=(
+                            _error_response_for(resp.text, req_id)
+                            if capture_error
+                            else None
+                        ),
+                    )
 
                 pv: str | None = None
                 content_type = resp.headers.get("content-type", "")
@@ -3808,6 +4207,8 @@ def _post_and_stream(
                         # to run()/run_sse()'s outer `except Exception` safety
                         # net, which swallows the re-raised write error: a dead
                         # reader cannot observe the truncated body anyway.
+                        if observe is not None:
+                            observe(payload)
                         if input_required_hook is not None:
                             replacement = input_required_hook(payload)
                             if replacement is None:
@@ -3822,6 +4223,8 @@ def _post_and_stream(
                     if text:
                         if capture_init:
                             pv = _extract_protocol_version(text)
+                        if observe is not None:
+                            observe(text)
                         # Same hook on the non-SSE branch: a modern server
                         # may answer with a bare JSON body, and an MRTR
                         # result arrives there just as legitimately.
@@ -4012,6 +4415,7 @@ def _post_parsed(
     tracker: "_CancelTracker | None" = None,
     has_id: bool = True,
     emit_error_on_failure: bool = True,
+    observe: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, Any] | None, _StreamResult | None]:
     """Send a POST and return the parsed JSON-RPC response.
 
@@ -4033,6 +4437,10 @@ def _post_parsed(
     result it already collected, so writing an error too would emit a
     SECOND JSON-RPC response for the same id. Page 1 keeps it True (no
     partial exists, so the error is the only response).
+
+    ``observe`` (#459) sees every interleaved non-response frame before it
+    is emitted, so a ``tools/list_changed`` riding this stream still
+    invalidates the ``x-mcp-header`` cache.
     """
     last_error: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -4103,6 +4511,8 @@ def _post_parsed(
                         # request / notification interleaved before the response) must
                         # be delivered, not dropped — _post_and_stream emits every
                         # message event, so the pagination path must too.
+                        if observe is not None:
+                            observe(payload)
                         _emit(payload, tracker)
                     return None, _StreamResult(session, 200)
 
@@ -4334,6 +4744,9 @@ def _paginate_and_stream(
     tracker: _CancelTracker | None = None,
     *,
     has_id: bool = True,
+    tool_cache: _ToolHeaderCache | None = None,
+    tools_list_hook: Callable[[str], str] | None = None,
+    observe: Callable[[str], None] | None = None,
 ) -> _StreamResult | None:
     """Transparently follow ``result.nextCursor`` and emit one merged response.
 
@@ -4346,12 +4759,27 @@ def _paginate_and_stream(
     handle 401 / 404 recovery just like a non-paginated request. Errors
     on page 2+ return the accumulated partial result rather than losing
     items already collected.
+
+    #459, when ``x-mcp-header`` mirroring is on: ``tool_cache`` learns the
+    merged ``tools`` list (``replace`` when complete, ``update`` when
+    truncated, which never forgets unseen tools) and drops tools with an
+    invalid annotation from what is emitted. ``tools_list_hook`` does the
+    same on both ``_post_and_stream`` fallbacks, and ``observe`` sees every
+    interleaved frame (``tools/list_changed`` invalidation).
     """
     try:
         request = json.loads(line)
     except json.JSONDecodeError:
         return _post_and_stream(
-            client, url, line, headers, req_id, tracker, has_id=has_id
+            client,
+            url,
+            line,
+            headers,
+            req_id,
+            tracker,
+            has_id=has_id,
+            input_required_hook=tools_list_hook,
+            observe=observe,
         )
 
     base_params = request.get("params")
@@ -4389,6 +4817,7 @@ def _paginate_and_stream(
             # response. Page>=2 flushes the partial below, so suppress the error
             # here to avoid a duplicate JSON-RPC response for the same id.
             emit_error_on_failure=(page == 1),
+            observe=observe,
         )
         if stream is None:
             if page == 1:
@@ -4422,7 +4851,15 @@ def _paginate_and_stream(
                 # invariant (mirrors the capture-init note in run()'s _dispatch)
                 # if the table ever grows to a non-idempotent method.
                 return _post_and_stream(
-                    client, url, line, headers, req_id, tracker, has_id=has_id
+                    client,
+                    url,
+                    line,
+                    headers,
+                    req_id,
+                    tracker,
+                    has_id=has_id,
+                    input_required_hook=tools_list_hook,
+                    observe=observe,
                 )
             log(
                 f"pagination: page {page} response not parseable, "
@@ -4534,6 +4971,12 @@ def _paginate_and_stream(
     # client can RESUME pagination itself instead of silently losing the tail.
     if truncated and pending_cursor:
         merged_result["nextCursor"] = pending_cursor
+
+    if tool_cache is not None and isinstance(merged_result.get(result_key), list):
+        tools = merged_result[result_key]
+        merged_result[result_key] = (
+            tool_cache.update(tools) if truncated else tool_cache.replace(tools)
+        )
 
     merged_response: dict[str, Any] = {
         "jsonrpc": request.get("jsonrpc", "2.0"),
@@ -5558,8 +6001,14 @@ def _listen_stream_loop(
     publish_response: Callable[[httpx.Response | None], None] | None = None,
     restart: threading.Event | None = None,
     label: str = "listen stream",
+    observe: Callable[[str], None] | None = None,
 ) -> None:
     """Reader thread: maintain the modern ``subscriptions/listen`` stream.
+
+    ``observe`` (#459) sees every message frame before it is handled —
+    including a ``tools/list_changed`` the forwarding gates then hold back,
+    which still means the catalog changed — so the ``x-mcp-header`` cache
+    is invalidated from this thread (``_ToolHeaderCache`` locks for it).
 
     ``client`` is this thread's own DEDICATED httpx client (#352 round-2
     finding 2) — never run()'s shared one. A read parked in
@@ -5861,6 +6310,8 @@ def _listen_stream_loop(
                                 return
                             if event_type != "message":
                                 continue
+                            if observe is not None:
+                                observe(data)
                             outcome = _handle_listen_message(
                                 data, listen_id, tracker, state, acked=acked
                             )
@@ -5898,6 +6349,8 @@ def _listen_stream_loop(
                     else:
                         _read_bounded(resp, client)
                         text = resp.text.strip()
+                        if text and observe is not None:
+                            observe(text)
                         # acked=False: a single-JSON-body 200 carries at
                         # most one message, which cannot have been preceded
                         # by an ack on the same attempt — so a list_changed
@@ -6808,6 +7261,7 @@ def _client_listen_loop(
     timeout: httpx.Timeout,
     aborted: threading.Event,
     on_exit: Callable[[], None],
+    observe: Callable[[str], None] | None = None,
 ) -> None:
     """Pass one client-originated ``subscriptions/listen`` through (#446).
 
@@ -6858,6 +7312,8 @@ def _client_listen_loop(
                     # already buffered when the stream was closed.
                     if aborted.is_set():
                         return
+                    if observe is not None:
+                        observe(payload)  # #459: list_changed invalidation
                     _emit(payload, tracker)
                     if _is_pure_response_for(payload, req_id):
                         # The final response ends the listen: stop reading,
@@ -6905,6 +7361,7 @@ def run(
     protocol_era: str = "legacy",
     listen_read_timeout: float = 300.0,
     max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
+    mcp_param_headers: str = "modern",
 ) -> None:
     """Run the stdio-to-HTTP relay loop.
 
@@ -7011,6 +7468,14 @@ def run(
             transient) and long-lived streams (the legacy SSE reader, the
             modern era's ``subscriptions/listen``) reconnect like any other
             dropped connection. See ``--max-message-size``.
+        mcp_param_headers: ``x-mcp-header`` → ``Mcp-Param-{Name}``
+            mirroring (spec rev 2026-07-28, SEP-2243, #459). ``"modern"``
+            (default) mirrors on a session that resolved to the modern era:
+            ``tools/list`` responses teach a ``_ToolHeaderCache`` (tools with
+            an invalid annotation are dropped from what the client sees),
+            every ``tools/call`` carries the headers, and a ``-32020`` for
+            the call triggers one re-list and one retry. ``"off"`` disables
+            all of it. No effect on the legacy era.
 
     Limitation — JSON-RPC batches: a top-level array (a batch) is
     treated like a notification for error synthesis. ``_extract_id_and_presence``
@@ -7259,6 +7724,13 @@ def run(
     else:
         era = "legacy"
 
+    # #459: x-mcp-header -> Mcp-Param-{Name} mirroring. Resolved once, here,
+    # after the era: None on the legacy era and under --mcp-param-headers
+    # off, which keeps every hook below uninstalled and the legacy wire
+    # byte-identical.
+    mirroring = mcp_param_headers == "modern" and era == "modern"
+    tool_cache = _ToolHeaderCache() if mirroring else None
+
     # --- modern era: true cancellation (#270 Phase 2 PR D) ---
     # The single cell a stdin cancel can act on, created ONLY on the modern
     # era: `None` on legacy means every `abort`/`publish_response` argument
@@ -7345,7 +7817,149 @@ def run(
         )
         cold_start_login = None
 
-    def _prepare_headers(line: str) -> dict[str, str]:
+    param_seq = 0
+
+    def _refresh_tool_header_cache(abort: "threading.Event | None") -> bool:
+        """Re-list tools for the -32020 rung (#459); True when committed.
+
+        A relay-minted, `_meta`-carrying `tools/list` (a strict modern server
+        rejects a body without it) under `_PARAM_ID_PREFIX`, following
+        `nextCursor` up to `MAX_LIST_PAGES`. `_post_parsed` returns the
+        answer instead of emitting it, so the client never sees it; frames
+        interleaved on that stream are the client's and are emitted as
+        usual. The catalog is committed only if no `tools/list_changed`
+        invalidated the cache meanwhile (`generation`); otherwise the cache
+        stays empty and the caller does not retry.
+        """
+        nonlocal param_seq
+        assert tool_cache is not None
+        generation = tool_cache.generation
+        tools: list[Any] = []
+        cursor: Any = None
+        complete = False
+        for _page in range(MAX_LIST_PAGES):
+            if _abort_requested(abort):
+                return False
+            param_seq += 1
+            minted_id = f"{_PARAM_ID_PREFIX}{param_seq}"
+            params: dict[str, Any] = {} if cursor is None else {"cursor": cursor}
+            minted = _inject_modern_meta(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": minted_id,
+                        "method": "tools/list",
+                        "params": params,
+                    }
+                ),
+                modern_state,
+            )
+            parsed, stream = _post_parsed(
+                client,
+                url,
+                minted,
+                _prepare_headers(minted),
+                minted_id,
+                tracker=tracker,
+                has_id=True,
+                emit_error_on_failure=False,
+                observe=tool_cache.observe,
+            )
+            if stream is None or stream.status_code != 200 or parsed is None:
+                log("re-list for Mcp-Param headers failed; not retrying the call")
+                return False
+            result = parsed.get("result")
+            page = result.get("tools") if isinstance(result, dict) else None
+            if not isinstance(page, list):
+                log("re-list for Mcp-Param headers returned no tools; not retrying")
+                return False
+            tools.extend(page)
+            cursor = result.get("nextCursor")
+            if not cursor:
+                complete = True
+                break
+        if not tool_cache.commit_if_current(generation, tools, complete=complete):
+            log("tool list changed during the Mcp-Param re-list; not retrying")
+            return False
+        return True
+
+    def _make_tools_list_hook(rid: Any) -> Callable[[str], str]:
+        """Hook for a streamed ``tools/list`` answer to ``rid`` (#459).
+
+        Teaches ``tool_cache`` from a single page (``update``: a page is
+        partial, so unseen tools are kept) and drops tools whose
+        ``x-mcp-header`` annotations are invalid. Returns the ORIGINAL
+        payload whenever nothing was dropped, so a clean catalog reaches the
+        client byte for byte; never returns None.
+        """
+
+        def hook(payload: str) -> str:
+            if tool_cache is None or '"tools"' not in payload:
+                return payload
+            try:
+                msg = json.loads(payload)
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                return payload
+            if not isinstance(msg, dict) or "id" not in msg:
+                return payload
+            if msg["id"] != rid or type(msg["id"]) is not type(rid):
+                return payload
+            result = msg.get("result")
+            tools = result.get("tools") if isinstance(result, dict) else None
+            if not isinstance(tools, list):
+                return payload
+            kept = tool_cache.update(tools)
+            if kept is tools:
+                return payload
+            result["tools"] = kept
+            return json.dumps(msg)
+
+        return hook
+
+    def _param_decls_for(line: str) -> tuple[_McpParamDecl, ...] | None:
+        """The cached declarations for a ``tools/call`` line's tool (#459).
+
+        None when mirroring is off or ``line`` is not a ``tools/call`` —
+        ``_prepare_headers`` then falls back to its own lookup.
+        """
+        if tool_cache is None or not _is_method(line, "tools/call"):
+            return None
+        try:
+            params = json.loads(line).get("params")
+        except (json.JSONDecodeError, ValueError, RecursionError, AttributeError):
+            return None
+        name = params.get("name") if isinstance(params, dict) else None
+        return tool_cache.declarations_for(name)
+
+    def _mcp_param_headers_for(
+        line: str, param_decls: tuple[_McpParamDecl, ...] | None
+    ) -> dict[str, str]:
+        """``Mcp-Param-*`` for a ``tools/call`` line (#459); ``{}`` otherwise.
+
+        A substring pre-gate keeps every other method to one ``in`` test;
+        only a ``tools/call`` line pays the parse.
+        """
+        if tool_cache is None or '"tools/call"' not in line:
+            return {}
+        try:
+            msg = json.loads(line)
+        except (json.JSONDecodeError, ValueError, RecursionError):
+            return {}
+        if not isinstance(msg, dict) or msg.get("method") != "tools/call":
+            return {}
+        params = msg.get("params")
+        if not isinstance(params, dict):
+            return {}
+        decls = (
+            param_decls
+            if param_decls is not None
+            else tool_cache.declarations_for(params.get("name"))
+        )
+        return _build_mcp_param_headers(decls, params.get("arguments"))
+
+    def _prepare_headers(
+        line: str, *, param_decls: tuple[_McpParamDecl, ...] | None = None
+    ) -> dict[str, str]:
         """Build per-request headers for ``line``.
 
         LEGACY era (the ``else`` branch below): session + protocol version,
@@ -7382,6 +7996,15 @@ def run(
         2025-06-18, so this is legacy-batch dead code territory; inventing
         a synthetic method value for a line with none would be worse than
         omitting the header).
+
+        ``Mcp-Param-{Name}`` (#459, modern era with mirroring on): every
+        pinned ``mcp-param-*`` is dropped by the same rule, then a
+        ``tools/call`` gets the headers its tool's ``x-mcp-header``
+        declarations derive from its ``arguments`` — from
+        ``tool_cache``, or from ``param_decls`` when the caller pins them
+        (an MRTR continuation reuses the set its opening call was sent
+        with). Under ``--mcp-param-headers off`` a pinned ``Mcp-Param-*``
+        rides untouched.
         """
         with headers_lock:
             h = dict(headers)
@@ -7405,6 +8028,11 @@ def run(
                 h["Mcp-Method"] = mcp_headers["Mcp-Method"]
             if "Mcp-Name" in mcp_headers:
                 h["Mcp-Name"] = mcp_headers["Mcp-Name"]
+            if tool_cache is not None:
+                h = {
+                    k: v for k, v in h.items() if not k.lower().startswith("mcp-param-")
+                }
+                h.update(_mcp_param_headers_for(line, param_decls))
             return h
         # session_id / protocol_version are mutated only by this (main) thread,
         # so they need no lock; only the shared ``headers`` object is contended.
@@ -7614,7 +8242,10 @@ def run(
         return capability, envelope
 
     def _mrtr_open_round(
-        client_id: Any, stored_line: str, result: dict[str, Any]
+        client_id: Any,
+        stored_line: str,
+        result: dict[str, Any],
+        param_decls: tuple[_McpParamDecl, ...] | None = None,
     ) -> None:
         """Record one ``InputRequiredResult`` and mint its requests.
 
@@ -7671,6 +8302,13 @@ def run(
                 # mismatch is -32020 HeaderMismatch on a compliant server
                 # (the same pinning PR A #352 applies to listen reconnects).
                 "pinned_version": _mrtr_pinned_version(stored_line),
+                # #459, same reasoning: every continuation carries the
+                # Mcp-Param set the opening call was sent with (snapshotted
+                # when it was POSTed), even if a tools/list_changed empties
+                # the cache before or while the user answers — a
+                # header-less retry would be a -32020 that throws their
+                # answers away.
+                "param_decls": param_decls,
                 "request_state": None,
                 "has_request_state": False,
                 "expected_keys": set(),
@@ -7824,7 +8462,7 @@ def run(
         net. ``round_opened`` is cleared per POST for the same reason: it
         must describe THIS POST's outcome, never the previous attempt's.
         """
-        retry_headers = _prepare_headers(retry_line)
+        retry_headers = _prepare_headers(retry_line, param_decls=txn.get("param_decls"))
         if txn["pinned_version"]:
             retry_headers = {
                 k: v
@@ -8254,7 +8892,10 @@ def run(
             )
 
     def _make_input_required_hook(
-        client_id: Any, upstream_id: Any, stored_line: str
+        client_id: Any,
+        upstream_id: Any,
+        stored_line: str,
+        param_decls: tuple[_McpParamDecl, ...] | None = None,
     ) -> Callable[[str], str | None]:
         """Build the per-POST MRTR interception hook (design change 1).
 
@@ -8262,8 +8903,9 @@ def run(
         ``upstream_id`` is the id THIS POST carried, which differs from N
         on a retry ("The JSON-RPC ``id`` MUST be different between the
         initial request and the retry" — MRTR client requirement 3).
-        A fresh hook per POST, so no state can leak between the up-to-four
-        dispatches one stdin line may make (initial + 401 + 403 + 404).
+        A fresh hook per POST, so no state can leak between the up-to-five
+        dispatches one stdin line may make (initial + 401 + 403 + 404 +
+        the #459 -32020 retry).
 
         Returns the line to emit, or ``None`` to swallow it. Anything that
         is not an ``input_required`` result for ``upstream_id`` is returned
@@ -8328,7 +8970,7 @@ def run(
                     return None
                 matched = True
             if result is not None:
-                _mrtr_open_round(client_id, stored_line, result)
+                _mrtr_open_round(client_id, stored_line, result, param_decls)
                 return None
             if is_match:
                 # #356 review R5F1: this payload is the terminal answer —
@@ -8509,6 +9151,7 @@ def run(
                 "timeout": listen_timeout,
                 "aborted": aborted,
                 "on_exit": lambda: client_listens.release(req_id, listen_client),
+                "observe": tool_cache.observe if tool_cache is not None else None,
             },
             name="mcp-stdio-client-listen",
             daemon=True,
@@ -8557,6 +9200,7 @@ def run(
                 "stop": listen_stream.stop,
                 "timeout": listen_timeout,
                 "state": listen_stream.state,
+                "observe": tool_cache.observe if tool_cache is not None else None,
             },
             daemon=True,
         )
@@ -8634,6 +9278,7 @@ def run(
                 "publish_response": subscriptions.publish_response,
                 "restart": res_stream.restart,
                 "label": "resource listen stream",
+                "observe": tool_cache.observe if tool_cache is not None else None,
             },
             daemon=True,
         )
@@ -8841,6 +9486,10 @@ def run(
                     # _discover_reseed (defined once, above the loop) gives
                     # the initialize branch its one-shot reseed retry
                     # (#350 review round 4).
+                    # #459: a client (re)initializing starts over and will
+                    # re-list; drop what the old session taught the cache.
+                    if tool_cache is not None and _is_initialize_request(line):
+                        tool_cache.invalidate()
                     handled, modern_reply = _handle_modern_special_method(
                         line,
                         req_id,
@@ -9101,6 +9750,9 @@ def run(
                         # behaviour — after which the per-line `finally`
                         # clears the cell. These are list methods; they are
                         # rarely the long calls a user reaches for escape on.
+                        # #459: only a TOOLS list feeds the x-mcp-header
+                        # cache; every list still lets `observe` see frames.
+                        learns = tool_cache is not None and detected[1] == "tools"
                         return _paginate_and_stream(
                             client,
                             url,
@@ -9110,6 +9762,13 @@ def run(
                             detected[1],
                             tracker,
                             has_id=req_has_id,
+                            tool_cache=tool_cache if learns else None,
+                            tools_list_hook=(
+                                _make_tools_list_hook(req_id) if learns else None
+                            ),
+                            observe=(
+                                tool_cache.observe if tool_cache is not None else None
+                            ),
                         )
                     # Any `initialize` request is a capture point — not just the
                     # first. A client-driven re-initialize that renegotiates a
@@ -9164,18 +9823,37 @@ def run(
                         capture_init=capture_init,
                         has_id=req_has_id,
                         # Fresh hook per POST (#270 PR C) — one stdin line
-                        # can dispatch up to four times through the
+                        # can dispatch up to five times through the
                         # recovery ladder, and each POST must intercept
                         # under its own id with no state carried over.
                         # None on every non-eligible line and on the whole
                         # legacy era.
+                        # #459: a client `tools/list` that carries its own
+                        # cursor reaches here, not the pagination branch; its
+                        # page teaches the x-mcp-header cache through the
+                        # same slot (never MRTR-eligible: `tools/list` is not
+                        # in _MRTR_SUPPORTED_METHODS, and the hook never
+                        # returns None, so it never swallows).
                         input_required_hook=(
-                            _make_input_required_hook(req_id, req_id, content)
+                            _make_input_required_hook(
+                                req_id,
+                                req_id,
+                                content,
+                                # #459: the Mcp-Param set THIS POST carries,
+                                # for the transaction it may open.
+                                param_decls=_param_decls_for(content),
+                            )
                             if mrtr_eligible
-                            else None
+                            else (
+                                _make_tools_list_hook(req_id)
+                                if tool_cache is not None
+                                and _is_method(content, "tools/list")
+                                else None
+                            )
                         ),
-                        # Always paired with the hook (#356 review R1F1): a
-                        # stream that breaks after a swallow must answer
+                        # Always paired with the MRTR hook (#356 review R1F1;
+                        # the #459 tools/list hook never swallows and needs
+                        # none): a stream that breaks after a swallow must answer
                         # through the transaction's abort funnel, not with a
                         # bare error that leaves the transaction alive to
                         # answer a second time.
@@ -9201,6 +9879,12 @@ def run(
                             in_flight.publish_response
                             if in_flight is not None
                             else None
+                        ),
+                        # #459: the -32020 rung needs the JSON-RPC error a
+                        # 400 carried; parsed only with mirroring on.
+                        capture_error=tool_cache is not None,
+                        observe=(
+                            tool_cache.observe if tool_cache is not None else None
                         ),
                     )
                     if result is not None and result.protocol_version:
@@ -9291,9 +9975,10 @@ def run(
                 # The downstream client retries at its own level. This bounded
                 # single attempt is deliberate: it avoids unbounded recovery loops.
                 #
-                # Worst case the same line is dispatched up to 4 times in one
-                # iteration (initial + 401-refresh + 403-step-up + 404-reinit, when
-                # each retry returns the next branch's status). That is safe only
+                # Worst case the same line is dispatched up to 5 times in one
+                # iteration (initial + 401-refresh + 403-step-up + 404-reinit +
+                # the #459 -32020 retry, when each retry returns the next
+                # branch's status). That is safe only
                 # because each prior dispatch returned a non-200 with NO body
                 # delivered to stdout — the at-most-once guard in _post_and_stream
                 # covers replay after a partial 200, not these distinct non-200
@@ -9449,6 +10134,61 @@ def run(
                 # reply on Streamable HTTP) — synthesize an error for it too, matching
                 # the empty-200 guard in _post_and_stream. A 202 to a NOTIFICATION
                 # (no id) stays correctly silent. See #11 and.
+                # #459: Mcp-Param HeaderMismatch — re-list once, retry once.
+                # A `tools/call` the server rejected with -32020 for THIS id
+                # (``error_response`` is only set for a pure JSON-RPC error
+                # envelope carrying this exact id) was refused by the
+                # endpoint's header validation BEFORE dispatch (python-sdk v2
+                # rejects before the handler; serve's ladder before
+                # `_dispatch_modern`), so re-POSTing it is safe although
+                # `tools/call` is not replay-safe (#444) — the same "non-200,
+                # nothing delivered" guarantee the 401/403 rungs rely on,
+                # plus the id correlation. Any 400 alone would NOT prove it:
+                # an intermediary could answer 400 after the origin ran the
+                # tool. A -32020 for an unrelated header (a modern client's
+                # own `_meta` mismatch) also lands here and costs one wasted
+                # re-list and retry, bounded to once per line. A 401/403 on
+                # the retry is not recovered (the "converse" rule above). The
+                # re-list publishes no response handle (`_post_parsed`, the
+                # `_InFlightPost` gap), so a cancel cannot cut a page short;
+                # it is honoured before each page and before the retry.
+                if (
+                    tool_cache is not None
+                    and req_has_id
+                    and result.status_code == 400
+                    and result.error_code == _HEADER_MISMATCH
+                    and _is_method(line, "tools/call")
+                ):
+                    param_abort = (
+                        in_flight.abort_event_for(req_id)
+                        if in_flight is not None
+                        else None
+                    )
+                    if _abort_requested(param_abort):
+                        continue
+                    log(
+                        "upstream rejected Mcp-Param headers (-32020); re-listing tools"
+                    )
+                    if _refresh_tool_header_cache(param_abort):
+                        if _abort_requested(param_abort):
+                            continue
+                        req_headers = _prepare_headers(line)
+                        result = _dispatch(line, req_headers)
+                        if result is None:
+                            continue
+                        if result.aborted:  # PR D — see the top-level arm.
+                            continue
+                    if (
+                        result.status_code == 400
+                        and result.error_code == _HEADER_MISMATCH
+                        and result.error_response is not None
+                    ):
+                        # Hand the client the server's own -32020 (one line,
+                        # re-serialised; cancel-gated through `_emit`) rather
+                        # than an opaque "HTTP 400".
+                        _emit(json.dumps(result.error_response), tracker)
+                        continue
+
                 req_202_hang = result.status_code == 202 and req_has_id
                 is_error = result.status_code >= 400 or req_202_hang
 

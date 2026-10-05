@@ -51,6 +51,7 @@ spec. See [Working with MCP 2026-07-28 servers](modes.md#protocol-eras).
 |------|---------|-------------|
 | `--protocol-era {legacy,modern,auto}` | `legacy` | How to talk to the remote server. `legacy` behaves exactly as before; `auto` asks the server once at startup and picks for you; `modern` skips the question when you already know it is a newer server. Ignored (with a warning) on `--transport sse` |
 | `--listen-read-timeout SEC` | `300` | How long to wait on a quiet notification connection before reconnecting. Only used against newer servers. Unlike `--sse-read-timeout`, `0` is not allowed — the connection always needs a timeout. Silently ignored on `--transport sse` |
+| `--mcp-param-headers {modern,off}` | `modern` | Mirror tool arguments a newer server marks with `x-mcp-header` into `Mcp-Param-*` headers, hide tools with invalid annotations, and recover from a `-32020` by re-listing once and retrying the call once. `off` disables all of it. Only used against newer servers (#459) |
 
 !!! note "What `--check` does and does not cover"
     `--check` confirms the server is reachable either way — if the older
@@ -173,7 +174,7 @@ mcp-stdio implements the following specifications:
 ### MCP (Model Context Protocol)
 
 - Streamable HTTP transport (current, spec rev 2025-06-18) — negotiated `MCP-Protocol-Version` is captured from `initialize` and sent on every subsequent request
-- Streamable HTTP transport, spec rev **2026-07-28** — capability discovery, per-request metadata and headers, session-less requests, cache hints on list results, the long-lived notification connection (both as a client and, in `serve`, for the listChanged trio and per-URI resource subscriptions), and mid-call requests back to the client. Opt in with `--protocol-era`; `serve` answers both revisions on one endpoint. Interoperability verified against python-sdk v2.0.0 in both directions
+- Streamable HTTP transport, spec rev **2026-07-28** — capability discovery, per-request metadata and headers (including `Mcp-Param-*` from `x-mcp-header`), session-less requests, cache hints on list results, the long-lived notification connection (both as a client and, in `serve`, for the listChanged trio and per-URI resource subscriptions), and mid-call requests back to the client. Opt in with `--protocol-era`; `serve` answers both revisions on one endpoint. Interoperability verified against python-sdk v2.0.0 in both directions
 - SSE transport (legacy, MCP 2024-11-05)
 - Client ID Metadata Documents (MCP 2025-11-25 draft extension) — see the OAuth section below
 

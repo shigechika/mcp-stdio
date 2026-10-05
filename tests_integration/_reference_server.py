@@ -46,7 +46,7 @@ from mcp.server.mcpserver import (
 from mcp.server.subscriptions import InMemorySubscriptionBus, ListenHandler
 from mcp.shared.subscriptions import ResourceUpdated
 from mcp.types import SubscriptionsListenRequestParams
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # The URI the subscribable resource is published under. Matching is
 # exact-string on the SDK side, so the test, the tool and the resource
@@ -185,6 +185,19 @@ def build_app() -> tuple[Any, dict[str, Any]]:
     def add(a: int, b: int) -> int:
         """Add two integers."""
         return a + b
+
+    @mcp.tool()
+    def region_op(
+        region: Annotated[str, Field(json_schema_extra={"x-mcp-header": "Region"})],
+    ) -> str:
+        """Echo a region the server also requires as `Mcp-Param-Region` (#459).
+
+        The `x-mcp-header` annotation makes python-sdk v2 reject a modern
+        `tools/call` that does not mirror `region` into the header
+        (`-32020 HeaderMismatch`), which is what `test_mcp_param_e2e.py`
+        drives the relay against.
+        """
+        return f"region {region}"
 
     @mcp.tool()
     async def guarded_op(

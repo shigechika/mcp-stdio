@@ -158,6 +158,10 @@ wondering what changed under the hood:
   instant as the request, a server that does all its work before it starts
   replying, and long paginated lists — and in those the reply is still
   discarded, so you never see a result you cancelled.
+- Tools whose server asks for an argument in a header (`x-mcp-header`)
+  get it: mcp-stdio learns each tool's request from the tool list and adds
+  the header to every call, so servers that insist on it (python-sdk v2)
+  accept the call. Tools whose annotations are invalid are hidden.
 - Clients that already speak the newer protocol themselves (Claude Code
   2.1.281 and later, for example) are passed through as they are: their
   own capabilities reach the server unchanged, and a long-lived

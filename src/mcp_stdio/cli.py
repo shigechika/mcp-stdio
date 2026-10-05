@@ -682,6 +682,22 @@ def _main() -> None:
         ),
     )
     parser.add_argument(
+        "--mcp-param-headers",
+        choices=["modern", "off"],
+        default="modern",
+        help=(
+            "Mirror tool arguments a server marks with x-mcp-header into "
+            "Mcp-Param-* request headers (MCP 2026-07-28; servers such as "
+            "python-sdk v2 reject a tools/call without them). 'modern' "
+            "(default) does it on a session that negotiated the 2026-07-28 "
+            "era: tools/list answers teach the relay each tool's "
+            "annotations, tools with invalid annotations are hidden, and a "
+            "-32020 HeaderMismatch triggers one re-list and one retry. "
+            "'off' disables all of it. No effect on a legacy session or on "
+            "--transport sse. See #459."
+        ),
+    )
+    parser.add_argument(
         "--max-message-size",
         type=_non_negative_int,
         default=_DEFAULT_MAX_MESSAGE_SIZE,
@@ -1119,6 +1135,7 @@ def _main() -> None:
             protocol_era=args.protocol_era,
             listen_read_timeout=args.listen_read_timeout,
             max_message_size=args.max_message_size,
+            mcp_param_headers=args.mcp_param_headers,
         )
 
 
