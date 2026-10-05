@@ -3941,7 +3941,9 @@ class TestMaxMessageSize:
         ("http://localhost:6274", "http://localhost:6274"),
         ("HTTPS://App.Example.COM:443", "https://app.example.com"),
         ("http://[::1]:80", "http://[::1]"),
-        ("https://app.example.com/", "https://app.example.com"),
+        ("https://app.example.com/", "https://app.example.com"),  # lone "/" ok
+        ("chrome-extension://ABCdef", "chrome-extension://abcdef"),
+        ("vscode-webview://1a2b3c", "vscode-webview://1a2b3c"),
     ],
 )
 def test_normalize_origin_canonical(value, expected):
@@ -3954,13 +3956,17 @@ def test_normalize_origin_canonical(value, expected):
         "null",
         "",
         "file://",
-        "ftp://app.example.com",
         "http://localhost@evil.example",  # userinfo (typescript-sdk#2489)
         "http://app.example.com/path",
         "http://app.example.com?q=1",
         "http://app.example.com#f",
         "http://app.example.com:99999",
         "http://app.example.com extra",
+        "\x00http://localhost",  # urlsplit would strip the control byte
+        "https://a\x00b.example",
+        "https://app.example.com\x7f",
+        "chrome-extension://",
+        "chrome-extension://x@y",
     ],
 )
 def test_normalize_origin_rejects(value):
@@ -3986,10 +3992,16 @@ def test_normalize_origin_rejects(value):
         (["null"], False),
         (["http://attacker.example:8080"], False),
         (["http://localhost", "http://localhost"], False),  # duplicated header
+        (["http://127.0.1.1:8000"], True),  # 127.0.0.0/8
+        (["http://app.localhost:3000"], True),  # *.localhost
+        (["http://localhost.:8080"], True),  # trailing dot
+        (["chrome-extension://allowed"], True),
+        (["chrome-extension://other"], False),
+        (["chrome-extension://localhost"], False),  # never the loopback rule
     ],
 )
 def test_origin_allowed(values, expected):
-    allowed = frozenset({"https://app.example.com"})
+    allowed = frozenset({"https://app.example.com", "chrome-extension://allowed"})
     assert server._origin_allowed(values, allowed) is expected
 
 
@@ -4062,7 +4074,7 @@ def test_public_url_origin_is_allowed_but_not_a_reflected_host():
             headers={"Origin": "https://gw.example.org"},
             timeout=10,
         )
-        assert ok.status_code != 403
+        assert ok.status_code == 201
     with _run(oauth=_provider()) as (base, _):
         # ...but without one, an Origin matching the (attacker-controlled)
         # Host is not.
@@ -4081,8 +4093,54 @@ def test_serve_main_bad_allow_origin(value):
         server.serve_main(["--allow-origin", value, "--", "true"])
 
 
-def test_serve_main_passes_normalized_allow_origin(monkeypatch):
+def test_serve_main_passes_allow_origin(monkeypatch):
     seen = {}
     monkeypatch.setattr(server, "serve", lambda command, **kw: seen.update(kw))
     server.serve_main(["--allow-origin", "HTTPS://App.Example.com:443", "--", "true"])
-    assert seen["allowed_origins"] == ["https://app.example.com"]
+    # Validated here, normalized once in build_server.
+    assert seen["allowed_origins"] == ["HTTPS://App.Example.com:443"]
+
+
+def test_serve_main_public_url_origin_without_oauth(monkeypatch):
+    """--public-url names the gateway's own origin even without the AS."""
+    seen = {}
+    monkeypatch.setattr(server, "serve", lambda command, **kw: seen.update(kw))
+    server.serve_main(
+        [
+            "--public-url",
+            "https://tools.example.com/x",
+            "--auth-token",
+            "t",
+            "--",
+            "true",
+        ]
+    )
+    assert seen["allowed_origins"] == ["https://tools.example.com"]
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Content-Length": "-1"},  # would be 400 before the Origin check
+        {"Content-Length": str(server._DEFAULT_MAX_MESSAGE_SIZE + 1)},  # 413
+    ],
+)
+def test_bad_origin_gets_403_before_body_checks(gateway, headers):
+    """The spec's 403 wins over the Content-Length 400/413 branches, and the
+    body is never read (the connection is closed instead)."""
+    import socket
+
+    url, _ = gateway
+    host, port = urlsplit(url).hostname, urlsplit(url).port
+    lines = [
+        "POST /mcp HTTP/1.1",
+        f"Host: {host}:{port}",
+        "Origin: http://attacker.example",
+        *(f"{k}: {v}" for k, v in headers.items()),
+        "",
+        "",
+    ]
+    with socket.create_connection((host, port), timeout=5) as sock:
+        sock.sendall("\r\n".join(lines).encode())
+        status = sock.recv(1024).split(b"\r\n", 1)[0]
+    assert b" 403 " in status

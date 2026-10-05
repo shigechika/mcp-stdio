@@ -77,10 +77,14 @@ a crossover.
 - Browser requests are checked against their `Origin` header (DNS-rebinding
   protection, #449): a web page that rebinds its own hostname to `127.0.0.1`
   cannot drive a loopback gateway, even one with no auth. Loopback origins
-  and the `--public-url` origin are accepted; add any other browser client's
-  origin with `--allow-origin https://app.example.com` (repeatable, exact
-  match). Anything else gets `403`. Clients that send no `Origin` — Claude
-  Code, Claude Desktop, the mcp-stdio relay, SDK clients — are unaffected.
+  (`localhost`, `*.localhost`, `127.0.0.0/8`, `[::1]`) and the `--public-url`
+  origin are accepted; add any other browser client's origin with
+  `--allow-origin https://app.example.com` or, for a browser extension,
+  `--allow-origin chrome-extension://<id>` (repeatable, exact match).
+  Anything else gets `403`. Clients that send no `Origin` — Claude Code,
+  Claude Desktop, the mcp-stdio relay, SDK clients — are unaffected.
+  `--allow-origin` only relaxes this check; serve sends no CORS headers, so a
+  browser client on another origin also needs a proxy that adds them.
 - Session handling is strict and lifecycle-correct: requests route by
   `Mcp-Session-Id` only (never by JSON-RPC request id), and each session has its
   own child. A fresh `initialize` mints a new session; an unknown or terminated

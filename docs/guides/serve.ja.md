@@ -79,11 +79,15 @@ spawn、切断か idle タイムアウトで破棄）、認証済みアイデン
 - ブラウザからのリクエストは `Origin` ヘッダーで検証します（DNS rebinding
   対策、#449）。自分のホスト名を `127.0.0.1` に向け直した Web ページから、
   ループバックのゲートウェイを操作することはできません（認証なしの場合でも）。
-  ループバックのオリジンと `--public-url` のオリジンは受け付けます。それ以外の
-  ブラウザのクライアントは `--allow-origin https://app.example.com` で追加して
-  ください（繰り返し指定可、完全一致）。それ以外には `403` を返します。
-  `Origin` を送らないクライアント（Claude Code、Claude Desktop、mcp-stdio の
-  relay、SDK のクライアント）には影響しません。
+  ループバックのオリジン（`localhost`、`*.localhost`、`127.0.0.0/8`、`[::1]`）と
+  `--public-url` のオリジンは受け付けます。それ以外のブラウザのクライアントは
+  `--allow-origin https://app.example.com`、ブラウザ拡張なら
+  `--allow-origin chrome-extension://<id>` で追加してください（繰り返し指定可、
+  完全一致）。それ以外には `403` を返します。`Origin` を送らないクライアント
+  （Claude Code、Claude Desktop、mcp-stdio の relay、SDK のクライアント）には
+  影響しません。`--allow-origin` はこの検証を緩めるだけで、serve は CORS
+  ヘッダーを返さないため、別オリジンのブラウザクライアントには CORS ヘッダーを
+  付けるプロキシも必要です。
 - セッション処理は厳密かつライフサイクル準拠です：リクエストは
   `Mcp-Session-Id` のみでルーティングされ（JSON-RPC のリクエスト id では
   相関しません）、各セッションは専用の子プロセスを持ちます。新しい

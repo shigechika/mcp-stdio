@@ -381,7 +381,8 @@ that the child's own runtime needs to start); `--allow-origin ORIGIN`
 (repeatable; a browser request whose `Origin` is not loopback, the
 `--public-url` origin, or one of these gets `403`, which closes the DNS
 rebinding path to a loopback gateway; requests without an `Origin` header,
-as non-browser MCP clients send them, are unaffected; #449); and for the embedded AS:
+as non-browser MCP clients send them, are unaffected; it adds no CORS
+headers; #449); and for the embedded AS:
 `--enable-oauth`, `--public-url URL` (pins the issuer; recommended behind a
 proxy), `--trusted-user-header HEADER`, `--dev-user USER` (insecure, testing
 only), `--access-token-ttl SECONDS`, `--allow-redirect-uri URL` (repeatable;

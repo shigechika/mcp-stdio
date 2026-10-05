@@ -373,7 +373,8 @@ open-gateway と共有 static-token principal は、いずれも本物の呼び�
 `--allow-origin ORIGIN`（繰り返し指定可。ブラウザからのリクエストで `Origin` が
 ループバック、`--public-url` のオリジン、ここで指定したもののいずれでもなければ
 `403` を返し、ループバックのゲートウェイへの DNS rebinding を防ぐ。`Origin`
-ヘッダーを送らないブラウザ以外の MCP クライアントには影響しない。#449）;
+ヘッダーを送らないブラウザ以外の MCP クライアントには影響しない。CORS ヘッダーは
+付けない。#449）;
 埋め込み AS 用: `--enable-oauth`、`--public-url URL`（issuer 固定・
 プロキシ背後で推奨）、`--trusted-user-header HEADER`、`--dev-user USER`
 （非セキュア・検証用）、`--access-token-ttl SECONDS`、`--allow-redirect-uri URL`
