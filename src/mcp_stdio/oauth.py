@@ -1361,12 +1361,16 @@ def refresh_access_token(
     *,
     resource: str | None = None,
     auth_method: str = "none",
+    scope: str | None = None,
 ) -> dict[str, Any]:
     """Refresh an access token.
 
     Args:
         resource: RFC 8707 resource indicator (the MCP server URL).
         auth_method: Token endpoint authentication method (RFC 6749 §2.3).
+        scope: The scope the cached token was granted (RFC 6749 §6 allows
+            re-sending it). Microsoft Entra ID rejects a refresh without it
+            (AADSTS90009) when the client is also the resource app.
 
     Returns the raw token response dict.
     """
@@ -1390,6 +1394,8 @@ def refresh_access_token(
             data["client_secret"] = client_secret
     if resource:
         data["resource"] = resource
+    if scope:
+        data["scope"] = scope
 
     with client.stream(
         "POST",
@@ -1580,6 +1586,7 @@ def refresh_cached_token(server_url: str, client: httpx.Client) -> TokenData | N
                 oauth_resource=oauth_resource,
             ),
             auth_method=auth_method,
+            scope=cached.scope,
         )
     except Exception as e:
         # Sanitise the interpolated exception text: today's reachable exceptions
@@ -1844,21 +1851,37 @@ def _run_authorization_flow(
         if scope:
             params["scope"] = scope
 
-        auth_url = f"{metadata.authorization_endpoint}?{urlencode(params)}"
-        # Log a STATE-REDACTED URL. The user still needs a clickable URL when the
-        # browser does not auto-open, but the single-use CSRF ``state`` nonce
-        # does not need to land in stderr — MCP host logs (Claude Desktop/Code)
-        # persist to files that may be shared in bug reports. The browser
-        # receives the full URL below; the PKCE secret (``code_verifier``) is
-        # never in the URL and the S256 ``code_challenge`` is public, so only
-        # ``state`` is worth redacting.
-        log_url = (
-            f"{metadata.authorization_endpoint}"
-            f"?{urlencode({**params, 'state': '<redacted>'})}"
-        )
-        log(f"authorize URL (open in browser if not auto-opened):\n{log_url}")
-
-        webbrowser.open(auth_url)
+        # RFC 6749 §3.1: the endpoint URI "MAY include a query component,
+        # which MUST be retained when adding additional query parameters"
+        # (e.g. Azure AD B2C's `?p=B2C_1_signin`), so append with `&` then.
+        sep = "&" if urlsplit(metadata.authorization_endpoint).query else "?"
+        auth_url = f"{metadata.authorization_endpoint}{sep}{urlencode(params)}"
+        try:
+            opened = webbrowser.open(auth_url)
+        except Exception:  # noqa: BLE001 — a broken browser hook must not abort the flow
+            opened = False
+        if opened:
+            # Log a STATE-REDACTED URL. The browser already has the full URL,
+            # and the single-use CSRF ``state`` nonce does not need to land in
+            # stderr — MCP host logs (Claude Desktop/Code) persist to files
+            # that may be shared in bug reports. The PKCE secret
+            # (``code_verifier``) is never in the URL and the S256
+            # ``code_challenge`` is public, so only ``state`` is redacted.
+            log_url = (
+                f"{metadata.authorization_endpoint}{sep}"
+                f"{urlencode({**params, 'state': '<redacted>'})}"
+            )
+            log(f"authorize URL (opened in your browser):\n{log_url}")
+        else:
+            # No browser (SSH, headless): the logged URL is the only way in,
+            # and a redacted ``state`` would fail the callback's CSRF check,
+            # so this one time the full URL is logged. ``state`` is single-use
+            # and dies with this flow.
+            log(
+                "could not open a browser; open this URL to authorize "
+                "(or use --oauth-device on a headless host):\n"
+                f"{auth_url}"
+            )
 
         def serve() -> None:
             while not done.is_set():

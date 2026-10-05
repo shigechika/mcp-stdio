@@ -6,6 +6,7 @@ import inspect
 import json
 import threading
 import time
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
@@ -1850,6 +1851,23 @@ class TestRefreshToken:
         req = httpx_mock.get_requests()[0]
         assert b"grant_type=refresh_token" in req.content
         assert b"refresh_token=rt123" in req.content
+        assert b"scope=" not in req.content  # omitted when unknown
+
+    def test_scope_is_sent_when_given(self, httpx_mock):
+        httpx_mock.add_response(
+            url="https://api.example.com/token", json={"access_token": "new_at"}
+        )
+        client = httpx.Client()
+        refresh_access_token(
+            "https://api.example.com/token",
+            "cid",
+            None,
+            "rt123",
+            client,
+            scope="api://app/.default offline_access",
+        )
+        sent = parse_qs(httpx_mock.get_requests()[0].content.decode())
+        assert sent["scope"] == ["api://app/.default offline_access"]
 
     def test_token_rotation(self, httpx_mock):
         """Server issues a new refresh_token (rotation)."""
@@ -2097,6 +2115,9 @@ class TestRefreshCachedToken:
         data = refresh_cached_token("https://api.example.com/mcp", client)
         assert data is not None and data.scope == "read write admin"
         assert load_token("https://api.example.com/mcp").scope == "read write admin"
+        # The refresh grant re-sent the cached scope (Entra AADSTS90009).
+        req = httpx_mock.get_requests()[0]
+        assert parse_qs(req.content.decode())["scope"] == ["read write admin"]
 
     def test_returns_none_when_no_cached_token(self, tmp_path, monkeypatch):
         store_file = tmp_path / "tokens.json"
@@ -5082,6 +5103,62 @@ class TestAuthorizationFlowFailurePaths:
         assert "state=%3Credacted%3E" in err
         assert real_state not in err
 
+    def test_authorize_endpoint_query_is_retained(self, monkeypatch):
+        """RFC 6749 §3.1: an endpoint query (Azure AD B2C `?p=...`) is kept and
+        the flow's parameters are appended with `&`, never a second `?`."""
+        opened: dict[str, str] = {}
+
+        def fake_open(url: str) -> bool:
+            opened["url"] = url
+            return True
+
+        monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", fake_open)
+        meta = OAuthMetadata(
+            authorization_endpoint="https://ex.com/authorize?p=B2C_1_signin",
+            token_endpoint="https://ex.com/token",
+        )
+        with pytest.raises(TimeoutError):
+            _run_authorization_flow(
+                "https://ex.com/mcp",
+                httpx.Client(),
+                metadata=meta,
+                cached=None,
+                client_id_override="cid",
+                timeout=0.3,
+            )
+        url = opened["url"]
+        assert url.count("?") == 1
+        q = parse_qs(urlparse(url).query)
+        assert q["p"] == ["B2C_1_signin"]
+        assert q["client_id"] == ["cid"]
+
+    @pytest.mark.parametrize("opener", ["false", "raises"])
+    def test_full_url_logged_when_no_browser_opens(self, monkeypatch, capsys, opener):
+        """With no browser (SSH, headless) the logged URL is the only way in,
+        so it must carry the real state; a redacted one fails the callback."""
+        seen: dict[str, str] = {}
+
+        def fake_open(url: str) -> bool:
+            seen["url"] = url
+            if opener == "raises":
+                raise RuntimeError("no browser hook")
+            return False
+
+        monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", fake_open)
+        with pytest.raises(TimeoutError):
+            _run_authorization_flow(
+                "https://ex.com/mcp",
+                httpx.Client(),
+                metadata=self.META,
+                cached=None,
+                client_id_override="cid",
+                timeout=0.3,
+            )
+        err = capsys.readouterr().err
+        assert seen["url"] in err
+        assert "redacted" not in err
+        assert "--oauth-device" in err
+
     def test_callback_error_with_matching_state_raises_oauth_error(self, monkeypatch):
         """A LEGITIMATE error callback echoes `state` (RFC 6749 §4.1.2.1) →
         surfaces the OAuth error, no code exchange. (: state is now
@@ -5204,14 +5281,17 @@ class TestAuthorizationFlowFailurePaths:
 
         monkeypatch.setattr("mcp_stdio.oauth.webbrowser.open", boom)
         client = httpx.Client()
-        with pytest.raises(RuntimeError, match="no browser available"):
+        # A raising browser hook no longer aborts the flow: the full URL is
+        # logged for the user to open by hand, and the flow waits for the
+        # callback until its deadline — then must still close the server.
+        with pytest.raises(TimeoutError):
             _run_authorization_flow(
                 "https://ex.com/mcp",
                 client,
                 metadata=self.META,
                 cached=None,
                 client_id_override="cid",  # skip DCR; reach the webbrowser step
-                timeout=5,
+                timeout=0.3,
             )
         assert closed, "callback server was not closed on the webbrowser failure"
 
