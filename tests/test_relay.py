@@ -21610,3 +21610,54 @@ class TestRunMcpParamHeadersAlways:
         )
         call = httpx_mock.get_requests()[-1]
         assert call.headers["mcp-param-owner"] == "octo"
+
+    def test_unicode_escaped_method_still_gets_the_header(self, httpx_mock):
+        self._initialize(httpx_mock)
+        httpx_mock.add_response(
+            url=self.URL,
+            json={"jsonrpc": "2.0", "id": 2, "result": {"tools": [self.TOOL]}},
+        )
+        httpx_mock.add_response(
+            url=self.URL, json={"jsonrpc": "2.0", "id": 3, "result": {"content": []}}
+        )
+        escaped = (
+            '{"jsonrpc":"2.0","id":3,"method":"tools/\\u0063all",'
+            '"params":{"name":"get_file","arguments":{"owner":"octo"}}}'
+        )
+        self._run(
+            [
+                self._line(1, "initialize", {"protocolVersion": "2025-11-25"}),
+                self._line(2, "tools/list"),
+                escaped,
+            ],
+            mcp_param_headers="always",
+        )
+        assert httpx_mock.get_requests()[-1].headers["mcp-param-owner"] == "octo"
+
+    def test_initialize_answered_with_an_error_keeps_the_cache(self, httpx_mock):
+        self._initialize(httpx_mock)
+        httpx_mock.add_response(
+            url=self.URL,
+            json={"jsonrpc": "2.0", "id": 2, "result": {"tools": [self.TOOL]}},
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            json={"jsonrpc": "2.0", "id": 4, "error": {"code": -32603, "message": "x"}},
+        )
+        httpx_mock.add_response(
+            url=self.URL, json={"jsonrpc": "2.0", "id": 3, "result": {"content": []}}
+        )
+        self._run(
+            [
+                self._line(1, "initialize", {"protocolVersion": "2025-11-25"}),
+                self._line(2, "tools/list"),
+                self._line(4, "initialize", {"protocolVersion": "2025-11-25"}),
+                self._line(
+                    3,
+                    "tools/call",
+                    {"name": "get_file", "arguments": {"owner": "octo"}},
+                ),
+            ],
+            mcp_param_headers="always",
+        )
+        assert httpx_mock.get_requests()[-1].headers["mcp-param-owner"] == "octo"

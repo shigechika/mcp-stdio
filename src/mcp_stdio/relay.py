@@ -8035,8 +8035,9 @@ def run(
         Parsed whenever mirroring is on: a substring pre-gate would miss a
         serializer that escapes ``/`` (``"tools\\/call"``).
         """
-        # "call" survives JSON's "/" escaping, so this cheap gate is safe.
-        if tool_cache is None or "call" not in line:
+        # "call" survives JSON's "/" escaping; a line with any "\u" escape
+        # (which could spell the method otherwise) is always parsed.
+        if tool_cache is None or ("call" not in line and "\\u" not in line):
             return {}
         try:
             msg = json.loads(line)
@@ -10346,6 +10347,7 @@ def run(
                     tool_cache is not None
                     and era == "legacy"
                     and not is_error
+                    and result.protocol_version  # an InitializeResult, not an error
                     and _is_initialize_request(line)
                 ):
                     tool_cache.invalidate()
