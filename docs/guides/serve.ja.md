@@ -62,7 +62,7 @@ spawn、切断か idle タイムアウトで破棄）、認証済みアイデン
 | こうしたい | こうする |
 |---|---|
 | Claude.ai カスタムコネクタ（ブラウザベースのクライアント） | `--allow-redirect-uri https://claude.ai/api/mcp/auth_callback` |
-| 1 ホストに複数バックエンド | バックエンドごとに serve プロセスを分け、パススコープ issuer を使う：`--public-url https://mcp.example.com/team-a`、`…/team-b`——AS エンドポイントと well-known もプレフィックス配下に収まります |
+| 1 ホストに複数バックエンド | バックエンドごとに serve プロセスを分け、パススコープ issuer を使う：`--public-url https://mcp.example.com/team-a`、`…/team-b`——AS エンドポイントと well-known もプレフィックス配下に収まります。claude.ai のカスタムコネクタには使えません。claude.ai は現在、パスがちょうど `/mcp` でないエンドポイントには MCP のリクエストを送らないため（[anthropics/claude-ai-mcp#878](https://github.com/anthropics/claude-ai-mcp/issues/878)、[#738](https://github.com/anthropics/claude-ai-mcp/issues/738)）、その場合はバックエンドごとにホスト名を分けてください |
 | 同時ユーザー数の上限 | `--max-sessions N`（既定 100。超過した `initialize` は `503`） |
 | OAuth の代わりに静的トークン | `--enable-oauth` を外して `MCP_STDIO_SERVE_TOKEN` を設定 |
 | アクセストークンの寿命を調整 | `--access-token-ttl SECONDS`（既定 3600） |
