@@ -7886,8 +7886,12 @@ def run(
     ) -> bool:
         """Re-list tools for the -32020 rung (#459); True when committed.
 
-        A relay-minted, `_meta`-carrying `tools/list` (a strict modern server
-        rejects a body without it) under `_PARAM_ID_PREFIX`, following
+        A relay-minted `tools/list` under `_PARAM_ID_PREFIX` — on the modern
+        era `_meta`-carrying (a strict modern server rejects a body without
+        it); on a legacy session (`--mcp-param-headers always`) a plain
+        2025-era request with the session's headers, whose rotated
+        `Mcp-Session-Id` is adopted like any other successful response —
+        following
         `nextCursor` up to `MAX_LIST_PAGES`. `_post_parsed` returns the
         answer instead of emitting it, so the client never sees it; frames
         interleaved on that stream are the client's and are emitted as
@@ -7898,10 +7902,10 @@ def run(
         ``client_line`` is the rejected call of a #446 modern stdio client
         (None for a legacy client's): its `io.modelcontextprotocol/*` `_meta`
         (that client's own version and capabilities — a catalog may depend
-        on them) rides the re-list; otherwise the relay's own
+        on them) rides the re-list; otherwise (modern era) the relay's own
         `_inject_modern_meta`.
         """
-        nonlocal param_seq
+        nonlocal param_seq, session_id
         assert tool_cache is not None
         client_meta = _modern_client_meta(client_line) if client_line else None
         generation = tool_cache.generation
@@ -7938,6 +7942,12 @@ def run(
                 emit_error_on_failure=False,
                 observe=tool_cache.observe,
             )
+            if era == "legacy" and stream is not None and stream.session_id:
+                if stream.status_code == 200:
+                    # Same adoption rule as run()'s loop: only from a
+                    # successful response, so the next page and the retried
+                    # call carry the rotated id instead of a stale one.
+                    session_id = stream.session_id
             if stream is None or stream.status_code != 200 or parsed is None:
                 log("re-list for Mcp-Param headers failed; not retrying the call")
                 return False
@@ -8048,9 +8058,12 @@ def run(
         acceptance criterion #3 ("byte-identical" wire bytes against a
         legacy remote) hold structurally rather than by assertion. ``line``
         is ignored on this branch, except under ``--mcp-param-headers
-        always`` (#459), which adds the same ``Mcp-Param-*`` block as the
-        modern branch — opt-in, and only for a ``tools/call`` whose tool
-        declared ``x-mcp-header``.
+        always`` (#459), which applies the same ``Mcp-Param-*`` block as the
+        modern branch: opt-in, it ADDS headers only for a ``tools/call``
+        whose tool declared ``x-mcp-header``, and — the one change on every
+        request — drops any ``Mcp-Param-*`` pinned with ``-H`` (a pinned
+        value must not ride on a request that derives none; ``off`` keeps
+        it).
 
         MODERN era: per spec rev 2026-07-28 there is no ``Mcp-Session-Id`` at
         all (the relay's own ``session_id`` never gets set on this path — see

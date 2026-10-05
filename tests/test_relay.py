@@ -21545,3 +21545,39 @@ class TestRunMcpParamHeadersAlways:
         )
         call = httpx_mock.get_requests()[-1]
         assert "mcp-param-owner" not in call.headers
+
+    def test_legacy_relist_adopts_a_rotated_session(self, httpx_mock):
+        """#461 codex P2: the re-list's successful response rotates S1 -> S2;
+        the retried call must carry S2, not the stale S1."""
+        self._initialize(httpx_mock)
+        httpx_mock.add_response(
+            url=self.URL,
+            status_code=400,
+            json={
+                "jsonrpc": "2.0",
+                "id": 3,
+                "error": {"code": -32020, "message": "missing Mcp-Param-owner header"},
+            },
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            json={"jsonrpc": "2.0", "id": "x", "result": {"tools": [self.TOOL]}},
+            headers={"mcp-session-id": "S2"},
+        )
+        httpx_mock.add_response(
+            url=self.URL, json={"jsonrpc": "2.0", "id": 3, "result": {"content": []}}
+        )
+        self._run(
+            [
+                self._line(1, "initialize", {"protocolVersion": "2025-11-25"}),
+                self._line(
+                    3,
+                    "tools/call",
+                    {"name": "get_file", "arguments": {"owner": "octo"}},
+                ),
+            ],
+            mcp_param_headers="always",
+        )
+        retry = httpx_mock.get_requests()[-1]
+        assert retry.headers["mcp-session-id"] == "S2"
+        assert retry.headers["mcp-param-owner"] == "octo"
