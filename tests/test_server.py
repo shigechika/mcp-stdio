@@ -1224,6 +1224,7 @@ def _authorize(
     response_type="code",
     headers=None,
     drop=None,
+    resource=None,
 ):
     params = {
         "client_id": client_id,
@@ -1232,7 +1233,7 @@ def _authorize(
         "state": state,
         "code_challenge": challenge,
         "code_challenge_method": method,
-        "resource": base + "/mcp",
+        "resource": resource or base + "/mcp",
     }
     for k in drop or []:
         params.pop(k, None)
@@ -1255,7 +1256,7 @@ def _token(base, data):
     return httpx.post(base + "/token", data=data, timeout=10)
 
 
-def _authed_mcp(base, token, mid=1):
+def _authed_mcp(base, token, mid=1, path="/mcp"):
     """An authenticated MCP call with the given bearer token.
 
     Uses ``initialize`` so a valid token gets 200 (and opens a session) while
@@ -1263,17 +1264,19 @@ def _authed_mcp(base, token, mid=1):
     exactly the status distinction these tests assert.
     """
     return httpx.post(
-        base + "/mcp",
+        base + path,
         content=json.dumps({"jsonrpc": "2.0", "id": mid, "method": "initialize"}),
         headers={"Authorization": f"Bearer {token}"},
         timeout=10,
     )
 
 
-def _full_flow(base, redirect=_REDIRECT, headers=None):
+def _full_flow(base, redirect=_REDIRECT, headers=None, resource=None):
     cid = _register(base, redirect).json()["client_id"]
     verifier, challenge = client_oauth.generate_pkce()
-    az = _authorize(base, cid, challenge, redirect=redirect, headers=headers)
+    az = _authorize(
+        base, cid, challenge, redirect=redirect, headers=headers, resource=resource
+    )
     assert az.status_code == 302, az.text
     code = _redirect_params(az)["code"]
     tok = _token(
@@ -4183,10 +4186,23 @@ def test_idn_public_url_starts_without_guessing_its_origin(capsys):
 
 def test_mcp_path_is_case_insensitive(gateway):
     url, _ = gateway
-    base = url.rsplit("/mcp", 1)[0]
+    base = _base(url)
     sid, resp = _init(base + "/MCP")
     assert resp.status_code == 200 and sid
+    # GET and DELETE route through the same path check: an unknown session
+    # on /MCP is the session 404, not the wrong-path one, and DELETE works.
+    get = httpx.get(base + "/MCP", headers={"Mcp-Session-Id": "unknown"}, timeout=10)
+    assert get.status_code == 404 and "unknown or expired session" in get.text
+    gone = httpx.delete(base + "/MCP", headers={"Mcp-Session-Id": sid}, timeout=10)
+    assert gone.status_code in (200, 204)
     assert httpx.post(base + "/mcpx", content="{}", timeout=10).status_code == 404
+
+
+def test_mcp_path_case_folding_is_ascii_only():
+    """str.lower() would map the Kelvin sign (U+212A) to "k"; a path compare
+    must not."""
+    assert server._ascii_lower("/MCP") == "/mcp"
+    assert server._ascii_lower("/\u212a") == "/\u212a"
 
 
 def test_validate_access_token_audience_ignores_case():
@@ -4198,39 +4214,8 @@ def test_validate_access_token_audience_ignores_case():
 
 
 def test_upper_cased_connector_url_end_to_end():
-    """Authorize for `<base>/MCP`, then call `/MCP` with the token: 200."""
+    """Authorize for `<BASE>/MCP`, then call `/MCP` with the token: 200."""
     with _run(oauth=_provider()) as (base, _):
-        cid = _register(base).json()["client_id"]
-        verifier, challenge = client_oauth.generate_pkce()
-        az = httpx.get(
-            base + "/authorize",
-            params={
-                "client_id": cid,
-                "response_type": "code",
-                "redirect_uri": _REDIRECT,
-                "state": "s",
-                "code_challenge": challenge,
-                "code_challenge_method": "S256",
-                "resource": base.upper() + "/MCP",
-            },
-            follow_redirects=False,
-            timeout=10,
-        )
-        code = _redirect_params(az)["code"]
-        access = _token(
-            base,
-            {
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": _REDIRECT,
-                "client_id": cid,
-                "code_verifier": verifier,
-            },
-        ).json()["access_token"]
-        resp = httpx.post(
-            base + "/MCP",
-            content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
-            headers={"Authorization": f"Bearer {access}"},
-            timeout=10,
-        )
-        assert resp.status_code == 200
+        *_, tok = _full_flow(base, resource=base.upper() + "/MCP")
+        access = tok.json()["access_token"]
+        assert _authed_mcp(base, access, path="/MCP").status_code == 200

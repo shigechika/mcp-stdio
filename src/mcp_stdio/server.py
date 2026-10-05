@@ -96,6 +96,16 @@ _HOST_ALLOWED = set(
 )
 
 
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def _ascii_lower(value: str) -> str:
+    """Fold ASCII letters only. ``str.lower`` also applies Unicode case
+    mappings (the Kelvin sign U+212A lowers to ``k``), which a URL path
+    comparison must not (#456)."""
+    return value.translate(_ASCII_LOWER)
+
+
 def _sanitize_host(host: str) -> str:
     """Keep only safe host[:port] characters; empty -> caller falls back."""
     return "".join(c for c in host if c in _HOST_ALLOWED)
@@ -5263,15 +5273,18 @@ class _OAuthProvider:
                 del self._access[token]
                 return None
             tok_resource = entry.get("resource")
-            # Case-insensitive (#456): a client that upper-cases the connector
-            # URL (claude.ai's `https://MCP.EXAMPLE.COM/MCP`) requests the
-            # token for that spelling; a token for another resource differs in
-            # more than case, and is only ever valid on the serve that issued it.
+            # ASCII case-insensitive (#456): a client that upper-cases the
+            # connector URL (claude.ai's `https://MCP.EXAMPLE.COM/MCP`) requests
+            # the token for that spelling. A token for another resource differs
+            # in more than case; one that differs only in the case of an issuer
+            # path prefix could only come from another serve process sharing
+            # this token store, which --token-store forbids (one file per
+            # process).
             if (
                 tok_resource is not None
                 and expected_resource is not None
-                and tok_resource.rstrip("/").lower()
-                != expected_resource.rstrip("/").lower()
+                and _ascii_lower(tok_resource.rstrip("/"))
+                != _ascii_lower(expected_resource.rstrip("/"))
             ):
                 return None
             return entry
@@ -5599,7 +5612,7 @@ class _Handler(BaseHTTPRequestHandler):
         # (`/MCP`), and since serve exposes exactly one MCP path a different
         # case cannot reach a different resource; auth still applies.
         path = self.path.split("?", 1)[0]
-        if path.lower() != self._mcp_wire_path().lower():
+        if _ascii_lower(path) != _ascii_lower(self._mcp_wire_path()):
             self._send_json(404, _error_body("not found"))
             return True
         return False
