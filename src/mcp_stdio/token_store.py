@@ -725,12 +725,16 @@ def _write_store(data: dict[str, Any]) -> None:
 
 
 @contextlib.contextmanager
-def _file_lock(name: str, wait: float | None = None) -> Iterator[None]:
+def _file_lock(name: str, wait: float | None = None) -> Iterator[bool]:
     """Best-effort advisory exclusive lock on ``_STORE_DIR / name``.
 
     ``wait`` None blocks until the lock is free (``_store_lock``); a number
-    bounds the wait in seconds, after which the lock is skipped with a
-    warning (``refresh_lock``, #454). Everything below applies to both.
+    bounds the wait in seconds (``refresh_lock``, #454). Yields False only
+    when that bounded wait ran out while another holder kept the lock, so
+    the caller can decide not to proceed; it yields True when the lock is
+    held AND on the degrade-to-unlocked paths below (no primitive, a planted
+    special file), which keep their old "never block on lock trouble"
+    behavior. Everything below applies to both.
 
         For ``_store_lock`` it serialises ``save_token`` / ``delete_token`` so
         updates to distinct server keys merge rather than clobbering each other
@@ -783,7 +787,7 @@ def _file_lock(name: str, wait: float | None = None) -> Iterator[None]:
                     f"saves may last-writer-wins",
                     file=sys.stderr,
                 )
-        yield
+        yield True
         return
     # the 0o600 mode above applies only on CREATION. Re-tighten a
     # pre-existing lock file via the fd (fchmod, anchored to this inode like
@@ -798,18 +802,14 @@ def _file_lock(name: str, wait: float | None = None) -> Iterator[None]:
         except OSError:
             pass
     locked = False
+    timed_out = False
     try:
         try:
             locked = _acquire(fd, wait)
-            if not locked:
-                print(
-                    f"warning: {lock_path.name} still held after {wait:g}s; "
-                    f"proceeding without it",
-                    file=sys.stderr,
-                )
+            timed_out = not locked
         except (OSError, ImportError, ValueError):
             pass  # best-effort: fall back to an unsynchronised write
-        yield
+        yield not timed_out
     finally:
         if locked and sys.platform == "win32":
             try:
@@ -869,18 +869,19 @@ def _store_lock() -> Iterator[None]:
     each call opens its own fd, so code holding it must not call
     ``save_token`` / ``delete_token``.
     """
-    with _file_lock("tokens.json.lock"):
+    with _file_lock("tokens.json.lock"):  # blocking: never times out
         yield
 
 
-# Upper bound on waiting for another process's refresh (#454). Its holder
-# makes one token-endpoint round trip, so this only runs out when that
-# process is stuck; then refreshing unlocked beats stalling this one.
+# Upper bound on waiting for another process's refresh (#454). Running out
+# does NOT mean refreshing unlocked — the holder may just be slow, and two
+# exchanges of one rotating refresh token is the race this lock prevents —
+# the caller re-reads the store and otherwise reports a transient failure.
 _REFRESH_LOCK_WAIT_SECS = 30.0
 
 
 @contextlib.contextmanager
-def refresh_lock(wait: float = _REFRESH_LOCK_WAIT_SECS) -> Iterator[None]:
+def refresh_lock(wait: float | None = None) -> Iterator[bool]:
     """Cross-process lock around one refresh's load -> exchange -> save (#454).
 
     A separate file from ``_store_lock`` (which ``save_token`` takes inside
@@ -888,10 +889,13 @@ def refresh_lock(wait: float = _REFRESH_LOCK_WAIT_SECS) -> Iterator[None]:
     relay processes exchanging the same token make the AS answer the second
     with ``invalid_grant`` — or revoke the whole family; holding this and
     re-reading the store after acquiring it means each process exchanges
-    the latest token. Bounded wait, then unlocked with a warning.
+    the latest token. Yields False when the bounded wait (default
+    ``_REFRESH_LOCK_WAIT_SECS``) ran out: the caller must then not exchange.
     """
-    with _file_lock("tokens.json.refresh.lock", wait=wait):
-        yield
+    if wait is None:
+        wait = _REFRESH_LOCK_WAIT_SECS
+    with _file_lock("tokens.json.refresh.lock", wait=wait) as acquired:
+        yield acquired
 
 
 def load_token(server_url: str) -> TokenData | None:
@@ -1031,12 +1035,19 @@ def save_token(server_url: str, data: TokenData) -> None:
             )
 
 
-def delete_token(server_url: str, *, expected_refresh_token: str | None = None) -> bool:
+def delete_token(
+    server_url: str,
+    *,
+    expected_refresh_token: str | None = None,
+    expected_access_token: str | None = None,
+) -> bool:
     """Delete token data for a server URL; True when an entry was removed.
 
-    With ``expected_refresh_token``, delete only while the stored entry still
-    carries that refresh token (#454): a refresh that just failed must not
-    remove a newer token another process saved in the meantime.
+    With ``expected_refresh_token`` / ``expected_access_token``, delete only
+    while the stored entry still carries those values (#454): a refresh that
+    just failed must not remove a newer token another process saved in the
+    meantime — the access token catches an AS that does not rotate the
+    refresh token.
     """
     with _store_lock():
         try:
@@ -1055,9 +1066,14 @@ def delete_token(server_url: str, *, expected_refresh_token: str | None = None) 
         for key in {_normalize_key(server_url), server_url}:
             if key in store:
                 entry = store[key]
-                if expected_refresh_token is not None and (
-                    not isinstance(entry, dict)
-                    or entry.get("refresh_token") != expected_refresh_token
+                expected = {
+                    "refresh_token": expected_refresh_token,
+                    "access_token": expected_access_token,
+                }
+                if any(
+                    want is not None
+                    and (not isinstance(entry, dict) or entry.get(field) != want)
+                    for field, want in expected.items()
                 ):
                     continue
                 del store[key]

@@ -1223,15 +1223,18 @@ class OAuthTokenError(RuntimeError):
     #454). The code is AS-controlled: kept only when it is a short string.
     """
 
-    def __init__(self, message: str, error: Any) -> None:
+    def __init__(self, message: str, error: Any, status: int | None = None) -> None:
         super().__init__(message)
         self.error = error if isinstance(error, str) and len(error) <= 64 else ""
+        # The HTTP status it arrived with (None for an in-body error on a 200),
+        # so a 5xx/429 stays transient whatever its body says.
+        self.status = status
 
 
-def _token_error(body: dict[str, Any]) -> OAuthTokenError:
+def _token_error(body: dict[str, Any], status: int | None = None) -> OAuthTokenError:
     desc = body.get("error_description", body["error"])
     return OAuthTokenError(
-        f"OAuth token error: {_sanitize_oauth_error(desc)}", body["error"]
+        f"OAuth token error: {_sanitize_oauth_error(desc)}", body["error"], status
     )
 
 
@@ -1276,7 +1279,7 @@ def _parse_token_response(resp: httpx.Response) -> dict[str, Any]:
         except Exception:
             body = None
         if isinstance(body, dict) and "error" in body:
-            raise _token_error(body)
+            raise _token_error(body, resp.status_code)
 
     resp.raise_for_status()
 
@@ -1597,18 +1600,21 @@ _TRANSIENT_TOKEN_ERRORS = frozenset({"temporarily_unavailable", "server_error"})
 def _refresh_error_is_dead(e: Exception) -> bool:
     """Whether a refresh failure proves the stored grant unusable (#454).
 
-    Only the plainly transient cases keep the token: a transport error
-    (no answer at all), an HTTP 5xx or 429, or a transient ``error`` code.
-    Everything else — ``invalid_grant``, ``invalid_client``, any other 4xx,
-    an unparseable success — is treated as dead, as every failure was
-    before.
+    Only the plainly transient cases keep the token: an HTTP 5xx or 429
+    (whatever its body says), a transient ``error`` code, or any other httpx
+    failure before a status was judged (no answer, a body over
+    --max-message-size, an undecodable body). Everything else —
+    ``invalid_grant``, ``invalid_client``, any other 4xx, a 200 without an
+    access token — is treated as dead, as every failure was before.
     """
     if isinstance(e, OAuthTokenError):
+        if e.status is not None and (e.status >= 500 or e.status == 429):
+            return False
         return e.error not in _TRANSIENT_TOKEN_ERRORS
     if isinstance(e, httpx.HTTPStatusError):
         status = e.response.status_code
         return not (status >= 500 or status == 429)
-    if isinstance(e, httpx.TransportError):
+    if isinstance(e, httpx.HTTPError):
         return False
     return True
 
@@ -1626,26 +1632,54 @@ def refresh_cached_token(server_url: str, client: httpx.Client) -> TokenData | N
     return _refresh_cached_token_ex(server_url, client).data
 
 
-def _refresh_cached_token_ex(server_url: str, client: httpx.Client) -> _RefreshOutcome:
+def _refresh_cached_token_ex(
+    server_url: str,
+    client: httpx.Client,
+    *,
+    seen_access_token: str | None = None,
+    delete_if_dead: bool = False,
+) -> _RefreshOutcome:
     """``refresh_cached_token`` plus why it failed, under ``refresh_lock`` (#454).
 
-    The store is read once before taking the cross-process lock and again
-    after: if another relay process refreshed in between, its token is
-    used as-is instead of exchanging again, and in any case the exchange
-    uses the LATEST stored refresh token. Two processes therefore never
-    spend the same rotating refresh token.
+    ``seen_access_token`` is the (expired) token the caller holds; without
+    one, the store is read before taking the lock. After taking it the
+    store is read again: if the token there differs, another relay process
+    already refreshed and its token is returned without an exchange;
+    otherwise the exchange spends the LATEST stored refresh token. Two
+    processes therefore never spend the same rotating refresh token.
+
+    If the bounded wait for the lock runs out, nothing is exchanged (the
+    holder may just be slow): a token stored meanwhile is returned, else a
+    transient failure. ``delete_if_dead`` deletes a dead grant while the
+    lock is still held, compared against the failed refresh AND access
+    tokens, so no newer token can be removed.
     """
-    snapshot = load_token(server_url)
-    with refresh_lock():
+    if seen_access_token is None:
+        snapshot = load_token(server_url)
+        seen_access_token = snapshot.access_token if snapshot else None
+    with refresh_lock() as acquired:
         cached = load_token(server_url)
         if (
-            snapshot is not None
+            seen_access_token is not None
             and cached is not None
-            and cached.access_token != snapshot.access_token
+            and cached.access_token != seen_access_token
         ):
             log("another mcp-stdio process already refreshed the token; using it")
             return _RefreshOutcome(cached)
-        return _refresh_locked(server_url, client, cached)
+        if not acquired:
+            log(
+                "another mcp-stdio process is still refreshing this token; "
+                "not refreshing concurrently"
+            )
+            return _RefreshOutcome(None)
+        outcome = _refresh_locked(server_url, client, cached)
+        if outcome.dead and delete_if_dead and cached is not None:
+            delete_token(
+                server_url,
+                expected_refresh_token=cached.refresh_token,
+                expected_access_token=cached.access_token,
+            )
+        return outcome
 
 
 def _refresh_locked(
@@ -1697,8 +1731,12 @@ def _refresh_locked(
             # cause (``invalid_scope``, or a scope it cannot accept back
             # verbatim), retry once exactly as before #451 — without it — so
             # sending the scope can never turn a working refresh into a
-            # failing one. A transport error is not retried here.
-            if not cached.scope:
+            # failing one. A transport error, or a transient answer
+            # (5xx/429, ``temporarily_unavailable``), is not retried: the
+            # scope did not cause it, and a scope-less retry could turn it
+            # into a "dead" answer (Entra's AADSTS90009) that deletes the
+            # token (#454).
+            if not cached.scope or not _refresh_error_is_dead(e):
                 raise
             log(
                 f"token refresh with scope failed ({_sanitize_oauth_error(e)}); retrying without scope"
@@ -2569,8 +2607,17 @@ def ensure_token(
             # fail a request this path previously always served. Degrade to the
             # in-memory reconciled token (refresh below re-reads the store, so it
             # would still use the old settings until the next successful save).
+            # Under refresh_lock, applied to a fresh read (#454): writing back
+            # this possibly stale copy could overwrite a refresh token another
+            # process just rotated.
             try:
-                save_token(server_url, cached)
+                with refresh_lock() as acquired:
+                    latest = load_token(server_url) if acquired else None
+                    if latest is not None and latest.access_token:
+                        latest.no_resource_indicator = desired_no_ri
+                        latest.oauth_resource = oauth_resource
+                        save_token(server_url, latest)
+                        cached = latest
             except OSError as e:
                 log(f"warning: could not persist reconciled resource settings: {e}")
         if (
@@ -2582,21 +2629,19 @@ def ensure_token(
 
         # Try refresh (skip if client_secret has expired per RFC 7591 §3.2.1)
         if cached.refresh_token and cached.token_endpoint and cached.client_id:
-            outcome = _refresh_cached_token_ex(server_url, client)
+            # A dead grant is deleted inside the refresh lock — clearing the
+            # stale token so the full flow below isn't blocked by cached
+            # failure state (cf. anthropics/claude-code#37747) — and only
+            # while the store still holds the token that failed (#454).
+            outcome = _refresh_cached_token_ex(
+                server_url,
+                client,
+                seen_access_token=cached.access_token,
+                delete_if_dead=True,
+            )
             if outcome.data:
                 return outcome.data
-            if outcome.dead:
-                # The grant is dead — clear the stale token so the full flow
-                # below isn't blocked by cached failure state
-                # (cf. anthropics/claude-code#37747). Compare-and-delete
-                # (#454): if another process stored a newer token meanwhile,
-                # it survives.
-                delete_token(
-                    server_url,
-                    expected_refresh_token=outcome.refresh_token
-                    or cached.refresh_token,
-                )
-            else:
+            if not outcome.dead:
                 # A transient failure (no answer, 5xx/429, temporarily_unavailable)
                 # says nothing about the grant: keep the token for the next
                 # attempt instead of throwing away weeks of refresh token (#454).

@@ -8050,24 +8050,42 @@ class TestRefreshDurability:
 
         def racing(server_url, client, cached):
             outcome = real_locked(server_url, client, cached)
-            self._save_expired(refresh_token="rt-new", access_token="at-new")
+            # an unlocked (degraded) writer slips in before the delete; a
+            # non-rotating AS keeps the refresh token, so only the access
+            # token differs
+            self._save_expired(refresh_token="rt-old", access_token="at-new")
             return outcome
 
         monkeypatch.setattr(oauth_mod, "_refresh_locked", racing)
         assert self._ensure() is None
         survivor = load_token(_DUR_URL)
-        assert survivor is not None and survivor.refresh_token == "rt-new"
+        assert survivor is not None and survivor.access_token == "at-new"
 
-    def test_concurrent_refreshes_spend_the_refresh_token_once(self, httpx_mock):
-        """Two refreshers (two processes; threads with their own lock fds
-        behave the same): the second waits, re-reads, and uses the first's
-        new token instead of replaying the rotated refresh token."""
-        from mcp_stdio.oauth import refresh_cached_token
+    def test_concurrent_refreshes_spend_the_refresh_token_once(
+        self, httpx_mock, monkeypatch
+    ):
+        """Two refreshers that both saw the old token (two processes; threads
+        with their own lock fds behave the same): the second blocks on the
+        lock while the first exchanges, then re-reads and uses the new token
+        instead of replaying the rotated refresh token."""
+        from mcp_stdio import token_store
+        from mcp_stdio.oauth import _refresh_cached_token_ex
 
         self._save_expired()
+        in_exchange = threading.Event()
+        b_waiting = threading.Event()
+        real_acquire = token_store._acquire
 
-        def slow_token(request):
-            time.sleep(0.3)
+        def acquire(fd, wait):
+            if threading.current_thread().name == "B":
+                b_waiting.set()
+            return real_acquire(fd, wait)
+
+        monkeypatch.setattr(token_store, "_acquire", acquire)
+
+        def token_endpoint(request):
+            in_exchange.set()
+            assert b_waiting.wait(5)  # B is now queued behind A's lock
             return httpx.Response(
                 200,
                 json={
@@ -8077,20 +8095,128 @@ class TestRefreshDurability:
                 },
             )
 
-        httpx_mock.add_callback(slow_token, url=_DUR_TOKEN)
-        results: list[object] = []
-        threads = [
-            threading.Thread(
-                target=lambda: results.append(
-                    refresh_cached_token(_DUR_URL, httpx.Client())
-                )
-            )
-            for _ in range(2)
-        ]
-        for th in threads:
-            th.start()
-            time.sleep(0.05)  # both snapshot the old token before the first saves
-        for th in threads:
-            th.join(5)
+        httpx_mock.add_callback(token_endpoint, url=_DUR_TOKEN)
+        results: dict[str, object] = {}
+
+        def run(name):
+            results[name] = _refresh_cached_token_ex(
+                _DUR_URL, httpx.Client(), seen_access_token="at-old"
+            ).data
+
+        a = threading.Thread(target=run, args=("A",), name="A")
+        a.start()
+        assert in_exchange.wait(5)
+        b = threading.Thread(target=run, args=("B",), name="B")
+        b.start()
+        a.join(5)
+        b.join(5)
         assert len(httpx_mock.get_requests()) == 1
-        assert [r.access_token for r in results] == ["at-new", "at-new"]
+        assert results["A"].access_token == results["B"].access_token == "at-new"
+
+    def test_lock_timeout_does_not_exchange(self, httpx_mock, monkeypatch):
+        """A slow holder is not a stuck one: running out of patience must not
+        start a second exchange of the same refresh token."""
+        from mcp_stdio import token_store
+        from mcp_stdio.oauth import _refresh_cached_token_ex
+
+        self._save_expired()
+        monkeypatch.setattr(token_store, "_REFRESH_LOCK_WAIT_SECS", 0.1)
+        held, release = threading.Event(), threading.Event()
+
+        def holder():
+            with token_store.refresh_lock():
+                held.set()
+                release.wait(5)
+
+        t = threading.Thread(target=holder)
+        t.start()
+        assert held.wait(5)
+        try:
+            outcome = _refresh_cached_token_ex(_DUR_URL, httpx.Client())
+        finally:
+            release.set()
+            t.join(5)
+        assert outcome.data is None and outcome.dead is False
+        assert httpx_mock.get_requests() == []
+
+    @pytest.mark.parametrize(
+        "status, body",
+        [
+            (503, {"error": "invalid_grant"}),  # a 5xx stays transient
+            (429, {"error": "rate_limit_exceeded"}),
+            (500, {"error": "unknown_error"}),
+        ],
+    )
+    def test_status_wins_over_the_error_body(self, httpx_mock, status, body):
+        from mcp_stdio.token_store import load_token
+
+        self._save_expired()
+        httpx_mock.add_response(url=_DUR_TOKEN, status_code=status, json=body)
+        assert self._ensure() is None
+        assert load_token(_DUR_URL) is not None
+
+    def test_decoding_error_is_transient(self, httpx_mock):
+        from mcp_stdio.token_store import load_token
+
+        self._save_expired()
+        httpx_mock.add_exception(httpx.DecodingError("bad gzip"), url=_DUR_TOKEN)
+        assert self._ensure() is None
+        assert load_token(_DUR_URL) is not None
+
+    def test_scope_retry_skipped_after_a_transient_answer(self, httpx_mock):
+        """A 503 is not the scope's fault: no scope-less retry, whose own
+        (e.g. Entra AADSTS90009) answer would read as a dead grant."""
+        from mcp_stdio.token_store import load_token, save_token
+
+        save_token(
+            _DUR_URL,
+            TokenData(
+                access_token="at-old",
+                refresh_token="rt-old",
+                expires_at=time.time() - 10,
+                scope="api://app/.default",
+                client_id="cid",
+                token_endpoint=_DUR_TOKEN,
+                authorization_endpoint="https://auth.example.com/authorize",
+            ),
+        )
+        httpx_mock.add_response(url=_DUR_TOKEN, status_code=503, text="")
+        assert self._ensure() is None
+        assert len(httpx_mock.get_requests()) == 1
+        assert load_token(_DUR_URL) is not None
+
+    def test_reconcile_applies_to_the_latest_stored_token(self, monkeypatch):
+        """A changed --oauth-resource is persisted onto a fresh read under the
+        refresh lock, never by writing back a stale copy."""
+        from mcp_stdio import oauth as oauth_mod
+        from mcp_stdio.token_store import load_token, save_token
+
+        save_token(
+            _DUR_URL,
+            TokenData(
+                access_token="at-1", refresh_token="rt-1", expires_at=time.time() + 3600
+            ),
+        )
+        real_load = oauth_mod.load_token
+        calls = {"n": 0}
+
+        def load(url):
+            calls["n"] += 1
+            if calls["n"] == 2:  # another process rotated between our reads
+                save_token(
+                    _DUR_URL,
+                    TokenData(
+                        access_token="at-2",
+                        refresh_token="rt-2",
+                        expires_at=time.time() + 3600,
+                    ),
+                )
+            return real_load(url)
+
+        monkeypatch.setattr(oauth_mod, "load_token", load)
+        data = ensure_token(
+            _DUR_URL, httpx.Client(), oauth_resource="api://x", interactive=False
+        )
+        stored = load_token(_DUR_URL)
+        assert stored.refresh_token == "rt-2" and stored.oauth_resource == "api://x"
+        assert data.access_token == "at-2"
