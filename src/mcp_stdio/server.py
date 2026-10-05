@@ -4007,12 +4007,19 @@ def _origin_allowed(values: list[str], allowed: frozenset[str]) -> bool:
 def _origin_of_url(url: str) -> str:
     """The canonical origin of an absolute http(s) URL such as --public-url.
 
-    An internationalized host is converted to its IDNA (punycode) form
-    first, which is how a browser serializes it in an ``Origin`` header.
+    Raises ValueError for an internationalized host rather than guessing its
+    punycode form: Python's ``idna`` codec (IDNA 2003) maps some names
+    differently from the IDNA browsers use (``faß`` -> ``fass``), which would
+    trust a different origin than the one browsers send. Callers warn and
+    the operator lists the browser's punycode origin with ``--allow-origin``.
     """
     p = urlsplit(url)
-    netloc = p.netloc.encode("idna").decode("ascii")
-    return _normalize_origin(f"{p.scheme}://{netloc}")
+    if not p.netloc.isascii():
+        raise ValueError(
+            "an internationalized host is not converted; add the punycode "
+            "origin your browser sends with --allow-origin"
+        )
+    return _normalize_origin(f"{p.scheme}://{p.netloc}")
 
 
 def _normalize_public_url(url: str) -> str:

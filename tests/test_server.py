@@ -4148,22 +4148,24 @@ def test_bad_origin_gets_403_before_body_checks(gateway, headers):
     assert b" 403 " in status
 
 
-def test_idn_public_url_origin_is_punycode():
-    """An internationalized --public-url still starts the gateway, and its
-    origin is allowed in the punycode form a browser sends (#450 review)."""
-    assert server._origin_of_url("https://bücher.example/x") == (
-        "https://xn--bcher-kva.example"
-    )
+def test_idn_public_url_starts_without_guessing_its_origin(capsys):
+    """An internationalized --public-url still starts the gateway, but its
+    origin is not guessed (Python's IDNA 2003 can differ from browsers'):
+    the operator lists the punycode origin with --allow-origin (#450 review)."""
+    with pytest.raises(ValueError):
+        server._origin_of_url("https://faß.example/x")
     httpd, registry = server.build_server(
         _BACKEND,
         host="127.0.0.1",
         port=0,
-        oauth=_provider(public_url="https://bücher.example"),
+        oauth=_provider(public_url="https://faß.example"),
+        allowed_origins=["https://xn--fa-hia.example"],
     )
     try:
-        assert (
-            "https://xn--bcher-kva.example" in httpd.RequestHandlerClass.allowed_origins
+        assert httpd.RequestHandlerClass.allowed_origins == frozenset(
+            {"https://xn--fa-hia.example"}
         )
+        assert "--allow-origin" in capsys.readouterr().err
     finally:
         registry.shutdown_all()
         httpd.server_close()
