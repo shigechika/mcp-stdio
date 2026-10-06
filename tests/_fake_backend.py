@@ -19,6 +19,9 @@ Reads newline-delimited JSON-RPC from stdin and reacts:
   passes just as happily when the whole feature is broken.
 - ``trigger_resource_update`` (notification) -> emits
   ``notifications/resources/updated`` for ``params.uri``
+- ``resources/read`` (request) for a ``ui://`` uri -> one text content naming
+  the uri (#469); any other uri still gets the generic -32601, which
+  existing tests rely on
 - ``seen_initialize`` (request) -> the last ``initialize`` request this child
   received, verbatim as parsed (#466: proves what serve forwarded)
 - ``exit`` (any)                -> the process exits
@@ -110,6 +113,19 @@ def main() -> None:
                             else {}
                         ),
                     },
+                }
+            )
+        elif (
+            method == "resources/read"
+            and "id" in msg
+            and str((msg.get("params") or {}).get("uri", "")).startswith("ui://")
+        ):
+            uri = msg["params"]["uri"]
+            _send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": mid,
+                    "result": {"contents": [{"uri": uri, "text": f"app {uri}"}]},
                 }
             )
         elif method == "seen_initialize" and "id" in msg:

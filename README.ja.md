@@ -375,6 +375,10 @@ open-gateway と共有 static-token principal は、いずれも本物の呼び�
 古いクライアントの `initialize` からバックエンドに渡す前に取り除く。capability を
 宣言しながら応答しないクライアント向け。claude.ai は `roots` を宣言するが、
 バックエンドが `roots/list` を送るとタイムアウトする。anthropics/claude-ai-mcp#708、#466）;
+`--accept-claimless-resource-read`（プロトコルの申告もセッションも持たない
+`resources/read` に `400` を返さず、2026-07-28 のリクエストとして応答する。
+Claude の iOS アプリは MCP App の `ui://` リソースをこの形で読みに来る。
+anthropics/claude-ai-mcp#1042、#469）;
 `--allow-origin ORIGIN`（繰り返し指定可。ブラウザからのリクエストで `Origin` が
 ループバック、`--public-url` のオリジン、ここで指定したもののいずれでもなければ
 `403` を返し、ループバックのゲートウェイへの DNS rebinding を防ぐ。`Origin`
