@@ -131,6 +131,7 @@ Arguments:
 | `--max-sessions N` | `100` | 最大同時セッション数；上限を超えた initialize は `503` を取得します |
 | `--session-idle-ttl SECONDS` | `0`（無効） | 古いクライアントのセッション向け（新しいクライアントには `--modern-idle-ttl`）。 アイドルタイムアウト；非アクティブ後にセッションと子を削除。DELETE なしで接続を切ったクライアントがスロットをピンしない |
 | `--max-sessions-per-owner N` | `0`（無効） | 新しい initialize 時に、その OAuth ユーザーの古いセッションを `N` 件まで LRU で削除し、DELETE せず再接続するクライアントが残したゴーストを回収。static-token と open-gateway のセッションは対象外 |
+| `--drop-client-capability CAP` | — | 古いクライアントの `initialize` から `roots`・`elicitation`・`sampling` を取り除いてからバックエンドに渡し、バックエンドがクライアントにそれを要求しないようにする（繰り返し可能）。capability を宣言しながら応答しないクライアント向け：claude.ai は `roots` を宣言するが、バックエンドが `roots/list` を送るとタイムアウトし、コネクタの接続に失敗する（[anthropics/claude-ai-mcp#708](https://github.com/anthropics/claude-ai-mcp/issues/708)、#466）。新しいクライアントには影響しない |
 
 <a id="modern-era-serve"></a>
 

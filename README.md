@@ -378,7 +378,12 @@ its caller's identity without its own OAuth stack — requires
 `--enable-oauth`; the open-gateway and shared static-token principals are
 exempt, same as `--max-sessions-per-owner`; refuses a search-path /
 dynamic-linker variable name such as `PATH`, `LD_PRELOAD`, or `PYTHONPATH`
-that the child's own runtime needs to start); `--allow-origin ORIGIN`
+that the child's own runtime needs to start); `--drop-client-capability CAP`
+(repeatable; `roots`, `elicitation` or `sampling`: removed from a legacy
+client's `initialize` before the backend sees it, for clients that declare a
+capability but never answer it — claude.ai declares `roots`, and a backend
+that then sends `roots/list` times out, anthropics/claude-ai-mcp#708, #466);
+`--allow-origin ORIGIN`
 (repeatable; a browser request whose `Origin` is not loopback, the
 `--public-url` origin, or one of these gets `403`, which closes the DNS
 rebinding path to a loopback gateway; requests without an `Origin` header,

@@ -4990,3 +4990,103 @@ def test_fetch_client_metadata_dns_failure(monkeypatch):
     monkeypatch.setattr(server, "_cimd_getaddrinfo", fail)
     with pytest.raises(server._CimdFetchError, match="cannot resolve"):
         server._fetch_client_metadata(_CIMD_URL)
+
+
+# -- --drop-client-capability (#466) --
+
+_CLAUDE_INIT = {
+    "jsonrpc": "2.0",
+    "id": "init",
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {
+            "roots": {"listChanged": True},
+            "elicitation": {},
+            "experimental": {"x": {}},
+        },
+        "clientInfo": {"name": "claude-code", "version": "2.1.220"},
+    },
+}
+
+
+@contextlib.contextmanager
+def _gateway_dropping(drop):
+    httpd, registry = server.build_server(
+        _BACKEND, host="127.0.0.1", port=0, drop_client_capabilities=drop
+    )
+    host, port = httpd.server_address[0], httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield f"http://{host}:{port}/mcp"
+    finally:
+        httpd.shutdown()
+        registry.shutdown_all()
+        httpd.server_close()
+
+
+def _seen_initialize(url, init):
+    r = _post(url, init)
+    assert r.status_code == 200, r.text
+    sid = r.headers["mcp-session-id"]
+    seen = _post(url, {"jsonrpc": "2.0", "id": 2, "method": "seen_initialize"}, sid)
+    return r, seen.json()["result"]["msg"]
+
+
+def test_drop_client_capability_removes_keys_before_the_child():
+    with _gateway_dropping({"roots", "elicitation"}) as url:
+        r, seen = _seen_initialize(url, _CLAUDE_INIT)
+    assert seen["params"]["capabilities"] == {"experimental": {"x": {}}}
+    # Everything else reaches the child unchanged ...
+    assert seen["params"]["clientInfo"] == _CLAUDE_INIT["params"]["clientInfo"]
+    assert seen["id"] == "init"
+    # ... and the client still gets the child's own initialize result.
+    assert r.json()["result"]["serverInfo"]["name"] == "fake"
+
+
+def test_drop_client_capability_off_forwards_initialize_untouched():
+    with _gateway_dropping(()) as url:
+        _, seen = _seen_initialize(url, _CLAUDE_INIT)
+    assert seen == _CLAUDE_INIT
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        None,
+        "not an object",
+        {"capabilities": "not an object"},
+        {"capabilities": {"sampling": {}}},  # nothing to drop
+    ],
+)
+def test_drop_client_capabilities_leaves_other_shapes_alone(params):
+    msg = {"jsonrpc": "2.0", "id": 1, "method": "initialize"}
+    if params is not None:
+        msg["params"] = params
+    assert server._drop_client_capabilities(msg, frozenset({"roots"})) is msg
+
+
+def test_drop_client_capabilities_does_not_mutate_input():
+    msg = json.loads(json.dumps(_CLAUDE_INIT))
+    out = server._drop_client_capabilities(msg, frozenset({"roots"}))
+    assert msg == _CLAUDE_INIT
+    assert "roots" not in out["params"]["capabilities"]
+
+
+def test_serve_main_drop_client_capability_choices(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(server, "serve", lambda cmd, **kw: seen.update(kw))
+    server.serve_main(
+        [
+            "--drop-client-capability",
+            "roots",
+            "--drop-client-capability",
+            "elicitation",
+            "--",
+            "true",
+        ]
+    )
+    assert seen["drop_client_capabilities"] == ["roots", "elicitation"]
+    with pytest.raises(SystemExit):
+        server.serve_main(["--drop-client-capability", "tools", "--", "true"])

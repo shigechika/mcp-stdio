@@ -19,6 +19,8 @@ Reads newline-delimited JSON-RPC from stdin and reacts:
   passes just as happily when the whole feature is broken.
 - ``trigger_resource_update`` (notification) -> emits
   ``notifications/resources/updated`` for ``params.uri``
+- ``seen_initialize`` (request) -> the last ``initialize`` request this child
+  received, verbatim as parsed (#466: proves what serve forwarded)
 - ``exit`` (any)                -> the process exits
 
 ``--no-resource-subscribe`` in argv drops ``resources.subscribe`` from the
@@ -76,6 +78,7 @@ def main() -> None:
     # received, in order, as (method, uri) pairs. #381's refcount lifecycle
     # is asserted against this log.
     subscribe_log: list[list[str]] = []
+    last_initialize: dict | None = None
     while True:
         line = sys.stdin.readline()
         if line == "":
@@ -90,6 +93,7 @@ def main() -> None:
         method = msg.get("method")
         mid = msg.get("id")
         if method == "initialize" and "id" in msg:
+            last_initialize = msg
             server_info = {"name": "fake", "version": "0"}
             if "--echo-env" in sys.argv:
                 server_info["envValue"] = _ECHO_ENV_VALUE
@@ -108,6 +112,8 @@ def main() -> None:
                     },
                 }
             )
+        elif method == "seen_initialize" and "id" in msg:
+            _send({"jsonrpc": "2.0", "id": mid, "result": {"msg": last_initialize}})
         elif method == "echo" and "id" in msg:
             # pid lets a test prove two sessions hit two distinct child
             # processes (no cross-session response leakage).

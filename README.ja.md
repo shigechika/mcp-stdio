@@ -371,6 +371,10 @@ open-gateway と共有 static-token principal は、いずれも本物の呼び�
 ではないため注入対象から除外される。`--max-sessions-per-owner` と同じ除外規則。
 `PATH`・`LD_PRELOAD`・`PYTHONPATH` など、子プロセス自身のランタイムが起動に
 必要とする検索パス／動的リンカ系の変数名は指定を拒否する）;
+`--drop-client-capability CAP`（繰り返し指定可。`roots`・`elicitation`・`sampling`。
+古いクライアントの `initialize` からバックエンドに渡す前に取り除く。capability を
+宣言しながら応答しないクライアント向け。claude.ai は `roots` を宣言するが、
+バックエンドが `roots/list` を送るとタイムアウトする。anthropics/claude-ai-mcp#708、#466）;
 `--allow-origin ORIGIN`（繰り返し指定可。ブラウザからのリクエストで `Origin` が
 ループバック、`--public-url` のオリジン、ここで指定したもののいずれでもなければ
 `403` を返し、ループバックのゲートウェイへの DNS rebinding を防ぐ。`Origin`
