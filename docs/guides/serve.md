@@ -59,7 +59,7 @@ a crossover.
 
 | You need… | Do this |
 |---|---|
-| Claude.ai custom connectors (browser-based clients) | `--allow-redirect-uri https://claude.ai/api/mcp/auth_callback` |
+| Claude.ai custom connectors (browser-based clients) | `--allow-redirect-uri https://claude.ai/api/mcp/auth_callback` (claude.ai registers through Dynamic Client Registration) plus `--allow-client-id-url https://claude.ai/oauth/mcp-oauth-client-metadata` (its "No sign-in" mode always presents that Client ID Metadata Document URL instead, #463) |
 | Several backends on one host | run one serve process per backend with path-scoped issuers: `--public-url https://mcp.example.com/team-a`, `…/team-b` — AS endpoints and well-known documents nest under each prefix. Not for claude.ai custom connectors: claude.ai currently cannot complete a connection to an endpoint whose path is anything other than exactly `/mcp` — MCP requests stop once the token is issued ([anthropics/claude-ai-mcp#878](https://github.com/anthropics/claude-ai-mcp/issues/878)), and a multi-segment path gets none at all ([#738](https://github.com/anthropics/claude-ai-mcp/issues/738)) — so give each backend its own hostname there |
 | Cap concurrent users | `--max-sessions N` (default 100; excess `initialize` gets `503`) |
 | Static token instead of OAuth | drop `--enable-oauth`, set `MCP_STDIO_SERVE_TOKEN` |
@@ -71,6 +71,23 @@ a crossover.
   PKCE (S256 only), refresh rotation with replay detection, and RFC 8707
   audience binding — MCP clients discover all of it via the standard
   well-known documents; there is nothing to configure client-side.
+- Client ID Metadata Documents (`--allow-client-id-url`, #463) are opt-in and
+  allowlisted: only a listed URL is ever fetched, at `/authorize`, over HTTPS
+  to a public address (private, loopback and other special-use addresses are
+  refused), without following redirects, capped at 5 KB. The document's own
+  `redirect_uris` are the client's registration (https entries match exactly,
+  loopback entries on any port); it must name itself as `client_id`, carry a
+  `client_name`, and use `token_endpoint_auth_method` `none`
+  (`private_key_jwt` is not supported). It is cached for its
+  `Cache-Control: max-age` (60 s to 24 h, 1 h without one); when a re-fetch
+  fails at the network level, the copy validated earlier is used for up to
+  24 h more, while a document that fetches but no longer validates is refused
+  at once. A fetch that fails is not retried for 30 s, and a `404`/`410`
+  counts as the client withdrawing the document. Removing a URL from the
+  allowlist also stops its codes and refresh tokens at the token endpoint.
+  The AS metadata never advertises `client_id_metadata_document_supported`:
+  a client that saw it would present its own document URL instead of using
+  DCR, and serve would refuse every URL not on the list.
 - Treat `--token-store`'s file like a private key. It is created `0600` in
   a `0700` directory.
 - Every request is logged to stderr with query strings redacted.

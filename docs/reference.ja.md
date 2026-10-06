@@ -121,6 +121,7 @@ Arguments:
 | `--dev-user USER` | — | **非セキュア、テスト用のみ。** 実際の SSO なしでループバックテスト用のスタンドイン user identity |
 | `--access-token-ttl SECONDS` | `3600` | アクセストークンライフタイム（秒） |
 | `--allow-redirect-uri URL` | — | Dynamic Client Registration で信頼する追加リダイレクト URI（繰り返し可能；例：ウェブベースのクライアント用 `https://claude.ai/api/mcp/auth_callback`） |
+| `--allow-client-id-url URL` | — | この Client ID Metadata Document の URL を完全一致で `client_id` として受け付ける（繰り返し可能；例：claude.ai 用 `https://claude.ai/oauth/mcp-oauth-client-metadata`）。`/authorize` で文書を取得し、その `redirect_uris` を登録として扱う。`client_id_metadata_document_supported` は広告しないので、ほかのクライアントは引き続き DCR を使う（#463） |
 | `--token-store PATH` | — | 発行済みトークン、登録、リプレイ墓石を永続化するパス。再起動時にサーバーが生存し、クライアントは有効なトークンを保持します。各 serve プロセスは独自のパスを持つ必要があります。ファイルは `0600` で作成；秘密鍵のように扱います |
 
 ### セッション管理
@@ -209,6 +210,7 @@ mcp-stdio は以下の仕様を実装しています：
 - [クライアント ID メタデータドキュメント](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization#client-id-metadata-documents)
   - MCP 2025-11-25 / draft-ietf-oauth-client-id-metadata-document-00
   - --client-metadata-url はオペレータホストの HTTPS ドキュメントを client_id として提示
+  - serve の組み込み AS は許可リストの文書 URL を受け付ける（--allow-client-id-url）：client_id の完全一致、https またはループバックの redirect_uris、共有シークレット禁止、公開アドレスのみ・リダイレクト非追従の取得、5 KB 上限、Cache-Control max-age（draft-02）
 
 - [RFC 6749](https://www.rfc-editor.org/rfc/rfc6749) OAuth 2.0
   - §2.3.1 client_secret_basic（percent エンコードされた認証情報による Authorization ヘッダー）

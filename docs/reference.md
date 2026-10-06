@@ -121,6 +121,7 @@ Arguments:
 | `--dev-user USER` | — | **Insecure, testing only.** Stand-in user identity for loopback testing without real SSO |
 | `--access-token-ttl SECONDS` | `3600` | Access token lifetime in seconds |
 | `--allow-redirect-uri URL` | — | Additional redirect URI to trust for Dynamic Client Registration (repeatable; e.g., `https://claude.ai/api/mcp/auth_callback` for web-based clients) |
+| `--allow-client-id-url URL` | — | Accept this exact Client ID Metadata Document URL as a `client_id` (repeatable; e.g., `https://claude.ai/oauth/mcp-oauth-client-metadata` for claude.ai). The document is fetched at `/authorize` and its `redirect_uris` become the registration. `client_id_metadata_document_supported` is not advertised, so other clients keep using DCR (#463) |
 | `--token-store PATH` | — | Path to persist issued tokens, registrations, and replay tombstones. Survives restarts so clients retain valid tokens. Each serve process must have its own path. File is created `0600`; treat like a private key |
 
 ### Session Management
@@ -209,6 +210,7 @@ mcp-stdio implements the following specifications:
 - [Client ID Metadata Documents](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization#client-id-metadata-documents)
   - MCP 2025-11-25 / draft-ietf-oauth-client-id-metadata-document-00
   - --client-metadata-url presents an operator-hosted HTTPS document as client_id
+  - serve's embedded AS accepts allowlisted document URLs (--allow-client-id-url): exact client_id match, https or loopback redirect_uris, no shared secrets, public-address-only fetch without redirects, 5 KB cap, Cache-Control max-age (draft-02)
 
 - [RFC 6749](https://www.rfc-editor.org/rfc/rfc6749) OAuth 2.0
   - §2.3.1 client_secret_basic (Authorization header with percent-encoded credentials)
