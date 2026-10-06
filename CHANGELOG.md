@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.45.0](https://github.com/shigechika/mcp-stdio/compare/v0.44.0...v0.45.0) (2026-10-06)
+
+
+### Features
+
+* **relay:** re-authorize in the background when the refresh token is dead ([#472](https://github.com/shigechika/mcp-stdio/issues/472)) ([6773e92](https://github.com/shigechika/mcp-stdio/commit/6773e924ebbef44dcdc023e2d075f6a1a6a39705))
+* **serve:** accept Client ID Metadata Document client_ids in the embedded AS ([#464](https://github.com/shigechika/mcp-stdio/issues/464)) ([a0984b9](https://github.com/shigechika/mcp-stdio/commit/a0984b92898506764506d2d5fd6ff0097aa217f0))
+* **serve:** opt-in --accept-claimless-resource-read for Claude iOS MCP Apps ([#470](https://github.com/shigechika/mcp-stdio/issues/470)) ([281af7e](https://github.com/shigechika/mcp-stdio/commit/281af7e1c0bfb064c0b609a40dae3c726ac70047))
+* **serve:** opt-in --drop-client-capability for legacy initialize ([#467](https://github.com/shigechika/mcp-stdio/issues/467)) ([82f33bc](https://github.com/shigechika/mcp-stdio/commit/82f33bc984cbbca70dc746f604f092515d92c8e2)), closes [#466](https://github.com/shigechika/mcp-stdio/issues/466)
+
+
+### Bug Fixes
+
+* **serve:** raise the listen backlog from 5 to 128 ([#468](https://github.com/shigechika/mcp-stdio/issues/468)) ([db8e936](https://github.com/shigechika/mcp-stdio/commit/db8e936f32a0370d2a272194b6661eed1bfde53f))
+
 ## [0.44.0](https://github.com/shigechika/mcp-stdio/compare/v0.43.8...v0.44.0) (2026-10-06)
 
 
