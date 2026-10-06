@@ -5217,12 +5217,14 @@ _REAUTH_MESSAGE = (
 class _Reauthorizer:
     """At most one background re-authorization per process (#471).
 
-    ``login(rejected_authorization)`` runs the interactive flow and returns
-    the new headers, or None (it owns any cross-process exclusion: a sibling
-    relay already signing in for the same server makes it return None). It
-    gets the ``Authorization`` value the server rejected, so a cached token
-    that is still that one is not handed back, while a different one -- a
-    sibling's fresh sign-in -- is used as is. ``refresh_was_dead`` says
+    ``login(rejected_authorization)`` returns the new headers, or None. It
+    gets the ``Authorization`` value the server rejected and owns all of the
+    sign-in policy, which runs on this class's thread and may block: cli's
+    ``_build_reauth_login`` adopts a stored token that differs from the
+    rejected one without signing in, waits (bounded) for a sibling relay
+    already signing in for the same server and then adopts its token, and
+    only otherwise runs the interactive flow -- returning None when the
+    sign-in fails or the sibling is still busy after the wait. ``refresh_was_dead`` says
     whether the refresher's LAST failure proved the grant dead; only then is
     a re-authorization worth a browser. Call ``maybe_start`` while still
     holding the relay's ``refresh_lock`` right after the failed refresh, so
