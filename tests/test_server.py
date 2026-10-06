@@ -4355,6 +4355,12 @@ def test_validate_client_id_url_rejects(url):
         ("0.0.0.0", False),
         ("::", False),
         ("255.255.255.255", False),
+        ("fec0::1", False),  # deprecated site-local; CPython says is_global
+        ("2002:a00:1::1", False),  # 6to4 of 10.0.0.1
+        ("2002:a04f:680a::1", True),  # 6to4 of 160.79.104.10
+        ("64:ff9b::a00:1", False),  # NAT64 of 10.0.0.1
+        ("64:ff9b::a04f:680a", True),  # NAT64 of 160.79.104.10
+        ("2001:db8::1", False),  # documentation
     ],
 )
 def test_cimd_address_allowed(addr, ok):
@@ -4375,6 +4381,9 @@ def test_cimd_address_allowed(addr, ok):
         ("private, no-cache", 0.0),
         ("public", None),
         ("max-age=abc", None),
+        # Restrictive directives win whatever the order.
+        ("max-age=86400, no-cache", 0.0),
+        ("no-store, max-age=86400", 0.0),
     ],
 )
 def test_cimd_max_age(header, expected):
@@ -4558,6 +4567,53 @@ def test_cimd_invalid_refetch_aborts_and_evicts():
     # to fall back on either.
     assert _cimd_authorize(prov)["kind"] == "bad_request"
     assert len(fetch.calls) == 3
+
+
+def test_cimd_concurrent_authorizes_share_one_failed_fetch(capsys):
+    gate = threading.Event()
+    calls = []
+
+    def slow_failing_fetch(url):
+        calls.append(url)
+        gate.wait(5)
+        raise server._CimdFetchError("timed out")
+
+    prov = _cimd_provider(slow_failing_fetch)
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = [ex.submit(_cimd_authorize, prov) for _ in range(4)]
+        time.sleep(0.2)
+        gate.set()
+        results = [f.result(timeout=10) for f in futs]
+    assert all(r["kind"] == "bad_request" for r in results)
+    assert calls == [_CIMD_URL]
+    assert capsys.readouterr().err.count("cannot fetch client metadata") == 1
+    # Failures are not cached: the next, non-concurrent request fetches again.
+    _cimd_authorize(prov)
+    assert len(calls) == 2
+
+
+def test_cimd_concurrent_waiters_share_stale_copy_on_failure():
+    clock = [0.0]
+    gate = threading.Event()
+    calls = []
+
+    def fetch(url):
+        calls.append(url)
+        if len(calls) == 1:
+            return _doc_bytes(), 300.0
+        gate.wait(5)
+        raise server._CimdFetchError("HTTP 403")
+
+    prov = _cimd_provider(fetch, now=lambda: clock[0])
+    assert _cimd_authorize(prov)["kind"] == "redirect"
+    clock[0] = 1000.0
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futs = [ex.submit(_cimd_authorize, prov) for _ in range(3)]
+        time.sleep(0.2)
+        gate.set()
+        results = [f.result(timeout=10) for f in futs]
+    assert all(r["kind"] == "redirect" for r in results)
+    assert len(calls) == 2
 
 
 def test_cimd_concurrent_authorizes_share_one_fetch():
@@ -4758,24 +4814,57 @@ def test_fetch_client_metadata_oversize_is_error(_plain_tls):
             server._fetch_client_metadata(f"https://claude.ai:{port}/doc")
 
 
-def test_fetch_client_metadata_deadline(_plain_tls, monkeypatch):
-    monkeypatch.setattr(server, "_CIMD_FETCH_TIMEOUT_SECS", 0.5)
-
-    def trickle(h):
+def test_fetch_client_metadata_truncated_body_is_transport_error(_plain_tls):
+    def short(h):
         h.send_response(200)
         h.send_header("Content-Length", "100")
         h.end_headers()
-        for _ in range(20):
-            h.wfile.write(b" ")
-            h.wfile.flush()
-            time.sleep(0.1)
+        h.wfile.write(b'{"client_id":')
+        h.close_connection = True
 
-    with _cimd_http_server(trickle) as (port, _):
+    with _cimd_http_server(short) as (port, _):
         _plain_tls(port)
-        t0 = time.monotonic()
-        with pytest.raises(server._CimdFetchError):
+        with pytest.raises(server._CimdFetchError, match="before the whole body"):
             server._fetch_client_metadata(f"https://claude.ai:{port}/doc")
-        assert time.monotonic() - t0 < 1.5
+
+
+@pytest.mark.parametrize("phase", ["headers", "body"])
+def test_fetch_client_metadata_deadline_bounds_trickle(_plain_tls, monkeypatch, phase):
+    # A peer that keeps every single read under the socket timeout must still
+    # be cut off at the overall deadline -- in http.client's header loop as
+    # well as in the body reads. The peer paces itself on an Event that the
+    # teardown sets, so the server thread ends promptly.
+    monkeypatch.setattr(server, "_CIMD_FETCH_TIMEOUT_SECS", 0.5)
+    stop = threading.Event()
+
+    def trickle(h):
+        if phase == "headers":
+            h.wfile.write(b"HTTP/1.1 200 OK\r\n")
+            for i in range(40):
+                h.wfile.write(f"X-Pad-{i}: x\r\n".encode())
+                h.wfile.flush()
+                if stop.wait(0.05):
+                    return
+        else:
+            h.send_response(200)
+            h.send_header("Content-Length", "100")
+            h.end_headers()
+            for _ in range(40):
+                h.wfile.write(b" ")
+                h.wfile.flush()
+                if stop.wait(0.05):
+                    return
+
+    try:
+        with _cimd_http_server(trickle) as (port, _):
+            _plain_tls(port)
+            t0 = time.monotonic()
+            with pytest.raises(server._CimdFetchError):
+                server._fetch_client_metadata(f"https://claude.ai:{port}/doc")
+            assert time.monotonic() - t0 < 1.5
+            stop.set()
+    finally:
+        stop.set()
 
 
 def test_fetch_client_metadata_refuses_private_address(monkeypatch):

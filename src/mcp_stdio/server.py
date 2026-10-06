@@ -4450,27 +4450,46 @@ def _validate_client_id_url(url: str) -> str:
     return url
 
 
+_NAT64_WELL_KNOWN = ipaddress.ip_network("64:ff9b::/96")
+
+
 def _cimd_address_allowed(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     """True only for a globally routable unicast address (draft-02 Sec. 8.6:
-    never fetch from an RFC 6890 special-use address). An IPv4-mapped IPv6
-    address is judged by its IPv4 form, which older CPython does not do."""
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
+    never fetch from an RFC 6890 special-use address).
+
+    An IPv6 address that embeds an IPv4 one is judged by the IPv4 address it
+    reaches: IPv4-mapped (older CPython does not unwrap it), 6to4, and the
+    NAT64 well-known prefix (RFC 6052; a DNS64 resolver synthesizes it for an
+    IPv4-only host, so refusing it outright would break NAT64 networks).
+    Deprecated site-local ``fec0::/10`` is refused explicitly: CPython still
+    reports it ``is_global``.
+    """
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        elif ip.sixtofour is not None:
+            ip = ip.sixtofour
+        elif ip in _NAT64_WELL_KNOWN:
+            ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+        elif ip.is_site_local:
+            return False
     return ip.is_global and not ip.is_multicast
 
 
 def _cimd_max_age(cache_control: str | None) -> float | None:
-    """Seconds from a Cache-Control header: ``max-age=N``, or 0 for
-    ``no-store``/``no-cache`` (the caller's floor then applies). None when the
-    header says neither. Expires / ETag revalidation are not implemented."""
+    """Seconds from a Cache-Control header: 0 when it carries ``no-store`` or
+    ``no-cache`` anywhere (they win over ``max-age``, whatever the order; the
+    caller's floor then applies), else ``max-age=N``, else None. Expires /
+    ETag revalidation are not implemented."""
     if not cache_control:
         return None
-    for directive in cache_control.split(","):
+    directives = cache_control.split(",")
+    if any(d.strip().lower() in ("no-store", "no-cache") for d in directives):
+        return 0.0
+    for directive in directives:
         m = _CIMD_MAX_AGE_RE.fullmatch(directive)
         if m:
             return float(m.group(1))
-        if directive.strip().lower() in ("no-store", "no-cache"):
-            return 0.0
     return None
 
 
@@ -4481,6 +4500,15 @@ def _cimd_getaddrinfo(host: str, port: int) -> list[Any]:
     return socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
 
 
+def _cimd_shutdown(sock: socket.socket) -> None:
+    """Watchdog action for ``_fetch_client_metadata``: shut the socket down so
+    a pending read returns. Shutting down a closed socket is not an error."""
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
 def _fetch_client_metadata(url: str) -> tuple[bytes, float | None]:
     """Fetch a client metadata document. Returns ``(body, max_age)``.
 
@@ -4489,10 +4517,14 @@ def _fetch_client_metadata(url: str) -> tuple[bytes, float | None]:
     made to a vetted address (so a second, rebinding DNS answer is never
     used) with normal certificate verification against the host name.
     ``http.client`` never follows redirects, and draft-02 Sec. 5 forbids
-    following them, so a 3xx is just "not 200". The body is read in chunks
-    against one overall deadline (overrun by at most one blocking read, itself
-    bounded by the budget left when the response started), stopping past
-    ``_CIMD_MAX_BYTES``.
+    following them, so a 3xx is just "not 200". The body is read in chunks,
+    stopping past ``_CIMD_MAX_BYTES``; a body shorter than its Content-Length
+    is a transport failure, not a document.
+
+    One deadline covers connect through the last byte. Socket timeouts bound
+    each read, but http.client's header and chunk-framing loops make many
+    reads, so a watchdog timer also shuts the socket down at the deadline,
+    which unblocks whatever read is pending.
 
     Raises _CimdFetchError on any failure.
     """
@@ -4531,8 +4563,22 @@ def _fetch_client_metadata(url: str) -> tuple[bytes, float | None]:
     last_err: Exception | None = None
     for addr in addrs:
         conn = None
+        ssock = None
+        watchdog = None
+        wd_sock = None
         try:
             sock = socket.create_connection((addr, port), timeout=remaining())
+            # wrap_socket() detaches sock, so the watchdog gets its own
+            # descriptor for the same connection: shutdown() acts on the
+            # connection, and a dup cannot be recycled under it.
+            try:
+                wd_sock = sock.dup()
+            except BaseException:
+                sock.close()
+                raise
+            watchdog = threading.Timer(remaining(), _cimd_shutdown, (wd_sock,))
+            watchdog.daemon = True
+            watchdog.start()
             try:
                 ssock = ctx.wrap_socket(sock, server_hostname=host)
             except BaseException:
@@ -4557,9 +4603,8 @@ def _fetch_client_metadata(url: str) -> tuple[bytes, float | None]:
             if resp.status != 200:
                 raise _CimdFetchError(f"HTTP {resp.status}")
             # Not ssock.settimeout() from here on: http.client closes the
-            # socket object once a close-delimited response is read, so the
-            # deadline is checked between reads instead (each blocking read
-            # is still bounded by the timeout set before getresponse()).
+            # socket object once a close-delimited response is read. The
+            # watchdog bounds the reads; remaining() reports the overrun.
             body = b""
             while len(body) <= _CIMD_MAX_BYTES:
                 remaining()
@@ -4569,16 +4614,30 @@ def _fetch_client_metadata(url: str) -> tuple[bytes, float | None]:
                 body += chunk
             if len(body) > _CIMD_MAX_BYTES:
                 raise _CimdFetchError(f"larger than {_CIMD_MAX_BYTES} bytes")
+            # read1() answers b"" at a premature EOF instead of raising
+            # IncompleteRead; the unread part of a Content-Length is left in
+            # resp.length.
+            if resp.length:
+                raise _CimdFetchError("connection closed before the whole body")
             return body, _cimd_max_age(resp.getheader("Cache-Control"))
         except _CimdFetchError:
             raise
         except (OSError, http.client.HTTPException) as e:
-            # ssl.SSLError and socket.timeout are OSErrors. Try the next
-            # vetted address; report the last error if none works.
+            # ssl.SSLError and socket.timeout are OSErrors, and so is the
+            # error a watchdog shutdown raises. Try the next vetted address
+            # (remaining() stops that once the deadline has passed); report
+            # the last error if none works.
+            remaining()
             last_err = e
         finally:
+            if watchdog is not None:
+                watchdog.cancel()
+            if wd_sock is not None:
+                wd_sock.close()
             if conn is not None:
                 conn.close()
+            if ssock is not None:
+                ssock.close()
     raise _CimdFetchError(f"cannot fetch: {last_err}")
 
 
@@ -4679,10 +4738,14 @@ class _ClientMetadataCache:
     client_id URLs.
 
     Never called under ``_OAuthProvider._lock``. ``_lock`` guards ``_entries``
-    only and is never held across a fetch; one flight lock per URL makes
-    concurrent /authorize requests for the same client share a single fetch
-    (a waiter re-checks the cache once it gets the flight lock). The allowlist
-    is fixed at startup, so both dicts are bounded by it.
+    and ``_failures`` only and is never held across a fetch; one flight lock
+    per URL makes concurrent /authorize requests for the same client share a
+    single fetch. A waiter that gets the flight lock re-checks the cache, and
+    when the fetch it waited on FAILED (``_failures`` moved on while it
+    waited) it takes that outcome instead of fetching again: the stale copy
+    if one is usable, else None. A later, non-concurrent request fetches
+    afresh -- failures are not cached (draft-02 Sec. 5.2). The allowlist is
+    fixed at startup, so every dict is bounded by it.
 
     ``fetch`` and ``now`` are injectable for tests.
     """
@@ -4699,6 +4762,7 @@ class _ClientMetadataCache:
         self._now = now
         self._lock = threading.Lock()
         self._entries: dict[str, _CimdClient] = {}
+        self._failures = dict.fromkeys(allowed, 0)
         self._flights = {url: threading.Lock() for url in allowed}
 
     def resolve(self, url: str) -> _CimdClient | None:
@@ -4709,17 +4773,25 @@ class _ClientMetadataCache:
             return None
         with self._lock:
             entry = self._entries.get(url)
+            failures_seen = self._failures[url]
         if entry is not None and self._now() < entry.fresh_until:
             return entry
         with flight:
             with self._lock:
                 entry = self._entries.get(url)
+                shared_failure = self._failures[url] != failures_seen
             now = self._now()
             if entry is not None and now < entry.fresh_until:
                 return entry
+            if shared_failure:
+                # The fetch this request queued behind failed; its outcome
+                # was logged once already.
+                return entry if entry is not None and now < entry.stale_until else None
             try:
                 body, max_age = self._fetch(url)
             except _CimdFetchError as e:
+                with self._lock:
+                    self._failures[url] += 1
                 if entry is not None and now < entry.stale_until:
                     log(
                         f"warning: cannot re-fetch client metadata document "
@@ -4733,6 +4805,7 @@ class _ClientMetadataCache:
             except _CimdInvalidError as e:
                 with self._lock:
                     self._entries.pop(url, None)
+                    self._failures[url] += 1
                 log(f"warning: invalid client metadata document {url}: {e}")
                 return None
             ttl = _CIMD_DEFAULT_TTL_SECS if max_age is None else max_age
