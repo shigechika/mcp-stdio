@@ -7768,6 +7768,21 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_empty(200)
 
 
+class _GatewayHTTPServer(ThreadingHTTPServer):
+    """``ThreadingHTTPServer`` with a listen backlog sized for a burst.
+
+    socketserver's default ``request_queue_size`` of 5 is the ``listen()``
+    backlog: a sixth connection arriving before the accept loop catches up
+    is refused or reset by the kernel (macOS does this readily) -- a client
+    that opens a handful of connections at once, or several clients
+    reconnecting together after a restart, then sees a spurious connect
+    error. 128 is a conventional value (``SOMAXCONN`` on many systems); the
+    kernel clamps it to its own limit.
+    """
+
+    request_queue_size = 128
+
+
 def build_server(
     command: list[str],
     *,
@@ -7856,7 +7871,7 @@ def build_server(
             "drop_client_capabilities": frozenset(drop_client_capabilities),
         },
     )
-    httpd = ThreadingHTTPServer((host, port), handler)
+    httpd = _GatewayHTTPServer((host, port), handler)
     # Don't let the process hang on lingering SSE handler threads at shutdown.
     httpd.daemon_threads = True
     # Attached rather than returned: the (httpd, registry) tuple is this
