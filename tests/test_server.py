@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import re
+import ssl
 import stat
 import sys
 import threading
@@ -4846,11 +4847,14 @@ def _plain_tls(monkeypatch):
         )
         monkeypatch.setattr(server, "_cimd_address_allowed", lambda ip: True)
 
-        class Ctx:
+        # A real SSLContext subclass: HTTPSConnection reads verify_mode /
+        # check_hostname from it on 3.10-3.11. Only the TLS wrap is skipped.
+        class Ctx(ssl.SSLContext):
             def wrap_socket(self, sock, server_hostname=None, **kw):
                 return sock
 
-        monkeypatch.setattr(server, "_cimd_ssl_context", lambda: Ctx())
+        ctx = Ctx(ssl.PROTOCOL_TLS_CLIENT)
+        monkeypatch.setattr(server, "_cimd_ssl_context", lambda: ctx)
 
     return patch
 
