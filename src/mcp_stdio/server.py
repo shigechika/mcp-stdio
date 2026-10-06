@@ -6056,6 +6056,30 @@ class _OAuthProvider:
                 del self._clients[k]
 
 
+_DROPPABLE_CLIENT_CAPABILITIES = ("roots", "elicitation", "sampling")
+
+
+def _drop_client_capabilities(
+    msg: dict[str, Any], drop: frozenset[str]
+) -> dict[str, Any]:
+    """``--drop-client-capability`` (#466): a copy of a legacy ``initialize``
+    whose ``params.capabilities`` lacks the ``drop`` keys, so the child never
+    learns the client claimed them and a well-behaved child never sends the
+    matching request (``roots/list`` ...) that a client like claude.ai
+    declares but never answers (anthropics/claude-ai-mcp#708). ``msg`` itself
+    is not modified. A malformed ``params``/``capabilities`` is returned as is
+    -- the child answers it exactly as it would have.
+    """
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return msg
+    caps = params.get("capabilities")
+    if not isinstance(caps, dict) or not drop.intersection(caps):
+        return msg
+    kept = {k: v for k, v in caps.items() if k not in drop}
+    return {**msg, "params": {**params, "capabilities": kept}}
+
+
 class _Handler(BaseHTTPRequestHandler):
     """Streamable HTTP MCP endpoint backed by a per-session stdio child.
 
@@ -6077,6 +6101,9 @@ class _Handler(BaseHTTPRequestHandler):
     oauth: _OAuthProvider | None = None
     # Non-loopback origins the #449 Origin check accepts (canonical form).
     allowed_origins: frozenset[str] = frozenset()
+    # --drop-client-capability (#466): keys removed from a legacy
+    # initialize's params.capabilities before it reaches the child.
+    drop_client_capabilities: frozenset[str] = frozenset()
 
     # Quieter, consistent logging: route BaseHTTPRequestHandler's access log
     # through the project logger instead of stderr's default apache-style line.
@@ -7556,9 +7583,12 @@ class _Handler(BaseHTTPRequestHandler):
                     stale.shutdown()
                 self._send_json(503, _error_body("backend unavailable", req_id))
                 return
+            forward = msg
+            if is_init and self.drop_client_capabilities:
+                forward = _drop_client_capabilities(msg, self.drop_client_capabilities)
             try:
                 line = backend.send_request(
-                    json.dumps(msg), req_id, _BACKEND_RESPONSE_TIMEOUT_SECS
+                    json.dumps(forward), req_id, _BACKEND_RESPONSE_TIMEOUT_SECS
                 )
             except _DuplicateInFlightId as exc:
                 # Client reused a JSON-RPC id already in flight on this session
@@ -7755,6 +7785,7 @@ def build_server(
     user_env_var: str | None = None,
     max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
     allowed_origins: Iterable[str] = (),
+    drop_client_capabilities: Iterable[str] = (),
 ) -> tuple[ThreadingHTTPServer, SessionRegistry]:
     """Construct the HTTP server and session registry without running the loop.
 
@@ -7780,7 +7811,10 @@ def build_server(
     the #449 ``Origin`` allowlist beyond loopback; an ``oauth`` provider's
     explicit ``public_url`` origin is added automatically. The
     request-derived issuer never is: a DNS-rebinding request controls
-    ``Host``.
+    ``Host``. ``drop_client_capabilities`` (a subset of
+    ``_DROPPABLE_CLIENT_CAPABILITIES``) is removed from every legacy
+    ``initialize``'s ``params.capabilities`` before it reaches the child
+    (#466); empty, the legacy path forwards the body untouched.
     """
     origins = {_normalize_origin(o) for o in allowed_origins}
     if oauth is not None and oauth.public_url:
@@ -7819,6 +7853,7 @@ def build_server(
             "modern_only": modern_only,
             "max_message_size": max_message_size,
             "allowed_origins": frozenset(origins),
+            "drop_client_capabilities": frozenset(drop_client_capabilities),
         },
     )
     httpd = ThreadingHTTPServer((host, port), handler)
@@ -7849,6 +7884,7 @@ def serve(
     user_env_var: str | None = None,
     max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
     allowed_origins: Iterable[str] = (),
+    drop_client_capabilities: Iterable[str] = (),
 ) -> None:
     """Run the reverse gateway until interrupted.
 
@@ -7859,8 +7895,9 @@ def serve(
     concurrent sessions; ``idle_ttl`` (when ``> 0``) evicts idle sessions.
     ``user_env_var`` injects the authenticated principal into each spawned
     child's environment (see :func:`build_server`). ``max_message_size``
-    bounds a single request body and ``allowed_origins`` extends the
-    ``Origin`` allowlist (see :func:`build_server`).
+    bounds a single request body, ``allowed_origins`` extends the
+    ``Origin`` allowlist and ``drop_client_capabilities`` edits legacy
+    ``initialize`` requests (see :func:`build_server`).
     """
     httpd, registry = build_server(
         command,
@@ -7878,6 +7915,7 @@ def serve(
         user_env_var=user_env_var,
         max_message_size=max_message_size,
         allowed_origins=allowed_origins,
+        drop_client_capabilities=drop_client_capabilities,
     )
     # #385: the legacy reaper now always starts (it sweeps dead children
     # unconditionally, not just idle-past-TTL ones), independent of
@@ -8198,6 +8236,22 @@ def serve_main(argv: list[str]) -> None:
         ),
     )
     parser.add_argument(
+        "--drop-client-capability",
+        action="append",
+        default=[],
+        choices=_DROPPABLE_CLIENT_CAPABILITIES,
+        metavar="CAP",
+        help=(
+            "Remove this capability (roots, elicitation or sampling) from a "
+            "legacy client's initialize before it reaches the backend, so "
+            "the backend never asks the client for it. For clients that "
+            "declare a capability but never answer the request (claude.ai "
+            "declares roots and elicitation; a backend that then sends "
+            "roots/list times out, anthropics/claude-ai-mcp#708). "
+            "Repeatable. Off by default; the modern era is unaffected."
+        ),
+    )
+    parser.add_argument(
         "--modern-idle-ttl",
         type=float,
         default=0.0,
@@ -8453,4 +8507,5 @@ def serve_main(argv: list[str]) -> None:
         user_env_var=args.user_env,
         max_message_size=args.max_message_size,
         allowed_origins=allowed_origins,
+        drop_client_capabilities=args.drop_client_capability,
     )

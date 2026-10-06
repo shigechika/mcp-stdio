@@ -131,6 +131,7 @@ Arguments:
 | `--max-sessions N` | `100` | Maximum concurrent sessions; an initialize past the cap gets `503` |
 | `--session-idle-ttl SECONDS` | `0` (disabled) | Idle timeout for OLDER clients' sessions (newer clients have `--modern-idle-ttl`); evict a session and its child after this much inactivity so a client that disconnects without DELETE does not pin a slot |
 | `--max-sessions-per-owner N` | `0` (disabled) | On a new initialize, LRU-evict that OAuth user's older sessions down to `N`, reclaiming ghosts left by a client that reconnects without DELETE; static-token and open-gateway sessions are exempt |
+| `--drop-client-capability CAP` | — | Remove `roots`, `elicitation` or `sampling` from an older client's `initialize` before it reaches the backend, so the backend never asks the client for it (repeatable). For clients that declare a capability but never answer it: claude.ai declares `roots`, and a backend that then sends `roots/list` times out and the connector fails to connect ([anthropics/claude-ai-mcp#708](https://github.com/anthropics/claude-ai-mcp/issues/708), #466). Newer clients are unaffected |
 
 <a id="modern-era-serve"></a>
 
