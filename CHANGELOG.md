@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.44.0](https://github.com/shigechika/mcp-stdio/compare/v0.43.8...v0.44.0) (2026-10-06)
+
+
+### Features
+
+* --mcp-param-headers always mirrors x-mcp-header on legacy sessions ([#461](https://github.com/shigechika/mcp-stdio/issues/461)) ([cb44c98](https://github.com/shigechika/mcp-stdio/commit/cb44c98992147036dc275ae6d2f172f8cd8784e5))
+* mirror x-mcp-header annotations into Mcp-Param-* headers (SEP-2243) ([#460](https://github.com/shigechika/mcp-stdio/issues/460)) ([3477d8a](https://github.com/shigechika/mcp-stdio/commit/3477d8a9885a69dc1238bddee1812e798ce38920))
+
+
+### Bug Fixes
+
+* **serve:** match the MCP path and token audience case-insensitively ([#457](https://github.com/shigechika/mcp-stdio/issues/457)) ([c79dbe8](https://github.com/shigechika/mcp-stdio/commit/c79dbe8d24ea58658d94dcc301558f59938eedae))
+
 ## [0.43.8](https://github.com/shigechika/mcp-stdio/compare/v0.43.7...v0.43.8) (2026-10-05)
 
 
