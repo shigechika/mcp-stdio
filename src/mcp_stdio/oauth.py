@@ -2561,6 +2561,7 @@ def ensure_token(
     resource_indicator: bool = True,
     oauth_resource: str | None = None,
     interactive: bool = True,
+    reject_access_token: str | None = None,
 ) -> TokenData | None:
     """Ensure a valid access token is available.
 
@@ -2591,6 +2592,13 @@ def ensure_token(
     When ``resource_indicator=False`` the RFC 8707 ``resource`` parameter is
     omitted from all requests. Use ``--no-resource-indicator`` for AS that
     reject the parameter (e.g. Microsoft Entra ID v2 with api:// scopes).
+
+    ``reject_access_token`` is an access token the server has already
+    rejected (#471, mid-session re-authorization): a cached token equal to it
+    is not returned as valid even before its ``expires_at`` -- a revoked
+    token can still look unexpired -- so the refresh and, failing that, the
+    interactive flow run. A DIFFERENT cached token (another relay process
+    signed in meanwhile) is still used as is.
 
     Returns TokenData with a valid access_token.
     """
@@ -2631,7 +2639,9 @@ def ensure_token(
                         cached = latest
             except OSError as e:
                 log(f"warning: could not persist reconciled resource settings: {e}")
-        if (
+        if cached.access_token == reject_access_token:
+            log("the cached OAuth token was rejected by the server; not reusing it")
+        elif (
             cached.expires_at is None
             or cached.expires_at > time.time() + refresh_leeway
         ):

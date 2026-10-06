@@ -82,6 +82,7 @@ stdio.
 - **Session recovery** — resets MCP session ID on 404 and retries
 - **Protocol version header** — captures the negotiated `protocolVersion` from the `initialize` response and injects `MCP-Protocol-Version` on every subsequent Streamable HTTP request (MCP spec rev 2025-06-18); servers that enforce the header would otherwise reject post-initialize requests with `400 Bad Request`
 - **Token refresh on 401** — automatically refreshes expired OAuth tokens mid-session (OAuth mode only)
+- **Re-authorization when the refresh token dies** — if the refresh itself is rejected (revoked or expired grant, no refresh token), the relay runs the same interactive sign-in as at startup on a background thread, answers that request with `-32002` ("finish signing in, then retry"), and later requests use the new token, with no restart needed. One sign-in at a time: relay processes for the same server wait for each other and reuse the stored token, and a failed attempt starts a 60 s cooldown. On by default with `--oauth` / `--oauth-device`; opt out with `--no-oauth-reauth` (#471)
 - **Proactive token refresh** — a background timer refreshes the OAuth token shortly before it expires (lead time: `--oauth-refresh-leeway`), so a long-lived session survives gateways that signal token expiry as an HTTP 200 tool-error instead of a transport 401 (e.g. Atlassian's MCP gateway); on by default in OAuth mode, opt out with `--no-proactive-refresh` (#242)
 - **Step-up authorization on 403** — on a `Bearer error="insufficient_scope"` challenge, re-authorizes for the union of the granted and required scopes ([RFC 9470](https://www.rfc-editor.org/rfc/rfc9470) / MCP step-up; cf. anthropics/claude-code#44652)
 - **Cold-start (`--oauth-eager`)** — answers `initialize` locally and runs the interactive OAuth flow on a background thread, so a 30–180 s browser/SSO/MFA login does not exceed the client's ~60 s initialize timeout. Gated methods return `-32002` until login completes, then `notifications/*/list_changed` tells the client to fetch the now-available lists. Streamable HTTP only; a warm (valid/refreshable) cache is unaffected (#296)
@@ -234,6 +235,8 @@ Options:
                          token before it expires. On by default in OAuth mode;
                          keeps long sessions alive against gateways that signal
                          expiry as an HTTP 200 tool-error rather than a 401 (#242)
+  --no-oauth-reauth      Do not sign in again in the background when the refresh
+                         token stops working mid-session (on by default; #471)
   --oauth-timeout SECONDS
                          Seconds to wait for the interactive OAuth flow (browser
                          callback / device-code confirmation) before giving up
@@ -549,7 +552,7 @@ See [WORKAROUNDS.md](WORKAROUNDS.md) for known issues in Claude Code, Claude Des
 2. Reads JSON-RPC messages from stdin (sent by Claude Desktop/Code)
 3. Relays them over HTTPS to the remote MCP server
 4. Parses responses and writes them to stdout
-5. On 401 (OAuth mode only), refreshes the access token and retries; with static `--bearer-token` / `-H` auth the 401 is surfaced to the client
+5. On 401 (OAuth mode only), refreshes the access token and retries; when the refresh itself is rejected, it re-authorizes in the background and answers `-32002` until the sign-in completes (#471); with static `--bearer-token` / `-H` auth the 401 is surfaced to the client
 6. In OAuth mode a background timer also refreshes the token shortly before it expires (`--oauth-refresh-leeway`), independent of request flow — this keeps long sessions alive against gateways that report token expiry as an HTTP 200 tool-error rather than a 401 (opt out with `--no-proactive-refresh`)
 
 Transport details:

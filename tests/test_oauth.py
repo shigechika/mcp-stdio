@@ -8261,3 +8261,54 @@ class TestRefreshDurability:
 
         monkeypatch.setattr(oauth_mod, "refresh_lock", no_lock)
         assert oauth_mod.refresh_cached_token(_DUR_URL, httpx.Client()) is None
+
+
+class TestEnsureTokenRejectAccessToken:
+    """#471: mid-session re-authorization passes the token the server just
+    rejected; a cached copy of it must not be handed back as valid."""
+
+    URL = "https://example.com/mcp"
+
+    def _setup(self, tmp_path, monkeypatch, access_token):
+        monkeypatch.setattr("mcp_stdio.token_store._STORE_DIR", tmp_path)
+        monkeypatch.setattr(
+            "mcp_stdio.token_store._STORE_FILE", tmp_path / "tokens.json"
+        )
+        from mcp_stdio.token_store import save_token
+
+        # Unexpired: a revoked token can still look valid locally.
+        save_token(
+            self.URL,
+            TokenData(access_token=access_token, expires_at=time.time() + 3600),
+        )
+        sentinel = TokenData(access_token="fresh_from_full_flow")
+        monkeypatch.setattr(
+            "mcp_stdio.oauth._probe_www_authenticate", lambda *a, **k: None
+        )
+        monkeypatch.setattr(
+            "mcp_stdio.oauth.discover_oauth_metadata",
+            lambda *a, **k: OAuthMetadata(
+                authorization_endpoint="https://example.com/authorize",
+                token_endpoint="https://example.com/token",
+            ),
+        )
+        monkeypatch.setattr(
+            "mcp_stdio.oauth._run_authorization_flow", lambda *a, **k: sentinel
+        )
+        return sentinel
+
+    def test_rejected_cached_token_runs_the_full_flow(self, tmp_path, monkeypatch):
+        sentinel = self._setup(tmp_path, monkeypatch, "revoked")
+        data = ensure_token(self.URL, httpx.Client(), reject_access_token="revoked")
+        assert data is sentinel
+
+    def test_a_different_cached_token_is_still_used(self, tmp_path, monkeypatch):
+        # Another relay process signed in meanwhile: no second browser.
+        self._setup(tmp_path, monkeypatch, "sibling-fresh")
+        data = ensure_token(self.URL, httpx.Client(), reject_access_token="revoked")
+        assert data.access_token == "sibling-fresh"
+
+    def test_default_keeps_using_the_cached_token(self, tmp_path, monkeypatch):
+        self._setup(tmp_path, monkeypatch, "revoked")
+        data = ensure_token(self.URL, httpx.Client())
+        assert data.access_token == "revoked"

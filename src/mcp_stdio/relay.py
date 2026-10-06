@@ -5197,6 +5197,120 @@ def _cold_start_loop(
         log(f"cold-start background error: {e}")
 
 
+# --- mid-session re-authorization when the refresh token is dead (#471) ---
+#
+# A 401 whose refresh fails because the grant is DEAD (refresh token revoked or
+# expired, none issued, client_secret expired) used to leave the relay answering
+# "authentication failed" until a restart. _Reauthorizer runs the same
+# interactive flow --oauth-eager uses on a background thread instead; the line
+# that hit the 401 is answered -32002 ("finish signing in and retry"), and once
+# the flow completes the Authorization header is swapped so the next request
+# goes through. Never re-dispatches inside the 401 rung (that would block the
+# stdin loop for the length of a browser sign-in).
+_REAUTH_COOLDOWN_SECS = 60.0
+_REAUTH_MESSAGE = (
+    "the upstream authorization expired; re-authorizing: finish signing in "
+    "(browser, or the device code in the mcp-stdio log), then retry"
+)
+
+
+class _Reauthorizer:
+    """At most one background re-authorization per process (#471).
+
+    ``login(rejected_authorization)`` returns the new headers, or None. It
+    gets the ``Authorization`` value the server rejected and owns all of the
+    sign-in policy, which runs on this class's thread and may block: cli's
+    ``_build_reauth_login`` adopts a stored token that differs from the
+    rejected one without signing in, waits (bounded) for a sibling relay
+    already signing in for the same server and then adopts its token, and
+    only otherwise runs the interactive flow -- returning None when the
+    sign-in fails or the sibling is still busy after the wait. ``refresh_was_dead`` says
+    whether the refresher's LAST failure proved the grant dead; only then is
+    a re-authorization worth a browser. Call ``maybe_start`` while still
+    holding the relay's ``refresh_lock`` right after the failed refresh, so
+    no other refresh can overwrite that verdict in between.
+
+    After a failed attempt a new one is not started for
+    ``_REAUTH_COOLDOWN_SECS``, so a client that keeps retrying does not keep
+    opening browser tabs. ``now`` is injectable for tests.
+    """
+
+    def __init__(
+        self,
+        *,
+        login: Callable[[str | None], dict[str, str] | None],
+        refresh_was_dead: Callable[[], bool],
+        headers: dict[str, str],
+        headers_lock: threading.Lock,
+        now: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._login = login
+        self._refresh_was_dead = refresh_was_dead
+        self._headers = headers
+        self._headers_lock = headers_lock
+        self._now = now
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._retry_after = 0.0
+
+    def maybe_start(self, rejected_authorization: str | None) -> bool:
+        """True when the caller should answer -32002 ("retry"): a
+        re-authorization is running (started now or already in flight), or
+        the credentials were already replaced after the 401'd request was
+        sent (a sign-in finished meanwhile; a retry uses the new ones). False
+        when the refresh failure was transient or the cooldown is on (the
+        caller keeps its ordinary error).
+
+        ``rejected_authorization`` is the ``Authorization`` value the 401'd
+        request ACTUALLY carried -- None when it carried none, never a
+        stand-in for "the current one", which may already be a fresh token
+        installed after that request was sent."""
+        if not self._refresh_was_dead():
+            return False
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return True
+            with self._headers_lock:
+                current = self._headers.get("Authorization")
+            if rejected_authorization != current:
+                return True
+            if self._now() < self._retry_after:
+                return False
+            log("refresh token is no longer valid; re-authorizing in the background")
+            self._thread = threading.Thread(
+                target=self._run,
+                args=(rejected_authorization,),
+                name="oauth-reauth",
+                daemon=True,
+            )
+            self._thread.start()
+            return True
+
+    def _run(self, rejected_authorization: str | None) -> None:
+        try:
+            new_headers = self._login(rejected_authorization)
+        except Exception as e:  # noqa: BLE001 -- the daemon must never crash the relay
+            log(f"re-authorization error: {e}")
+            new_headers = None
+        if new_headers:
+            with self._headers_lock:
+                self._headers.update(new_headers)
+            log("re-authorization complete; new requests use the new token")
+            return
+        log(
+            "re-authorization did not complete; the next attempt starts no "
+            f"sooner than {_REAUTH_COOLDOWN_SECS:g}s from now"
+        )
+        with self._lock:
+            self._retry_after = self._now() + _REAUTH_COOLDOWN_SECS
+
+    def join(self, timeout: float | None = None) -> None:
+        """Wait for a running attempt (tests)."""
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout)
+
+
 # --- modern era: relay-originated subscriptions/listen stream (#270 Phase 2 PR A) ---
 #
 # Spec rev 2026-07-28 removed the legacy long-lived GET stream, so on the
@@ -7415,6 +7529,8 @@ def run(
     proactive_refresh: bool = True,
     refresh_leeway: float = 60.0,
     cold_start_login: Any = None,
+    reauth_login: Any = None,
+    refresh_was_dead: Any = None,
     protocol_era: str = "legacy",
     listen_read_timeout: float = 300.0,
     max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
@@ -7484,6 +7600,14 @@ def run(
             ``_reinitialize`` sends a legacy ``initialize`` handshake to
             establish a session, which is meaningless on a path with no
             sessions at all (#270 Phase 1).
+        reauth_login: Optional callable like ``cold_start_login`` but taking
+            the rejected ``Authorization`` value, run on a background thread
+            when a 401's refresh fails because the grant is dead (#471; see
+            ``_Reauthorizer``). Needs
+            ``refresh_was_dead`` and ``token_refresher``; any of the three
+            None keeps today's "authentication failed".
+        refresh_was_dead: Optional callable: did ``token_refresher``'s last
+            failure prove the grant dead (as opposed to transient)?
         protocol_era: One of ``"legacy"`` (default), ``"modern"``, or
             ``"auto"``. ``"legacy"`` is today's behaviour — the initialize
             handshake, ``Mcp-Session-Id`` tracking, and 401/403/404 recovery,
@@ -7686,6 +7810,18 @@ def run(
     # the AS's refresh-token rotation. Both are uncontended when the timer is off.
     headers_lock = threading.Lock()
     refresh_lock = threading.Lock()
+    reauthorizer = (
+        _Reauthorizer(
+            login=reauth_login,
+            refresh_was_dead=refresh_was_dead,
+            headers=headers,
+            headers_lock=headers_lock,
+        )
+        if reauth_login is not None
+        and refresh_was_dead is not None
+        and token_refresher is not None
+        else None
+    )
 
     # Resolve the protocol era BEFORE the stdin loop starts (#270 Phase 1).
     # "legacy" (the default) does NOTHING here — zero extra network traffic,
@@ -8570,6 +8706,9 @@ def run(
         must describe THIS POST's outcome, never the previous attempt's.
         """
         retry_headers = _prepare_headers(retry_line, param_decls=txn.get("param_decls"))
+        # #471: what this retry actually carried, for the 401 arm's
+        # re-authorization trigger.
+        txn["sent_authorization"] = retry_headers.get("Authorization")
         if txn["pinned_version"]:
             retry_headers = {
                 k: v
@@ -8738,6 +8877,12 @@ def run(
                 log("MRTR retry received 401, attempting token refresh")
                 with refresh_lock:
                     new_headers = token_refresher()
+                    if not new_headers and reauthorizer is not None:
+                        # #471: the dialog itself still ends in the
+                        # terminal arm below, but a dead grant starts the
+                        # background sign-in so the client's NEXT attempt
+                        # works.
+                        reauthorizer.maybe_start(txn.get("sent_authorization"))
                 if new_headers:
                     with headers_lock:
                         headers.update(new_headers)
@@ -10115,6 +10260,15 @@ def run(
                     # never race the AS's refresh-token rotation (#242).
                     with refresh_lock:
                         new_headers = token_refresher()
+                        # #471: decided under the same lock, so the
+                        # timer's refresh cannot overwrite the verdict.
+                        reauthorizing = (
+                            not new_headers
+                            and reauthorizer is not None
+                            and reauthorizer.maybe_start(
+                                req_headers.get("Authorization")
+                            )
+                        )
                     if new_headers:
                         with headers_lock:
                             headers.update(new_headers)
@@ -10165,6 +10319,22 @@ def run(
                             )
                         ):
                             session_id = result.session_id
+                    elif reauthorizing:
+                        # #471: the grant is dead and a background sign-in
+                        # is running. Not re-dispatched here (that would
+                        # block the stdin loop for the whole sign-in); the
+                        # client retries, and a stale legacy session then
+                        # recovers through the 404 rung.
+                        if req_has_id:
+                            _emit(
+                                _error_response(
+                                    _REAUTH_MESSAGE,
+                                    req_id,
+                                    code=_COLD_START_NOT_READY_CODE,
+                                ),
+                                tracker,
+                            )
+                        continue
                     else:
                         log("token refresh failed, returning error")
                         if req_has_id:
@@ -10819,6 +10989,8 @@ def run_sse(
     cancel_filter: bool = True,
     normalize_arguments: bool = True,
     token_refresher: Any = None,
+    reauth_login: Any = None,
+    refresh_was_dead: Any = None,
     scope_upgrader: Any = None,
     token_expiry_getter: Any = None,
     proactive_refresh: bool = True,
@@ -10871,6 +11043,9 @@ def run_sse(
         token_refresher: Optional callable that returns updated headers
             on successful token refresh, or None on failure. Called when
             the server returns HTTP 401 on POST.
+        reauth_login / refresh_was_dead: as for :func:`run` (#471): a dead
+            grant on a 401 starts a background sign-in and the request gets
+            ``-32002`` instead of "authentication failed".
         scope_upgrader: Optional callable invoked when the server returns
             HTTP 403 with a ``Bearer error="insufficient_scope"``
             challenge on POST. Receives the scope string from the
@@ -10922,6 +11097,18 @@ def run_sse(
     # Serialises the proactive-refresh timer's refresh against the reactive 401
     # refresh below so the two never race the AS's refresh-token rotation (#242).
     refresh_lock = threading.Lock()
+    reauthorizer = (
+        _Reauthorizer(
+            login=reauth_login,
+            refresh_was_dead=refresh_was_dead,
+            headers=headers,
+            headers_lock=headers_lock,
+        )
+        if reauth_login is not None
+        and refresh_was_dead is not None
+        and token_refresher is not None
+        else None
+    )
     reader = threading.Thread(
         target=_sse_reader_loop,
         args=(client, url, headers, state, tracker, headers_lock),
@@ -11105,6 +11292,13 @@ def run_sse(
                         # never race the AS's refresh-token rotation (#242).
                         with refresh_lock:
                             new_headers = token_refresher()
+                            reauthorizing = (
+                                not new_headers
+                                and reauthorizer is not None
+                                and reauthorizer.maybe_start(
+                                    resp.request.headers.get("authorization")
+                                )
+                            )
                         if new_headers:
                             with headers_lock:
                                 headers.update(new_headers)
@@ -11134,9 +11328,20 @@ def run_sse(
                             # class this transport works around.
                             settled = tracked and not state.untrack(req_id)
                             if req_has_id and not settled:
-                                _write_line(
-                                    _error_response("authentication failed", req_id)
-                                )
+                                if reauthorizing:
+                                    # #471: see run()'s 401 rung.
+                                    _emit(
+                                        _error_response(
+                                            _REAUTH_MESSAGE,
+                                            req_id,
+                                            code=_COLD_START_NOT_READY_CODE,
+                                        ),
+                                        tracker,
+                                    )
+                                else:
+                                    _write_line(
+                                        _error_response("authentication failed", req_id)
+                                    )
                             continue
 
                     if resp.status_code == 403 and scope_upgrader:

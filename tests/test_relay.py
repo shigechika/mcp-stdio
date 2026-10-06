@@ -17,6 +17,7 @@ import httpx
 import pytest
 from pytest_httpx import IteratorStream
 
+from mcp_stdio import relay as _relay_mod
 from mcp_stdio.relay import (
     MAX_LIST_PAGES,
     MAX_RETRIES,
@@ -21661,3 +21662,272 @@ class TestRunMcpParamHeadersAlways:
             mcp_param_headers="always",
         )
         assert httpx_mock.get_requests()[-1].headers["mcp-param-owner"] == "octo"
+
+
+# --- #471: background re-authorization when the refresh token is dead ---
+
+
+class _GatedStdin:
+    """Yields each line only once its gate (an Event, or None) is set."""
+
+    def __init__(self, lines):
+        self._items = list(lines)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self._items:
+            raise StopIteration
+        line, gate = self._items.pop(0)
+        if gate is not None:
+            assert gate.wait(5), "gate never opened"
+        return line + "\n"
+
+
+class TestReauthorizer:
+    def _make(self, login, dead=True, now=None):
+        headers = {"Authorization": "Bearer old"}
+        r = _relay_mod._Reauthorizer(
+            login=login,
+            refresh_was_dead=lambda: dead,
+            headers=headers,
+            headers_lock=threading.Lock(),
+            **({"now": now} if now else {}),
+        )
+        return r, headers
+
+    def test_transient_failure_starts_nothing(self):
+        calls = []
+        r, _ = self._make(lambda _r: calls.append(1), dead=False)
+        assert r.maybe_start("Bearer old") is False
+        assert calls == []
+
+    def test_dead_starts_once_and_swaps_headers(self):
+        gate = threading.Event()
+        calls = []
+
+        def login(rejected):
+            calls.append(rejected)
+            gate.wait(5)
+            return {"Authorization": "Bearer new"}
+
+        r, headers = self._make(login)
+        assert r.maybe_start("Bearer old") is True
+        # Concurrent 401s while it runs share the one attempt.
+        assert r.maybe_start("Bearer old") is True
+        assert r.maybe_start("Bearer old") is True
+        gate.set()
+        r.join(5)
+        # login learns which credential the server rejected.
+        assert calls == ["Bearer old"]
+        assert headers["Authorization"] == "Bearer new"
+
+    def test_credentials_replaced_since_the_request_means_retry(self):
+        # A sign-in finished after the 401'd request was sent: no new
+        # sign-in, just tell the client to retry with the new credentials.
+        calls = []
+        r, headers = self._make(lambda _r: calls.append(1))
+        headers["Authorization"] = "Bearer newer"
+        assert r.maybe_start("Bearer old") is True
+        r.join(5)
+        assert calls == []
+
+    def test_failed_attempt_cools_down(self):
+        clock = [100.0]
+        calls = []
+
+        def login(_rejected):
+            calls.append(1)
+            return None
+
+        r, headers = self._make(login, now=lambda: clock[0])
+        assert r.maybe_start("Bearer old") is True
+        r.join(5)
+        assert headers["Authorization"] == "Bearer old"
+        assert r.maybe_start("Bearer old") is False  # cooling down: no new browser
+        clock[0] += _relay_mod._REAUTH_COOLDOWN_SECS
+        assert r.maybe_start("Bearer old") is True
+        r.join(5)
+        assert calls == [1, 1]
+
+    def test_login_exception_is_contained_and_cools_down(self):
+        clock = [0.0]
+
+        def login(_rejected):
+            raise RuntimeError("boom")
+
+        r, headers = self._make(login, now=lambda: clock[0])
+        assert r.maybe_start("Bearer old") is True
+        r.join(5)
+        assert headers["Authorization"] == "Bearer old"
+        assert r.maybe_start("Bearer old") is False
+
+    def test_request_without_authorization_never_rejects_a_fresh_token(self):
+        # code-review: None used to mean "the current header", so a 401'd
+        # request that carried NO Authorization could mark a token installed
+        # meanwhile as rejected and open a second browser.
+        calls = []
+        r, headers = self._make(lambda rejected: calls.append(rejected))
+        headers["Authorization"] = "Bearer fresh"
+        assert r.maybe_start(None) is True  # retry: credentials exist now
+        r.join(5)
+        assert calls == []
+        del headers["Authorization"]
+        assert r.maybe_start(None) is True
+        r.join(5)
+        assert calls == [None]
+
+
+class TestRunReauthOn401:
+    URL = "https://example.com/mcp"
+
+    def test_dead_grant_answers_32002_then_next_request_uses_new_token(
+        self, httpx_mock, monkeypatch
+    ):
+        done = threading.Event()
+        real_log = _relay_mod.log
+
+        def spy_log(msg, *a, **k):
+            real_log(msg, *a, **k)
+            if "re-authorization complete" in msg:
+                done.set()
+
+        monkeypatch.setattr(_relay_mod, "log", spy_log)
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Authorization": "Bearer old"},
+            status_code=401,
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Authorization": "Bearer new"},
+            json={"jsonrpc": "2.0", "id": 2, "result": {"ok": True}},
+        )
+        logins = []
+
+        def login(rejected):
+            logins.append(rejected)
+            return {"Authorization": "Bearer new"}
+
+        stdout = StringIO()
+        stdin = _GatedStdin(
+            [
+                ('{"jsonrpc":"2.0","method":"tools/call","id":1}', None),
+                ('{"jsonrpc":"2.0","method":"tools/call","id":2}', done),
+            ]
+        )
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run(
+                self.URL,
+                {"Authorization": "Bearer old"},
+                token_refresher=lambda: None,
+                refresh_was_dead=lambda: True,
+                reauth_login=login,
+                proactive_refresh=False,
+            )
+        msgs = [json.loads(x) for x in stdout.getvalue().splitlines() if x]
+        assert msgs[0]["id"] == 1
+        assert msgs[0]["error"]["code"] == -32002
+        assert "re-authorizing" in msgs[0]["error"]["message"]
+        assert msgs[1] == {"jsonrpc": "2.0", "id": 2, "result": {"ok": True}}
+        assert logins == ["Bearer old"]
+
+    def test_transient_refresh_failure_keeps_authentication_failed(self, httpx_mock):
+        httpx_mock.add_response(url=self.URL, status_code=401)
+        logins = []
+        stdout = StringIO()
+        with (
+            patch("sys.stdin", StringIO('{"jsonrpc":"2.0","method":"x","id":1}\n')),
+            patch("sys.stdout", stdout),
+        ):
+            run(
+                self.URL,
+                {},
+                token_refresher=lambda: None,
+                refresh_was_dead=lambda: False,
+                reauth_login=lambda _r: logins.append(1),
+                proactive_refresh=False,
+            )
+        msg = json.loads(stdout.getvalue().strip())
+        assert msg["error"]["message"] == "authentication failed"
+        assert logins == []
+
+    def test_notification_gets_no_reply_but_still_starts_reauth(self, httpx_mock):
+        httpx_mock.add_response(url=self.URL, status_code=401)
+        started = threading.Event()
+
+        def login(_rejected):
+            started.set()
+            return None
+
+        stdout = StringIO()
+        with (
+            patch(
+                "sys.stdin",
+                StringIO('{"jsonrpc":"2.0","method":"notifications/x"}\n'),
+            ),
+            patch("sys.stdout", stdout),
+        ):
+            run(
+                self.URL,
+                {},
+                token_refresher=lambda: None,
+                refresh_was_dead=lambda: True,
+                reauth_login=login,
+                proactive_refresh=False,
+            )
+        assert stdout.getvalue() == ""
+        assert started.wait(5)
+
+
+class TestRunSseReauthOn401:
+    URL = "https://example.com/sse"
+
+    def test_dead_grant_answers_32002(self, httpx_mock):
+        release_stdin = threading.Event()
+
+        def sse_gen():
+            yield b"event: endpoint\ndata: /messages?sessionId=xyz\n\n"
+            release_stdin.wait(timeout=3)
+
+        httpx_mock.add_response(
+            url=self.URL,
+            method="GET",
+            stream=IteratorStream(sse_gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+
+        def post_callback(request):
+            release_stdin.set()
+            return httpx.Response(status_code=401)
+
+        httpx_mock.add_callback(
+            post_callback,
+            url="https://example.com/messages?sessionId=xyz",
+            method="POST",
+            is_reusable=True,
+        )
+        started = threading.Event()
+
+        def login(_rejected):
+            started.set()
+            return None
+
+        stdin = _BlockingStdin(
+            '{"jsonrpc":"2.0","method":"test","id":7}\n', release_stdin
+        )
+        stdout = StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            run_sse(
+                self.URL,
+                {},
+                token_refresher=lambda: None,
+                refresh_was_dead=lambda: True,
+                reauth_login=login,
+            )
+        msgs = [json.loads(x) for x in stdout.getvalue().strip().splitlines() if x]
+        assert len(msgs) == 1
+        assert msgs[0]["id"] == 7
+        assert msgs[0]["error"]["code"] == -32002
+        assert started.wait(5)
