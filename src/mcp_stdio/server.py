@@ -6069,7 +6069,9 @@ def _validate_claimless_routing_headers(
     not decode to ``params.uri`` gets the same 400 ``-32020`` as on the
     ladder. ABSENT headers pass -- unlike the ladder, where absence is itself
     a mismatch -- because a claim-less read is exactly a request that sent
-    none. Returns False after writing the rejection.
+    none. As on the ladder (rung 2c), a body with no string ``uri`` skips the
+    ``Mcp-Name`` check: dispatch owns that missing-param error. Returns False
+    after writing the rejection.
     """
 
     def _reject(message: str) -> bool:
@@ -6084,9 +6086,12 @@ def _validate_claimless_routing_headers(
     if method_header is not None and method_header != msg.get("method"):
         return _reject("Mcp-Method header does not match the request method")
     name_header = handler.headers.get("Mcp-Name")
-    if name_header is not None and _decode_mcp_name(
-        name_header
-    ) != _modern_name_bearing_value(msg):
+    name_value = _modern_name_bearing_value(msg)
+    if (
+        name_header is not None
+        and name_value is not None
+        and _decode_mcp_name(name_header) != name_value
+    ):
         return _reject(
             "Mcp-Name header does not match the corresponding request body value"
         )
@@ -6109,9 +6114,12 @@ def _claimless_resource_read(
     Qualifies only when ALL hold: a ``resources/read`` request; no
     ``Mcp-Session-Id`` (a legacy client always holds one after
     ``initialize``, so this is never a legal legacy request); no
-    ``MCP-Protocol-Version`` header and no ``_meta`` protocol version (a
-    partial claim still goes through the validation ladder); ``params`` an
-    object and ``params._meta``, if present, an object. The claim filled in
+    ``MCP-Protocol-Version`` header and no ``_meta`` protocol version;
+    ``params`` an object and ``params._meta``, if present, an object. A
+    partial claim is NOT promoted and keeps today's handling: a ``_meta``
+    version already classifies the request modern, so it meets the
+    validation ladder; a version header alone does not (D5 classifies on
+    the body), so that request stays legacy and gets the sessionless 400. The claim filled in
     is the newest version serve implements, with the client's
     ``clientCapabilities`` if it sent any, else ``{}``.
     """

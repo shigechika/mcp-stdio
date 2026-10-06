@@ -5945,19 +5945,30 @@ class TestClaimlessResourceRead:
         assert r.status_code == 400
         assert "mcp-session-id" not in r.headers
 
-    @pytest.mark.parametrize(
-        "headers,body_over",
-        [
-            # Partial claims go through the validation ladder as before.
-            ({"MCP-Protocol-Version": MODERN_VERSION}, {}),
-            ({}, {"_meta": {META_VERSION: MODERN_VERSION}}),
-        ],
-    )
-    def test_partial_claim_is_not_promoted(self, claimless_gateway, headers, body_over):
+    def test_meta_only_partial_claim_meets_the_ladder(self, claimless_gateway):
+        # A _meta version classifies the request modern, so the ladder
+        # answers: the missing version header is a -32020.
         body = json.loads(json.dumps(_IOS_READ))
-        body["params"].update(body_over)
-        r = _post(claimless_gateway, body, headers)
-        assert r.status_code == 400
+        body["params"]["_meta"] = {META_VERSION: MODERN_VERSION, META_CAPS: {}}
+        _assert_rejected(_post(claimless_gateway, body), HEADER_MISMATCH, req_id=7)
+
+    def test_header_only_partial_claim_keeps_the_sessionless_400(
+        self, claimless_gateway
+    ):
+        # D5 classifies on the body, so a version header alone stays legacy
+        # and gets today's sessionless -32000, not the ladder.
+        r = _post(
+            claimless_gateway, _IOS_READ, {"MCP-Protocol-Version": MODERN_VERSION}
+        )
+        _assert_rejected(r, LEGACY_ERROR, req_id=7)
+
+    def test_name_header_without_uri_is_left_to_dispatch(self, claimless_gateway):
+        # Same as the ladder's rung 2c: no body uri, no Mcp-Name comparison.
+        body = {"jsonrpc": "2.0", "id": 7, "method": "resources/read", "params": {}}
+        r = _post(claimless_gateway, body, {"Mcp-Name": "ui://a"})
+        # Reached dispatch: the fake child answers a uri-less read -32601,
+        # which serve maps to 404 (see test_resources_read_compares_the_uri_field).
+        assert r.status_code == 404, r.text
 
     def test_matching_routing_headers_are_accepted(self, claimless_gateway):
         headers = {"Mcp-Method": "resources/read", "Mcp-Name": "ui://widget/app.html"}
