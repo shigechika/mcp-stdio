@@ -25,7 +25,7 @@ mcp-stdio handles this on its own when the refresh token is what stopped working
 If no sign-in starts, check the following:
 - `--no-oauth-reauth` is not set.
 - The refresh did not fail only transiently (a 5xx or network error keeps the token and does not open a browser).
-- No other mcp-stdio process for the same server is already signing in (see the log).
+- Another mcp-stdio process for the same server may already be signing in. This process then waits for it and uses its token (see the log).
 - No failed attempt happened within the last 60 s.
 
 To start over completely, delete the cached token and run your client again:

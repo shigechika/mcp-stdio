@@ -21700,7 +21700,7 @@ class TestReauthorizer:
     def test_transient_failure_starts_nothing(self):
         calls = []
         r, _ = self._make(lambda _r: calls.append(1), dead=False)
-        assert r.maybe_start() is False
+        assert r.maybe_start("Bearer old") is False
         assert calls == []
 
     def test_dead_starts_once_and_swaps_headers(self):
@@ -21715,8 +21715,8 @@ class TestReauthorizer:
         r, headers = self._make(login)
         assert r.maybe_start("Bearer old") is True
         # Concurrent 401s while it runs share the one attempt.
-        assert r.maybe_start() is True
-        assert r.maybe_start() is True
+        assert r.maybe_start("Bearer old") is True
+        assert r.maybe_start("Bearer old") is True
         gate.set()
         r.join(5)
         # login learns which credential the server rejected.
@@ -21742,12 +21742,12 @@ class TestReauthorizer:
             return None
 
         r, headers = self._make(login, now=lambda: clock[0])
-        assert r.maybe_start() is True
+        assert r.maybe_start("Bearer old") is True
         r.join(5)
         assert headers["Authorization"] == "Bearer old"
-        assert r.maybe_start() is False  # cooling down: no new browser
+        assert r.maybe_start("Bearer old") is False  # cooling down: no new browser
         clock[0] += _relay_mod._REAUTH_COOLDOWN_SECS
-        assert r.maybe_start() is True
+        assert r.maybe_start("Bearer old") is True
         r.join(5)
         assert calls == [1, 1]
 
@@ -21758,10 +21758,25 @@ class TestReauthorizer:
             raise RuntimeError("boom")
 
         r, headers = self._make(login, now=lambda: clock[0])
-        assert r.maybe_start() is True
+        assert r.maybe_start("Bearer old") is True
         r.join(5)
         assert headers["Authorization"] == "Bearer old"
-        assert r.maybe_start() is False
+        assert r.maybe_start("Bearer old") is False
+
+    def test_request_without_authorization_never_rejects_a_fresh_token(self):
+        # code-review: None used to mean "the current header", so a 401'd
+        # request that carried NO Authorization could mark a token installed
+        # meanwhile as rejected and open a second browser.
+        calls = []
+        r, headers = self._make(lambda rejected: calls.append(rejected))
+        headers["Authorization"] = "Bearer fresh"
+        assert r.maybe_start(None) is True  # retry: credentials exist now
+        r.join(5)
+        assert calls == []
+        del headers["Authorization"]
+        assert r.maybe_start(None) is True
+        r.join(5)
+        assert calls == [None]
 
 
 class TestRunReauthOn401:

@@ -900,19 +900,21 @@ def refresh_lock(wait: float | None = None) -> Iterator[bool]:
 
 
 @contextlib.contextmanager
-def reauth_lock(server_url: str) -> Iterator[bool]:
-    """Cross-process, NON-blocking lock around one mid-session interactive
+def reauth_lock(server_url: str, wait: float = 0.0) -> Iterator[bool]:
+    """Cross-process lock around one mid-session interactive
     re-authorization for ``server_url`` (#471).
 
     Several relay processes for one server (Claude Desktop runs more than
     one) that all hit a dead refresh token would otherwise each open a
-    browser. Yields False when another process holds it: that process is
-    already signing in, and its token reaches this one through the store.
-    One lock file per server (a hash of the URL), so signing in to one
-    server never holds up another.
+    browser. ``wait`` bounds how long to wait for a sibling's sign-in to
+    finish (0: do not wait); yields False when it ran out. One lock file per
+    server, named from the same normalised key the store uses, so two spellings
+    of one server share it, and signing in to one server never holds up
+    another.
     """
-    digest = hashlib.sha256(server_url.encode("utf-8")).hexdigest()[:16]
-    with _file_lock(f"tokens.json.reauth.{digest}.lock", wait=0) as acquired:
+    key = _normalize_key(server_url)
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    with _file_lock(f"tokens.json.reauth.{digest}.lock", wait=wait) as acquired:
         yield acquired
 
 

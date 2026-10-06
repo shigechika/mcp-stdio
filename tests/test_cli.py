@@ -1,6 +1,7 @@
 """Tests for mcp_stdio.cli module."""
 
 import argparse
+import threading
 from unittest.mock import patch
 
 import pytest
@@ -1922,46 +1923,92 @@ class TestRefresherRecordsDeadVerdict:
 
 
 class TestBuildReauthLogin:
-    def test_runs_login_while_holding_the_lock(self, monkeypatch, tmp_path):
+    URL = "https://example.com/mcp"
+
+    def _store(self, monkeypatch, tmp_path, access_token=None):
         from mcp_stdio import token_store
 
         monkeypatch.setattr(token_store, "_STORE_DIR", tmp_path)
+        monkeypatch.setattr(token_store, "_STORE_FILE", tmp_path / "tokens.json")
+        if access_token is not None:
+            token_store.save_token(self.URL, TokenData(access_token=access_token))
+        return token_store
+
+    def _reauth(self, login, lock_wait=0.0):
+        return _build_reauth_login(
+            self.URL, login, use_id_token=False, lock_wait=lock_wait
+        )
+
+    def test_adopts_a_different_stored_token_without_signing_in(
+        self, monkeypatch, tmp_path
+    ):
+        # A sibling signed in (or refreshed) after the 401'd request was
+        # sent -- even with no refresh token, its token is simply used.
+        self._store(monkeypatch, tmp_path, "sibling")
+        calls = []
+        reauth = self._reauth(lambda _r: calls.append(1))
+        assert reauth("Bearer old") == {"Authorization": "Bearer sibling"}
+        assert calls == []
+
+    def test_signs_in_while_holding_the_lock(self, monkeypatch, tmp_path):
+        token_store = self._store(monkeypatch, tmp_path, "old")
         seen = []
 
         def login(rejected):
             assert rejected == "Bearer old"
             # The lock is held: a sibling cannot take it now.
-            with token_store.reauth_lock("https://example.com/mcp") as acquired:
+            with token_store.reauth_lock(self.URL) as acquired:
                 seen.append(acquired)
             return {"Authorization": "Bearer new"}
 
-        reauth = _build_reauth_login("https://example.com/mcp", login)
-        assert reauth("Bearer old") == {"Authorization": "Bearer new"}
+        assert self._reauth(login)("Bearer old") == {"Authorization": "Bearer new"}
         assert seen == [False]
 
-    def test_sibling_holding_the_lock_skips_the_login(
+    def test_gives_up_when_a_sibling_keeps_signing_in(
         self, monkeypatch, tmp_path, capsys
     ):
-        from mcp_stdio import token_store
-
-        monkeypatch.setattr(token_store, "_STORE_DIR", tmp_path)
+        token_store = self._store(monkeypatch, tmp_path, "old")
         calls = []
-        reauth = _build_reauth_login(
-            "https://example.com/mcp", lambda _r: calls.append(1)
-        )
-        with token_store.reauth_lock("https://example.com/mcp") as acquired:
+        reauth = self._reauth(lambda _r: calls.append(1), lock_wait=0.2)
+        with token_store.reauth_lock(self.URL) as acquired:
             assert acquired is True
             assert reauth("Bearer old") is None
         assert calls == []
-        assert "already signing in" in capsys.readouterr().err
+        assert "still signing in" in capsys.readouterr().err
 
-    def test_lock_is_per_server(self, monkeypatch, tmp_path):
-        from mcp_stdio import token_store
+    def test_waits_for_a_sibling_and_adopts_its_token(self, monkeypatch, tmp_path):
+        token_store = self._store(monkeypatch, tmp_path, "old")
+        holding = threading.Event()
+        release = threading.Event()
 
-        monkeypatch.setattr(token_store, "_STORE_DIR", tmp_path)
-        reauth = _build_reauth_login("https://b.example/mcp", lambda _r: {"A": "1"})
+        def sibling():
+            with token_store.reauth_lock(self.URL):
+                holding.set()
+                release.wait(5)
+                token_store.save_token(self.URL, TokenData(access_token="sibling"))
+
+        t = threading.Thread(target=sibling)
+        t.start()
+        assert holding.wait(5)
+        calls = []
+        reauth = self._reauth(lambda _r: calls.append(1), lock_wait=10)
+        result = {}
+        waiter = threading.Thread(target=lambda: result.update(r=reauth("Bearer old")))
+        waiter.start()
+        release.set()
+        waiter.join(10)
+        t.join(5)
+        assert result["r"] == {"Authorization": "Bearer sibling"}
+        assert calls == []
+
+    def test_lock_is_per_server_and_follows_the_store_key(self, monkeypatch, tmp_path):
+        token_store = self._store(monkeypatch, tmp_path)
         with token_store.reauth_lock("https://a.example/mcp"):
-            assert reauth(None) == {"A": "1"}
+            with token_store.reauth_lock("https://b.example/mcp") as other:
+                assert other is True
+        with token_store.reauth_lock("https://Host.example/mcp"):
+            with token_store.reauth_lock("https://host.example:443/mcp/") as same:
+                assert same is False
 
 
 class TestColdStartLoginRejectsTheRejectedToken:

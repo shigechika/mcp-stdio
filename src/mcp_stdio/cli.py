@@ -18,6 +18,7 @@ from .relay import (
     _DEFAULT_MAX_MESSAGE_SIZE,
     _MAX_MESSAGE_SIZE_ATTR,
     check_connection,
+    log,
     run,
     run_sse,
 )
@@ -343,26 +344,57 @@ def _build_scope_upgrader(
 
 
 def _build_reauth_login(
-    server_url: str, login: Callable[[str | None], dict[str, str] | None]
+    server_url: str,
+    login: Callable[[str | None], dict[str, str] | None],
+    *,
+    use_id_token: bool,
+    lock_wait: float,
 ) -> Callable[[str | None], dict[str, str] | None]:
     """Wrap a ``_build_cold_start_login`` callable for mid-session
-    re-authorization (#471): run it only while holding
-    ``token_store.reauth_lock`` for this server, so sibling relay processes
-    that hit the same dead grant open one browser between them. When another
-    process holds the lock, return None without signing in -- its token
-    reaches this process through the store on the next refresh."""
+    re-authorization (#471). Runs on the relay's re-authorization thread, so
+    it may block.
+
+    If the store already holds a token other than the rejected one (another
+    relay process signed in, or refreshed, after the 401'd request was
+    sent), adopt it without signing in -- whether or not it has a refresh
+    token. Otherwise sign in while holding ``token_store.reauth_lock`` for
+    this server, so sibling processes that hit the same dead grant open one
+    browser between them: a process that finds a sibling signing in waits
+    for it (up to ``lock_wait``) and then adopts the sibling's token. A
+    token adopted this way that turns out dead too gets its own 401, whose
+    rejected value is then the stored one, so the next attempt signs in."""
+
+    def adopt(rejected_authorization: str | None) -> dict[str, str] | None:
+        from .token_store import load_token
+
+        cached = load_token(server_url)
+        if cached is None or not cached.access_token:
+            return None
+        try:
+            value = _bearer_header_value(_effective_bearer(cached, use_id_token))
+        except ValueError:
+            return None
+        if value == rejected_authorization:
+            return None
+        log("using the OAuth token another mcp-stdio process stored")
+        return {"Authorization": value}
 
     def reauth(rejected_authorization: str | None) -> dict[str, str] | None:
         from .token_store import reauth_lock
 
-        with reauth_lock(server_url) as acquired:
+        adopted = adopt(rejected_authorization)
+        if adopted:
+            return adopted
+        with reauth_lock(server_url, wait=lock_wait) as acquired:
             if not acquired:
-                print(
-                    "another mcp-stdio process is already signing in to this "
-                    "server; using its token once it is stored",
-                    file=sys.stderr,
+                log(
+                    "another mcp-stdio process is still signing in to this "
+                    "server; not starting a second sign-in"
                 )
                 return None
+            adopted = adopt(rejected_authorization)
+            if adopted:
+                return adopted
             return login(rejected_authorization)
 
     return reauth
@@ -909,11 +941,13 @@ def _main() -> None:
         or args.oauth_resource is not None
         or args.oauth_use_id_token
         or args.oauth_eager
+        or args.no_oauth_reauth
     ):
         print(
             "warning: --client-id / --client-metadata-url / --oauth-scope / "
             "--no-resource-indicator / --oauth-resource / --oauth-use-id-token / "
-            "--oauth-eager are ignored without --oauth or --oauth-device",
+            "--oauth-eager / --no-oauth-reauth are ignored without --oauth or "
+            "--oauth-device",
             file=sys.stderr,
         )
 
@@ -1046,6 +1080,7 @@ def _main() -> None:
             follow_redirects=False,
         )
         setattr(client, _MAX_MESSAGE_SIZE_ATTR, args.max_message_size)
+        cold_start = False
         try:
             token_data = ensure_token(
                 args.url,
@@ -1065,22 +1100,7 @@ def _main() -> None:
                 # OAuth to a background thread in the relay (it answers initialize
                 # locally and gates until login completes). No Authorization is
                 # set now; the cold-start daemon installs it on success.
-                cold_start_login = _build_cold_start_login(
-                    args.url,
-                    headers,
-                    client_id=client_id or None,
-                    client_metadata_url=args.client_metadata_url,
-                    scope=args.oauth_scope or None,
-                    device_flow=args.oauth_device,
-                    refresh_leeway=args.oauth_refresh_leeway,
-                    resource_indicator=not args.no_resource_indicator,
-                    oauth_resource=args.oauth_resource,
-                    oauth_timeout=args.oauth_timeout,
-                    timeout_connect=args.timeout_connect,
-                    timeout_read=args.timeout_read,
-                    use_id_token=args.oauth_use_id_token,
-                    max_message_size=args.max_message_size,
-                )
+                cold_start = True
             else:
                 # WARM path (token available, or non-eager blocking flow). Drop
                 # any differently-cased 'authorization' header a -H supplied
@@ -1111,6 +1131,28 @@ def _main() -> None:
             # or steps up), so only build them on the real relay path. See #15.
             # They work for both warm and cold paths: the refresher/upgrader
             # rebuild Authorization from the (eventually) cached token.
+            # One interactive-login callable serves both the cold start and
+            # the mid-session re-authorization (#471), so the two flows can
+            # never drift apart. Built after the warm path has settled the
+            # headers; a cold start sets no Authorization here.
+            interactive_login = _build_cold_start_login(
+                args.url,
+                headers,
+                client_id=client_id or None,
+                client_metadata_url=args.client_metadata_url,
+                scope=args.oauth_scope or None,
+                device_flow=args.oauth_device,
+                refresh_leeway=args.oauth_refresh_leeway,
+                resource_indicator=not args.no_resource_indicator,
+                oauth_resource=args.oauth_resource,
+                oauth_timeout=args.oauth_timeout,
+                timeout_connect=args.timeout_connect,
+                timeout_read=args.timeout_read,
+                use_id_token=args.oauth_use_id_token,
+                max_message_size=args.max_message_size,
+            )
+            if cold_start:
+                cold_start_login = interactive_login
             if not (args.check or args.test):
                 token_refresher = _build_token_refresher(
                     args.url,
@@ -1127,22 +1169,10 @@ def _main() -> None:
                     # proves the grant dead.
                     reauth_login = _build_reauth_login(
                         args.url,
-                        _build_cold_start_login(
-                            args.url,
-                            headers,
-                            client_id=client_id or None,
-                            client_metadata_url=args.client_metadata_url,
-                            scope=args.oauth_scope or None,
-                            device_flow=args.oauth_device,
-                            refresh_leeway=args.oauth_refresh_leeway,
-                            resource_indicator=not args.no_resource_indicator,
-                            oauth_resource=args.oauth_resource,
-                            oauth_timeout=args.oauth_timeout,
-                            timeout_connect=args.timeout_connect,
-                            timeout_read=args.timeout_read,
-                            use_id_token=args.oauth_use_id_token,
-                            max_message_size=args.max_message_size,
-                        ),
+                        interactive_login,
+                        use_id_token=args.oauth_use_id_token,
+                        # Long enough for a sibling's whole sign-in.
+                        lock_wait=args.oauth_timeout + 30.0,
                     )
                 scope_upgrader = _build_scope_upgrader(
                     args.url,

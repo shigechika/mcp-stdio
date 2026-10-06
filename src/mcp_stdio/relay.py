@@ -5251,7 +5251,7 @@ class _Reauthorizer:
         self._thread: threading.Thread | None = None
         self._retry_after = 0.0
 
-    def maybe_start(self, rejected_authorization: str | None = None) -> bool:
+    def maybe_start(self, rejected_authorization: str | None) -> bool:
         """True when the caller should answer -32002 ("retry"): a
         re-authorization is running (started now or already in flight), or
         the credentials were already replaced after the 401'd request was
@@ -5260,7 +5260,9 @@ class _Reauthorizer:
         caller keeps its ordinary error).
 
         ``rejected_authorization`` is the ``Authorization`` value the 401'd
-        request carried; None means "the current one"."""
+        request ACTUALLY carried -- None when it carried none, never a
+        stand-in for "the current one", which may already be a fresh token
+        installed after that request was sent."""
         if not self._refresh_was_dead():
             return False
         with self._lock:
@@ -5268,9 +5270,7 @@ class _Reauthorizer:
                 return True
             with self._headers_lock:
                 current = self._headers.get("Authorization")
-            if rejected_authorization is None:
-                rejected_authorization = current
-            elif rejected_authorization != current:
+            if rejected_authorization != current:
                 return True
             if self._now() < self._retry_after:
                 return False
@@ -8704,6 +8704,9 @@ def run(
         must describe THIS POST's outcome, never the previous attempt's.
         """
         retry_headers = _prepare_headers(retry_line, param_decls=txn.get("param_decls"))
+        # #471: what this retry actually carried, for the 401 arm's
+        # re-authorization trigger.
+        txn["sent_authorization"] = retry_headers.get("Authorization")
         if txn["pinned_version"]:
             retry_headers = {
                 k: v
@@ -8877,7 +8880,7 @@ def run(
                         # terminal arm below, but a dead grant starts the
                         # background sign-in so the client's NEXT attempt
                         # works.
-                        reauthorizer.maybe_start()
+                        reauthorizer.maybe_start(txn.get("sent_authorization"))
                 if new_headers:
                     with headers_lock:
                         headers.update(new_headers)
