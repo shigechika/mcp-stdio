@@ -5959,6 +5959,25 @@ class TestClaimlessResourceRead:
         r = _post(claimless_gateway, body, headers)
         assert r.status_code == 400
 
+    def test_matching_routing_headers_are_accepted(self, claimless_gateway):
+        headers = {"Mcp-Method": "resources/read", "Mcp-Name": "ui://widget/app.html"}
+        r = _post(claimless_gateway, _IOS_READ, headers)
+        assert r.status_code == 200, r.text
+
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            {"Mcp-Method": "tools/call"},
+            {"Mcp-Name": "ui://other"},
+            [("Mcp-Method", "resources/read"), ("Mcp-Method", "resources/read")],
+        ],
+    )
+    def test_contradictory_routing_headers_are_rejected(
+        self, claimless_gateway, headers
+    ):
+        r = _post(claimless_gateway, _IOS_READ, headers)
+        _assert_rejected(r, HEADER_MISMATCH, req_id=7)
+
     def test_sessioned_read_stays_on_the_legacy_session(self, claimless_gateway):
         init = _post(
             claimless_gateway,

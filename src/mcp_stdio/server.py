@@ -6059,6 +6059,40 @@ class _OAuthProvider:
 _DROPPABLE_CLIENT_CAPABILITIES = ("roots", "elicitation", "sampling")
 
 
+def _validate_claimless_routing_headers(
+    handler: Any, msg: dict[str, Any], req_id: Any
+) -> bool:
+    """The routing-header rungs of ``_validate_modern`` for a request
+    ``_claimless_resource_read`` promoted (#469), applied only to the headers
+    the client actually sent: a repeated ``Mcp-Method``/``Mcp-Name``, an
+    ``Mcp-Method`` other than the body's method, or an ``Mcp-Name`` that does
+    not decode to ``params.uri`` gets the same 400 ``-32020`` as on the
+    ladder. ABSENT headers pass -- unlike the ladder, where absence is itself
+    a mismatch -- because a claim-less read is exactly a request that sent
+    none. Returns False after writing the rejection.
+    """
+
+    def _reject(message: str) -> bool:
+        handler._send_json(400, _error_body(message, req_id, code=_MCP_HEADER_MISMATCH))
+        return False
+
+    for header in _MODERN_ROUTING_HEADERS:
+        values = handler.headers.get_all(header)
+        if values is not None and len(values) > 1:
+            return _reject(f"{header} header appears more than once")
+    method_header = handler.headers.get("Mcp-Method")
+    if method_header is not None and method_header != msg.get("method"):
+        return _reject("Mcp-Method header does not match the request method")
+    name_header = handler.headers.get("Mcp-Name")
+    if name_header is not None and _decode_mcp_name(
+        name_header
+    ) != _modern_name_bearing_value(msg):
+        return _reject(
+            "Mcp-Name header does not match the corresponding request body value"
+        )
+    return True
+
+
 def _claimless_resource_read(
     kind: str, msg: dict[str, Any], headers: Any
 ) -> dict[str, Any] | None:
@@ -7568,11 +7602,14 @@ class _Handler(BaseHTTPRequestHandler):
         if self.accept_claimless_resource_read:
             # #469, opt-in: a claim-less sessionless resources/read (Claude
             # iOS) is served statelessly as 2026-07-28 instead of earning
-            # the sessionless 400 below. Skips _validate_modern on purpose:
-            # the request carries none of the headers the ladder checks,
-            # and _claimless_resource_read admits nothing else.
+            # the sessionless 400 below. It cannot pass _validate_modern,
+            # whose version rungs are exactly what the request lacks; the
+            # routing-header rungs still apply to whatever headers it did
+            # send (_validate_claimless_routing_headers).
             promoted = _claimless_resource_read(kind, msg, self.headers)
             if promoted is not None:
+                if not _validate_claimless_routing_headers(self, msg, req_id):
+                    return
                 self._dispatch_modern(kind, promoted, req_id)
                 return
 
