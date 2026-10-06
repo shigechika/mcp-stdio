@@ -7,6 +7,7 @@ import pytest
 
 from mcp_stdio.cli import (
     _bearer_header_value,
+    _build_cold_start_login,
     _build_reauth_login,
     _build_scope_upgrader,
     _build_token_refresher,
@@ -1886,14 +1887,10 @@ class TestReauthWiring:
 
 
 class TestRefresherRecordsDeadVerdict:
-    def _refresher(self, monkeypatch, outcome, stored="old-at"):
+    def _refresher(self, monkeypatch, outcome):
         monkeypatch.setattr("mcp_stdio.cli.httpx.Client", _SpyClient)
         monkeypatch.setattr(
             "mcp_stdio.oauth._refresh_cached_token_ex", lambda url, client: outcome
-        )
-        monkeypatch.setattr(
-            "mcp_stdio.token_store.load_token",
-            lambda url: TokenData(access_token=stored) if stored else None,
         )
         state = {"dead": False}
         return (
@@ -1903,13 +1900,12 @@ class TestRefresherRecordsDeadVerdict:
             state,
         )
 
-    def test_dead_failure_records_verdict_and_rejected_token(self, monkeypatch):
+    def test_dead_failure_records_the_verdict(self, monkeypatch):
         refresher, state = self._refresher(
             monkeypatch, _RefreshOutcome(None, dead=True)
         )
         assert refresher() is None
         assert state["dead"] is True
-        assert state["rejected_access_token"] == "old-at"
 
     def test_transient_failure_is_not_dead(self, monkeypatch):
         refresher, state = self._refresher(monkeypatch, _RefreshOutcome(None))
@@ -1932,14 +1928,15 @@ class TestBuildReauthLogin:
         monkeypatch.setattr(token_store, "_STORE_DIR", tmp_path)
         seen = []
 
-        def login():
+        def login(rejected):
+            assert rejected == "Bearer old"
             # The lock is held: a sibling cannot take it now.
             with token_store.reauth_lock("https://example.com/mcp") as acquired:
                 seen.append(acquired)
             return {"Authorization": "Bearer new"}
 
         reauth = _build_reauth_login("https://example.com/mcp", login)
-        assert reauth() == {"Authorization": "Bearer new"}
+        assert reauth("Bearer old") == {"Authorization": "Bearer new"}
         assert seen == [False]
 
     def test_sibling_holding_the_lock_skips_the_login(
@@ -1949,10 +1946,12 @@ class TestBuildReauthLogin:
 
         monkeypatch.setattr(token_store, "_STORE_DIR", tmp_path)
         calls = []
-        reauth = _build_reauth_login("https://example.com/mcp", lambda: calls.append(1))
+        reauth = _build_reauth_login(
+            "https://example.com/mcp", lambda _r: calls.append(1)
+        )
         with token_store.reauth_lock("https://example.com/mcp") as acquired:
             assert acquired is True
-            assert reauth() is None
+            assert reauth("Bearer old") is None
         assert calls == []
         assert "already signing in" in capsys.readouterr().err
 
@@ -1960,6 +1959,58 @@ class TestBuildReauthLogin:
         from mcp_stdio import token_store
 
         monkeypatch.setattr(token_store, "_STORE_DIR", tmp_path)
-        reauth = _build_reauth_login("https://b.example/mcp", lambda: {"A": "1"})
+        reauth = _build_reauth_login("https://b.example/mcp", lambda _r: {"A": "1"})
         with token_store.reauth_lock("https://a.example/mcp"):
-            assert reauth() == {"A": "1"}
+            assert reauth(None) == {"A": "1"}
+
+
+class TestColdStartLoginRejectsTheRejectedToken:
+    """#471 (codex review): the token to reject is the one the 401'd request
+    carried, compared with what the store holds now -- not whatever the store
+    held when the refresh failed."""
+
+    def _login(self, monkeypatch, stored):
+        seen = {}
+
+        def fake_ensure(url, client, **kw):
+            seen.update(kw)
+            return TokenData(access_token="fresh")
+
+        monkeypatch.setattr("mcp_stdio.cli.httpx.Client", _SpyClient)
+        monkeypatch.setattr("mcp_stdio.oauth.ensure_token", fake_ensure)
+        monkeypatch.setattr(
+            "mcp_stdio.token_store.load_token",
+            lambda url: TokenData(access_token=stored),
+        )
+        login = _build_cold_start_login(
+            "https://example.com/mcp",
+            {},
+            client_id=None,
+            client_metadata_url=None,
+            scope=None,
+            device_flow=False,
+            refresh_leeway=60,
+            resource_indicator=True,
+            oauth_resource=None,
+            oauth_timeout=120,
+            timeout_connect=10,
+            timeout_read=120,
+            use_id_token=False,
+        )
+        return login, seen
+
+    def test_store_still_holds_the_rejected_token(self, monkeypatch):
+        login, seen = self._login(monkeypatch, "revoked")
+        assert login("Bearer revoked")["Authorization"] == "Bearer fresh"
+        assert seen["reject_access_token"] == "revoked"
+
+    def test_store_already_holds_a_newer_token(self, monkeypatch):
+        # A sign-in finished after the request was sent: keep that token.
+        login, seen = self._login(monkeypatch, "newer")
+        login("Bearer revoked")
+        assert seen["reject_access_token"] is None
+
+    def test_cold_start_call_rejects_nothing(self, monkeypatch):
+        login, seen = self._login(monkeypatch, "revoked")
+        login()
+        assert seen["reject_access_token"] is None

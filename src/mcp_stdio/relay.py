@@ -5217,9 +5217,12 @@ _REAUTH_MESSAGE = (
 class _Reauthorizer:
     """At most one background re-authorization per process (#471).
 
-    ``login`` runs the interactive flow and returns the new headers, or None
-    (it owns any cross-process exclusion: a sibling relay already signing in
-    for the same server makes it return None). ``refresh_was_dead`` says
+    ``login(rejected_authorization)`` runs the interactive flow and returns
+    the new headers, or None (it owns any cross-process exclusion: a sibling
+    relay already signing in for the same server makes it return None). It
+    gets the ``Authorization`` value the server rejected, so a cached token
+    that is still that one is not handed back, while a different one -- a
+    sibling's fresh sign-in -- is used as is. ``refresh_was_dead`` says
     whether the refresher's LAST failure proved the grant dead; only then is
     a re-authorization worth a browser. Call ``maybe_start`` while still
     holding the relay's ``refresh_lock`` right after the failed refresh, so
@@ -5233,7 +5236,7 @@ class _Reauthorizer:
     def __init__(
         self,
         *,
-        login: Callable[[], dict[str, str] | None],
+        login: Callable[[str | None], dict[str, str] | None],
         refresh_was_dead: Callable[[], bool],
         headers: dict[str, str],
         headers_lock: threading.Lock,
@@ -5248,28 +5251,42 @@ class _Reauthorizer:
         self._thread: threading.Thread | None = None
         self._retry_after = 0.0
 
-    def maybe_start(self) -> bool:
-        """True when a re-authorization is running -- started now or
-        already in flight -- so the caller answers -32002; False when the
-        refresh failure was transient or the cooldown is on (the caller
-        keeps its ordinary error)."""
+    def maybe_start(self, rejected_authorization: str | None = None) -> bool:
+        """True when the caller should answer -32002 ("retry"): a
+        re-authorization is running (started now or already in flight), or
+        the credentials were already replaced after the 401'd request was
+        sent (a sign-in finished meanwhile; a retry uses the new ones). False
+        when the refresh failure was transient or the cooldown is on (the
+        caller keeps its ordinary error).
+
+        ``rejected_authorization`` is the ``Authorization`` value the 401'd
+        request carried; None means "the current one"."""
         if not self._refresh_was_dead():
             return False
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return True
+            with self._headers_lock:
+                current = self._headers.get("Authorization")
+            if rejected_authorization is None:
+                rejected_authorization = current
+            elif rejected_authorization != current:
+                return True
             if self._now() < self._retry_after:
                 return False
             log("refresh token is no longer valid; re-authorizing in the background")
             self._thread = threading.Thread(
-                target=self._run, name="oauth-reauth", daemon=True
+                target=self._run,
+                args=(rejected_authorization,),
+                name="oauth-reauth",
+                daemon=True,
             )
             self._thread.start()
             return True
 
-    def _run(self) -> None:
+    def _run(self, rejected_authorization: str | None) -> None:
         try:
-            new_headers = self._login()
+            new_headers = self._login(rejected_authorization)
         except Exception as e:  # noqa: BLE001 -- the daemon must never crash the relay
             log(f"re-authorization error: {e}")
             new_headers = None
@@ -7581,9 +7598,10 @@ def run(
             ``_reinitialize`` sends a legacy ``initialize`` handshake to
             establish a session, which is meaningless on a path with no
             sessions at all (#270 Phase 1).
-        reauth_login: Optional callable with ``cold_start_login``'s contract,
-            run on a background thread when a 401's refresh fails because
-            the grant is dead (#471; see ``_Reauthorizer``). Needs
+        reauth_login: Optional callable like ``cold_start_login`` but taking
+            the rejected ``Authorization`` value, run on a background thread
+            when a 401's refresh fails because the grant is dead (#471; see
+            ``_Reauthorizer``). Needs
             ``refresh_was_dead`` and ``token_refresher``; any of the three
             None keeps today's "authentication failed".
         refresh_was_dead: Optional callable: did ``token_refresher``'s last
@@ -10242,7 +10260,9 @@ def run(
                         reauthorizing = (
                             not new_headers
                             and reauthorizer is not None
-                            and reauthorizer.maybe_start()
+                            and reauthorizer.maybe_start(
+                                req_headers.get("Authorization")
+                            )
                         )
                     if new_headers:
                         with headers_lock:
@@ -11270,7 +11290,9 @@ def run_sse(
                             reauthorizing = (
                                 not new_headers
                                 and reauthorizer is not None
-                                and reauthorizer.maybe_start()
+                                and reauthorizer.maybe_start(
+                                    resp.request.headers.get("authorization")
+                                )
                             )
                         if new_headers:
                             with headers_lock:

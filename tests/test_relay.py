@@ -21699,7 +21699,7 @@ class TestReauthorizer:
 
     def test_transient_failure_starts_nothing(self):
         calls = []
-        r, _ = self._make(lambda: calls.append(1), dead=False)
+        r, _ = self._make(lambda _r: calls.append(1), dead=False)
         assert r.maybe_start() is False
         assert calls == []
 
@@ -21707,26 +21707,37 @@ class TestReauthorizer:
         gate = threading.Event()
         calls = []
 
-        def login():
-            calls.append(1)
+        def login(rejected):
+            calls.append(rejected)
             gate.wait(5)
             return {"Authorization": "Bearer new"}
 
         r, headers = self._make(login)
-        assert r.maybe_start() is True
+        assert r.maybe_start("Bearer old") is True
         # Concurrent 401s while it runs share the one attempt.
         assert r.maybe_start() is True
         assert r.maybe_start() is True
         gate.set()
         r.join(5)
-        assert calls == [1]
+        # login learns which credential the server rejected.
+        assert calls == ["Bearer old"]
         assert headers["Authorization"] == "Bearer new"
+
+    def test_credentials_replaced_since_the_request_means_retry(self):
+        # A sign-in finished after the 401'd request was sent: no new
+        # sign-in, just tell the client to retry with the new credentials.
+        calls = []
+        r, headers = self._make(lambda _r: calls.append(1))
+        headers["Authorization"] = "Bearer newer"
+        assert r.maybe_start("Bearer old") is True
+        r.join(5)
+        assert calls == []
 
     def test_failed_attempt_cools_down(self):
         clock = [100.0]
         calls = []
 
-        def login():
+        def login(_rejected):
             calls.append(1)
             return None
 
@@ -21743,7 +21754,7 @@ class TestReauthorizer:
     def test_login_exception_is_contained_and_cools_down(self):
         clock = [0.0]
 
-        def login():
+        def login(_rejected):
             raise RuntimeError("boom")
 
         r, headers = self._make(login, now=lambda: clock[0])
@@ -21780,8 +21791,8 @@ class TestRunReauthOn401:
         )
         logins = []
 
-        def login():
-            logins.append(1)
+        def login(rejected):
+            logins.append(rejected)
             return {"Authorization": "Bearer new"}
 
         stdout = StringIO()
@@ -21805,7 +21816,7 @@ class TestRunReauthOn401:
         assert msgs[0]["error"]["code"] == -32002
         assert "re-authorizing" in msgs[0]["error"]["message"]
         assert msgs[1] == {"jsonrpc": "2.0", "id": 2, "result": {"ok": True}}
-        assert logins == [1]
+        assert logins == ["Bearer old"]
 
     def test_transient_refresh_failure_keeps_authentication_failed(self, httpx_mock):
         httpx_mock.add_response(url=self.URL, status_code=401)
@@ -21820,7 +21831,7 @@ class TestRunReauthOn401:
                 {},
                 token_refresher=lambda: None,
                 refresh_was_dead=lambda: False,
-                reauth_login=lambda: logins.append(1),
+                reauth_login=lambda _r: logins.append(1),
                 proactive_refresh=False,
             )
         msg = json.loads(stdout.getvalue().strip())
@@ -21831,7 +21842,7 @@ class TestRunReauthOn401:
         httpx_mock.add_response(url=self.URL, status_code=401)
         started = threading.Event()
 
-        def login():
+        def login(_rejected):
             started.set()
             return None
 
@@ -21884,7 +21895,7 @@ class TestRunSseReauthOn401:
         )
         started = threading.Event()
 
-        def login():
+        def login(_rejected):
             started.set()
             return None
 
