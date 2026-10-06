@@ -25,6 +25,7 @@ Arguments:
 | `--oauth-eager` | — | Cold-start: answer initialize locally and run interactive OAuth in the background, so a long login does not exceed the client's ~60 s timeout |
 | `--oauth-refresh-leeway SECONDS` | `MCP_OAUTH_REFRESH_LEEWAY` | Proactively refresh tokens this many seconds before expiry (default: 60) |
 | `--no-proactive-refresh` | — | Disable the background timer that refreshes the OAuth token before it expires |
+| `--no-oauth-reauth` | — | Do not sign in again in the background when a 401's refresh is rejected (revoked or expired grant, no refresh token). By default the relay runs the interactive flow on a background thread, answers that request with `-32002`, and later requests use the new token (#471) |
 | `--oauth-timeout SECONDS` | — | Seconds to wait for the interactive OAuth flow (browser callback / device-code confirmation) before giving up (default: 120) |
 | `--no-resource-indicator` | — | Omit the RFC 8707 resource parameter from all OAuth requests. Required for some authorization servers that reject it (e.g. Microsoft Entra ID with api:// scopes) |
 | `--oauth-resource URI` | — | Send this exact RFC 8707 resource value on every OAuth request instead of the server-URL-derived one. Required for AS that demand a specific resource identifier, e.g. Entra ID's App ID URI `api://<app-id>`. Persisted in the token store. Mutually exclusive with `--no-resource-indicator` |

@@ -20,13 +20,19 @@ Common issues and how to resolve them. For the full list of known workarounds in
 **Cause:** The server may have rotated its keys or revoked the grant.
 
 **Solution:**
-Delete the cached token and re-authorize:
+mcp-stdio handles this on its own when the refresh token is what stopped working (#471). The request that hit the `401` comes back with `-32002` ("re-authorizing … then retry"), and a browser window opens for a new sign-in; with `--oauth-device`, the device code is printed in the mcp-stdio log. Once you finish signing in, retry the request, and it goes through with the new token. No restart is needed.
+
+If no sign-in starts, check the following:
+- `--no-oauth-reauth` is not set.
+- The refresh did not fail only transiently (a 5xx or network error keeps the token and does not open a browser).
+- No other mcp-stdio process for the same server is already signing in (see the log).
+- No failed attempt happened within the last 60 s.
+
+To start over completely, delete the cached token and run your client again:
 
 ```bash
 rm ~/.config/mcp-stdio/tokens.json
 ```
-
-Then run your client again. On first use, a browser window opens for login; after that, tokens are cached and refreshed automatically.
 
 ### Repeated "Connection expired" prompts despite a valid refresh token
 

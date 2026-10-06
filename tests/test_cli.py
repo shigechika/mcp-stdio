@@ -7,6 +7,7 @@ import pytest
 
 from mcp_stdio.cli import (
     _bearer_header_value,
+    _build_reauth_login,
     _build_scope_upgrader,
     _build_token_refresher,
     _effective_bearer,
@@ -15,6 +16,7 @@ from mcp_stdio.cli import (
     main,
 )
 from mcp_stdio.relay import _MAX_MESSAGE_SIZE_ATTR
+from mcp_stdio.oauth import _RefreshOutcome
 from mcp_stdio.token_store import TokenData
 
 
@@ -1607,8 +1609,8 @@ class TestBuildTokenRefresher:
         _SpyClient.instances.clear()
         monkeypatch.setattr("mcp_stdio.cli.httpx.Client", _SpyClient)
         monkeypatch.setattr(
-            "mcp_stdio.oauth.refresh_cached_token",
-            lambda url, client: TokenData(access_token="fresh"),
+            "mcp_stdio.oauth._refresh_cached_token_ex",
+            lambda url, client: _RefreshOutcome(TokenData(access_token="fresh")),
         )
         refresher = _build_token_refresher(
             "https://example.com/mcp", {"X-Base": "1"}, 10, 120
@@ -1629,8 +1631,10 @@ class TestBuildTokenRefresher:
         _SpyClient.instances.clear()
         monkeypatch.setattr("mcp_stdio.cli.httpx.Client", _SpyClient)
         monkeypatch.setattr(
-            "mcp_stdio.oauth.refresh_cached_token",
-            lambda url, client: TokenData(access_token="bad\r\nX-Inject: 1"),
+            "mcp_stdio.oauth._refresh_cached_token_ex",
+            lambda url, client: _RefreshOutcome(
+                TokenData(access_token="bad\r\nX-Inject: 1")
+            ),
         )
         refresher = _build_token_refresher("https://example.com/mcp", {}, 10, 120)
         assert refresher() is None
@@ -1641,7 +1645,8 @@ class TestBuildTokenRefresher:
         _SpyClient.instances.clear()
         monkeypatch.setattr("mcp_stdio.cli.httpx.Client", _SpyClient)
         monkeypatch.setattr(
-            "mcp_stdio.oauth.refresh_cached_token", lambda url, client: None
+            "mcp_stdio.oauth._refresh_cached_token_ex",
+            lambda url, client: _RefreshOutcome(None),
         )
         refresher = _build_token_refresher("https://example.com/mcp", {}, 10, 120)
         assert refresher() is None
@@ -1656,8 +1661,8 @@ class TestBuildTokenRefresher:
         _SpyClient.instances.clear()
         monkeypatch.setattr("mcp_stdio.cli.httpx.Client", _SpyClient)
         monkeypatch.setattr(
-            "mcp_stdio.oauth.refresh_cached_token",
-            lambda url, client: TokenData(access_token="fresh"),
+            "mcp_stdio.oauth._refresh_cached_token_ex",
+            lambda url, client: _RefreshOutcome(TokenData(access_token="fresh")),
         )
         live = {"X-Base": "1"}
         refresher = _build_token_refresher("https://example.com/mcp", live, 10, 120)
@@ -1681,7 +1686,7 @@ class TestBuildTokenRefresher:
         def boom(url, client):
             raise OSError("read-only file system")
 
-        monkeypatch.setattr("mcp_stdio.oauth.refresh_cached_token", boom)
+        monkeypatch.setattr("mcp_stdio.oauth._refresh_cached_token_ex", boom)
         refresher = _build_token_refresher("https://example.com/mcp", {}, 10, 120)
         assert refresher() is None
         assert _SpyClient.instances[-1].closed
@@ -1838,3 +1843,123 @@ class TestMcpParamHeadersFlag:
         ):
             main()
         assert "--mcp-param-headers always is ignored" in capsys.readouterr().err
+
+
+# --- #471: mid-session re-authorization wiring ---
+
+
+class TestReauthWiring:
+    def _main(self, argv, target="mcp_stdio.cli.run"):
+        with (
+            patch("sys.argv", ["mcp-stdio", *argv]),
+            patch("mcp_stdio.oauth.ensure_token") as mock_ensure,
+            patch(target) as mock_run,
+        ):
+            mock_ensure.return_value.access_token = "tok"
+            mock_ensure.return_value.id_token = None
+            main()
+        return mock_run.call_args.kwargs
+
+    def test_on_by_default_under_oauth(self):
+        kw = self._main(["--oauth", "https://example.com/mcp"])
+        assert callable(kw["reauth_login"])
+        assert kw["refresh_was_dead"]() is False
+
+    def test_on_for_sse_too(self):
+        kw = self._main(
+            ["--oauth", "--transport", "sse", "https://example.com/sse"],
+            target="mcp_stdio.cli.run_sse",
+        )
+        assert callable(kw["reauth_login"])
+
+    def test_no_oauth_reauth_turns_it_off(self):
+        kw = self._main(["--oauth", "--no-oauth-reauth", "https://example.com/mcp"])
+        assert kw["reauth_login"] is None
+
+    def test_not_built_without_oauth(self):
+        with (
+            patch("sys.argv", ["mcp-stdio", "https://example.com/mcp"]),
+            patch("mcp_stdio.cli.run") as mock_run,
+        ):
+            main()
+        assert mock_run.call_args.kwargs["reauth_login"] is None
+
+
+class TestRefresherRecordsDeadVerdict:
+    def _refresher(self, monkeypatch, outcome, stored="old-at"):
+        monkeypatch.setattr("mcp_stdio.cli.httpx.Client", _SpyClient)
+        monkeypatch.setattr(
+            "mcp_stdio.oauth._refresh_cached_token_ex", lambda url, client: outcome
+        )
+        monkeypatch.setattr(
+            "mcp_stdio.token_store.load_token",
+            lambda url: TokenData(access_token=stored) if stored else None,
+        )
+        state = {"dead": False}
+        return (
+            _build_token_refresher(
+                "https://example.com/mcp", {}, 10, 120, refresh_state=state
+            ),
+            state,
+        )
+
+    def test_dead_failure_records_verdict_and_rejected_token(self, monkeypatch):
+        refresher, state = self._refresher(
+            monkeypatch, _RefreshOutcome(None, dead=True)
+        )
+        assert refresher() is None
+        assert state["dead"] is True
+        assert state["rejected_access_token"] == "old-at"
+
+    def test_transient_failure_is_not_dead(self, monkeypatch):
+        refresher, state = self._refresher(monkeypatch, _RefreshOutcome(None))
+        assert refresher() is None
+        assert state["dead"] is False
+
+    def test_success_clears_the_verdict(self, monkeypatch):
+        refresher, state = self._refresher(
+            monkeypatch, _RefreshOutcome(TokenData(access_token="fresh"))
+        )
+        state["dead"] = True
+        assert refresher()["Authorization"] == "Bearer fresh"
+        assert state["dead"] is False
+
+
+class TestBuildReauthLogin:
+    def test_runs_login_while_holding_the_lock(self, monkeypatch, tmp_path):
+        from mcp_stdio import token_store
+
+        monkeypatch.setattr(token_store, "_STORE_DIR", tmp_path)
+        seen = []
+
+        def login():
+            # The lock is held: a sibling cannot take it now.
+            with token_store.reauth_lock("https://example.com/mcp") as acquired:
+                seen.append(acquired)
+            return {"Authorization": "Bearer new"}
+
+        reauth = _build_reauth_login("https://example.com/mcp", login)
+        assert reauth() == {"Authorization": "Bearer new"}
+        assert seen == [False]
+
+    def test_sibling_holding_the_lock_skips_the_login(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        from mcp_stdio import token_store
+
+        monkeypatch.setattr(token_store, "_STORE_DIR", tmp_path)
+        calls = []
+        reauth = _build_reauth_login("https://example.com/mcp", lambda: calls.append(1))
+        with token_store.reauth_lock("https://example.com/mcp") as acquired:
+            assert acquired is True
+            assert reauth() is None
+        assert calls == []
+        assert "already signing in" in capsys.readouterr().err
+
+    def test_lock_is_per_server(self, monkeypatch, tmp_path):
+        from mcp_stdio import token_store
+
+        monkeypatch.setattr(token_store, "_STORE_DIR", tmp_path)
+        reauth = _build_reauth_login("https://b.example/mcp", lambda: {"A": "1"})
+        with token_store.reauth_lock("https://a.example/mcp"):
+            assert reauth() == {"A": "1"}
