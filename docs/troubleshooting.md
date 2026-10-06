@@ -129,7 +129,7 @@ See Claude Code [#34498](https://github.com/anthropics/claude-code/issues/34498)
 
 **Problem:** A claude.ai custom connector pointing at a `mcp-stdio serve --enable-oauth` endpoint never finishes signing in, and serve's stderr shows `GET /authorize … 400`.
 
-**Cause:** claude.ai identifies itself with a Client ID Metadata Document URL (`https://claude.ai/oauth/mcp-oauth-client-metadata`) instead of registering through Dynamic Client Registration — always in its "No sign-in" mode, and whenever the authorization server advertises support. serve accepts such a `client_id` only when the URL is allowlisted.
+**Cause:** claude.ai identifies itself with a Client ID Metadata Document URL (`https://claude.ai/oauth/mcp-oauth-client-metadata`) instead of registering through Dynamic Client Registration — always in its "No sign-in" mode, and whenever the authorization server advertises support (serve never does). serve accepts such a `client_id` only when the URL is allowlisted.
 
 **Solution:**
 1. Add `--allow-client-id-url https://claude.ai/oauth/mcp-oauth-client-metadata` to the serve command (#463). No `--allow-redirect-uri` is needed for it: the document lists claude.ai's callback.

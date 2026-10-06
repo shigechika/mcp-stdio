@@ -129,7 +129,7 @@ Claude Code の [#34498](https://github.com/anthropics/claude-code/issues/34498)
 
 **問題：** `mcp-stdio serve --enable-oauth` のエンドポイントを指す claude.ai のカスタムコネクタのサインインが完了せず、serve の stderr に `GET /authorize … 400` が出ます。
 
-**原因：** claude.ai は Dynamic Client Registration で登録する代わりに、Client ID Metadata Document の URL（`https://claude.ai/oauth/mcp-oauth-client-metadata`）を client_id として名乗ります。「ログインなし（No sign-in）」の設定では常に、それ以外でも認可サーバーが対応を広告していればこの方式です。serve がこの形の `client_id` を受け付けるのは、URL が許可リストにある場合だけです。
+**原因：** claude.ai は Dynamic Client Registration で登録する代わりに、Client ID Metadata Document の URL（`https://claude.ai/oauth/mcp-oauth-client-metadata`）を client_id として名乗ります。「ログインなし（No sign-in）」の設定では常に、それ以外でも認可サーバーが対応を広告していればこの方式です（serve は広告しません）。serve がこの形の `client_id` を受け付けるのは、URL が許可リストにある場合だけです。
 
 **解決方法：**
 1. serve のコマンドに `--allow-client-id-url https://claude.ai/oauth/mcp-oauth-client-metadata` を追加してください（#463）。文書に claude.ai のコールバックが載っているので、`--allow-redirect-uri` は不要です。

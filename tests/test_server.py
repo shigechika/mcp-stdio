@@ -4361,6 +4361,12 @@ def test_validate_client_id_url_rejects(url):
         ("64:ff9b::a00:1", False),  # NAT64 of 10.0.0.1
         ("64:ff9b::a04f:680a", True),  # NAT64 of 160.79.104.10
         ("2001:db8::1", False),  # documentation
+        ("192.0.0.9", False),  # PCP anycast: is_global, but special-purpose
+        ("2001:1::1", False),  # likewise (2001::/23)
+        ("2001:3::1", False),  # AMT
+        ("::7f00:1", False),  # IPv4-compatible ::127.0.0.1
+        ("64:ff9b::c000:9", False),  # NAT64 of 192.0.0.9
+        ("64:ff9b:1::1", False),  # local-use NAT64
     ],
 )
 def test_cimd_address_allowed(addr, ok):
@@ -4450,14 +4456,13 @@ def test_parse_client_metadata_absent_auth_method_is_public():
     assert keys
 
 
-def test_cimd_metadata_flag_only_with_allowlist():
-    assert "client_id_metadata_document_supported" not in _provider().metadata(
-        "https://gw.example"
-    )
+def test_cimd_metadata_flag_never_advertised():
+    # Advertising it would move every CIMD-capable client (Claude Code, ...)
+    # off DCR onto its own, non-allowlisted URL.
     md = _cimd_provider(_FakeFetch((_doc_bytes(), 300.0))).metadata(
         "https://gw.example"
     )
-    assert md["client_id_metadata_document_supported"] is True
+    assert "client_id_metadata_document_supported" not in md
     assert md["registration_endpoint"] == "https://gw.example/register"
 
 
@@ -4565,31 +4570,104 @@ def test_cimd_invalid_refetch_aborts_and_evicts():
     assert _cimd_authorize(prov)["kind"] == "bad_request"
     # ... and the old copy is gone, so a later transport failure has nothing
     # to fall back on either.
+    clock[0] = 301 + 31
     assert _cimd_authorize(prov)["kind"] == "bad_request"
     assert len(fetch.calls) == 3
 
 
+def test_cimd_gone_document_is_withdrawn_not_stale():
+    clock = [0.0]
+    fetch = _FakeFetch(
+        (_doc_bytes(), 300.0), server._CimdInvalidError("HTTP 410: gone")
+    )
+    prov = _cimd_provider(fetch, now=lambda: clock[0])
+    assert _cimd_authorize(prov)["kind"] == "redirect"
+    clock[0] = 301  # within the stale grace, but a 410 is not an outage
+    assert _cimd_authorize(prov)["kind"] == "bad_request"
+
+
+def test_cimd_failure_backoff_limits_refetches(capsys):
+    clock = [0.0]
+    fetch = _FakeFetch(server._CimdFetchError("HTTP 403"))
+    prov = _cimd_provider(fetch, now=lambda: clock[0])
+    for _ in range(5):
+        assert _cimd_authorize(prov)["kind"] == "bad_request"
+    assert len(fetch.calls) == 1
+    assert capsys.readouterr().err.count("cannot fetch client metadata") == 1
+    clock[0] = 30.0  # the backoff is over: fetch again
+    _cimd_authorize(prov)
+    assert len(fetch.calls) == 2
+
+
+def test_cimd_backoff_still_serves_the_stale_copy():
+    clock = [0.0]
+    fetch = _FakeFetch((_doc_bytes(), 300.0), server._CimdFetchError("HTTP 403"))
+    prov = _cimd_provider(fetch, now=lambda: clock[0])
+    assert _cimd_authorize(prov)["kind"] == "redirect"
+    clock[0] = 400.0
+    for _ in range(3):
+        assert _cimd_authorize(prov)["kind"] == "redirect"
+    assert len(fetch.calls) == 2
+
+
+def test_cimd_refresh_refused_after_url_leaves_allowlist(tmp_path):
+    # Grants outlive the process with --token-store; a URL the operator took
+    # off --allow-client-id-url must not keep refreshing.
+    store = tmp_path / "store.json"
+    prov = _cimd_provider(_FakeFetch((_doc_bytes(), 300.0)), store_path=store)
+    verifier, challenge = client_oauth.generate_pkce()
+    out = _cimd_authorize(prov, challenge=challenge)
+    code = parse_qs(urlsplit(out["location"]).query)["code"][0]
+    status, tok = prov.token(
+        {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": _CIMD_CALLBACK,
+            "client_id": _CIMD_URL,
+            "code_verifier": verifier,
+        }
+    )
+    assert status == 200, tok
+    restarted = _provider(store_path=store)
+    status, body = restarted.token(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": tok["refresh_token"],
+            "client_id": _CIMD_URL,
+        }
+    )
+    assert status == 400
+    assert body["error_description"] == "client is no longer allowed"
+    # DCR clients are untouched by the check.
+    assert restarted._client_still_allowed("Abc_-123") is True
+
+
+# The concurrency tests below hold the first fetch on an Event until it has
+# started; whether the other workers queue on the flight lock or arrive after
+# the outcome, the cache (or the failure backoff) answers them, so the
+# assertions do not depend on thread timing.
+
+
 def test_cimd_concurrent_authorizes_share_one_failed_fetch(capsys):
     gate = threading.Event()
+    started = threading.Event()
     calls = []
 
     def slow_failing_fetch(url):
         calls.append(url)
+        started.set()
         gate.wait(5)
         raise server._CimdFetchError("timed out")
 
     prov = _cimd_provider(slow_failing_fetch)
     with ThreadPoolExecutor(max_workers=4) as ex:
         futs = [ex.submit(_cimd_authorize, prov) for _ in range(4)]
-        time.sleep(0.2)
+        assert started.wait(5)
         gate.set()
         results = [f.result(timeout=10) for f in futs]
     assert all(r["kind"] == "bad_request" for r in results)
     assert calls == [_CIMD_URL]
     assert capsys.readouterr().err.count("cannot fetch client metadata") == 1
-    # Failures are not cached: the next, non-concurrent request fetches again.
-    _cimd_authorize(prov)
-    assert len(calls) == 2
 
 
 def test_cimd_concurrent_waiters_share_stale_copy_on_failure():
@@ -4597,10 +4675,13 @@ def test_cimd_concurrent_waiters_share_stale_copy_on_failure():
     gate = threading.Event()
     calls = []
 
+    started = threading.Event()
+
     def fetch(url):
         calls.append(url)
         if len(calls) == 1:
             return _doc_bytes(), 300.0
+        started.set()
         gate.wait(5)
         raise server._CimdFetchError("HTTP 403")
 
@@ -4609,7 +4690,7 @@ def test_cimd_concurrent_waiters_share_stale_copy_on_failure():
     clock[0] = 1000.0
     with ThreadPoolExecutor(max_workers=3) as ex:
         futs = [ex.submit(_cimd_authorize, prov) for _ in range(3)]
-        time.sleep(0.2)
+        assert started.wait(5)
         gate.set()
         results = [f.result(timeout=10) for f in futs]
     assert all(r["kind"] == "redirect" for r in results)
@@ -4620,15 +4701,18 @@ def test_cimd_concurrent_authorizes_share_one_fetch():
     gate = threading.Event()
     calls = []
 
+    started = threading.Event()
+
     def slow_fetch(url):
         calls.append(url)
+        started.set()
         gate.wait(5)
         return _doc_bytes(), 300.0
 
     prov = _cimd_provider(slow_fetch)
     with ThreadPoolExecutor(max_workers=4) as ex:
         futs = [ex.submit(_cimd_authorize, prov) for _ in range(4)]
-        time.sleep(0.2)
+        assert started.wait(5)
         gate.set()
         results = [f.result(timeout=10) for f in futs]
     assert all(r["kind"] == "redirect" for r in results)
@@ -4663,7 +4747,7 @@ def test_cimd_full_flow_over_http_code_token_refresh():
         md = httpx.get(
             base + "/.well-known/oauth-authorization-server", timeout=10
         ).json()
-        assert md["client_id_metadata_document_supported"] is True
+        assert "client_id_metadata_document_supported" not in md
         verifier, challenge = client_oauth.generate_pkce()
         az = _authorize(base, _CIMD_URL, challenge, redirect=_CIMD_CALLBACK)
         assert az.status_code == 302, az.text
@@ -4763,10 +4847,10 @@ def _plain_tls(monkeypatch):
         monkeypatch.setattr(server, "_cimd_address_allowed", lambda ip: True)
 
         class Ctx:
-            def wrap_socket(self, sock, server_hostname=None):
+            def wrap_socket(self, sock, server_hostname=None, **kw):
                 return sock
 
-        monkeypatch.setattr(server.ssl, "create_default_context", lambda: Ctx())
+        monkeypatch.setattr(server, "_cimd_ssl_context", lambda: Ctx())
 
     return patch
 
@@ -4797,7 +4881,15 @@ def test_fetch_client_metadata_ok(_plain_tls):
     assert seen["host"] == f"claude.ai:{port}"
 
 
-@pytest.mark.parametrize("status", [301, 302, 304, 403, 404, 500])
+@pytest.mark.parametrize("status", [404, 410])
+def test_fetch_client_metadata_gone_is_invalid(_plain_tls, status):
+    with _cimd_http_server(_reply(status, b"{}")) as (port, _):
+        _plain_tls(port)
+        with pytest.raises(server._CimdInvalidError, match=f"HTTP {status}"):
+            server._fetch_client_metadata(f"https://claude.ai:{port}/doc")
+
+
+@pytest.mark.parametrize("status", [301, 302, 304, 403, 500])
 def test_fetch_client_metadata_non_200_is_error(_plain_tls, status):
     with _cimd_http_server(
         _reply(status, b"{}", [("Location", "https://evil.example/doc")])
@@ -4828,7 +4920,7 @@ def test_fetch_client_metadata_truncated_body_is_transport_error(_plain_tls):
             server._fetch_client_metadata(f"https://claude.ai:{port}/doc")
 
 
-@pytest.mark.parametrize("phase", ["headers", "body"])
+@pytest.mark.parametrize("phase", ["headers", "body", "close-delimited body"])
 def test_fetch_client_metadata_deadline_bounds_trickle(_plain_tls, monkeypatch, phase):
     # A peer that keeps every single read under the socket timeout must still
     # be cut off at the overall deadline -- in http.client's header loop as
@@ -4847,7 +4939,8 @@ def test_fetch_client_metadata_deadline_bounds_trickle(_plain_tls, monkeypatch, 
                     return
         else:
             h.send_response(200)
-            h.send_header("Content-Length", "100")
+            if phase == "body":
+                h.send_header("Content-Length", "100")
             h.end_headers()
             for _ in range(40):
                 h.wfile.write(b" ")
@@ -4859,7 +4952,8 @@ def test_fetch_client_metadata_deadline_bounds_trickle(_plain_tls, monkeypatch, 
         with _cimd_http_server(trickle) as (port, _):
             _plain_tls(port)
             t0 = time.monotonic()
-            with pytest.raises(server._CimdFetchError):
+            # A body the watchdog cut short is a timeout, never a document.
+            with pytest.raises(server._CimdFetchError, match="timed out"):
                 server._fetch_client_metadata(f"https://claude.ai:{port}/doc")
             assert time.monotonic() - t0 < 1.5
             stop.set()

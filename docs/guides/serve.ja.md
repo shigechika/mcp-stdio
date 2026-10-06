@@ -61,7 +61,7 @@ spawn、切断か idle タイムアウトで破棄）、認証済みアイデン
 
 | こうしたい | こうする |
 |---|---|
-| Claude.ai カスタムコネクタ（ブラウザベースのクライアント） | `--allow-client-id-url https://claude.ai/oauth/mcp-oauth-client-metadata`。claude.ai はこの Client ID Metadata Document の URL を client_id として名乗るようになります。「ログインなし（No sign-in）」の設定では常にこの方式です（#463）。従来の `--allow-redirect-uri https://claude.ai/api/mcp/auth_callback` で足りるのは、claude.ai が Dynamic Client Registration にフォールバックした場合だけです |
+| Claude.ai カスタムコネクタ（ブラウザベースのクライアント） | `--allow-redirect-uri https://claude.ai/api/mcp/auth_callback`（claude.ai は Dynamic Client Registration で登録します）に加えて `--allow-client-id-url https://claude.ai/oauth/mcp-oauth-client-metadata`（「ログインなし（No sign-in）」の設定では、代わりに常にこの Client ID Metadata Document の URL を名乗ります。#463） |
 | 1 ホストに複数バックエンド | バックエンドごとに serve プロセスを分け、パススコープ issuer を使う：`--public-url https://mcp.example.com/team-a`、`…/team-b`——AS エンドポイントと well-known もプレフィックス配下に収まります。claude.ai のカスタムコネクタには使えません。claude.ai は現在、パスがちょうど `/mcp` でないエンドポイントへの接続を完了できないため（トークン発行後に MCP のリクエストが途絶える：[anthropics/claude-ai-mcp#878](https://github.com/anthropics/claude-ai-mcp/issues/878)、複数階層のパスでは 1 件も届かない：[#738](https://github.com/anthropics/claude-ai-mcp/issues/738)）、その場合はバックエンドごとにホスト名を分けてください |
 | 同時ユーザー数の上限 | `--max-sessions N`（既定 100。超過した `initialize` は `503`） |
 | OAuth の代わりに静的トークン | `--enable-oauth` を外して `MCP_STDIO_SERVE_TOKEN` を設定 |
@@ -84,8 +84,13 @@ spawn、切断か idle タイムアウトで破棄）、認証済みアイデン
   `Cache-Control: max-age`（60 秒〜24 時間。指定がなければ 1 時間）です。
   再取得がネットワークの段階で失敗したときは、以前に検証済みの写しを最大
   24 時間まで延長して使います。取得はできたが検証に通らなくなった文書は
-  直ちに拒否します。登録があるときは AS メタデータで
-  `client_id_metadata_document_supported: true` を広告します。
+  直ちに拒否します。取得に失敗したら 30 秒は再取得しません。`404`／`410` は
+  クライアントが文書を取り下げたものとして扱います。許可リストから URL を
+  外すと、トークンエンドポイントでもそのクライアントの認可コードと
+  refresh token が使えなくなります。AS メタデータで
+  `client_id_metadata_document_supported` は広告しません。広告すると
+  クライアントは DCR の代わりに自分の文書 URL を名乗るようになり、serve は
+  リストにない URL をすべて拒否してしまうためです。
 - `--token-store` のファイルは秘密鍵と同様に扱ってください。`0700` の
   ディレクトリに `0600` で作成されます。
 - 全リクエストはクエリ文字列を redact した形で stderr にログされます。

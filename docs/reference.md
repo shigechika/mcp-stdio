@@ -121,7 +121,7 @@ Arguments:
 | `--dev-user USER` | — | **Insecure, testing only.** Stand-in user identity for loopback testing without real SSO |
 | `--access-token-ttl SECONDS` | `3600` | Access token lifetime in seconds |
 | `--allow-redirect-uri URL` | — | Additional redirect URI to trust for Dynamic Client Registration (repeatable; e.g., `https://claude.ai/api/mcp/auth_callback` for web-based clients) |
-| `--allow-client-id-url URL` | — | Accept this exact Client ID Metadata Document URL as a `client_id` (repeatable; e.g., `https://claude.ai/oauth/mcp-oauth-client-metadata` for claude.ai). The document is fetched at `/authorize` and its `redirect_uris` become the registration; advertises `client_id_metadata_document_supported` (#463) |
+| `--allow-client-id-url URL` | — | Accept this exact Client ID Metadata Document URL as a `client_id` (repeatable; e.g., `https://claude.ai/oauth/mcp-oauth-client-metadata` for claude.ai). The document is fetched at `/authorize` and its `redirect_uris` become the registration. `client_id_metadata_document_supported` is not advertised, so other clients keep using DCR (#463) |
 | `--token-store PATH` | — | Path to persist issued tokens, registrations, and replay tombstones. Survives restarts so clients retain valid tokens. Each serve process must have its own path. File is created `0600`; treat like a private key |
 
 ### Session Management

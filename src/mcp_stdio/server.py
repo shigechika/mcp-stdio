@@ -4387,6 +4387,13 @@ _CIMD_DEFAULT_TTL_SECS = 3600.0
 # datacenter IPs get a bot challenge from claude.ai). Never applied to a
 # document that fetched but failed validation (see _ClientMetadataCache).
 _CIMD_STALE_GRACE_SECS = 86400.0
+# After a failed fetch (transport or validation), the same URL is not fetched
+# again for this long: requests in the meantime get the stale copy if one is
+# usable, else are refused. Bounds the outbound requests and log lines an
+# unauthenticated /authorize loop can cause, and makes requests queued behind
+# a failing fetch take its outcome. A rate limit on fetching, not a cached
+# error: the failure itself is never served as a document (draft-02 Sec. 5.2).
+_CIMD_RETRY_BACKOFF_SECS = 30.0
 _CIMD_MAX_AGE_RE = re.compile(r'\s*max-age\s*=\s*"?(\d+)"?\s*', re.IGNORECASE)
 _CIMD_SECRET_FIELDS = ("client_secret", "client_secret_expires_at")
 
@@ -4398,9 +4405,10 @@ class _CimdFetchError(Exception):
 
 
 class _CimdInvalidError(Exception):
-    """A fetched client metadata document that fails validation. Aborts the
-    authorization request and evicts any cached copy: the client changed it,
-    so the old copy is no longer what the client publishes."""
+    """A fetched client metadata document that fails validation, or a 404/410
+    for it. Aborts the authorization request and evicts any cached copy: the
+    client changed or withdrew it, so the old copy is no longer what the
+    client publishes."""
 
 
 def _validate_client_id_url(url: str) -> str:
@@ -4451,18 +4459,31 @@ def _validate_client_id_url(url: str) -> str:
 
 
 _NAT64_WELL_KNOWN = ipaddress.ip_network("64:ff9b::/96")
+# Special-purpose blocks refused WHOLE, because CPython's is_global follows
+# the IANA registry's per-entry "globally reachable" column and so passes
+# some of their members (192.0.0.9 PCP anycast, 2001:1::1, AMT 2001:3::/32,
+# ...), while draft-02 Sec. 8.6 refuses special-use addresses as such. Also
+# the deprecated IPv4-compatible ::/96 (::7f00:1 reaches 127.0.0.1 where it
+# is still routed), local-use NAT64, and site-local fec0::/10, all of which
+# CPython reports is_global.
+_CIMD_REFUSED_NETWORKS = (
+    ipaddress.ip_network("192.0.0.0/24"),
+    ipaddress.ip_network("::/96"),
+    ipaddress.ip_network("64:ff9b:1::/48"),
+    ipaddress.ip_network("2001::/23"),
+    ipaddress.ip_network("fec0::/10"),
+)
 
 
 def _cimd_address_allowed(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """True only for a globally routable unicast address (draft-02 Sec. 8.6:
-    never fetch from an RFC 6890 special-use address).
+    """True only for a globally routable unicast address outside every
+    special-purpose block (draft-02 Sec. 8.6: never fetch from an RFC 6890
+    special-use address).
 
     An IPv6 address that embeds an IPv4 one is judged by the IPv4 address it
     reaches: IPv4-mapped (older CPython does not unwrap it), 6to4, and the
     NAT64 well-known prefix (RFC 6052; a DNS64 resolver synthesizes it for an
     IPv4-only host, so refusing it outright would break NAT64 networks).
-    Deprecated site-local ``fec0::/10`` is refused explicitly: CPython still
-    reports it ``is_global``.
     """
     if isinstance(ip, ipaddress.IPv6Address):
         if ip.ipv4_mapped is not None:
@@ -4471,8 +4492,8 @@ def _cimd_address_allowed(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> 
             ip = ip.sixtofour
         elif ip in _NAT64_WELL_KNOWN:
             ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
-        elif ip.is_site_local:
-            return False
+    if any(ip in net for net in _CIMD_REFUSED_NETWORKS):
+        return False
     return ip.is_global and not ip.is_multicast
 
 
@@ -4500,13 +4521,30 @@ def _cimd_getaddrinfo(host: str, port: int) -> list[Any]:
     return socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
 
 
-def _cimd_shutdown(sock: socket.socket) -> None:
-    """Watchdog action for ``_fetch_client_metadata``: shut the socket down so
-    a pending read returns. Shutting down a closed socket is not an error."""
+def _cimd_shutdown(sock: socket.socket, fired: threading.Event) -> None:
+    """Watchdog action for ``_fetch_client_metadata``: record that it fired and
+    shut the socket down so a pending read returns. Shutting down a closed
+    socket is not an error."""
+    fired.set()
     try:
         sock.shutdown(socket.SHUT_RDWR)
     except OSError:
         pass
+
+
+_cimd_tls: ssl.SSLContext | None = None
+
+
+def _cimd_ssl_context() -> ssl.SSLContext:
+    """The TLS context for every CIMD fetch, built once (loading the trust
+    store per fetch is wasted work): system CAs, hostname checking, TLS 1.2 or
+    newer. A racing first use may build two; either is equivalent."""
+    global _cimd_tls
+    if _cimd_tls is None:
+        ctx = ssl.create_default_context()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        _cimd_tls = ctx
+    return _cimd_tls
 
 
 def _fetch_client_metadata(url: str) -> tuple[bytes, float | None]:
@@ -4517,16 +4555,20 @@ def _fetch_client_metadata(url: str) -> tuple[bytes, float | None]:
     made to a vetted address (so a second, rebinding DNS answer is never
     used) with normal certificate verification against the host name.
     ``http.client`` never follows redirects, and draft-02 Sec. 5 forbids
-    following them, so a 3xx is just "not 200". The body is read in chunks,
-    stopping past ``_CIMD_MAX_BYTES``; a body shorter than its Content-Length
-    is a transport failure, not a document.
+    following them, so a 3xx is just "not 200". 404 and 410 say the document
+    is gone, which is a withdrawal (_CimdInvalidError), not an outage. The
+    body is read in chunks, stopping past ``_CIMD_MAX_BYTES``; a body cut
+    short -- below its Content-Length, or a close-delimited one ended without
+    TLS close_notify (``suppress_ragged_eofs=False``) -- is a transport
+    failure, not a document.
 
     One deadline covers connect through the last byte. Socket timeouts bound
     each read, but http.client's header and chunk-framing loops make many
     reads, so a watchdog timer also shuts the socket down at the deadline,
-    which unblocks whatever read is pending.
+    which unblocks whatever read is pending; a body that ends because the
+    watchdog fired is reported as a timeout, never returned.
 
-    Raises _CimdFetchError on any failure.
+    Raises _CimdFetchError or _CimdInvalidError.
     """
     p = urlsplit(url)
     host = p.hostname or ""
@@ -4559,29 +4601,31 @@ def _fetch_client_metadata(url: str) -> tuple[bytes, float | None]:
     if not addrs:
         raise _CimdFetchError(f"cannot resolve {host}: no addresses")
 
-    ctx = ssl.create_default_context()
+    ctx = _cimd_ssl_context()
     last_err: Exception | None = None
     for addr in addrs:
         conn = None
         ssock = None
         watchdog = None
         wd_sock = None
+        fired = threading.Event()
         try:
             sock = socket.create_connection((addr, port), timeout=remaining())
-            # wrap_socket() detaches sock, so the watchdog gets its own
-            # descriptor for the same connection: shutdown() acts on the
-            # connection, and a dup cannot be recycled under it.
             try:
+                # wrap_socket() detaches sock, so the watchdog gets its own
+                # descriptor for the same connection: shutdown() acts on the
+                # connection, and a dup cannot be recycled under it.
                 wd_sock = sock.dup()
+                watchdog = threading.Timer(
+                    remaining(), _cimd_shutdown, (wd_sock, fired)
+                )
+                watchdog.daemon = True
+                watchdog.start()
+                ssock = ctx.wrap_socket(
+                    sock, server_hostname=host, suppress_ragged_eofs=False
+                )
             except BaseException:
-                sock.close()
-                raise
-            watchdog = threading.Timer(remaining(), _cimd_shutdown, (wd_sock,))
-            watchdog.daemon = True
-            watchdog.start()
-            try:
-                ssock = ctx.wrap_socket(sock, server_hostname=host)
-            except BaseException:
+                # Detached (and so a no-op) once wrap_socket() has succeeded.
                 sock.close()
                 raise
             # host (not addr) so the Host header and the TLS name match the
@@ -4600,6 +4644,8 @@ def _fetch_client_metadata(url: str) -> tuple[bytes, float | None]:
             )
             ssock.settimeout(remaining())
             resp = conn.getresponse()
+            if resp.status in (404, 410):
+                raise _CimdInvalidError(f"HTTP {resp.status}: the document is gone")
             if resp.status != 200:
                 raise _CimdFetchError(f"HTTP {resp.status}")
             # Not ssock.settimeout() from here on: http.client closes the
@@ -4612,6 +4658,8 @@ def _fetch_client_metadata(url: str) -> tuple[bytes, float | None]:
                 if not chunk:
                     break
                 body += chunk
+            if fired.is_set():
+                raise _CimdFetchError("timed out")
             if len(body) > _CIMD_MAX_BYTES:
                 raise _CimdFetchError(f"larger than {_CIMD_MAX_BYTES} bytes")
             # read1() answers b"" at a premature EOF instead of raising
@@ -4620,13 +4668,15 @@ def _fetch_client_metadata(url: str) -> tuple[bytes, float | None]:
             if resp.length:
                 raise _CimdFetchError("connection closed before the whole body")
             return body, _cimd_max_age(resp.getheader("Cache-Control"))
-        except _CimdFetchError:
+        except (_CimdFetchError, _CimdInvalidError):
             raise
         except (OSError, http.client.HTTPException) as e:
-            # ssl.SSLError and socket.timeout are OSErrors, and so is the
-            # error a watchdog shutdown raises. Try the next vetted address
-            # (remaining() stops that once the deadline has passed); report
-            # the last error if none works.
+            # ssl.SSLError (SSLEOFError for a ragged EOF) and socket.timeout
+            # are OSErrors, and so is the error a watchdog shutdown raises.
+            # Try the next vetted address (remaining() stops that once the
+            # deadline has passed); report the last error if none works.
+            if fired.is_set():
+                raise _CimdFetchError("timed out") from e
             remaining()
             last_err = e
         finally:
@@ -4738,14 +4788,13 @@ class _ClientMetadataCache:
     client_id URLs.
 
     Never called under ``_OAuthProvider._lock``. ``_lock`` guards ``_entries``
-    and ``_failures`` only and is never held across a fetch; one flight lock
-    per URL makes concurrent /authorize requests for the same client share a
-    single fetch. A waiter that gets the flight lock re-checks the cache, and
-    when the fetch it waited on FAILED (``_failures`` moved on while it
-    waited) it takes that outcome instead of fetching again: the stale copy
-    if one is usable, else None. A later, non-concurrent request fetches
-    afresh -- failures are not cached (draft-02 Sec. 5.2). The allowlist is
-    fixed at startup, so every dict is bounded by it.
+    and ``_retry_after`` only and is never held across a fetch; one flight
+    lock per URL makes concurrent /authorize requests for the same client
+    share a single fetch. After a failure the URL is not fetched again for
+    ``_CIMD_RETRY_BACKOFF_SECS``, so a request that waited behind the failing
+    fetch, or arrives soon after it, gets the stale copy if one is usable,
+    else None, without a second fetch or log line. The allowlist is fixed at
+    startup, so every dict is bounded by it.
 
     ``fetch`` and ``now`` are injectable for tests.
     """
@@ -4762,8 +4811,22 @@ class _ClientMetadataCache:
         self._now = now
         self._lock = threading.Lock()
         self._entries: dict[str, _CimdClient] = {}
-        self._failures = dict.fromkeys(allowed, 0)
+        self._retry_after: dict[str, float] = {}
         self._flights = {url: threading.Lock() for url in allowed}
+
+    def _cached(self, url: str) -> _CimdClient | None | bool:
+        """The cache's answer without fetching: the entry while fresh; during
+        the retry backoff the stale entry if usable, else None; False when a
+        fetch is due."""
+        with self._lock:
+            entry = self._entries.get(url)
+            retry_after = self._retry_after.get(url, 0.0)
+        now = self._now()
+        if entry is not None and now < entry.fresh_until:
+            return entry
+        if now < retry_after:
+            return entry if entry is not None and now < entry.stale_until else None
+        return False
 
     def resolve(self, url: str) -> _CimdClient | None:
         """The validated client for an allowlisted ``url``, or None (logged)
@@ -4771,27 +4834,22 @@ class _ClientMetadataCache:
         flight = self._flights.get(url)
         if flight is None:
             return None
-        with self._lock:
-            entry = self._entries.get(url)
-            failures_seen = self._failures[url]
-        if entry is not None and self._now() < entry.fresh_until:
-            return entry
+        cached = self._cached(url)
+        if cached is not False:
+            return cached
         with flight:
+            cached = self._cached(url)
+            if cached is not False:
+                return cached
             with self._lock:
                 entry = self._entries.get(url)
-                shared_failure = self._failures[url] != failures_seen
-            now = self._now()
-            if entry is not None and now < entry.fresh_until:
-                return entry
-            if shared_failure:
-                # The fetch this request queued behind failed; its outcome
-                # was logged once already.
-                return entry if entry is not None and now < entry.stale_until else None
             try:
                 body, max_age = self._fetch(url)
+                keys, exact = _parse_client_metadata(body, url)
             except _CimdFetchError as e:
+                now = self._now()
                 with self._lock:
-                    self._failures[url] += 1
+                    self._retry_after[url] = now + _CIMD_RETRY_BACKOFF_SECS
                 if entry is not None and now < entry.stale_until:
                     log(
                         f"warning: cannot re-fetch client metadata document "
@@ -4800,12 +4858,10 @@ class _ClientMetadataCache:
                     return entry
                 log(f"warning: cannot fetch client metadata document {url}: {e}")
                 return None
-            try:
-                keys, exact = _parse_client_metadata(body, url)
             except _CimdInvalidError as e:
                 with self._lock:
                     self._entries.pop(url, None)
-                    self._failures[url] += 1
+                    self._retry_after[url] = self._now() + _CIMD_RETRY_BACKOFF_SECS
                 log(f"warning: invalid client metadata document {url}: {e}")
                 return None
             ttl = _CIMD_DEFAULT_TTL_SECS if max_age is None else max_age
@@ -4816,6 +4872,7 @@ class _ClientMetadataCache:
             )
             with self._lock:
                 self._entries[url] = entry
+                self._retry_after.pop(url, None)
             return entry
 
 
@@ -5280,6 +5337,16 @@ class _OAuthProvider:
                     "(issued tokens will not survive a restart)"
                 )
 
+    def _client_still_allowed(self, client_id: str) -> bool:
+        """False for a Client ID Metadata Document client whose URL is no
+        longer in --allow-client-id-url (removed, then restarted on the same
+        --token-store), so its codes and refresh tokens stop working. DCR ids
+        (``token_urlsafe``) never contain ``://`` and are not affected; an
+        access token already issued runs out on its own TTL."""
+        if "://" not in client_id:
+            return True
+        return self._cimd is not None and client_id in self._cimd.allowed
+
     # -- metadata --------------------------------------------------------
 
     def metadata(self, issuer: str) -> dict[str, Any]:
@@ -5293,11 +5360,14 @@ class _OAuthProvider:
             "code_challenge_methods_supported": ["S256"],
             "token_endpoint_auth_methods_supported": ["none"],
         }
-        # draft-ietf-oauth-client-id-metadata-document Sec. 6. Only with an
-        # --allow-client-id-url entry: a client that sees the flag will send
-        # its URL as the client_id, which serve resolves only when allowlisted.
-        if self._cimd is not None:
-            md["client_id_metadata_document_supported"] = True
+        # client_id_metadata_document_supported is deliberately NEVER
+        # advertised, even with --allow-client-id-url entries (#463). A client
+        # that sees it switches from DCR to its OWN document URL, and serve
+        # accepts only allowlisted ones: advertising it for claude.ai would
+        # break every other CIMD-capable client (Claude Code, ...) that works
+        # through DCR today. The client that needs CIMD here -- claude.ai's
+        # "No sign-in" mode -- presents its URL without checking the flag
+        # (anthropics/claude-ai-mcp#1064).
         # RFC 9207 Sec. 2.3: advertise iss support only when we actually emit it
         # — i.e. for an https issuer, since Sec. 2 requires the iss value to be an
         # https URL. A loopback http dev issuer neither advertises the flag nor
@@ -5561,6 +5631,11 @@ class _OAuthProvider:
                 "error": "invalid_grant",
                 "error_description": "client_id mismatch",
             }
+        if not self._client_still_allowed(entry["client_id"]):
+            return 400, {
+                "error": "invalid_grant",
+                "error_description": "client is no longer allowed",
+            }
         if form.get("redirect_uri") != entry["redirect_uri"]:
             return 400, {
                 "error": "invalid_grant",
@@ -5641,6 +5716,11 @@ class _OAuthProvider:
                 return 400, {
                     "error": "invalid_grant",
                     "error_description": "client_id mismatch",
+                }
+            if not self._client_still_allowed(entry["client_id"]):
+                return 400, {
+                    "error": "invalid_grant",
+                    "error_description": "client is no longer allowed",
                 }
             family = entry.get("family")
             # Rotate: tombstone the spent token (instead of a plain delete) so a

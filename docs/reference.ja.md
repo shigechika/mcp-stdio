@@ -121,7 +121,7 @@ Arguments:
 | `--dev-user USER` | — | **非セキュア、テスト用のみ。** 実際の SSO なしでループバックテスト用のスタンドイン user identity |
 | `--access-token-ttl SECONDS` | `3600` | アクセストークンライフタイム（秒） |
 | `--allow-redirect-uri URL` | — | Dynamic Client Registration で信頼する追加リダイレクト URI（繰り返し可能；例：ウェブベースのクライアント用 `https://claude.ai/api/mcp/auth_callback`） |
-| `--allow-client-id-url URL` | — | この Client ID Metadata Document の URL を完全一致で `client_id` として受け付ける（繰り返し可能；例：claude.ai 用 `https://claude.ai/oauth/mcp-oauth-client-metadata`）。`/authorize` で文書を取得し、その `redirect_uris` を登録として扱う。`client_id_metadata_document_supported` を広告する（#463） |
+| `--allow-client-id-url URL` | — | この Client ID Metadata Document の URL を完全一致で `client_id` として受け付ける（繰り返し可能；例：claude.ai 用 `https://claude.ai/oauth/mcp-oauth-client-metadata`）。`/authorize` で文書を取得し、その `redirect_uris` を登録として扱う。`client_id_metadata_document_supported` は広告しないので、ほかのクライアントは引き続き DCR を使う（#463） |
 | `--token-store PATH` | — | 発行済みトークン、登録、リプレイ墓石を永続化するパス。再起動時にサーバーが生存し、クライアントは有効なトークンを保持します。各 serve プロセスは独自のパスを持つ必要があります。ファイルは `0600` で作成；秘密鍵のように扱います |
 
 ### セッション管理
