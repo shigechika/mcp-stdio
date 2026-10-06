@@ -21931,3 +21931,38 @@ class TestRunSseReauthOn401:
         assert msgs[0]["id"] == 7
         assert msgs[0]["error"]["code"] == -32002
         assert started.wait(5)
+
+
+class TestDeepJsonMessage:
+    """#462 follow-up: 500 levels of nesting must round-trip on every
+    supported Python. CPython 3.10/3.11 stop parsing just under 1000 levels
+    (the recursion limit; deeper input becomes a per-message RecursionError
+    error, never a crash), while real MCP messages stay within a few dozen,
+    so 500 is the depth guaranteed to work everywhere."""
+
+    def test_500_levels_round_trip(self, httpx_mock):
+        depth = 500
+        deep = json.loads("[" * depth + "]" * depth)
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "t", "arguments": {"x": deep}},
+        }
+        response = {"jsonrpc": "2.0", "id": 1, "result": {"structured": deep}}
+        # A string body: pytest-httpx deep-copies a json= object, and
+        # copy.deepcopy itself hits the recursion limit at this depth.
+        httpx_mock.add_response(
+            url="https://example.com/mcp",
+            text=json.dumps(response),
+            headers={"content-type": "application/json"},
+        )
+        stdout = StringIO()
+        with (
+            patch("sys.stdin", StringIO(json.dumps(request) + "\n")),
+            patch("sys.stdout", stdout),
+        ):
+            run("https://example.com/mcp", {})
+        sent = json.loads(httpx_mock.get_requests()[0].content)
+        assert sent["params"]["arguments"]["x"] == deep
+        assert json.loads(stdout.getvalue()) == response
