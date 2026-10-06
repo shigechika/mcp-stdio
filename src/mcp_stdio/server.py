@@ -36,6 +36,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import math
@@ -46,6 +47,7 @@ import secrets
 import select
 import signal
 import socket
+import ssl
 import subprocess
 import threading
 import time
@@ -55,6 +57,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import SplitResult, parse_qs, urlencode, urlsplit
 
+from . import __version__
 from .relay import (
     _META_CLIENT_CAPABILITIES,
     _META_PROTOCOL_VERSION,
@@ -4360,6 +4363,389 @@ class _FirestoreReadError(Exception):
     """
 
 
+# -- Client ID Metadata Documents (#463) -----------------------------------
+#
+# draft-ietf-oauth-client-id-metadata-document (CIMD; MCP 2026-07-28 says an
+# AS SHOULD support it, DCR is deprecated): the client_id IS an https URL and
+# the AS fetches the JSON document behind it as the client's registration.
+# serve only ever fetches a URL the operator pre-registered with
+# --allow-client-id-url (draft-02 Sec. 7.2), compared byte-for-byte, so no
+# client-supplied URL ever reaches the network and DCR's token_urlsafe ids
+# (which never contain ":" or "/") cannot collide with one (Sec. 7.1).
+
+_CIMD_MAX_BYTES = 5 * 1024  # draft-02 Sec. 8.7's recommended read limit
+_CIMD_FETCH_TIMEOUT_SECS = 10.0  # whole fetch, connect through last byte
+# Cache lifetime: Cache-Control max-age clamped to [MIN, MAX] (draft-02
+# Sec. 5.2 lets the AS bound it; the floor also covers no-store/no-cache so
+# a busy /authorize does not re-fetch per request, Sec. 9.1's privacy note),
+# DEFAULT when the header gives none. claude.ai sends max-age=300.
+_CIMD_MIN_TTL_SECS = 60.0
+_CIMD_MAX_TTL_SECS = 86400.0
+_CIMD_DEFAULT_TTL_SECS = 3600.0
+# How long past expiry a previously VALIDATED document may still be used when
+# a re-fetch fails at the transport level (anthropics/claude-ai-mcp#650: some
+# datacenter IPs get a bot challenge from claude.ai). Never applied to a
+# document that fetched but failed validation (see _ClientMetadataCache).
+_CIMD_STALE_GRACE_SECS = 86400.0
+_CIMD_MAX_AGE_RE = re.compile(r'\s*max-age\s*=\s*"?(\d+)"?\s*', re.IGNORECASE)
+_CIMD_SECRET_FIELDS = ("client_secret", "client_secret_expires_at")
+
+
+class _CimdFetchError(Exception):
+    """A transport-level failure fetching a client metadata document (DNS,
+    refused address, connect/TLS error, timeout, non-200, oversize body). A
+    previously validated copy may stand in for it, within the stale grace."""
+
+
+class _CimdInvalidError(Exception):
+    """A fetched client metadata document that fails validation. Aborts the
+    authorization request and evicts any cached copy: the client changed it,
+    so the old copy is no longer what the client publishes."""
+
+
+def _validate_client_id_url(url: str) -> str:
+    """Validate an operator-configured ``--allow-client-id-url`` entry.
+
+    draft-02 Sec. 3: https, no userinfo, a path, no single-dot/double-dot
+    segments, no fragment (and query is SHOULD NOT; refused here). A path of
+    "/" is refused too, as the MCP spec requires a path component. The host
+    must be an ASCII DNS name, not an IP literal, so the address checks in
+    ``_cimd_address_allowed`` always apply to a resolved name. The string is
+    kept verbatim: draft-02 Sec. 3 compares Client Identifier URLs by simple
+    string comparison, without default-port or trailing-slash normalization.
+
+    Raises ValueError with a human-readable reason on rejection.
+    """
+    if not url.isascii() or any(c <= " " or c == "\x7f" for c in url):
+        raise ValueError(f"{url!r}: must be ASCII with no spaces or control chars")
+    try:
+        p = urlsplit(url)
+        port = p.port
+    except ValueError as e:
+        raise ValueError(f"{url!r}: {e}") from e
+    if p.scheme != "https":
+        raise ValueError(f"{url!r}: must be an https:// URL")
+    if "@" in p.netloc:
+        raise ValueError(f"{url!r}: must not contain userinfo")
+    host = p.hostname or ""
+    if not host:
+        raise ValueError(f"{url!r}: missing host")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise ValueError(f"{url!r}: host must be a DNS name, not an IP address")
+    if port == 0:
+        raise ValueError(f"{url!r}: invalid port")
+    if p.path in ("", "/"):
+        raise ValueError(f"{url!r}: must contain a path (e.g. /client.json)")
+    segments = p.path.split("/")
+    if "." in segments or ".." in segments:
+        raise ValueError(f"{url!r}: must not contain . or .. path segments")
+    if "?" in url:
+        raise ValueError(f"{url!r}: must not contain a query string")
+    if "#" in url:
+        raise ValueError(f"{url!r}: must not contain a fragment")
+    return url
+
+
+def _cimd_address_allowed(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True only for a globally routable unicast address (draft-02 Sec. 8.6:
+    never fetch from an RFC 6890 special-use address). An IPv4-mapped IPv6
+    address is judged by its IPv4 form, which older CPython does not do."""
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_global and not ip.is_multicast
+
+
+def _cimd_max_age(cache_control: str | None) -> float | None:
+    """Seconds from a Cache-Control header: ``max-age=N``, or 0 for
+    ``no-store``/``no-cache`` (the caller's floor then applies). None when the
+    header says neither. Expires / ETag revalidation are not implemented."""
+    if not cache_control:
+        return None
+    for directive in cache_control.split(","):
+        m = _CIMD_MAX_AGE_RE.fullmatch(directive)
+        if m:
+            return float(m.group(1))
+        if directive.strip().lower() in ("no-store", "no-cache"):
+            return 0.0
+    return None
+
+
+def _cimd_getaddrinfo(host: str, port: int) -> list[Any]:
+    """``socket.getaddrinfo`` for the CIMD fetch, a seam tests replace. Not
+    bounded by the fetch deadline: the stdlib resolver has no timeout knob, so
+    it is left to the system resolver's own."""
+    return socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+
+
+def _fetch_client_metadata(url: str) -> tuple[bytes, float | None]:
+    """Fetch a client metadata document. Returns ``(body, max_age)``.
+
+    stdlib only. The host is resolved once and EVERY address must pass
+    ``_cimd_address_allowed`` before any connection; the TLS connection is then
+    made to a vetted address (so a second, rebinding DNS answer is never
+    used) with normal certificate verification against the host name.
+    ``http.client`` never follows redirects, and draft-02 Sec. 5 forbids
+    following them, so a 3xx is just "not 200". The body is read in chunks
+    against one overall deadline (overrun by at most one blocking read, itself
+    bounded by the budget left when the response started), stopping past
+    ``_CIMD_MAX_BYTES``.
+
+    Raises _CimdFetchError on any failure.
+    """
+    p = urlsplit(url)
+    host = p.hostname or ""
+    port = p.port or 443
+    deadline = time.monotonic() + _CIMD_FETCH_TIMEOUT_SECS
+
+    def remaining() -> float:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise _CimdFetchError("timed out")
+        return left
+
+    try:
+        infos = _cimd_getaddrinfo(host, port)
+    except OSError as e:
+        raise _CimdFetchError(f"cannot resolve {host}: {e}") from e
+    addrs: list[str] = []
+    for info in infos:
+        addr = str(info[4][0]).split("%", 1)[0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError as e:
+            raise _CimdFetchError(f"{host} resolved to unparsable {addr!r}") from e
+        if not _cimd_address_allowed(ip):
+            raise _CimdFetchError(
+                f"{host} resolves to {addr}, which is not a public address"
+            )
+        if addr not in addrs:
+            addrs.append(addr)
+    if not addrs:
+        raise _CimdFetchError(f"cannot resolve {host}: no addresses")
+
+    ctx = ssl.create_default_context()
+    last_err: Exception | None = None
+    for addr in addrs:
+        conn = None
+        try:
+            sock = socket.create_connection((addr, port), timeout=remaining())
+            try:
+                ssock = ctx.wrap_socket(sock, server_hostname=host)
+            except BaseException:
+                sock.close()
+                raise
+            # host (not addr) so the Host header and the TLS name match the
+            # client_id; conn.sock is pre-set, so connect() never re-resolves.
+            conn = http.client.HTTPSConnection(
+                host, port, timeout=remaining(), context=ctx
+            )
+            conn.sock = ssock
+            conn.request(
+                "GET",
+                p.path,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": f"mcp-stdio/{__version__}",
+                },
+            )
+            ssock.settimeout(remaining())
+            resp = conn.getresponse()
+            if resp.status != 200:
+                raise _CimdFetchError(f"HTTP {resp.status}")
+            # Not ssock.settimeout() from here on: http.client closes the
+            # socket object once a close-delimited response is read, so the
+            # deadline is checked between reads instead (each blocking read
+            # is still bounded by the timeout set before getresponse()).
+            body = b""
+            while len(body) <= _CIMD_MAX_BYTES:
+                remaining()
+                chunk = resp.read1(_CIMD_MAX_BYTES + 1 - len(body))
+                if not chunk:
+                    break
+                body += chunk
+            if len(body) > _CIMD_MAX_BYTES:
+                raise _CimdFetchError(f"larger than {_CIMD_MAX_BYTES} bytes")
+            return body, _cimd_max_age(resp.getheader("Cache-Control"))
+        except _CimdFetchError:
+            raise
+        except (OSError, http.client.HTTPException) as e:
+            # ssl.SSLError and socket.timeout are OSErrors. Try the next
+            # vetted address; report the last error if none works.
+            last_err = e
+        finally:
+            if conn is not None:
+                conn.close()
+    raise _CimdFetchError(f"cannot fetch: {last_err}")
+
+
+class _CimdClient:
+    """A validated client metadata document, reduced to what /authorize uses.
+
+    ``redirect_keys`` are ``_match_key`` keys; ``exact_redirects`` is the set
+    passed to ``_match_key`` as its exact-match allowlist. The document IS the
+    registration (draft-02 Sec. 4.2), so --allow-redirect-uri plays no part.
+    """
+
+    __slots__ = ("redirect_keys", "exact_redirects", "fresh_until", "stale_until")
+
+    def __init__(
+        self,
+        redirect_keys: frozenset[tuple[Any, ...]],
+        exact_redirects: frozenset[str],
+        fresh_until: float,
+        stale_until: float,
+    ) -> None:
+        self.redirect_keys = redirect_keys
+        self.exact_redirects = exact_redirects
+        self.fresh_until = fresh_until
+        self.stale_until = stale_until
+
+
+def _parse_client_metadata(
+    body: bytes, url: str
+) -> tuple[frozenset[tuple[Any, ...]], frozenset[str]]:
+    """Validate a fetched document for ``url``; return its redirect keys and
+    exact-match https redirects. Raises _CimdInvalidError.
+
+    Checks: a JSON object; ``client_id`` equal to ``url`` by simple string
+    comparison (draft-02 Sec. 4); a non-empty ``client_name`` (MCP MUST); no
+    shared-secret fields (Sec. 4.1); ``token_endpoint_auth_method`` absent or
+    ``none`` -- ``private_key_jwt`` is refused because the token endpoint does
+    not authenticate clients, and accepting it as public would skip the client
+    authentication Sec. 8.2 requires. ``grant_types`` / ``response_types`` /
+    ``scope`` are requests the AS may narrow and are deliberately NOT checked
+    (claude.ai lists ``jwt-bearer``, anthropics/claude-ai-mcp#487).
+
+    ``redirect_uris`` must be a non-empty array; each entry is a loopback http
+    URI (port-agnostic, RFC 8252, as for DCR clients) or an https URI under the
+    same rules as --allow-redirect-uri, matched exactly. An entry that is
+    neither is skipped with a warning; no usable entry at all is invalid.
+    """
+    try:
+        doc = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError) as e:
+        raise _CimdInvalidError("not a JSON document") from e
+    if not isinstance(doc, dict):
+        raise _CimdInvalidError("not a JSON object")
+    if doc.get("client_id") != url:
+        raise _CimdInvalidError(
+            f"client_id {_log_safe_uri(doc.get('client_id'))} does not equal "
+            "the document URL"
+        )
+    name = doc.get("client_name")
+    if not isinstance(name, str) or not name.strip():
+        raise _CimdInvalidError("client_name is missing")
+    for field in _CIMD_SECRET_FIELDS:
+        if field in doc:
+            raise _CimdInvalidError(f"{field} must not be present")
+    method = doc.get("token_endpoint_auth_method", "none")
+    if method != "none":
+        raise _CimdInvalidError(
+            f"token_endpoint_auth_method {_log_safe_uri(method)} is not "
+            "supported (serve's token endpoint only serves public clients, "
+            "token_endpoint_auth_method=none)"
+        )
+    uris = doc.get("redirect_uris")
+    if not isinstance(uris, list) or not uris:
+        raise _CimdInvalidError("redirect_uris must be a non-empty array")
+    keys: set[tuple[Any, ...]] = set()
+    exact: set[str] = set()
+    for u in uris:
+        if not isinstance(u, str):
+            log(f"warning: {url}: skipping non-string redirect_uri {_log_safe_uri(u)}")
+            continue
+        rk = _redirect_key(u)
+        if rk is not None:
+            keys.add(("loopback", *rk))
+            continue
+        try:
+            _validate_allowed_redirect_uri(u)
+        except ValueError as e:
+            log(f"warning: {url}: skipping redirect_uri: {e}")
+            continue
+        keys.add(("exact", u))
+        exact.add(u)
+    if not keys:
+        raise _CimdInvalidError("no usable redirect_uris")
+    return frozenset(keys), frozenset(exact)
+
+
+class _ClientMetadataCache:
+    """Fetches, validates, and caches the documents of the allowlisted
+    client_id URLs.
+
+    Never called under ``_OAuthProvider._lock``. ``_lock`` guards ``_entries``
+    only and is never held across a fetch; one flight lock per URL makes
+    concurrent /authorize requests for the same client share a single fetch
+    (a waiter re-checks the cache once it gets the flight lock). The allowlist
+    is fixed at startup, so both dicts are bounded by it.
+
+    ``fetch`` and ``now`` are injectable for tests.
+    """
+
+    def __init__(
+        self,
+        allowed: frozenset[str],
+        *,
+        fetch: Any = _fetch_client_metadata,
+        now: Any = time.time,
+    ) -> None:
+        self.allowed = allowed
+        self._fetch = fetch
+        self._now = now
+        self._lock = threading.Lock()
+        self._entries: dict[str, _CimdClient] = {}
+        self._flights = {url: threading.Lock() for url in allowed}
+
+    def resolve(self, url: str) -> _CimdClient | None:
+        """The validated client for an allowlisted ``url``, or None (logged)
+        when it cannot be fetched or is invalid. None for any other url."""
+        flight = self._flights.get(url)
+        if flight is None:
+            return None
+        with self._lock:
+            entry = self._entries.get(url)
+        if entry is not None and self._now() < entry.fresh_until:
+            return entry
+        with flight:
+            with self._lock:
+                entry = self._entries.get(url)
+            now = self._now()
+            if entry is not None and now < entry.fresh_until:
+                return entry
+            try:
+                body, max_age = self._fetch(url)
+            except _CimdFetchError as e:
+                if entry is not None and now < entry.stale_until:
+                    log(
+                        f"warning: cannot re-fetch client metadata document "
+                        f"{url}: {e}; using the copy validated earlier"
+                    )
+                    return entry
+                log(f"warning: cannot fetch client metadata document {url}: {e}")
+                return None
+            try:
+                keys, exact = _parse_client_metadata(body, url)
+            except _CimdInvalidError as e:
+                with self._lock:
+                    self._entries.pop(url, None)
+                log(f"warning: invalid client metadata document {url}: {e}")
+                return None
+            ttl = _CIMD_DEFAULT_TTL_SECS if max_age is None else max_age
+            ttl = min(max(ttl, _CIMD_MIN_TTL_SECS), _CIMD_MAX_TTL_SECS)
+            now = self._now()
+            entry = _CimdClient(
+                keys, exact, now + ttl, now + ttl + _CIMD_STALE_GRACE_SECS
+            )
+            with self._lock:
+                self._entries[url] = entry
+            return entry
+
+
 class _OAuthProvider:
     """Minimal OAuth 2.1 Authorization Server: DCR + authorization-code + PKCE
     + refresh, with opaque bearer tokens held in memory and optionally
@@ -4388,9 +4774,11 @@ class _OAuthProvider:
         code_ttl: float = _AUTH_CODE_TTL_SECS,
         refresh_ttl: float = _REFRESH_TTL_SECS,
         allowed_redirect_uris: frozenset[str] = frozenset(),
+        client_id_urls: frozenset[str] = frozenset(),
         now: Any = time.time,
         store_path: Path | None = None,
         firestore_ref: tuple[str, str] | None = None,
+        fetch_client_metadata: Any = _fetch_client_metadata,
     ) -> None:
         self.public_url = public_url
         self.trusted_user_header = trusted_user_header
@@ -4405,6 +4793,19 @@ class _OAuthProvider:
             _validate_allowed_redirect_uri(u) for u in allowed_redirect_uris
         )
         self._now = now
+        # --allow-client-id-url (#463): Client ID Metadata Document clients,
+        # resolved at /authorize. In memory only -- codes and grants carry the
+        # client_id string, so nothing about these clients needs persisting.
+        # Same fail-fast validation as allowed_redirect_uris above.
+        self._cimd = (
+            _ClientMetadataCache(
+                frozenset(_validate_client_id_url(u) for u in client_id_urls),
+                fetch=fetch_client_metadata,
+                now=now,
+            )
+            if client_id_urls
+            else None
+        )
         self._lock = threading.Lock()
         self._clients: dict[str, dict[str, Any]] = {}
         self._codes: dict[str, dict[str, Any]] = {}
@@ -4819,6 +5220,11 @@ class _OAuthProvider:
             "code_challenge_methods_supported": ["S256"],
             "token_endpoint_auth_methods_supported": ["none"],
         }
+        # draft-ietf-oauth-client-id-metadata-document Sec. 6. Only with an
+        # --allow-client-id-url entry: a client that sees the flag will send
+        # its URL as the client_id, which serve resolves only when allowlisted.
+        if self._cimd is not None:
+            md["client_id_metadata_document_supported"] = True
         # RFC 9207 Sec. 2.3: advertise iss support only when we actually emit it
         # — i.e. for an https issuer, since Sec. 2 requires the iss value to be an
         # https URL. A loopback http dev issuer neither advertises the flag nor
@@ -4914,19 +5320,41 @@ class _OAuthProvider:
         """
         cid = params.get("client_id", "")
         redirect_uri = params.get("redirect_uri", "")
-        with self._lock:
-            client = self._clients.get(cid)
-        if not cid or client is None:
-            return {"kind": "bad_request", "message": "unknown or missing client_id"}
-        rk = _match_key(redirect_uri, self.allowed_redirect_uris)
-        if rk is None or rk not in client["redirect_keys"]:
+        if self._cimd is not None and cid in self._cimd.allowed:
+            # A Client ID Metadata Document client (#463). Fetched OUTSIDE
+            # self._lock (it can take seconds); the document is its
+            # registration, so its own https redirect_uris are the exact-match
+            # set, not --allow-redirect-uri.
+            cimd = self._cimd.resolve(cid)
+            if cimd is None:
+                return {
+                    "kind": "bad_request",
+                    "message": "client metadata document unavailable or invalid",
+                }
+            redirect_keys: Any = cimd.redirect_keys
+            exact_redirects = cimd.exact_redirects
+            # An operator-allowlisted URL, not a secret: log it whole.
+            client_label = cid
+        else:
+            with self._lock:
+                client = self._clients.get(cid)
+            if not cid or client is None:
+                return {
+                    "kind": "bad_request",
+                    "message": "unknown or missing client_id",
+                }
+            redirect_keys = client["redirect_keys"]
+            exact_redirects = self.allowed_redirect_uris
+            client_label = f"{cid[:8]}..."
+        rk = _match_key(redirect_uri, exact_redirects)
+        if rk is None or rk not in redirect_keys:
             # Same diagnostic as register() for the /authorize path (#286): the
             # redirect_uri is not registered for this client or no longer matches
             # the allowlist. Value is client-proposed and non-secret.
             log(
                 f"warning: rejected authorize redirect_uri {_log_safe_uri(redirect_uri)} "
-                f"for client {cid[:8]}...: not registered for this client or not in "
-                "the --allow-redirect-uri allowlist"
+                f"for client {client_label}: not registered for this client or not "
+                "in the --allow-redirect-uri allowlist"
             )
             return {"kind": "bad_request", "message": "invalid redirect_uri"}
 
@@ -7447,6 +7875,20 @@ def serve_main(argv: list[str]) -> None:
         ),
     )
     parser.add_argument(
+        "--allow-client-id-url",
+        action="append",
+        default=[],
+        metavar="URL",
+        help=(
+            "Accept this exact Client ID Metadata Document URL as an OAuth "
+            "client_id (e.g. https://claude.ai/oauth/mcp-oauth-client-metadata "
+            "for claude.ai). Repeatable. serve fetches the document at "
+            "/authorize, validates it, and uses its redirect_uris as the "
+            "client's registration; no other URL-shaped client_id is ever "
+            "fetched. Requires --enable-oauth."
+        ),
+    )
+    parser.add_argument(
         "--allow-origin",
         action="append",
         default=[],
@@ -7658,6 +8100,8 @@ def serve_main(argv: list[str]) -> None:
         parser.error("--dev-user requires --enable-oauth")
     if args.allow_redirect_uri and not args.enable_oauth:
         parser.error("--allow-redirect-uri requires --enable-oauth")
+    if args.allow_client_id_url and not args.enable_oauth:
+        parser.error("--allow-client-id-url requires --enable-oauth")
     if args.token_store is not None and not args.enable_oauth:
         parser.error("--token-store requires --enable-oauth")
     if args.token_store is not None and not args.token_store.strip():
@@ -7756,6 +8200,14 @@ def serve_main(argv: list[str]) -> None:
             parser.error(f"--allow-redirect-uri invalid: {e}")
         for u in allowed_redirect_uris:
             log(f"note: trusting exact redirect_uri {u!r} in addition to loopback")
+        try:
+            client_id_urls = frozenset(
+                _validate_client_id_url(u) for u in args.allow_client_id_url
+            )
+        except ValueError as e:
+            parser.error(f"--allow-client-id-url invalid: {e}")
+        for u in sorted(client_id_urls):
+            log(f"note: accepting client metadata document client_id {u!r}")
         store_path = None
         store_lock_fd = None  # held (referenced) for the process lifetime
         if args.token_store is not None:
@@ -7793,6 +8245,7 @@ def serve_main(argv: list[str]) -> None:
                 dev_user=args.dev_user,
                 access_ttl=float(args.access_token_ttl),
                 allowed_redirect_uris=allowed_redirect_uris,
+                client_id_urls=client_id_urls,
                 store_path=store_path,
                 firestore_ref=firestore_ref,
             )

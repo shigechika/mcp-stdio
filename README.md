@@ -387,7 +387,7 @@ headers; #449); and for the embedded AS:
 `--enable-oauth`, `--public-url URL` (pins the issuer; recommended behind a
 proxy), `--trusted-user-header HEADER`, `--dev-user USER` (insecure, testing
 only), `--access-token-ttl SECONDS`, `--allow-redirect-uri URL` (repeatable;
-see below), `--token-store PATH` or `--token-store-firestore COLLECTION/DOCUMENT`
+see below), `--allow-client-id-url URL` (repeatable; see below), `--token-store PATH` or `--token-store-firestore COLLECTION/DOCUMENT`
 (mutually exclusive, see below). Without either, tokens are in-memory only
 and a restart invalidates them (the client re-runs `--oauth`). The backend
 command follows the options (an optional `--` separator is supported).
@@ -401,6 +401,15 @@ command follows the options (an optional `--` separator is supported).
     client you actually trust; each entry is exactly as trusted as a
     hardcoded redirect target. It is independent of the loopback path (adding
     one never widens the other) and requires `--enable-oauth`.
+  - *Client ID Metadata Documents* — `--allow-client-id-url URL` (repeatable)
+    accepts that exact HTTPS URL as a `client_id` (draft-ietf-oauth-client-id-metadata-document,
+    which MCP 2026-07-28 prefers over DCR): serve fetches the document at
+    `/authorize` and uses its `redirect_uris` as the registration, so
+    `--allow-redirect-uri` is not needed for that client. claude.ai's
+    "No sign-in" connectors need
+    `--allow-client-id-url https://claude.ai/oauth/mcp-oauth-client-metadata`.
+    Only allowlisted URLs are fetched, only from public addresses, without
+    redirects; requires `--enable-oauth` (#463).
   - *Restart-durable tokens* — `--token-store PATH` persists the issued
     tokens, rotation tombstones, and client registrations to a JSON file
     (created `0600`, written atomically on every state change), so a client

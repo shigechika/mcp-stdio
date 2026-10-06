@@ -125,6 +125,16 @@ See Claude Code [#34498](https://github.com/anthropics/claude-code/issues/34498)
 2. If the server downgraded your scope, check the authorization server's policy or contact the server operator.
 3. Some servers support **step-up authorization**: if a tool call needs a broader scope, the server returns `403 insufficient_scope` with the required scopes listed, and mcp-stdio automatically re-authorizes for the union of the granted and required scopes (RFC 9470), then retries the call. Note that some MCP clients do not automatically retry a tool call after mcp-stdio completes a step-up in the background (Claude Code [#44652](https://github.com/anthropics/claude-code/issues/44652)) — if the call still reports an error, try it again once.
 
+### claude.ai connector to `mcp-stdio serve` fails with `unknown or missing client_id`
+
+**Problem:** A claude.ai custom connector pointing at a `mcp-stdio serve --enable-oauth` endpoint never finishes signing in, and serve's stderr shows `GET /authorize … 400`.
+
+**Cause:** claude.ai identifies itself with a Client ID Metadata Document URL (`https://claude.ai/oauth/mcp-oauth-client-metadata`) instead of registering through Dynamic Client Registration — always in its "No sign-in" mode, and whenever the authorization server advertises support. serve accepts such a `client_id` only when the URL is allowlisted.
+
+**Solution:**
+1. Add `--allow-client-id-url https://claude.ai/oauth/mcp-oauth-client-metadata` to the serve command (#463). No `--allow-redirect-uri` is needed for it: the document lists claude.ai's callback.
+2. If `/authorize` then answers `client metadata document unavailable or invalid`, serve's stderr says why (`cannot fetch client metadata document …` or `invalid client metadata document …`). A fetch failure usually means the host cannot reach claude.ai over HTTPS, or claude.ai answered with a bot challenge (`HTTP 403`, seen from some datacenter IP ranges: [anthropics/claude-ai-mcp#650](https://github.com/anthropics/claude-ai-mcp/issues/650)); a copy validated earlier keeps working for up to 24 h after it expires.
+
 ## Transport issues
 
 ### Connection timeout or slow responses

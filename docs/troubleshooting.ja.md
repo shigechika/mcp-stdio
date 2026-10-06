@@ -125,6 +125,16 @@ Claude Code の [#34498](https://github.com/anthropics/claude-code/issues/34498)
 2. サーバーがスコープをダウングレードした場合は、認可サーバーのポリシーを確認するか、サーバーオペレーターに連絡してください。
 3. 一部のサーバーは**ステップアップ認可**をサポートしています。ツール呼び出しがより広いスコープを必要とする場合、サーバーは `403 insufficient_scope` とともに必要なスコープを返し、mcp-stdio は付与済みスコープと必要スコープの和集合で自動的に再認可（RFC 9470）してから呼び出しを再試行します。一部の MCP クライアントは、mcp-stdio がバックグラウンドでステップアップを完了した後にツール呼び出しを自動再試行しません（Claude Code [#44652](https://github.com/anthropics/claude-code/issues/44652)）。エラーが表示された場合はもう一度呼び出してみてください。
 
+### claude.ai のコネクタから `mcp-stdio serve` に接続すると `unknown or missing client_id` で失敗する
+
+**問題：** `mcp-stdio serve --enable-oauth` のエンドポイントを指す claude.ai のカスタムコネクタのサインインが完了せず、serve の stderr に `GET /authorize … 400` が出ます。
+
+**原因：** claude.ai は Dynamic Client Registration で登録する代わりに、Client ID Metadata Document の URL（`https://claude.ai/oauth/mcp-oauth-client-metadata`）を client_id として名乗ります。「ログインなし（No sign-in）」の設定では常に、それ以外でも認可サーバーが対応を広告していればこの方式です。serve がこの形の `client_id` を受け付けるのは、URL が許可リストにある場合だけです。
+
+**解決方法：**
+1. serve のコマンドに `--allow-client-id-url https://claude.ai/oauth/mcp-oauth-client-metadata` を追加してください（#463）。文書に claude.ai のコールバックが載っているので、`--allow-redirect-uri` は不要です。
+2. それでも `/authorize` が `client metadata document unavailable or invalid` を返す場合は、serve の stderr に理由が出ています（`cannot fetch client metadata document …` または `invalid client metadata document …`）。取得の失敗は、多くの場合ホストから claude.ai へ HTTPS で到達できないか、claude.ai がボット判定の画面を返したことが原因です（`HTTP 403`。一部のデータセンターの IP 帯で発生：[anthropics/claude-ai-mcp#650](https://github.com/anthropics/claude-ai-mcp/issues/650)）。以前に検証済みの写しは、期限切れから最大 24 時間まで使い続けられます。
+
 ## トランスポートの問題
 
 ### 接続タイムアウトまたは遅いレスポンス

@@ -379,7 +379,8 @@ open-gateway と共有 static-token principal は、いずれも本物の呼び�
 埋め込み AS 用: `--enable-oauth`、`--public-url URL`（issuer 固定・
 プロキシ背後で推奨）、`--trusted-user-header HEADER`、`--dev-user USER`
 （非セキュア・検証用）、`--access-token-ttl SECONDS`、`--allow-redirect-uri URL`
-（繰り返し指定可・後述）、`--token-store PATH` または
+（繰り返し指定可・後述）、`--allow-client-id-url URL`（繰り返し指定可・後述）、
+`--token-store PATH` または
 `--token-store-firestore COLLECTION/DOCUMENT`（互いに排他、後述）。
 どちらも指定しない場合はインメモリのみで、再起動で発行済みトークンは失効します
 （クライアントは `--oauth` を再実行）。バックエンド
@@ -395,6 +396,15 @@ open-gateway と共有 static-token principal は、いずれも本物の呼び�
     各エントリはハードコードしたリダイレクト先と同等の信頼度を持ちます。
     ループバック経路とは独立しており（片方を追加してももう片方は広がりません）、
     `--enable-oauth` が前提です。
+  - *Client ID Metadata Document* — `--allow-client-id-url URL`（繰り返し指定可）は、
+    その HTTPS URL を完全一致で `client_id` として受け付けます
+    （draft-ietf-oauth-client-id-metadata-document。MCP 2026-07-28 は DCR より
+    こちらを推奨）。serve は `/authorize` で文書を取得し、その `redirect_uris` を
+    登録として扱うため、このクライアントには `--allow-redirect-uri` は不要です。
+    claude.ai の「ログインなし（No sign-in）」コネクタには
+    `--allow-client-id-url https://claude.ai/oauth/mcp-oauth-client-metadata` が
+    必要です。取得するのは許可リストの URL だけで、公開アドレスからのみ、
+    リダイレクトは追いません。`--enable-oauth` が前提です（#463）。
   - *再起動を生き延びるトークン* — `--token-store PATH` は発行済みトークン・
     rotation の消費台帳・クライアント登録を JSON ファイル（`0600` で作成、
     状態変化のたびに atomic 書き込み）に永続化します。再起動前に有効なトークンを
