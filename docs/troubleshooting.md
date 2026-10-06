@@ -187,7 +187,10 @@ consistent — including the `Mcp-Param-*` headers a tool asks for with
 and retries, so a server whose tool list just changed recovers on its own.
 If you passed `--mcp-param-headers off`, that switches the `Mcp-Param-*`
 headers and the retry off, so a server that requires them answers
-`-32020` directly — remove the flag first. Otherwise, if the error still
+`-32020` directly — remove the flag first. A server that requires them
+even on an older-protocol session (GitHub's hosted MCP server, for
+example: `missing Mcp-Param-owner header`) needs
+`--mcp-param-headers always`. Otherwise, if the error still
 reaches you, something between you and the server is rewriting the
 headers — usually a proxy or an API gateway. Try connecting without it to
 confirm.
