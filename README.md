@@ -383,6 +383,10 @@ that the child's own runtime needs to start); `--drop-client-capability CAP`
 client's `initialize` before the backend sees it, for clients that declare a
 capability but never answer it — claude.ai declares `roots`, and a backend
 that then sends `roots/list` times out, anthropics/claude-ai-mcp#708, #466);
+`--accept-claimless-resource-read` (serve a sessionless `resources/read` that
+carries no protocol claim as a 2026-07-28 request instead of a `400` — the
+Claude iOS app reads MCP App `ui://` resources that way,
+anthropics/claude-ai-mcp#1042, #469);
 `--allow-origin ORIGIN`
 (repeatable; a browser request whose `Origin` is not loopback, the
 `--public-url` origin, or one of these gets `403`, which closes the DNS

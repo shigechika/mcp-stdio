@@ -5881,3 +5881,161 @@ class TestWithoutModernEnvelope:
             {"method": "m", "params": {"_meta": {"progressToken": "p"}}},
         ):
             assert server._without_modern_envelope(msg) == msg
+
+
+# -- --accept-claimless-resource-read (#469) --
+
+
+@pytest.fixture()
+def claimless_gateway(request):
+    """A gateway with --accept-claimless-resource-read, optionally
+    --modern-only (``@pytest.mark.parametrize(..., indirect=True)``)."""
+    modern_only = getattr(request, "param", False)
+    httpd, registry = server.build_server(
+        _BACKEND,
+        host="127.0.0.1",
+        port=0,
+        accept_claimless_resource_read=True,
+        modern_only=modern_only,
+    )
+    host, port = httpd.server_address[0], httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://{host}:{port}/mcp"
+    finally:
+        httpd.shutdown()
+        registry.shutdown_all()
+        httpd.modern_pool.shutdown_all()
+        httpd.server_close()
+
+
+_IOS_READ = {
+    "jsonrpc": "2.0",
+    "id": 7,
+    "method": "resources/read",
+    "params": {"uri": "ui://widget/app.html"},
+}
+
+
+class TestClaimlessResourceRead:
+    @pytest.mark.parametrize("claimless_gateway", [False, True], indirect=True)
+    def test_claimless_read_is_served_as_modern(self, claimless_gateway):
+        # The Claude iOS shape: no _meta claim, no version header, no session
+        # (anthropics/claude-ai-mcp#1042). Also under --modern-only, the
+        # deployment shape of the upstream report.
+        r = _post(claimless_gateway, _IOS_READ)
+        assert r.status_code == 200, r.text
+        assert "mcp-session-id" not in r.headers
+        body = r.json()
+        assert body["id"] == 7
+        result = body["result"]
+        assert result["contents"][0]["uri"] == "ui://widget/app.html"
+        assert result["resultType"] == "complete"
+        assert result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "fake"
+
+    def test_claimless_read_keeps_client_meta(self, claimless_gateway):
+        body = json.loads(json.dumps(_IOS_READ))
+        body["params"]["_meta"] = {"progressToken": "p1"}
+        r = _post(claimless_gateway, body)
+        assert r.status_code == 200, r.text
+
+    def test_off_by_default_sessionless_read_is_400(self, gateway):
+        r = _post(gateway, _IOS_READ)
+        assert r.status_code == 400
+        assert "mcp-session-id" not in r.headers
+
+    def test_meta_only_partial_claim_meets_the_ladder(self, claimless_gateway):
+        # A _meta version classifies the request modern, so the ladder
+        # answers: the missing version header is a -32020.
+        body = json.loads(json.dumps(_IOS_READ))
+        body["params"]["_meta"] = {META_VERSION: MODERN_VERSION, META_CAPS: {}}
+        _assert_rejected(_post(claimless_gateway, body), HEADER_MISMATCH, req_id=7)
+
+    def test_header_only_partial_claim_keeps_the_sessionless_400(
+        self, claimless_gateway
+    ):
+        # D5 classifies on the body, so a version header alone stays legacy
+        # and gets today's sessionless -32000, not the ladder.
+        r = _post(
+            claimless_gateway, _IOS_READ, {"MCP-Protocol-Version": MODERN_VERSION}
+        )
+        _assert_rejected(r, LEGACY_ERROR, req_id=7)
+
+    def test_name_header_without_uri_is_left_to_dispatch(self, claimless_gateway):
+        # Same as the ladder's rung 2c: no body uri, no Mcp-Name comparison.
+        body = {"jsonrpc": "2.0", "id": 7, "method": "resources/read", "params": {}}
+        r = _post(claimless_gateway, body, {"Mcp-Name": "ui://a"})
+        # Reached dispatch: the fake child answers a uri-less read -32601,
+        # which serve maps to 404 (see test_resources_read_compares_the_uri_field).
+        assert r.status_code == 404, r.text
+
+    def test_matching_routing_headers_are_accepted(self, claimless_gateway):
+        headers = {"Mcp-Method": "resources/read", "Mcp-Name": "ui://widget/app.html"}
+        r = _post(claimless_gateway, _IOS_READ, headers)
+        assert r.status_code == 200, r.text
+
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            {"Mcp-Method": "tools/call"},
+            {"Mcp-Name": "ui://other"},
+            [("Mcp-Method", "resources/read"), ("Mcp-Method", "resources/read")],
+        ],
+    )
+    def test_contradictory_routing_headers_are_rejected(
+        self, claimless_gateway, headers
+    ):
+        r = _post(claimless_gateway, _IOS_READ, headers)
+        _assert_rejected(r, HEADER_MISMATCH, req_id=7)
+
+    def test_sessioned_read_stays_on_the_legacy_session(self, claimless_gateway):
+        init = _post(
+            claimless_gateway,
+            {"jsonrpc": "2.0", "id": "init", "method": "initialize"},
+        )
+        sid = init.headers["mcp-session-id"]
+        r = _post(claimless_gateway, _IOS_READ, {"Mcp-Session-Id": sid})
+        assert r.status_code == 200
+        # The legacy session's child answers directly: no modern stamping.
+        assert "resultType" not in r.json()["result"]
+        assert r.headers["mcp-session-id"] == sid
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "resources/list"},
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            {"jsonrpc": "2.0", "method": "resources/read", "params": {"uri": "ui://a"}},
+            {"jsonrpc": "2.0", "id": 1, "method": "resources/read", "params": "x"},
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "resources/read",
+                "params": {"uri": "ui://a", "_meta": "x"},
+            },
+        ],
+    )
+    def test_other_shapes_are_not_promoted(self, body):
+        assert (
+            server._claimless_resource_read(
+                "request" if "id" in body else "notification", body, {}
+            )
+            is None
+        )
+
+    def test_promoted_copy_fills_the_claim_without_mutating(self):
+        body = json.loads(json.dumps(_IOS_READ))
+        out = server._claimless_resource_read("request", body, {})
+        assert body == _IOS_READ
+        assert out["params"]["_meta"] == {META_VERSION: MODERN_VERSION, META_CAPS: {}}
+        assert out["params"]["uri"] == "ui://widget/app.html"
+
+
+def test_serve_main_accept_claimless_resource_read(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(server, "serve", lambda cmd, **kw: seen.update(kw))
+    server.serve_main(["--accept-claimless-resource-read", "--", "true"])
+    assert seen["accept_claimless_resource_read"] is True
+    server.serve_main(["--", "true"])
+    assert seen["accept_claimless_resource_read"] is False

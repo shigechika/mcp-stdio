@@ -64,6 +64,7 @@ spawn、切断か idle タイムアウトで破棄）、認証済みアイデン
 | Claude.ai カスタムコネクタ（ブラウザベースのクライアント） | `--allow-redirect-uri https://claude.ai/api/mcp/auth_callback`（claude.ai は Dynamic Client Registration で登録します）に加えて `--allow-client-id-url https://claude.ai/oauth/mcp-oauth-client-metadata`（「ログインなし（No sign-in）」の設定では、代わりに常にこの Client ID Metadata Document の URL を名乗ります。#463） |
 | 1 ホストに複数バックエンド | バックエンドごとに serve プロセスを分け、パススコープ issuer を使う：`--public-url https://mcp.example.com/team-a`、`…/team-b`——AS エンドポイントと well-known もプレフィックス配下に収まります。claude.ai のカスタムコネクタには使えません。claude.ai は現在、パスがちょうど `/mcp` でないエンドポイントへの接続を完了できないため（トークン発行後に MCP のリクエストが途絶える：[anthropics/claude-ai-mcp#878](https://github.com/anthropics/claude-ai-mcp/issues/878)、複数階層のパスでは 1 件も届かない：[#738](https://github.com/anthropics/claude-ai-mcp/issues/738)）、その場合はバックエンドごとにホスト名を分けてください |
 | クライアントに roots を問い合わせるバックエンド（例：`@modelcontextprotocol/server-filesystem`）を claude.ai から使う | `--drop-client-capability roots`。claude.ai は `roots` を宣言しながら `roots/list` に応答しないため、バックエンドがタイムアウトしてコネクタの接続に失敗します（[anthropics/claude-ai-mcp#708](https://github.com/anthropics/claude-ai-mcp/issues/708)、#466） |
+| Claude の iOS アプリで MCP App（`ui://` リソース）を使う | `--accept-claimless-resource-read`。iOS アプリはプロトコルの申告もセッションも持たずに読みに来るため、指定しないと serve は `400` を返します（[anthropics/claude-ai-mcp#1042](https://github.com/anthropics/claude-ai-mcp/issues/1042)、#469） |
 | 同時ユーザー数の上限 | `--max-sessions N`（既定 100。超過した `initialize` は `503`） |
 | OAuth の代わりに静的トークン | `--enable-oauth` を外して `MCP_STDIO_SERVE_TOKEN` を設定 |
 | アクセストークンの寿命を調整 | `--access-token-ttl SECONDS`（既定 3600） |

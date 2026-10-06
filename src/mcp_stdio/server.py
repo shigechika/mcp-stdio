@@ -6059,6 +6059,90 @@ class _OAuthProvider:
 _DROPPABLE_CLIENT_CAPABILITIES = ("roots", "elicitation", "sampling")
 
 
+def _validate_claimless_routing_headers(
+    handler: Any, msg: dict[str, Any], req_id: Any
+) -> bool:
+    """The routing-header rungs of ``_validate_modern`` for a request
+    ``_claimless_resource_read`` promoted (#469), applied only to the headers
+    the client actually sent: a repeated ``Mcp-Method``/``Mcp-Name``, an
+    ``Mcp-Method`` other than the body's method, or an ``Mcp-Name`` that does
+    not decode to ``params.uri`` gets the same 400 ``-32020`` as on the
+    ladder. ABSENT headers pass -- unlike the ladder, where absence is itself
+    a mismatch -- because a claim-less read is exactly a request that sent
+    none. As on the ladder (rung 2c), a body with no string ``uri`` skips the
+    ``Mcp-Name`` check: dispatch owns that missing-param error. Returns False
+    after writing the rejection.
+    """
+
+    def _reject(message: str) -> bool:
+        handler._send_json(400, _error_body(message, req_id, code=_MCP_HEADER_MISMATCH))
+        return False
+
+    for header in _MODERN_ROUTING_HEADERS:
+        values = handler.headers.get_all(header)
+        if values is not None and len(values) > 1:
+            return _reject(f"{header} header appears more than once")
+    method_header = handler.headers.get("Mcp-Method")
+    if method_header is not None and method_header != msg.get("method"):
+        return _reject("Mcp-Method header does not match the request method")
+    name_header = handler.headers.get("Mcp-Name")
+    name_value = _modern_name_bearing_value(msg)
+    if (
+        name_header is not None
+        and name_value is not None
+        and _decode_mcp_name(name_header) != name_value
+    ):
+        return _reject(
+            "Mcp-Name header does not match the corresponding request body value"
+        )
+    return True
+
+
+def _claimless_resource_read(
+    kind: str, msg: dict[str, Any], headers: Any
+) -> dict[str, Any] | None:
+    """``--accept-claimless-resource-read`` (#469): a copy of ``msg`` with the
+    2026-07-28 ``_meta`` claim filled in, or None when the request does not
+    qualify.
+
+    The Claude iOS app sends ``resources/read`` for an MCP App's ``ui://``
+    resource with no protocol claim at all -- no ``_meta`` protocol version,
+    no ``MCP-Protocol-Version``, no ``Mcp-Session-Id`` -- while the rest of
+    the conversation is 2026-07-28 (anthropics/claude-ai-mcp#1042). D5
+    classifies it legacy, and sessionless legacy is a 400.
+
+    Qualifies only when ALL hold: a ``resources/read`` request; no
+    ``Mcp-Session-Id`` (a legacy client always holds one after
+    ``initialize``, so this is never a legal legacy request); no
+    ``MCP-Protocol-Version`` header and no ``_meta`` protocol version;
+    ``params`` an object and ``params._meta``, if present, an object. A
+    partial claim is NOT promoted and keeps today's handling: a ``_meta``
+    version already classifies the request modern, so it meets the
+    validation ladder; a version header alone does not (D5 classifies on
+    the body), so that request stays legacy and gets the sessionless 400. The claim filled in
+    is the newest version serve implements, with the client's
+    ``clientCapabilities`` if it sent any, else ``{}``.
+    """
+    if kind != "request" or msg.get("method") != "resources/read":
+        return None
+    if headers.get("Mcp-Session-Id") is not None:
+        return None
+    if headers.get("MCP-Protocol-Version") is not None:
+        return None
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return None
+    meta = params.get("_meta", {})
+    if not isinstance(meta, dict) or _META_PROTOCOL_VERSION in meta:
+        return None
+    meta = {
+        **meta,
+        _META_PROTOCOL_VERSION: max(_SERVE_IMPLEMENTED_MODERN_VERSIONS),
+        _META_CLIENT_CAPABILITIES: meta.get(_META_CLIENT_CAPABILITIES, {}),
+    }
+    return {**msg, "params": {**params, "_meta": meta}}
+
+
 def _drop_client_capabilities(
     msg: dict[str, Any], drop: frozenset[str]
 ) -> dict[str, Any]:
@@ -6104,6 +6188,8 @@ class _Handler(BaseHTTPRequestHandler):
     # --drop-client-capability (#466): keys removed from a legacy
     # initialize's params.capabilities before it reaches the child.
     drop_client_capabilities: frozenset[str] = frozenset()
+    # --accept-claimless-resource-read (#469).
+    accept_claimless_resource_read: bool = False
 
     # Quieter, consistent logging: route BaseHTTPRequestHandler's access log
     # through the project logger instead of stderr's default apache-style line.
@@ -7521,6 +7607,19 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._dispatch_modern(kind, msg, req_id)
             return
+        if self.accept_claimless_resource_read:
+            # #469, opt-in: a claim-less sessionless resources/read (Claude
+            # iOS) is served statelessly as 2026-07-28 instead of earning
+            # the sessionless 400 below. It cannot pass _validate_modern,
+            # whose version rungs are exactly what the request lacks; the
+            # routing-header rungs still apply to whatever headers it did
+            # send (_validate_claimless_routing_headers).
+            promoted = _claimless_resource_read(kind, msg, self.headers)
+            if promoted is not None:
+                if not _validate_claimless_routing_headers(self, msg, req_id):
+                    return
+                self._dispatch_modern(kind, promoted, req_id)
+                return
 
         # --- session resolution (MCP Streamable HTTP session management) ---
         # When OAuth is enabled, sessions are bound to the authenticated user so
@@ -7801,6 +7900,7 @@ def build_server(
     max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
     allowed_origins: Iterable[str] = (),
     drop_client_capabilities: Iterable[str] = (),
+    accept_claimless_resource_read: bool = False,
 ) -> tuple[ThreadingHTTPServer, SessionRegistry]:
     """Construct the HTTP server and session registry without running the loop.
 
@@ -7830,6 +7930,9 @@ def build_server(
     ``_DROPPABLE_CLIENT_CAPABILITIES``) is removed from every legacy
     ``initialize``'s ``params.capabilities`` before it reaches the child
     (#466); empty, the legacy path forwards the body untouched.
+    ``accept_claimless_resource_read`` serves a sessionless ``resources/read``
+    that carries no protocol claim as 2026-07-28 (#469, see
+    :func:`_claimless_resource_read`); off, it gets the sessionless 400.
     """
     origins = {_normalize_origin(o) for o in allowed_origins}
     if oauth is not None and oauth.public_url:
@@ -7869,6 +7972,7 @@ def build_server(
             "max_message_size": max_message_size,
             "allowed_origins": frozenset(origins),
             "drop_client_capabilities": frozenset(drop_client_capabilities),
+            "accept_claimless_resource_read": accept_claimless_resource_read,
         },
     )
     httpd = _GatewayHTTPServer((host, port), handler)
@@ -7900,6 +8004,7 @@ def serve(
     max_message_size: int = _DEFAULT_MAX_MESSAGE_SIZE,
     allowed_origins: Iterable[str] = (),
     drop_client_capabilities: Iterable[str] = (),
+    accept_claimless_resource_read: bool = False,
 ) -> None:
     """Run the reverse gateway until interrupted.
 
@@ -7911,8 +8016,9 @@ def serve(
     ``user_env_var`` injects the authenticated principal into each spawned
     child's environment (see :func:`build_server`). ``max_message_size``
     bounds a single request body, ``allowed_origins`` extends the
-    ``Origin`` allowlist and ``drop_client_capabilities`` edits legacy
-    ``initialize`` requests (see :func:`build_server`).
+    ``Origin`` allowlist, ``drop_client_capabilities`` edits legacy
+    ``initialize`` requests and ``accept_claimless_resource_read`` serves a
+    claim-less ``resources/read`` (see :func:`build_server`).
     """
     httpd, registry = build_server(
         command,
@@ -7931,6 +8037,7 @@ def serve(
         max_message_size=max_message_size,
         allowed_origins=allowed_origins,
         drop_client_capabilities=drop_client_capabilities,
+        accept_claimless_resource_read=accept_claimless_resource_read,
     )
     # #385: the legacy reaper now always starts (it sweeps dead children
     # unconditionally, not just idle-past-TTL ones), independent of
@@ -8267,6 +8374,18 @@ def serve_main(argv: list[str]) -> None:
         ),
     )
     parser.add_argument(
+        "--accept-claimless-resource-read",
+        action="store_true",
+        help=(
+            "Serve a resources/read that carries no protocol claim and no "
+            "session (no _meta protocol version, no MCP-Protocol-Version, no "
+            "Mcp-Session-Id) as an MCP 2026-07-28 request instead of "
+            "answering 400. The Claude iOS app sends MCP App resource reads "
+            "that way (anthropics/claude-ai-mcp#1042). Works with "
+            "--modern-only. Off by default."
+        ),
+    )
+    parser.add_argument(
         "--modern-idle-ttl",
         type=float,
         default=0.0,
@@ -8523,4 +8642,5 @@ def serve_main(argv: list[str]) -> None:
         max_message_size=args.max_message_size,
         allowed_origins=allowed_origins,
         drop_client_capabilities=args.drop_client_capability,
+        accept_claimless_resource_read=args.accept_claimless_resource_read,
     )
