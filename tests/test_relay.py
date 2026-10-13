@@ -596,6 +596,11 @@ class TestPostAndStream:
             headers={"content-type": "text/event-stream"},
         )
         aborts: list[str] = []
+
+        def abort(reason: str) -> bool:
+            aborts.append(reason)
+            return True  # a live transaction answered
+
         _post_and_stream(
             httpx.Client(),
             "https://example.com/mcp",
@@ -603,11 +608,37 @@ class TestPostAndStream:
             {},
             1,
             input_required_hook=lambda payload: payload,
-            input_required_abort=aborts.append,
+            input_required_abort=abort,
         )
         assert len(aborts) == 1 and "ended without a response" in aborts[0]
         lines = self._stdout_lines(capsys)
         assert [m.get("method") for m in lines] == ["notifications/progress"]
+
+    def test_mrtr_hook_without_a_live_transaction_errors_directly(
+        self, httpx_mock, capsys
+    ):
+        """An MRTR-eligible request whose stream ends before any round
+        opened has no transaction to answer for it: the funnel declines
+        (returns False) and the relay writes the one error itself."""
+        httpx_mock.add_response(
+            stream=IteratorStream([f"data: {self._PROGRESS}\n\n".encode()]),
+            headers={"content-type": "text/event-stream"},
+        )
+        _post_and_stream(
+            httpx.Client(),
+            "https://example.com/mcp",
+            '{"id":1}',
+            {},
+            1,
+            input_required_hook=lambda payload: payload,
+            input_required_abort=lambda reason: False,
+        )
+        lines = self._stdout_lines(capsys)
+        assert [m.get("method") for m in lines] == ["notifications/progress", None]
+        assert (
+            lines[1]["id"] == 1
+            and "ended without a response" in lines[1]["error"]["message"]
+        )
 
     def test_cancelled_id_gets_no_synthesized_error(self, httpx_mock, capsys):
         httpx_mock.add_response(
@@ -16061,6 +16092,37 @@ class TestRunModernMrtrBridge:
         assert len(lines) == 2
         assert lines[1]["method"] == "elicitation/create"
         assert not [line for line in lines if "error" in line]
+
+    def test_progress_only_stream_before_any_round_gets_one_error(self, httpx_mock):
+        """#475 end to end: an MRTR-eligible tools/call whose stream carries
+        only progress and ends, before any round opened. The real abort
+        callback has no transaction to answer for, so the relay must write
+        the one error itself rather than leave id 2 waiting forever."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        progress = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {"progressToken": "t", "progress": 1},
+            }
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            stream=IteratorStream([f"event: message\ndata: {progress}\n\n".encode()]),
+            headers={"content-type": "text/event-stream"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [self._initialize({"elicitation": {}}), self._call()],
+            protocol_era="modern",
+        )
+        lines = self._out(output)
+        answers = [line for line in lines if line.get("id") == 2]
+        assert len(answers) == 1
+        assert "ended without a response" in answers[0]["error"]["message"]
+        assert any(line.get("method") == "notifications/progress" for line in lines)
 
     def test_interrupt_after_a_swallowed_round_aborts_once(self, httpx_mock):
         """#356 review R1F1. The stream carrying the `input_required` breaks

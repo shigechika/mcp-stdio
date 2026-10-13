@@ -4004,7 +4004,7 @@ def _post_and_stream(
     capture_init: bool = False,
     has_id: bool = True,
     input_required_hook: Callable[[str], str | None] | None = None,
-    input_required_abort: Callable[[str], None] | None = None,
+    input_required_abort: Callable[[str], bool] | None = None,
     abort: "threading.Event | None" = None,
     publish_response: Callable[["httpx.Response | None"], None] | None = None,
     capture_error: bool = False,
@@ -4351,11 +4351,15 @@ def _post_and_stream(
                     if tracker is not None and tracker.contains(req_id):
                         # Cancelled by the client: nothing is owed to it.
                         pass
-                    elif input_required_abort is not None:
-                        # An MRTR transaction may still be alive; its own
-                        # funnel writes the one error and retires it.
-                        input_required_abort(reason)
+                    elif input_required_abort is not None and input_required_abort(
+                        reason
+                    ):
+                        # A live MRTR transaction: its own funnel wrote the
+                        # one error and retired it.
+                        pass
                     else:
+                        # No transaction owns the answer (plain request, or
+                        # an MRTR-eligible request before any round opened).
                         _write_line(_error_response(reason, req_id))
                 # pv is intentionally None here: no InitializeResult was
                 # delivered, so an empty-200 to an `initialize` request leaves
@@ -9291,7 +9295,7 @@ def run(
 
         return hook
 
-    def _make_input_required_abort(client_id: Any) -> Callable[[str], None]:
+    def _make_input_required_abort(client_id: Any) -> Callable[[str], bool]:
         """Build the failure counterpart of the interception hook (R1F1).
 
         Handed to ``_post_and_stream`` alongside every hook and invoked on
@@ -9318,16 +9322,22 @@ def run(
         server, and the same code already covers the other "the exchange
         could not be completed" outcomes (cap breaches, a client error on a
         minted id).
+
+        Returns whether it answered: ``False`` when no transaction is live,
+        which is also the case for an initial request whose stream ended
+        before any round opened (#475). The caller then owes the client
+        the error itself.
         """
 
-        def abort(reason: str) -> None:
+        def abort(reason: str) -> bool:
             if client_id not in mrtr_txns:
                 log(
-                    f"MRTR POST for id {client_id!r} failed after the "
-                    f"transaction was already answered: {reason}"
+                    f"MRTR POST for id {client_id!r} failed with no live "
+                    f"transaction: {reason}"
                 )
-                return
+                return False
             _mrtr_abort(client_id, reason, code=-32000)
+            return True
 
         return abort
 
