@@ -4168,16 +4168,16 @@ def _post_and_stream(
         # this attempt (#475). ``emitted`` alone is not enough: a server may
         # send notifications (progress, logging) on a request-scoped SSE
         # stream before the response, and a stream that then ends without
-        # it must not pass for an answered request. Not tracked under an
-        # MRTR hook, which owns the answer for its transaction (it comes with
-        # ``input_required_abort``); the tools/list header hook comes without
-        # one, never swallows, and is tracked like a plain request.
+        # it must not pass for an answered request. The check runs on what
+        # reached stdout, i.e. after an MRTR hook rewrote the payload to the
+        # client's id. A request with a null id cannot be matched (a pure
+        # response needs a non-null id), so it is not tracked.
         # Deliberately NOT era-gated, like #444 and #416: both outcomes it
         # changes (an id left unanswered forever, and two answers for one id)
         # are JSON-RPC violations to fix, not legacy wire behavior to freeze.
         # A server that answers its requests sees no difference.
         answered = False
-        track_answer = input_required_abort is None
+        tracked = has_id and req_id is not None
         try:
             with client.stream("POST", url, content=content, headers=headers) as resp:
                 if publish_response is not None:
@@ -4284,8 +4284,17 @@ def _post_and_stream(
                             payload = replacement
                         _emit(payload, tracker)
                         emitted = True
-                        if track_answer and not answered:
-                            answered = _is_pure_response_for(payload, req_id)
+                        if (
+                            tracked
+                            and '"id"' in payload
+                            and _is_pure_response_for(payload, req_id)
+                        ):
+                            # The request is answered: stop reading, so a
+                            # misbehaving server's repeated response for the
+                            # same id never reaches the client (as
+                            # _client_listen_loop does).
+                            answered = True
+                            break
                 else:
                     _read_bounded(resp, client)
                     text = resp.text.strip()
@@ -4332,16 +4341,25 @@ def _post_and_stream(
                     # left hanging, mirroring the >=400 fall-through in run().
                     # Notifications (has_id False) stay silent.
                     _write_line(_error_response("empty response from server", req_id))
-                elif track_answer and emitted and has_id and not answered:
+                elif emitted and tracked and not answered and not swallowed:
                     # #475: the stream delivered only notifications and ended
                     # without the response. Same reasoning as above: without
                     # this the client waits forever for an id nobody answers.
+                    # Worded like #444: the server may have run the request.
                     log(f"request {req_id!r}: stream ended without a response")
-                    _write_line(
-                        _error_response(
-                            "upstream stream ended without a response", req_id
-                        )
+                    reason = (
+                        "upstream stream ended without a response; "
+                        "the request may have executed"
                     )
+                    if tracker is not None and tracker.contains(req_id):
+                        # Cancelled by the client: nothing is owed to it.
+                        pass
+                    elif input_required_abort is not None:
+                        # An MRTR transaction may still be alive; its own
+                        # funnel writes the one error and retires it.
+                        input_required_abort(reason)
+                    else:
+                        _write_line(_error_response(reason, req_id))
                 # pv is intentionally None here: no InitializeResult was
                 # delivered, so an empty-200 to an `initialize` request leaves
                 # the relay's protocol_version unset rather than guessing a
@@ -4376,14 +4394,15 @@ def _post_and_stream(
                 # funnel — required changes 4 and 10.
                 log(f"request {req_id!r} cancelled by the client: {e}")
                 return _aborted_result()
-            last_error = e
-            log(f"attempt {attempt}/{MAX_RETRIES} failed: {e}")
             if answered:
                 # #475: the response already reached the client; a read
                 # failure after it (a trailing frame, the close) must not
-                # produce a second answer for the same id.
+                # produce a second answer for the same id, nor count as a
+                # failed attempt.
                 log(f"request {req_id!r}: transport error after the response; ignored")
                 return _StreamResult(session, 200, protocol_version=pv)
+            last_error = e
+            log(f"attempt {attempt}/{MAX_RETRIES} failed: {e}")
             if emitted or swallowed:
                 # Response already partially delivered to the client; replaying
                 # the POST would duplicate it. Surface a stream-interrupted
