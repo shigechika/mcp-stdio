@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.45.1](https://github.com/shigechika/mcp-stdio/compare/v0.45.0...v0.45.1) (2026-10-13)
+
+
+### Bug Fixes
+
+* **relay:** do not treat a notification-only SSE reply as answered ([#476](https://github.com/shigechika/mcp-stdio/issues/476)) ([45da779](https://github.com/shigechika/mcp-stdio/commit/45da779768e7aee2fcf09d978e0e9a17f6ddf60e))
+
 ## [0.45.0](https://github.com/shigechika/mcp-stdio/compare/v0.44.0...v0.45.0) (2026-10-06)
 
 
