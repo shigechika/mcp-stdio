@@ -568,6 +568,25 @@ class TestPostAndStream:
         sleep.assert_not_called()
         assert self._stdout_lines(capsys) == [{"jsonrpc": "2.0", "id": 1, "result": {}}]
 
+    def test_tools_list_hook_does_not_disable_tracking(self, httpx_mock, capsys):
+        """A pass-through hook without ``input_required_abort`` (the
+        tools/list header hook) never takes over the answer, so the request
+        is still tracked: a notification-only stream gets its error."""
+        httpx_mock.add_response(
+            stream=IteratorStream([f"data: {self._PROGRESS}\n\n".encode()]),
+            headers={"content-type": "text/event-stream"},
+        )
+        _post_and_stream(
+            httpx.Client(),
+            "https://example.com/mcp",
+            '{"id":1}',
+            {},
+            1,
+            input_required_hook=lambda payload: payload,
+        )
+        lines = self._stdout_lines(capsys)
+        assert lines[-1]["id"] == 1 and "error" in lines[-1]
+
     def test_notification_on_a_notification_post_stays_silent(self, httpx_mock, capsys):
         """has_id False: nothing is ever synthesized for a notification."""
         httpx_mock.add_response(

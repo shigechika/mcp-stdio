@@ -4168,10 +4168,16 @@ def _post_and_stream(
         # this attempt (#475). ``emitted`` alone is not enough: a server may
         # send notifications (progress, logging) on a request-scoped SSE
         # stream before the response, and a stream that then ends without
-        # it must not pass for an answered request. Only meaningful when no
-        # MRTR hook is installed; the MRTR path keeps its own rules.
+        # it must not pass for an answered request. Not tracked under an
+        # MRTR hook, which owns the answer for its transaction (it comes with
+        # ``input_required_abort``); the tools/list header hook comes without
+        # one, never swallows, and is tracked like a plain request.
+        # Deliberately NOT era-gated, like #444 and #416: both outcomes it
+        # changes (an id left unanswered forever, and two answers for one id)
+        # are JSON-RPC violations to fix, not legacy wire behavior to freeze.
+        # A server that answers its requests sees no difference.
         answered = False
-        track_answer = input_required_hook is None
+        track_answer = input_required_abort is None
         try:
             with client.stream("POST", url, content=content, headers=headers) as resp:
                 if publish_response is not None:
