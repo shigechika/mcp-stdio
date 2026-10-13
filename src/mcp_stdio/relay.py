@@ -4175,7 +4175,8 @@ def _post_and_stream(
         # Deliberately NOT era-gated, like #444 and #416: both outcomes it
         # changes (an id left unanswered forever, and two answers for one id)
         # are JSON-RPC violations to fix, not legacy wire behavior to freeze.
-        # A server that answers its requests sees no difference.
+        # A server that answers its requests over a stream that stays intact
+        # sees no difference.
         answered = False
         tracked = has_id and req_id is not None
         try:
@@ -4284,11 +4285,7 @@ def _post_and_stream(
                             payload = replacement
                         _emit(payload, tracker)
                         emitted = True
-                        if (
-                            tracked
-                            and '"id"' in payload
-                            and _is_pure_response_for(payload, req_id)
-                        ):
+                        if tracked and _is_pure_response_for(payload, req_id):
                             # The request is answered: stop reading, so a
                             # misbehaving server's repeated response for the
                             # same id never reaches the client (as

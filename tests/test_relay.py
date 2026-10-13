@@ -636,6 +636,17 @@ class TestPostAndStream:
         lines = self._stdout_lines(capsys)
         assert len(lines) == 1 and lines[0]["error"]["message"] == "x"
 
+    def test_escaped_id_key_still_counts_as_the_response(self, httpx_mock, capsys):
+        """A JSON key may be escaped; recognition parses the payload rather
+        than looking for a literal ``"id"``, so no second answer follows."""
+        response = '{"jsonrpc":"2.0","\\u0069d":1,"result":{}}'
+        httpx_mock.add_response(
+            stream=IteratorStream([f"data: {response}\n\n".encode()]),
+            headers={"content-type": "text/event-stream"},
+        )
+        _post_and_stream(httpx.Client(), "https://example.com/mcp", '{"id":1}', {}, 1)
+        assert self._stdout_lines(capsys) == [{"jsonrpc": "2.0", "id": 1, "result": {}}]
+
     def test_a_repeated_response_is_not_forwarded(self, httpx_mock, capsys):
         """Reading stops at the request's response, so a server that sends
         it twice cannot put two answers for one id on the wire."""
