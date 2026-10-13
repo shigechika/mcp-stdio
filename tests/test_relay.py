@@ -640,18 +640,37 @@ class TestPostAndStream:
             and "ended without a response" in lines[1]["error"]["message"]
         )
 
-    def test_cancelled_id_gets_no_synthesized_error(self, httpx_mock, capsys):
+    def test_frames_after_the_response_still_arrive(self, httpx_mock, capsys):
+        """Reading continues past the response: a notification that follows
+        it (e.g. tools/list_changed) still reaches the client, and a repeated
+        response is dropped."""
+        response = '{"jsonrpc":"2.0","id":1,"result":{}}'
+        changed = '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}'
         httpx_mock.add_response(
-            stream=IteratorStream([f"data: {self._PROGRESS}\n\n".encode()]),
+            stream=IteratorStream(
+                [
+                    f"data: {response}\n\n".encode(),
+                    f"data: {response}\n\n".encode(),
+                    f"data: {changed}\n\n".encode(),
+                ]
+            ),
             headers={"content-type": "text/event-stream"},
         )
-        tracker = _CancelTracker()
-        tracker.add(1)
+        seen: list[str] = []
         _post_and_stream(
-            httpx.Client(), "https://example.com/mcp", '{"id":1}', {}, 1, tracker
+            httpx.Client(),
+            "https://example.com/mcp",
+            '{"id":1}',
+            {},
+            1,
+            observe=seen.append,
         )
         lines = self._stdout_lines(capsys)
-        assert [m.get("method") for m in lines] == ["notifications/progress"]
+        assert lines == [
+            {"jsonrpc": "2.0", "id": 1, "result": {}},
+            {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"},
+        ]
+        assert any("list_changed" in p for p in seen)
 
     def test_null_id_is_not_tracked(self, httpx_mock, capsys):
         """A null id cannot be matched to a response, so nothing is added
