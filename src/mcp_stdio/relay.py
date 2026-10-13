@@ -4164,6 +4164,14 @@ def _post_and_stream(
         # written), so both the empty-response synthesis and the
         # mid-stream replay must treat it exactly like a partial delivery.
         swallowed = False
+        # Whether the request's own JSON-RPC response has reached stdout on
+        # this attempt (#475). ``emitted`` alone is not enough: a server may
+        # send notifications (progress, logging) on a request-scoped SSE
+        # stream before the response, and a stream that then ends without
+        # it must not pass for an answered request. Only meaningful when no
+        # MRTR hook is installed; the MRTR path keeps its own rules.
+        answered = False
+        track_answer = input_required_hook is None
         try:
             with client.stream("POST", url, content=content, headers=headers) as resp:
                 if publish_response is not None:
@@ -4270,6 +4278,8 @@ def _post_and_stream(
                             payload = replacement
                         _emit(payload, tracker)
                         emitted = True
+                        if track_answer and not answered:
+                            answered = _is_pure_response_for(payload, req_id)
                 else:
                     _read_bounded(resp, client)
                     text = resp.text.strip()
@@ -4291,6 +4301,10 @@ def _post_and_stream(
                         if text:
                             _emit(text, tracker)
                             emitted = True
+                            # A single JSON body is the whole reply, passed
+                            # through as-is even when malformed; only the SSE
+                            # branch can carry notifications ahead of it.
+                            answered = True
 
                 if _abort_requested(abort):
                     # Required changes 2 and 4, the FALSE-NORMAL arm. A
@@ -4312,6 +4326,16 @@ def _post_and_stream(
                     # left hanging, mirroring the >=400 fall-through in run().
                     # Notifications (has_id False) stay silent.
                     _write_line(_error_response("empty response from server", req_id))
+                elif track_answer and emitted and has_id and not answered:
+                    # #475: the stream delivered only notifications and ended
+                    # without the response. Same reasoning as above: without
+                    # this the client waits forever for an id nobody answers.
+                    log(f"request {req_id!r}: stream ended without a response")
+                    _write_line(
+                        _error_response(
+                            "upstream stream ended without a response", req_id
+                        )
+                    )
                 # pv is intentionally None here: no InitializeResult was
                 # delivered, so an empty-200 to an `initialize` request leaves
                 # the relay's protocol_version unset rather than guessing a
@@ -4348,6 +4372,12 @@ def _post_and_stream(
                 return _aborted_result()
             last_error = e
             log(f"attempt {attempt}/{MAX_RETRIES} failed: {e}")
+            if answered:
+                # #475: the response already reached the client; a read
+                # failure after it (a trailing frame, the close) must not
+                # produce a second answer for the same id.
+                log(f"request {req_id!r}: transport error after the response; ignored")
+                return _StreamResult(session, 200, protocol_version=pv)
             if emitted or swallowed:
                 # Response already partially delivered to the client; replaying
                 # the POST would duplicate it. Surface a stream-interrupted
