@@ -672,6 +672,21 @@ class TestPostAndStream:
         ]
         assert any("list_changed" in p for p in seen)
 
+    def test_cancelled_id_gets_no_synthesized_error(self, httpx_mock, capsys):
+        """REVIEW.md §3: no synthesized error under an id the client has
+        cancelled (non-consuming tracker check)."""
+        httpx_mock.add_response(
+            stream=IteratorStream([f"data: {self._PROGRESS}\n\n".encode()]),
+            headers={"content-type": "text/event-stream"},
+        )
+        tracker = _CancelTracker()
+        tracker.add(1)
+        _post_and_stream(
+            httpx.Client(), "https://example.com/mcp", '{"id":1}', {}, 1, tracker
+        )
+        lines = self._stdout_lines(capsys)
+        assert [m.get("method") for m in lines] == ["notifications/progress"]
+
     def test_null_id_is_not_tracked(self, httpx_mock, capsys):
         """A null id cannot be matched to a response, so nothing is added
         after the server's own answer under id null."""
@@ -698,8 +713,8 @@ class TestPostAndStream:
         assert self._stdout_lines(capsys) == [{"jsonrpc": "2.0", "id": 1, "result": {}}]
 
     def test_a_repeated_response_is_not_forwarded(self, httpx_mock, capsys):
-        """Reading stops at the request's response, so a server that sends
-        it twice cannot put two answers for one id on the wire."""
+        """Only one answer per id: a repeated response is dropped while the
+        stream is still read to its end."""
         response = '{"jsonrpc":"2.0","id":1,"result":{}}'
         httpx_mock.add_response(
             stream=IteratorStream(

@@ -4175,11 +4175,15 @@ def _post_and_stream(
 
             A live MRTR transaction answers through its own funnel; when it
             does not (no transaction), the error is written here unless a
-            swallowed payload means the hook already answered.
+            swallowed payload means the hook already answered, or the client
+            has cancelled the id (the non-consuming tracker check REVIEW.md
+            §3 asks of every synthesized response, as in #444's path).
             """
             if input_required_abort is not None and input_required_abort(reason):
                 return
             if swallowed:
+                return
+            if tracker is not None and tracker.contains(req_id):
                 return
             _write_line(_error_response(reason, req_id))
 
