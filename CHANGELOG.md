@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.45.2](https://github.com/shigechika/mcp-stdio/compare/v0.45.1...v0.45.2) (2026-10-26)
+
+
+### Bug Fixes
+
+* **deps:** bump certifi and opentelemetry-api (security) ([#480](https://github.com/shigechika/mcp-stdio/issues/480)) ([e28b7e8](https://github.com/shigechika/mcp-stdio/commit/e28b7e87bacc4d9e5c0f96a1fe73b0cdad38b08c))
+
 ## [0.45.1](https://github.com/shigechika/mcp-stdio/compare/v0.45.0...v0.45.1) (2026-10-13)
 
 
