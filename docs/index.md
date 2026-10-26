@@ -4,7 +4,7 @@ A minimal stdio-to-HTTP gateway for MCP (Model Context Protocol) servers.
 One small Python package, one runtime dependency (`httpx`), two jobs:
 
 - **Connect** an MCP client that only speaks stdio (Claude Desktop, Claude
-  Code, …) to a **remote HTTP MCP server** — including the OAuth 2.1 login,
+  Code, Codex, …) to a **remote HTTP MCP server** — including the OAuth 2.1 login,
   token storage, and refresh.
 - **Publish** a local stdio MCP server as a **Streamable HTTP endpoint** with
   a built-in OAuth 2.1 authorization server — multi-user, session-isolated.

@@ -1,6 +1,7 @@
 # Connect to a remote MCP server
 
-Goal: a remote HTTP MCP server appears in Claude Desktop or Claude Code as
+Goal: a remote HTTP MCP server appears in your MCP client (Claude Desktop,
+Claude Code, Codex, …) as
 if it were a local one — login handled, tokens refreshed, transport quirks
 absorbed.
 
@@ -40,6 +41,12 @@ No OAuth on the server? Drop `--oauth`. Static token instead? Use
 
     ```bash
     claude mcp add my-remote-server -- mcp-stdio --oauth https://mcp.example.com/mcp
+    ```
+
+=== "Codex"
+
+    ```bash
+    codex mcp add my-remote-server -- mcp-stdio --oauth https://mcp.example.com/mcp
     ```
 
 Restart the client. On the first request a browser window opens for the

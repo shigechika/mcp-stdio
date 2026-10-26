@@ -54,6 +54,12 @@ Waiting for authorization (giving up in 120s)...
     claude mcp add my-remote-server -- mcp-stdio --oauth-device https://mcp.example.com/mcp
     ```
 
+=== "Codex"
+
+    ```bash
+    codex mcp add my-remote-server -- mcp-stdio --oauth-device https://mcp.example.com/mcp
+    ```
+
 トークンはブラウザフローと同じ `~/.config/mcp-stdio/tokens.json` に
 保存されます——サーバーURLごとに一度ログインすれば、都合の良い場所から
 実行して構わず、以後はすべてのターミナル・セッションで共有されます。

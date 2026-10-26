@@ -11,11 +11,11 @@
 
 ## 概要
 
-**クライアントゲートウェイ（既定モード） — stdio → HTTP。** [MCP](https://modelcontextprotocol.io/) クライアント（Claude Desktop, Claude Code）に対してローカルで稼働するセルフホスト MCP サーバのように振る舞いつつ、各種認証でリモート MCP サーバーへの接続を橋渡しします：
+**クライアントゲートウェイ（既定モード） — stdio → HTTP。** [MCP](https://modelcontextprotocol.io/) クライアント（Claude Desktop、Claude Code、OpenAI Codex など）に対してローカルで稼働するセルフホスト MCP サーバのように振る舞いつつ、各種認証でリモート MCP サーバーへの接続を橋渡しします：
 
 ```mermaid
 flowchart BT
-    A[Claude<br>Desktop/Code] <-- stdio --> B(mcp-stdio)
+    A[MCP クライアント<br>Claude / Codex / …] <-- stdio --> B(mcp-stdio)
     B <== "<b>HTTPS</b><br>Streamable HTTP / SSE<br>Bearer Token<br>Header<br>OAuth" ==> C[Remote<br>MCP Server]
     B -. "OAuth 2.1<br>(PKCE)" .-> D[Authorization<br>Server]
     D -. callback .-> B
@@ -196,6 +196,16 @@ claude mcp add my-remote-server \
   -- mcp-stdio https://your-server.example.com:8080/mcp
 ```
 
+## Codex の設定
+
+```bash
+codex mcp add my-remote-server \
+  --env MCP_BEARER_TOKEN=YOUR_TOKEN \
+  -- mcp-stdio https://your-server.example.com:8080/mcp
+```
+
+stdio サーバーを起動できる MCP クライアントなら、どれでも同じ形で使えます。コマンドに `mcp-stdio`、引数にリモートの URL（と必要なオプション）を指定してください。
+
 ## 使い方
 
 ```
@@ -287,7 +297,7 @@ mcp-stdio [OPTIONS] URL
 
 ```mermaid
 flowchart BT
-    A["MCP クライアント<br>Claude Code / Desktop<br>(または mcp-stdio --oauth)"]
+    A["MCP クライアント<br>Claude / claude.ai / Codex /<br>Meta Muse<br>(または mcp-stdio --oauth)"]
     B("mcp-stdio serve<br><b>HTTP → stdio</b> ゲートウェイ<br>認証: なし / 静的トークン /<br>埋め込み OAuth 2.1 AS")
     C["ローカルの stdio<br>MCP サーバ"]
     A <== "Streamable HTTP<br>Bearer / OAuth 2.1 (PKCE)" ==> B
@@ -406,7 +416,9 @@ anthropics/claude-ai-mcp#1042、#469）;
     実際に信頼できるクライアントに属すると確認できた URL だけを登録してください。
     各エントリはハードコードしたリダイレクト先と同等の信頼度を持ちます。
     ループバック経路とは独立しており（片方を追加してももう片方は広がりません）、
-    `--enable-oauth` が前提です。
+    `--enable-oauth` が前提です。例：
+    `https://claude.ai/api/mcp/auth_callback`（claude.ai）、
+    `https://agent.meta.ai/api/hatch/oauth/callback`（Meta Muse）。
   - *Client ID Metadata Document* — `--allow-client-id-url URL`（繰り返し指定可）は、
     その HTTPS URL を完全一致で `client_id` として受け付けます
     （draft-ietf-oauth-client-id-metadata-document。MCP 2026-07-28 は DCR より
@@ -534,7 +546,7 @@ Claude Code・Claude Desktop・mcp-remote・MCP SDK・Windows の既知の問題
 ## 仕組み
 
 1. `--oauth`（ブラウザ）または `--oauth-device`（ヘッドレス、RFC 8628）指定時、アクセストークンを取得（キャッシュ → リフレッシュ → ブラウザ/デバイス認証）
-2. stdin から JSON-RPC メッセージを読み取り（Claude Desktop/Code が送信）
+2. stdin から JSON-RPC メッセージを読み取り（MCP クライアントが送信）
 3. HTTPS でリモート MCP サーバーへ転送
 4. レスポンスをパースして stdout に書き出し
 5. 401 で（OAuth モードのみ）アクセストークンをリフレッシュしてリトライ。リフレッシュ自体が拒否されたときはバックグラウンドで再認可し、サインインが終わるまで `-32002` を返す（#471）。静的な `--bearer-token` / `-H` 認証では 401 をそのままクライアントに返す

@@ -1,7 +1,7 @@
 # リモート MCP サーバーに接続する
 
 ゴール：リモートの HTTP MCP サーバーを、あたかもローカルサーバーの
-ように Claude Desktop / Claude Code に登場させる——ログインは処理済み、
+ように MCP クライアント（Claude Desktop、Claude Code、Codex など）に登場させる——ログインは処理済み、
 トークンは自動更新、トランスポートの癖は吸収済みの状態で。
 
 ## 1. まず接続確認
@@ -40,6 +40,12 @@ OAuth ログイン、トークン交換、MCP `initialize` の往復——そし
 
     ```bash
     claude mcp add my-remote-server -- mcp-stdio --oauth https://mcp.example.com/mcp
+    ```
+
+=== "Codex"
+
+    ```bash
+    codex mcp add my-remote-server -- mcp-stdio --oauth https://mcp.example.com/mcp
     ```
 
 クライアントを再起動します。最初のリクエストでブラウザが開いてサーバーの
