@@ -11,12 +11,12 @@ mcp-stdio はひとつのコマンドにふたつの明確に異なる役割が�
 | mcp-stdio の居場所 | MCP クライアントの隣（手元のマシン） | MCP サーバーの隣（公開ホスト） |
 | 変換の向き | stdio → Streamable HTTP / SSE | Streamable HTTP → stdio |
 | OAuth での役割 | **クライアント**：ログインし、トークンを保存・リフレッシュ | **認可サーバー**：クライアントを登録し、トークンを発行・検証 |
-| 典型的な利用者 | Claude Desktop / Claude Code でリモートサーバーを使う人 | stdio MCP サーバーをリモートユーザーに届けたい運用者 |
+| 典型的な利用者 | MCP クライアント（Claude Desktop、Claude Code、Codex など）でリモートサーバーを使う人 | stdio MCP サーバーをリモートユーザーに届けたい運用者 |
 | 次に読む | [リモート MCP サーバーに接続する](guides/connect-remote.md) | [stdio サーバーを公開する](guides/serve.md) |
 
 ## クライアント側ゲートウェイとして（デフォルトモード）
 
-MCP クライアント（Claude Desktop、Claude Code など）はローカルの stdio
+MCP クライアント（Claude Desktop、Claude Code、Codex など）はローカルの stdio
 プロセスしか起動できませんが、使いたいサーバーはネットワークの向こうに
 あります。mcp-stdio がそのローカルプロセス*そのもの*になります：
 クライアントは mcp-stdio と stdio で会話し、mcp-stdio がすべての
@@ -26,7 +26,7 @@ MCP クライアント（Claude Desktop、Claude Code など）はローカル�
 
 ```mermaid
 graph TD
-    A["MCP クライアント<br/>(Claude Desktop / Claude Code)"]
+    A["MCP クライアント<br/>(Claude Desktop / Claude Code / Codex / …)"]
     B["mcp-stdio<br/>OAuth クライアント · トークンキャッシュ · トランスポート変換"]
     C["リモート MCP サーバー<br/>(Streamable HTTP または legacy SSE)"]
     A -- "stdio (JSON-RPC 行)" --> B
@@ -41,8 +41,8 @@ mcp-stdio --oauth https://mcp.example.com/mcp
 
 このモードが欲しくなるのは：
 
-- ベンダーやチームがホストする MCP サーバーを Claude Desktop / Claude
-  Code から使いたいとき；
+- ベンダーやチームがホストする MCP サーバーを、手元の MCP クライアント
+  （Claude Desktop、Claude Code、Codex など）から使いたいとき；
 - クライアント単体では完結できない OAuth ログインをサーバーが要求する
   とき；
 - クライアントが対応をやめた legacy SSE トランスポートをサーバーが
@@ -61,8 +61,8 @@ stdio 子プロセスを spawn し、`--enable-oauth` を付ければクライ�
 
 ```mermaid
 graph TD
-    A1["リモートユーザー A<br/>(Claude Desktop)"]
-    A2["リモートユーザー B<br/>(Claude.ai コネクタ)"]
+    A1["リモートユーザー A<br/>(Claude Desktop / Codex)"]
+    A2["リモートユーザー B<br/>(claude.ai / Meta Muse)"]
     B["mcp-stdio serve<br/>OAuth 認可サーバー · セッション管理"]
     C1["A 用の stdio 子プロセス<br/>(あなたの MCP サーバー)"]
     C2["B 用の stdio 子プロセス<br/>(あなたの MCP サーバー)"]
@@ -104,7 +104,7 @@ mcp-stdio serve --enable-oauth \
 mcp-stdio --protocol-era auto https://mcp.example.com/mcp
 ```
 
-MCP クライアント側——Claude Desktop でも Claude Code でも——の設定変更は
+MCP クライアント側——Claude Desktop でも Claude Code でも Codex でも——の設定変更は
 一切要りません。クライアントは今までどおりの話し方のままで、あいだを
 mcp-stdio が通訳します。
 
@@ -312,7 +312,7 @@ mcp-stdio が起動するすべての子プロセスへのハンドシェイク�
 
 ```mermaid
 graph TD
-    A["Claude Desktop"] -- "stdio" --> B["mcp-stdio<br/>（クライアントモード）"]
+    A["MCP クライアント<br/>(Claude Desktop / Codex / …)"] -- "stdio" --> B["mcp-stdio<br/>（クライアントモード）"]
     B -- "HTTPS + OAuth" --> C["mcp-stdio serve<br/>（サーバーモード）"]
     C -- "stdio" --> D["あなたの MCP サーバー"]
 ```

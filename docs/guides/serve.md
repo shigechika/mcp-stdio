@@ -1,8 +1,9 @@
 # Publish your stdio server
 
 Goal: a stdio MCP server on your host becomes an HTTPS Streamable HTTP
-endpoint that remote MCP clients — Claude Desktop, Claude Code, even
-Claude.ai custom connectors — can use, each user isolated in their own
+endpoint that remote MCP clients — Claude Desktop, Claude Code, Codex,
+even web-based clients such as claude.ai custom connectors and Meta Muse —
+can use, each user isolated in their own
 child process behind a real OAuth 2.1 login.
 
 ## 1. Smoke test on loopback
@@ -60,6 +61,7 @@ a crossover.
 | You need… | Do this |
 |---|---|
 | Claude.ai custom connectors (browser-based clients) | `--allow-redirect-uri https://claude.ai/api/mcp/auth_callback` (claude.ai registers through Dynamic Client Registration) plus `--allow-client-id-url https://claude.ai/oauth/mcp-oauth-client-metadata` (its "No sign-in" mode always presents that Client ID Metadata Document URL instead, #463) |
+| Meta Muse (agent.meta.ai) | `--allow-redirect-uri https://agent.meta.ai/api/hatch/oauth/callback` (Muse registers through Dynamic Client Registration with that callback) |
 | Several backends on one host | run one serve process per backend with path-scoped issuers: `--public-url https://mcp.example.com/team-a`, `…/team-b` — AS endpoints and well-known documents nest under each prefix. Not for claude.ai custom connectors: claude.ai currently cannot complete a connection to an endpoint whose path is anything other than exactly `/mcp` — MCP requests stop once the token is issued ([anthropics/claude-ai-mcp#878](https://github.com/anthropics/claude-ai-mcp/issues/878)), and a multi-segment path gets none at all ([#738](https://github.com/anthropics/claude-ai-mcp/issues/738)) — so give each backend its own hostname there |
 | A backend that asks the client for its roots (e.g. `@modelcontextprotocol/server-filesystem`) behind claude.ai | `--drop-client-capability roots` — claude.ai declares `roots` but never answers `roots/list`, so the backend times out and the connector fails to connect ([anthropics/claude-ai-mcp#708](https://github.com/anthropics/claude-ai-mcp/issues/708), #466) |
 | MCP Apps (`ui://` resources) in the Claude iOS app | `--accept-claimless-resource-read` — the iOS app reads them with no protocol claim and no session, which serve otherwise answers with `400` ([anthropics/claude-ai-mcp#1042](https://github.com/anthropics/claude-ai-mcp/issues/1042), #469) |

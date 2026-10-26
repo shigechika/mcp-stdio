@@ -10,12 +10,12 @@ docs hangs off this choice, so take a moment here.
 | mcp-stdio runs… | next to your MCP client (laptop) | next to your MCP server (host) |
 | It translates… | stdio → Streamable HTTP / SSE | Streamable HTTP → stdio |
 | OAuth role | **client**: logs in, stores and refreshes your tokens | **authorization server**: registers clients, issues and validates tokens |
-| Typical user | anyone using Claude Desktop / Claude Code with a remote server | the operator of a stdio MCP server that remote users should reach |
+| Typical user | anyone whose MCP client (Claude Desktop, Claude Code, Codex, …) should reach a remote server | the operator of a stdio MCP server that remote users should reach |
 | Start here | [Connect to a remote MCP server](guides/connect-remote.md) | [Publish your stdio server](guides/serve.md) |
 
 ## As a client-side gateway (default mode)
 
-Your MCP client (Claude Desktop, Claude Code, …) only launches local stdio
+Your MCP client (Claude Desktop, Claude Code, Codex, …) only launches local stdio
 processes, but the server you want lives on the network. mcp-stdio *is* that
 local process: your client talks stdio to it, and it relays every message to
 the remote server over HTTPS — handling the OAuth login, token cache, and
@@ -23,7 +23,7 @@ refresh so the connection survives longer than an access token does.
 
 ```mermaid
 graph TD
-    A["MCP client<br/>(Claude Desktop / Claude Code)"]
+    A["MCP client<br/>(Claude Desktop / Claude Code / Codex / …)"]
     B["mcp-stdio<br/>OAuth client · token cache · transport translation"]
     C["Remote MCP server<br/>(Streamable HTTP or legacy SSE)"]
     A -- "stdio (JSON-RPC lines)" --> B
@@ -38,8 +38,8 @@ mcp-stdio --oauth https://mcp.example.com/mcp
 
 You want this mode when:
 
-- a vendor / your team hosts an MCP server and you want it in Claude
-  Desktop or Claude Code;
+- a vendor / your team hosts an MCP server and you want it in your MCP
+  client (Claude Desktop, Claude Code, Codex, …);
 - the server needs an OAuth login your client cannot complete on its own;
 - the server still speaks the legacy SSE transport your client dropped.
 
@@ -56,8 +56,8 @@ server that registers clients and issues the tokens guarding it all.
 
 ```mermaid
 graph TD
-    A1["Remote user A<br/>(Claude Desktop)"]
-    A2["Remote user B<br/>(Claude.ai connector)"]
+    A1["Remote user A<br/>(Claude Desktop / Codex)"]
+    A2["Remote user B<br/>(claude.ai / Meta Muse)"]
     B["mcp-stdio serve<br/>OAuth authorization server · sessions"]
     C1["stdio child for A<br/>(your MCP server)"]
     C2["stdio child for B<br/>(your MCP server)"]
@@ -98,7 +98,7 @@ one flag and mcp-stdio figures the rest out:
 mcp-stdio --protocol-era auto https://mcp.example.com/mcp
 ```
 
-Your MCP client — Claude Desktop, Claude Code, anything else — needs no
+Your MCP client — Claude Desktop, Claude Code, Codex, anything else — needs no
 changes at all. It keeps speaking the dialect it already knows, and
 mcp-stdio translates.
 
@@ -314,7 +314,7 @@ ends, each side doing its half of the OAuth dance.
 
 ```mermaid
 graph TD
-    A["Claude Desktop"] -- "stdio" --> B["mcp-stdio<br/>(client mode)"]
+    A["MCP client<br/>(Claude Desktop / Codex / …)"] -- "stdio" --> B["mcp-stdio<br/>(client mode)"]
     B -- "HTTPS + OAuth" --> C["mcp-stdio serve<br/>(server mode)"]
     C -- "stdio" --> D["your MCP server"]
 ```

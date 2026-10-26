@@ -2,7 +2,8 @@
 
 ゴール：ホスト上の stdio MCP サーバーを HTTPS の Streamable HTTP
 エンドポイントにして、リモートの MCP クライアント——Claude Desktop、
-Claude Code、さらに Claude.ai のカスタムコネクタ——から使えるようにする。
+Claude Code、Codex、さらに claude.ai のカスタムコネクタや Meta Muse の
+ような Web のクライアント——から使えるようにする。
 各ユーザーは専用の子プロセスに隔離され、本物の OAuth 2.1 ログインで
 守られます。
 
@@ -62,6 +63,7 @@ spawn、切断か idle タイムアウトで破棄）、認証済みアイデン
 | こうしたい | こうする |
 |---|---|
 | Claude.ai カスタムコネクタ（ブラウザベースのクライアント） | `--allow-redirect-uri https://claude.ai/api/mcp/auth_callback`（claude.ai は Dynamic Client Registration で登録します）に加えて `--allow-client-id-url https://claude.ai/oauth/mcp-oauth-client-metadata`（「ログインなし（No sign-in）」の設定では、代わりに常にこの Client ID Metadata Document の URL を名乗ります。#463） |
+| Meta Muse（agent.meta.ai） | `--allow-redirect-uri https://agent.meta.ai/api/hatch/oauth/callback`（Muse はこのコールバックで Dynamic Client Registration を行う） |
 | 1 ホストに複数バックエンド | バックエンドごとに serve プロセスを分け、パススコープ issuer を使う：`--public-url https://mcp.example.com/team-a`、`…/team-b`——AS エンドポイントと well-known もプレフィックス配下に収まります。claude.ai のカスタムコネクタには使えません。claude.ai は現在、パスがちょうど `/mcp` でないエンドポイントへの接続を完了できないため（トークン発行後に MCP のリクエストが途絶える：[anthropics/claude-ai-mcp#878](https://github.com/anthropics/claude-ai-mcp/issues/878)、複数階層のパスでは 1 件も届かない：[#738](https://github.com/anthropics/claude-ai-mcp/issues/738)）、その場合はバックエンドごとにホスト名を分けてください |
 | クライアントに roots を問い合わせるバックエンド（例：`@modelcontextprotocol/server-filesystem`）を claude.ai から使う | `--drop-client-capability roots`。claude.ai は `roots` を宣言しながら `roots/list` に応答しないため、バックエンドがタイムアウトしてコネクタの接続に失敗します（[anthropics/claude-ai-mcp#708](https://github.com/anthropics/claude-ai-mcp/issues/708)、#466） |
 | Claude の iOS アプリで MCP App（`ui://` リソース）を使う | `--accept-claimless-resource-read`。iOS アプリはプロトコルの申告もセッションも持たずに読みに来るため、指定しないと serve は `400` を返します（[anthropics/claude-ai-mcp#1042](https://github.com/anthropics/claude-ai-mcp/issues/1042)、#469） |

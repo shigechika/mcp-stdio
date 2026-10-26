@@ -53,6 +53,12 @@ Same as [the browser flow](connect-remote.md), just swap `--oauth` for
     claude mcp add my-remote-server -- mcp-stdio --oauth-device https://mcp.example.com/mcp
     ```
 
+=== "Codex"
+
+    ```bash
+    codex mcp add my-remote-server -- mcp-stdio --oauth-device https://mcp.example.com/mcp
+    ```
+
 Tokens land in the same `~/.config/mcp-stdio/tokens.json` used by the
 browser flow — log in once per server URL, from wherever is convenient,
 and every terminal and session shares the result.

@@ -13,11 +13,11 @@ Authorization Server), so it can sit on either end of an MCP connection.
 
 ## Overview
 
-**Client gateway (default mode) — stdio → HTTP.** [MCP](https://modelcontextprotocol.io/) clients like Claude Desktop and Claude Code see mcp-stdio as a locally running self-hosted MCP server, while it relays all requests to a remote MCP server with support for various authentication methods:
+**Client gateway (default mode) — stdio → HTTP.** [MCP](https://modelcontextprotocol.io/) clients such as Claude Desktop, Claude Code and OpenAI Codex see mcp-stdio as a locally running self-hosted MCP server, while it relays all requests to a remote MCP server with support for various authentication methods:
 
 ```mermaid
 flowchart BT
-    A[Claude<br>Desktop/Code] <-- stdio --> B(mcp-stdio)
+    A[MCP client<br>Claude / Codex / …] <-- stdio --> B(mcp-stdio)
     B <== "<b>HTTPS</b><br>Streamable HTTP / SSE<br>Bearer Token<br>Header<br>OAuth" ==> C[Remote<br>MCP Server]
     B -. "OAuth 2.1<br>(PKCE)" .-> D[Authorization<br>Server]
     D -. callback .-> B
@@ -200,6 +200,16 @@ claude mcp add my-remote-server \
   -- mcp-stdio https://your-server.example.com:8080/mcp
 ```
 
+## Codex Configuration
+
+```bash
+codex mcp add my-remote-server \
+  --env MCP_BEARER_TOKEN=YOUR_TOKEN \
+  -- mcp-stdio https://your-server.example.com:8080/mcp
+```
+
+The same pattern works for any MCP client that launches stdio servers: give it `mcp-stdio` as the command and the remote URL (plus any options) as arguments.
+
 ## Usage
 
 ```
@@ -291,7 +301,7 @@ it over the network:
 
 ```mermaid
 flowchart BT
-    A["MCP client<br>Claude Code / Desktop<br>(or mcp-stdio --oauth)"]
+    A["MCP client<br>Claude / claude.ai / Codex /<br>Meta Muse<br>(or mcp-stdio --oauth)"]
     B("mcp-stdio serve<br><b>HTTP → stdio</b> gateway<br>auth: none / static token /<br>embedded OAuth 2.1 AS")
     C["local stdio<br>MCP server"]
     A <== "Streamable HTTP<br>Bearer / OAuth 2.1 (PKCE)" ==> B
@@ -412,7 +422,9 @@ command follows the options (an optional `--` separator is supported).
     or port matching — so add only a URL you have verified belongs to a
     client you actually trust; each entry is exactly as trusted as a
     hardcoded redirect target. It is independent of the loopback path (adding
-    one never widens the other) and requires `--enable-oauth`.
+    one never widens the other) and requires `--enable-oauth`. Examples:
+    `https://claude.ai/api/mcp/auth_callback` (claude.ai),
+    `https://agent.meta.ai/api/hatch/oauth/callback` (Meta Muse).
   - *Client ID Metadata Documents* — `--allow-client-id-url URL` (repeatable)
     accepts that exact HTTPS URL as a `client_id` (draft-ietf-oauth-client-id-metadata-document,
     which MCP 2026-07-28 prefers over DCR): serve fetches the document at
@@ -549,7 +561,7 @@ See [WORKAROUNDS.md](WORKAROUNDS.md) for known issues in Claude Code, Claude Des
 ## How It Works
 
 1. If `--oauth` (browser) or `--oauth-device` (headless, RFC 8628) is set, obtains an access token (cached → refresh → browser/device flow)
-2. Reads JSON-RPC messages from stdin (sent by Claude Desktop/Code)
+2. Reads JSON-RPC messages from stdin (sent by the MCP client)
 3. Relays them over HTTPS to the remote MCP server
 4. Parses responses and writes them to stdout
 5. On 401 (OAuth mode only), refreshes the access token and retries; when the refresh itself is rejected, it re-authorizes in the background and answers `-32002` until the sign-in completes (#471); with static `--bearer-token` / `-H` auth the 401 is surfaced to the client

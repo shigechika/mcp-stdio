@@ -4,7 +4,7 @@ MCP（Model Context Protocol）サーバーのための、最小構成の stdio 
 ゲートウェイ。小さな Python パッケージひとつ、ランタイム依存は `httpx`
 だけ。役割はふたつ：
 
-- stdio しか話せない MCP クライアント（Claude Desktop、Claude Code など）を
+- stdio しか話せない MCP クライアント（Claude Desktop、Claude Code、Codex など）を
   **リモートの HTTP MCP サーバーに接続**する——OAuth 2.1 ログイン、トークン
   保存、リフレッシュ込みで。
 - ローカルの stdio MCP サーバーを、OAuth 2.1 認可サーバー内蔵の
