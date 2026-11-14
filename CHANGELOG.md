@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.46.0](https://github.com/shigechika/mcp-stdio/compare/v0.45.2...v0.46.0) (2026-11-14)
+
+
+### Features
+
+* drop Python 3.10 (EOL) and add Python 3.15 support ([#484](https://github.com/shigechika/mcp-stdio/issues/484)) ([bbdbf90](https://github.com/shigechika/mcp-stdio/commit/bbdbf90560e3499f9be059daf2a5af4fc68cc991))
+
 ## [0.45.2](https://github.com/shigechika/mcp-stdio/compare/v0.45.1...v0.45.2) (2026-10-26)
 
 
