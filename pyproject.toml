@@ -4,7 +4,7 @@ dynamic = ["version"]
 description = "Stdio-to-HTTP gateway — connects MCP clients to remote HTTP MCP servers"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [{ name = "Shigechika AIKAWA" }]
 keywords = ["mcp", "stdio", "gateway", "proxy", "relay", "claude", "bridge", "oauth", "sse", "streamable-http"]
 classifiers = [
@@ -13,11 +13,11 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [

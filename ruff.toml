@@ -20,7 +20,7 @@
 # code is doing. That is the exception, and it is annotated where it applies —
 # not a reason to leave the whole repository ungated.
 
-target-version = "py310"
+target-version = "py311"
 
 [lint]
 select = ["E4", "E7", "E9", "F"]
