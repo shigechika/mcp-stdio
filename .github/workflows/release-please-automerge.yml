@@ -1,0 +1,37 @@
+name: release-please-automerge
+
+# Enable auto-merge on release-please's own release PR so a release goes out
+# once the required status checks pass, without a manual merge.
+#
+# The release PR only bumps the version and the changelog; the code it
+# releases is already on main. `--auto` waits for the branch ruleset's
+# required checks (test-ok etc.), so a red release PR is never merged.
+#
+# Auto-merge is enabled with RELEASE_PLEASE_TOKEN, not GITHUB_TOKEN: the
+# merge is attributed to whoever enabled it, and a push to main attributed to
+# GITHUB_TOKEN does not trigger other workflows, so release-please would never
+# run on the merge commit to cut the tag and the release.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  automerge:
+    runs-on: ubuntu-latest
+    # Only release-please's PR: its branch in this repository, opened by the
+    # repository owner (release-please runs with the owner's PAT).
+    if: >-
+      startsWith(github.event.pull_request.head.ref, 'release-please--') &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login == github.repository_owner
+    steps:
+      - name: Enable auto-merge
+        env:
+          # html_url is a GitHub-controlled canonical URL; passed via env, not
+          # interpolated into the run: script.
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+        run: gh pr merge --auto --squash "$PR_URL"
