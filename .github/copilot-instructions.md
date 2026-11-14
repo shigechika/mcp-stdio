@@ -55,7 +55,8 @@ pytest tests/ -v
 ```
 
 CI (`.github/workflows/test.yml`) runs `pytest tests/ -v` on Python 3.11–3.15
-on `ubuntu-latest`, plus a dedicated `windows-latest` / Python 3.12 job. The
+on `ubuntu-latest`, plus a dedicated `windows-latest` job on the latest `3.x`
+(the release workflow pins that job to 3.12 instead). The
 Windows job exists specifically to smoke-test the stdio newline handling
 (see the "## Windows" section in `WORKAROUNDS.md`) — it is not there for
 general cross-platform coverage, so don't suggest dropping it as redundant.
