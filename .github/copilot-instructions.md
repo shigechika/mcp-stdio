@@ -54,7 +54,7 @@ pip install -e ".[dev]"
 pytest tests/ -v
 ```
 
-CI (`.github/workflows/test.yml`) runs `pytest tests/ -v` on Python 3.10–3.14
+CI (`.github/workflows/test.yml`) runs `pytest tests/ -v` on Python 3.11–3.15
 on `ubuntu-latest`, plus a dedicated `windows-latest` / Python 3.12 job. The
 Windows job exists specifically to smoke-test the stdio newline handling
 (see the "## Windows" section in `WORKAROUNDS.md`) — it is not there for
