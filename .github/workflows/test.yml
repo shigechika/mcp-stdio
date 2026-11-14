@@ -58,3 +58,16 @@ jobs:
 
       - name: Run tests
         run: pytest tests/ -v
+
+  # Version-free required status check for the branch ruleset. The matrix
+  # legs above are named after their Python version, so binding the ruleset
+  # to them meant editing it on every Python bump; bind it to this job instead.
+  # `needs.test.result` is "success" only when every matrix leg succeeded.
+  test-ok:
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - if: needs.test.result != 'success'
+        run: exit 1
